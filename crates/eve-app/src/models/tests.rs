@@ -22,6 +22,9 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::sync::Notify;
 
+#[path = "codex_tests.rs"]
+mod codex;
+
 struct Harness {
     kernel: Kernel,
     admin: ConfigController,
@@ -30,6 +33,10 @@ struct Harness {
 }
 impl Harness {
     async fn start(root: &Path, url: &str, protocol: &str) -> Self {
+        Self::start_with_validator(root, url, protocol, false).await
+    }
+
+    async fn start_with_validator(root: &Path, url: &str, protocol: &str, validate: bool) -> Self {
         let backends = KernelServices {
             state: Arc::new(FileStateStore::open(root.join("state")).unwrap()),
             ..KernelServices::default()
@@ -38,34 +45,36 @@ impl Harness {
         let permissions = backends.permissions.clone();
         let logger = backends.logger.clone();
         let kernel = Kernel::with_services(backends);
-        let plugin = ConfigPlugin::new(
-            ConfigBootstrap::new(
-                root.join("state/configuration"),
-                vec![
-                    runtime_llm_schema(),
-                    crate::deferred_reply::schema(),
-                    config::openai_schema(),
-                    config::model_uses_schema(),
-                    config::dialogue_schema(),
-                    config::history_schema(),
-                    model_roles_schema(),
-                ],
-            )
-            .with_environment(BTreeMap::from([
-                (
-                    "EVE_OPENAI_BASE_URL".into(),
-                    url.trim_end_matches("/responses").into(),
-                ),
-                ("EVE_OPENAI_PROTOCOL".into(), protocol.into()),
-                ("EVE_OPENAI_MODEL_ROLE".into(), "primary".into()),
-                ("EVE_MODELS_PRIMARY_ENABLED".into(), "true".into()),
-                ("EVE_MODELS_PRIMARY_PROVIDER".into(), "openai".into()),
-                ("EVE_MODELS_PRIMARY_MODEL".into(), "model-a".into()),
-                ("EVE_MODELS_PRIMARY_TIMEOUT_MS".into(), "2500".into()),
-                ("EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS".into(), "32".into()),
-            ])),
+        let mut configuration = ConfigBootstrap::new(
+            root.join("state/configuration"),
+            vec![
+                runtime_llm_schema(),
+                crate::deferred_reply::schema(),
+                config::openai_schema(),
+                config::model_uses_schema(),
+                config::dialogue_schema(),
+                config::history_schema(),
+                model_roles_schema(),
+                eve_message_api::message_schema(),
+            ],
         )
-        .unwrap();
+        .with_environment(BTreeMap::from([
+            (
+                "EVE_OPENAI_BASE_URL".into(),
+                url.trim_end_matches("/responses").into(),
+            ),
+            ("EVE_OPENAI_PROTOCOL".into(), protocol.into()),
+            ("EVE_OPENAI_MODEL_ROLE".into(), "primary".into()),
+            ("EVE_MODELS_PRIMARY_ENABLED".into(), "true".into()),
+            ("EVE_MODELS_PRIMARY_PROVIDER".into(), "openai".into()),
+            ("EVE_MODELS_PRIMARY_MODEL".into(), "model-a".into()),
+            ("EVE_MODELS_PRIMARY_TIMEOUT_MS".into(), "2500".into()),
+            ("EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS".into(), "32".into()),
+        ]));
+        if validate {
+            configuration = configuration.with_validator(Arc::new(config::CoreConfigValidator));
+        }
+        let plugin = ConfigPlugin::new(configuration).unwrap();
         let admin = plugin.controller();
         let control = install_core_with_config(
             &kernel,
@@ -111,6 +120,14 @@ impl Harness {
     }
 
     fn update(&self, changes: &[(&str, &str, Value)], mode: ApplyMode) {
+        self.try_update(changes, mode).unwrap();
+    }
+
+    fn try_update(
+        &self,
+        changes: &[(&str, &str, Value)],
+        mode: ApplyMode,
+    ) -> eve_config_api::ConfigResult<eve_config_api::ConfigChange> {
         let document = self.admin.current().unwrap();
         let mut overrides = document.namespaces;
         for (namespace, field, value) in changes {
@@ -123,9 +140,7 @@ impl Harness {
                 .values
                 .insert((*field).into(), value.clone());
         }
-        self.admin
-            .replace(document.revision, overrides, mode)
-            .unwrap();
+        self.admin.replace(document.revision, overrides, mode)
     }
 
     fn submit(&self, text: &str, sink: Arc<dyn ControlEventSink>) -> GenerationKey {
@@ -262,6 +277,7 @@ fn streamed_auxiliary_usage_tail_preserves_success_under_host_deadline() {
                 let selected = resolver.resolve().unwrap();
                 assert_eq!(selected.provider_timeout, Duration::from_millis(1300));
                 let request = ModelRequest {
+                    session: None,
                     messages: vec![ChatMessage::text(ChatRole::User, "synthetic input")],
                     tools: vec![],
                 };
@@ -574,6 +590,7 @@ async fn explicit_primary_reference_rotates_only_new_selections_and_preserves_in
         selection
             .provider
             .complete(ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::text(ChatRole::User, "验证凭据快照")],
                 tools: vec![],
             })
@@ -756,6 +773,7 @@ async fn independent_auxiliary_endpoint_and_chat_protocol_never_receive_primary_
         .resolve()
         .unwrap();
     let request = || ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "独立端点验证")],
         tools: vec![],
     };
@@ -897,6 +915,7 @@ async fn auxiliary_use_routes_real_requests_keeps_old_selections_and_isolates_cr
         selected
             .provider
             .complete(ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::text(ChatRole::User, "路由验证")],
                 tools: vec![],
             })
@@ -1164,6 +1183,7 @@ async fn anonymous_auxiliary_route_uses_no_key_and_cannot_be_selected_as_primary
     selected
         .provider
         .complete(ModelRequest {
+            session: None,
             messages: vec![ChatMessage::text(ChatRole::User, "合成材料")],
             tools: vec![],
         })

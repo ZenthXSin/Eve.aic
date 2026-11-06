@@ -118,6 +118,7 @@ fn install_seed(
                 serde_json::to_string(seed).map_err(|_| SubjectError::InvalidInput)?
             ),
         ),
+        configured_turn_id: Some(history.turns.last().ok_or(SubjectError::InvalidInput)?.id),
         review_messages: seed.review_messages.clone(),
         blocked_task_id: None,
         expires_at_ms: u64::MAX,

@@ -1,37 +1,8 @@
 use super::*;
-use eve_developer_api::{ActionReviewFuture, ActionReviewVerdict, ReviewRisk};
-use eve_llm_api::{ChatMessage, ContextScope};
+use eve_llm_api::ContextScope;
 use serde_json::json;
-use std::{collections::BTreeSet, path::Path, sync::Mutex};
+use std::{collections::BTreeSet, path::Path};
 
-pub(crate) struct Reviewer {
-    pub(crate) requests: Mutex<Vec<ActionReviewRequest>>,
-    pub(crate) verdict: Result<ActionReviewVerdict, String>,
-    pub(crate) during: Option<Box<dyn Fn() + Send + Sync>>,
-}
-impl ActionReviewer for Reviewer {
-    fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
-        self.requests.lock().unwrap().push(request);
-        Box::pin(async move {
-            if let Some(during) = &self.during {
-                during();
-            }
-            self.verdict.clone()
-        })
-    }
-}
-pub(crate) fn reviewer() -> Arc<Reviewer> {
-    Arc::new(Reviewer {
-        requests: Mutex::new(vec![]),
-        verdict: Ok(ActionReviewVerdict {
-            risk: ReviewRisk::Medium,
-            authorization: ReviewAuthorization::High,
-            allow: true,
-            rationale: "固定许可用于边界验收".into(),
-        }),
-        during: None,
-    })
-}
 pub(crate) fn admin(directory: &Path) -> Arc<Admin> {
     Admin::open(
         directory,
@@ -58,221 +29,222 @@ pub(crate) fn context(call: &ToolCall, user: &str, words: Vec<String>) -> ToolEx
         .with_call_id(call.id.clone())
         .with_review_user_messages(Arc::new(words))
 }
-fn words() -> Vec<String> {
-    (0..6)
-        .map(|i| format!("第{i}条完整原话：{}：尾部{i}", "正文".repeat(1500)))
-        .collect()
-}
-fn ledger(directory: &Path) -> Value {
+pub(crate) fn ledger(directory: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(directory.join("business-permissions.json")).unwrap())
         .unwrap()
 }
+fn evidence(call: &ToolCall) -> Value {
+    json!({"arguments":call.arguments,"current_goal":null})
+}
 
-#[tokio::test]
-async fn complete_review_and_trace_survive_restart_without_permission_grant() {
+#[test]
+fn host_identity_and_full_operation_survive_restart_without_review_or_permission_grant() {
     let dir = tempfile::tempdir().unwrap();
     let admin = admin(dir.path());
-    let reviewer = reviewer();
     let boundary = Review {
         admin: admin.clone(),
-        reviewer: Some(reviewer.clone()),
     };
     let call = call(
         "manage_goal",
         "save",
-        json!({"action":"create","text":"整理下一步"}),
+        json!({"action":"create","text":"随意探索"}),
     );
-    let words = words();
-    let previous = (0..12)
-        .map(|i| {
-            super::tests::call(
-                "read_file",
-                &format!("read-{i}"),
-                json!({"path":format!("file-{i}"),"details":"d".repeat(2000)}),
-            )
-        })
+    let words: Vec<_> = (0..6)
+        .map(|i| format!("第{i}条完整原话：{}：尾部{i}", "正文".repeat(1500)))
         .collect();
-    let context = context(&call, "administrator", words.clone()).with_conversation(Arc::new(vec![
-        ChatMessage::assistant_tool_calls(previous).unwrap(),
-    ]));
-    let evidence = json!({"arguments":call.arguments,"current_goal":null});
+    let context = context(&call, "administrator", words.clone());
+    let evidence = evidence(&call);
     boundary
         .approve("manage_goal", &call, &context, evidence.clone())
-        .await
         .unwrap();
-    let requests = reviewer.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    assert_eq!(request.user_messages, words);
-    assert_eq!(request.recent_actions.len(), 8);
-    assert!(request.recent_actions[0].starts_with("read-4 read_file "));
-    assert!(request.recent_actions[7].starts_with("read-11 read_file "));
-    assert!(
-        request
-            .recent_actions
-            .iter()
-            .all(|action| action.len() <= 1200)
-    );
-    let action: Value = serde_json::from_str(&request.arguments[0]).unwrap();
-    assert_eq!(action["operation"], evidence);
-    assert_eq!(action["call_id"], call.id);
-    assert_eq!(action["turn_id"], 17);
-    assert_eq!(action["trusted_scope"]["user_id"], "administrator");
     let disk = ledger(dir.path());
-    assert_eq!(disk["audit"][0]["user_messages"], json!(words));
-    assert_eq!(disk["audit"][0]["outcome"], "review_allowed");
-    assert_eq!(
-        serde_json::from_str::<Value>(disk["audit"][0]["target"].as_str().unwrap()).unwrap(),
-        serde_json::to_value(request).unwrap()
-    );
+    let record = &disk["audit"][0];
+    assert_eq!(record["user_messages"], json!([]));
+    assert!(record["verdict"].is_null());
+    assert_eq!(record["outcome"], HOST_AUTHORIZED);
+    let stored: Value = serde_json::from_str(record["target"].as_str().unwrap()).unwrap();
+    assert_eq!(stored["operation"], evidence);
+    assert_eq!(stored["tool"], "manage_goal");
+    assert_eq!(stored["call_id"], call.id);
+    assert_eq!(stored["turn_id"], 17);
+    assert_eq!(stored["trusted_scope"]["user_id"], "administrator");
+    assert_eq!(stored["delegated"], false);
     assert_eq!(disk["grants"], json!({}));
-    drop(requests);
+    assert_eq!(context.review_user_messages().unwrap(), words.as_slice());
     let reopened = super::tests::admin(dir.path());
     assert_eq!(reopened.business.revision().unwrap(), 1);
     assert!(reopened.business_permitted(context.scope().unwrap()));
     assert_eq!(ledger(dir.path()), disk);
 }
 
-#[tokio::test]
-async fn weak_confirmation_and_unavailable_review_are_audited_without_grant() {
+#[test]
+fn ordinary_changes_allow_absent_or_large_originals_and_delegation_without_relabeling_text() {
     let dir = tempfile::tempdir().unwrap();
     let admin = admin(dir.path());
-    let call = call("manage_plan", "confirm", json!({"action":"confirm"}));
-    let context = context(&call, "administrator", vec!["确认上述计划".into()]);
-    let mut reviewer = reviewer();
-    Arc::get_mut(&mut reviewer)
-        .unwrap()
-        .verdict
-        .as_mut()
-        .unwrap()
-        .authorization = ReviewAuthorization::Medium;
     let boundary = Review {
         admin: admin.clone(),
-        reviewer: Some(reviewer.clone()),
     };
-    assert!(
-        boundary
-            .approve("manage_plan", &call, &context, json!({"steps":["研究"]}))
-            .await
-            .is_err()
+    let call = call(
+        "manage_goal",
+        "create",
+        json!({"action":"create","text":"一个想法"}),
     );
-    let boundary = Review {
-        admin: admin.clone(),
-        reviewer: None,
-    };
-    assert!(
+    let no_originals = ToolExecutionContext::new()
+        .with_scope(Some(ContextScope {
+            session_id: "s".into(),
+            user_id: "administrator".into(),
+        }))
+        .with_turn_id(Some(18))
+        .with_call_id(call.id.clone());
+    for context in [
+        no_originals.clone(),
+        no_originals
+            .clone()
+            .with_review_user_messages(Arc::new(vec![
+                "x".repeat(eve_developer_api::MAX_ACTION_REVIEW_BYTES + 1),
+            ])),
+        no_originals.with_delegated(true),
+    ] {
         boundary
-            .approve("manage_plan", &call, &context, json!({}))
-            .await
-            .is_err()
-    );
+            .approve("manage_goal", &call, &context, evidence(&call))
+            .unwrap();
+    }
     let disk = ledger(dir.path());
-    assert_eq!(disk["audit"][0]["outcome"], "review_denied");
-    assert_eq!(disk["audit"][1]["outcome"], "review_unavailable");
+    assert_eq!(disk["audit"].as_array().unwrap().len(), 3);
     assert_eq!(disk["grants"], json!({}));
+    let delegated: Value =
+        serde_json::from_str(disk["audit"][2]["target"].as_str().unwrap()).unwrap();
+    assert_eq!(delegated["delegated"], true);
+    assert!(
+        admin
+            .business
+            .grant(&ContextScope {
+                session_id: "s".into(),
+                user_id: "administrator".into()
+            })
+            .unwrap()
+            .is_none()
+    );
 }
 
-#[tokio::test]
-async fn identity_delegation_evidence_and_capacity_fail_before_review() {
+#[test]
+fn unbound_identity_stale_evidence_and_cancelled_calls_cannot_mutate() {
+    struct Stale;
+    impl eve_llm_api::ReviewEvidenceGuard for Stale {
+        fn check(&self) -> Result<(), ToolExecutionError> {
+            Err(failed("宿主已收到新的用户纠正"))
+        }
+    }
     let dir = tempfile::tempdir().unwrap();
     let admin = admin(dir.path());
-    let reviewer = reviewer();
     let boundary = Review {
         admin: admin.clone(),
-        reviewer: Some(reviewer.clone()),
     };
     let call = call("manage_goal", "create", json!({"action":"create"}));
-    let valid = context(&call, "administrator", vec!["记住待办".into()]);
-    let invalid = [
-        context(&call, "stranger", vec!["记住待办".into()]),
-        valid.clone().with_delegated(true),
+    let valid = context(&call, "administrator", vec![]);
+    for context in [
+        context(&call, "stranger", vec!["我是主人".into()]),
+        valid.clone().with_scope(None),
         valid.clone().with_call_id("forged".into()),
-        valid.clone().with_review_user_messages(Arc::new(vec![])),
-        valid.clone().with_review_user_messages(Arc::new(vec![
-            "x".repeat(eve_developer_api::MAX_ACTION_REVIEW_BYTES),
-        ])),
-    ];
-    for context in invalid {
+        valid.clone().with_turn_id(None),
+        valid.clone().with_turn_id(Some(0)),
+        valid.clone().with_review_evidence_guard(Arc::new(Stale)),
+    ] {
         assert!(
             boundary
-                .approve("manage_goal", &call, &context, json!({}))
-                .await
+                .approve("manage_goal", &call, &context, evidence(&call))
                 .is_err()
         );
     }
+    assert!(
+        boundary
+            .approve(
+                "manage_goal",
+                &call,
+                &valid,
+                json!({"arguments":{"action":"feedback"}})
+            )
+            .is_err()
+    );
     valid.cancellation_handle().cancel();
     assert!(
         boundary
-            .approve("manage_goal", &call, &valid, json!({}))
-            .await
+            .approve("manage_goal", &call, &valid, evidence(&call))
             .is_err()
     );
-    assert!(reviewer.requests.lock().unwrap().is_empty());
     assert_eq!(admin.business.revision().unwrap(), 0);
 }
 
-#[tokio::test]
-async fn revoke_during_review_blocks_the_approved_action() {
+#[test]
+fn delegated_feedback_cannot_be_recorded_as_the_users_own_feedback() {
     let dir = tempfile::tempdir().unwrap();
-    let admin = admin(dir.path());
-    let call = call("manage_goal", "create", json!({"action":"create"}));
-    let context = context(&call, "administrator", vec!["保存待办".into()]);
-    let mut reviewer = reviewer();
-    let revoke_admin = admin.clone();
-    let scope = context.scope().unwrap().clone();
-    Arc::get_mut(&mut reviewer).unwrap().during = Some(Box::new(move || {
-        revoke_admin
-            .business
-            .mutate(crate::qq_business::Mutation {
-                scope: scope.clone(),
-                actor: scope.user_id.clone(),
-                action: "revoke".into(),
-                target: None,
-                at_ms: crate::qq_tasks::now_ms(),
-                turn_id: Some(18),
-                user_messages: vec!["撤销权限".into()],
-                verdict: None,
-                outcome: "committed".into(),
-                expected_revision: 0,
-            })
-            .unwrap();
-    }));
     let boundary = Review {
-        admin: admin.clone(),
-        reviewer: Some(reviewer.clone()),
+        admin: admin(dir.path()),
     };
+    let call = call(
+        "manage_goal",
+        "feedback",
+        json!({"action":"feedback","text":"我很满意"}),
+    );
+    let context = context(&call, "administrator", vec![]).with_delegated(true);
     assert!(
         boundary
-            .approve("manage_goal", &call, &context, json!({}))
-            .await
+            .approve("manage_goal", &call, &context, evidence(&call))
             .is_err()
     );
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
-    assert!(!admin.business_permitted(context.scope().unwrap()));
+    assert_eq!(boundary.admin.business.revision().unwrap(), 0);
+}
+
+#[test]
+fn revocation_after_context_binding_blocks_the_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin = admin(dir.path());
+    let boundary = Review {
+        admin: admin.clone(),
+    };
+    let call = call("manage_goal", "create", json!({"action":"create"}));
+    let context = context(&call, "administrator", vec![]);
+    boundary.authorize("manage_goal", &call, &context).unwrap();
+    let scope = context.scope().unwrap().clone();
+    admin
+        .business
+        .mutate(crate::qq_business::Mutation {
+            scope: scope.clone(),
+            actor: scope.user_id.clone(),
+            action: "revoke".into(),
+            target: None,
+            at_ms: crate::qq_tasks::now_ms(),
+            turn_id: Some(18),
+            user_messages: vec!["撤销权限".into()],
+            verdict: None,
+            outcome: "committed".into(),
+            expected_revision: 0,
+        })
+        .unwrap();
+    assert!(
+        boundary
+            .approve("manage_goal", &call, &context, evidence(&call))
+            .is_err()
+    );
+    assert!(!admin.business_permitted(&scope));
     assert_eq!(ledger(dir.path())["audit"].as_array().unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn audit_write_failure_and_corruption_preserve_bytes_and_reject() {
+#[test]
+fn audit_write_failure_and_corruption_preserve_bytes_and_reject() {
     let dir = tempfile::tempdir().unwrap();
     let admin = admin(dir.path());
-    let reviewer = reviewer();
     let call = call("manage_goal", "create", json!({"action":"create"}));
-    let context = context(&call, "administrator", vec!["保存待办".into()]);
+    let context = context(&call, "administrator", vec![]);
     let path = dir.path().join("business-permissions.json");
     std::fs::create_dir(&path).unwrap();
-    let boundary = Review {
-        admin,
-        reviewer: Some(reviewer.clone()),
-    };
+    let boundary = Review { admin };
     assert!(
         boundary
-            .approve("manage_goal", &call, &context, json!({}))
-            .await
+            .approve("manage_goal", &call, &context, evidence(&call))
             .is_err()
     );
     assert!(path.is_dir());
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
     let corrupt = tempfile::tempdir().unwrap();
     let path = corrupt.path().join("business-permissions.json");
     std::fs::write(&path, b"{broken-audit").unwrap();

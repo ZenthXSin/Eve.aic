@@ -32,14 +32,18 @@ pub(crate) fn expired(
     limit: Duration,
     started: Instant,
     received: Option<usize>,
+    identity: crate::timing::RequestIdentity,
 ) -> LlmError {
-    eprintln!(
-        "EVE_MODEL_TIMEOUT {}",
-        serde_json::json!({
-            "phase":phase,"limit_ms":limit.as_millis(),
-            "at_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()),
-            "elapsed_ms":started.elapsed().as_millis(),"received_bytes":received,
-        })
+    let mut fields = identity.fields();
+    fields["phase"] = serde_json::json!(phase);
+    fields["limit_ms"] = serde_json::json!(limit.as_millis());
+    fields["at_ms"] = serde_json::json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
     );
+    fields["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+    fields["received_bytes"] = serde_json::json!(received);
+    eprintln!("EVE_MODEL_TIMEOUT {fields}");
     LlmError::ProviderTimeout
 }

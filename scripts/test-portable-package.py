@@ -16,7 +16,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 发行包验收检查自然段分条；按句分条由 segment_test 覆盖。启动器继承该环境变量。
@@ -49,14 +48,13 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         *, live=True, message_id="package-chat", expected_turns=1):
     config_path = root / "config.json"
     before = config_path.read_bytes()
-    if label == "windows-x64":
-        command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-                   "-ExecutionPolicy", "Bypass", "-File", str(root / "Launch.ps1"),
-                   "-NoPrompt", "-NoCheckUpdates", "-BridgeScript", str(bridge), "-BridgeArg", str(scenario)]
-    else:
-        node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
-        command = [str(node), str(root / "Launch.mjs"), "qq",
-                   "--no-prompt", "--no-check-updates", "--bridge-script", str(bridge), "--bridge-arg", str(scenario)]
+    events_path = scenario.with_suffix(".events.jsonl")
+    scenario_data = json.loads(scenario.read_text(encoding="utf-8"))
+    scenario_data["events_file"] = str(events_path)
+    scenario.write_text(json.dumps(scenario_data), encoding="utf-8")
+    node = root / "runtime/bin/node"
+    command = [str(node), str(root / "Launch.mjs"), "qq",
+               "--no-prompt", "--no-check-updates", "--bridge-script", str(bridge), "--bridge-arg", str(scenario)]
     environment = dict(os.environ)
     if live:
         # 默认启动必须实际采用自主发言，不能靠验收环境覆盖掩盖默认值回退。
@@ -148,7 +146,15 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         child.wait(timeout=30)
         for reader in readers:
             reader.join(timeout=3)
+        events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()] if events_path.exists() else []
+        commands = [event for event in events if event.get("direction") == "out"]
+        finishes = sum(event.get("type") == "finish" and event.get("id") == message_id for event in commands)
+        print(json.dumps({"portable_bridge_phase": "closed", "exit_code": child.returncode,
+                          "commands": [event.get("type") for event in commands][-16:],
+                          "finish_count": finishes}), flush=True)
         require(child.returncode == 0, "原生启动器退出失败：" + "".join(lines))
+        if live:
+            require(finishes == 1, "桥接没有恰好一次收到本轮 finish 结束命令")
         require(config_path.read_bytes() == before, "启动器重写了现有配置")
         output = "".join(lines)
         if updated is not None:
@@ -192,9 +198,10 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
 
 
 def main():
+    require(sys.platform == "linux", "发行包原生验收仅支持 Linux")
     dist = pathlib.Path(sys.argv[1]).resolve()
-    archives = list(dist.glob("Eve-*.zip")) + list(dist.glob("Eve-*.tar.gz"))
-    require(len(archives) == 1, "必须有一个待验收发行 ZIP")
+    archives = list(dist.glob("Eve-*.tar.gz"))
+    require(len(archives) == 1, "必须有一个待验收 Linux tar.gz 发行包")
     archive = archives[0]
     checksums = list(dist.glob("SHA256SUMS-*.txt"))
     require(len(checksums) == 1, "必须有一个对应平台的发行校验清单")
@@ -255,15 +262,12 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="Eve 验收 空格 ") as temporary:
             work = pathlib.Path(temporary)
-            if archive.suffix == ".zip":
-                with zipfile.ZipFile(archive) as zipped:
-                    zipped.extractall(work)
-            else:
-                with tarfile.open(archive) as tar:
-                    tar.extractall(work, filter="data")
+            with tarfile.open(archive) as tar:
+                tar.extractall(work, filter="data")
             root = next(work.glob("Eve-*"))
             manifest = json.loads((root / "build-info.json").read_text(encoding="utf-8"))
-            require(("windows" in manifest["target"]) == (os.name == "nt"), "构建目标错误")
+            targets = {"linux-x64": "x86_64-unknown-linux-gnu", "linux-arm64": "aarch64-unknown-linux-gnu"}
+            require(targets.get(manifest["platform_label"]) == manifest["target"], "构建目标错误")
             for path, digest in manifest["files_sha256"].items():
                 require(hashlib.sha256((root / path).read_bytes()).hexdigest() == digest, "解压文件校验失败：" + path)
             require(not (root / "config.json").exists() and not (root / "data").exists(), "发行包混入用户密钥或状态")
@@ -274,14 +278,10 @@ def main():
             config["qq"]["app_secret"] = "test-app-secret"
             config["web"] = {"listen": "127.0.0.1:0", "token": "synthetic-package-panel-token-12345678901234567890"}
             (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
-            node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
-            if os.name != "nt":
-                for name in ("Start-Eve", "Start-Console", "Open-Panel"):
-                    require(os.access(root / f"{name}.sh", os.X_OK), "解压丢失启动脚本执行权限")
+            node = root / "runtime/bin/node"
+            for name in ("Start-Eve", "Start-Console", "Open-Panel"):
+                require(os.access(root / f"{name}.sh", os.X_OK), "解压丢失启动脚本执行权限")
             validate_launcher([str(node), str(root / "Launch.mjs"), "qq", "--validate-only"], 'bundled_node')
-            if manifest["platform_label"] == "windows-x64":
-                validate_launcher(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                   "-File", str(root / "Launch.ps1"), "-ValidateOnly"], 'windows_powershell_5_1')
             bridge = work / "离线 桥接.mjs"
             bridge.write_bytes((pathlib.Path(__file__).resolve().parents[1] / "connectors/qqbot/test/fake-bridge.mjs").read_bytes())
             message = {"id": "package-chat", "scope": "c2c", "target_id": "user-1", "user_id": "user-1",
@@ -293,7 +293,8 @@ def main():
                 if restart:
                     steps += [{"wait_command": {"id": message["id"], "type": "finish"}}]
                 else:
-                    steps += [{"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": message["id"], "state": "Handled"}}]
+                    steps += [{"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": message["id"], "state": "Handled"}},
+                              {"wait_command": {"id": message["id"], "type": "finish"}}]
                 steps += [{"wait_file": str(stop_gate)}]
                 scenario.write_text(json.dumps({"script": steps}), encoding="utf-8")
                 run(root, config, bridge, scenario, stop_gate, requests, 3, manifest["platform_label"])
@@ -323,10 +324,6 @@ def main():
             subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root)],
                            check=True, timeout=90)
             require(len(requests) == 4, "信号验收重放了模型请求")
-            if manifest["platform_label"] == "windows-x64":
-                subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root), "--powershell"],
-                               check=True, timeout=90)
-                require(len(requests) == 4, "PowerShell 信号验收重放了模型请求")
     finally:
         server.shutdown()
         server.server_close()
@@ -335,7 +332,6 @@ def main():
               "target": manifest["target"], "archive": archive.name,
               "source_commit": manifest["source_commit"], "version": manifest["version"],
               "source_tree": manifest["source_tree"], "archive_sha256": expected,
-              "powershell_5_1": manifest["platform_label"] == "windows-x64",
               "node_launcher": True,
               "console_ctrl_c": True,
               "unicode_and_space_path": True, "web_http": True,

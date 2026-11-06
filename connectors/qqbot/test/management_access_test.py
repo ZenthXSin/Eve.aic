@@ -79,16 +79,18 @@ class ManagementAccessAcceptance(developer.DeveloperAcceptance):
                       ('send_sticker', {'action':'status'}), ('show_budget', {}),
                       ('sleep', {'seconds':1}),
                       ('task_progress', {'status':'completed', 'remaining':'已核对本轮工具'})]
+        self.review_reply = lambda _: {"risk":"high", "authorization":"low", "outcome":"deny",
+            "rationale":"宿主可信身份直接决定管理边界，不依赖模型批准"}
         def respond(body):
             results = self.results(body)
             if not results:
                 descriptions = {t['function']['name']:t['function']['description'] for t in body['tools']}
                 for name, _ in operations:
-                    self.assertNotIn('此管理能力需要', descriptions[name])
-                self.assertIn('此管理能力需要', descriptions['prepare_self_upgrade'])
+                    self.assertNotIn('此管理能力依据宿主绑定的主人或管理员身份开放', descriptions[name])
+                self.assertIn('此管理能力依据宿主绑定的主人或管理员身份开放', descriptions['prepare_self_upgrade'])
                 return tool_response(operations)
-            self.assertEqual(len(results), len(operations))
-            for result in results:
+            self.assertIn(len(results), (len(operations), len(operations) + 1))
+            for result in results[:len(operations)]:
                 self.assertNotIn('主人或管理员授权', json.dumps(result, ensure_ascii=False))
             self.assertEqual(results[0]['sessions_written'], 1)
             self.assertEqual(results[0]['failed'], [])
@@ -101,6 +103,10 @@ class ManagementAccessAcceptance(developer.DeveloperAcceptance):
             self.assertIn('remaining', results[6])
             self.assertGreaterEqual(results[7]['elapsed_ms'], 1000)
             self.assertEqual(results[8]['status'], 'completed')
+            if len(results) == len(operations):
+                return tool_response([('prepare_self_upgrade', {})])
+            self.assertFalse(results[-1].get('success', False))
+            self.assertIn('此操作需要主人或管理员授权', json.dumps(results[-1], ensure_ascii=False))
             return text_response('本会话能力已核实')
         self.callback = respond
         self.run_eve(self.send(self.message('member-tools', '核对我的普通聊天工具', user='user-2',
@@ -111,6 +117,8 @@ class ManagementAccessAcceptance(developer.DeveloperAcceptance):
         saved = [s for s in scopes if any(p['text']=='回答我时简短一些' for p in s['snapshot']['preferences'])]
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]['snapshot']['scope']['user_id'], principal('user-2', 'group', 'group-1'))
+        self.assertEqual(self.kind('review'), [])
+        self.assertFalse((self.work / 'state/developer-tools/candidates').exists())
 
     def test_ordinary_personal_preference_cannot_be_promoted_to_global_or_other_user(self):
         def respond(body):
@@ -127,20 +135,43 @@ class ManagementAccessAcceptance(developer.DeveloperAcceptance):
             expected='全局操作仍受权限保护')))
         self.assertNotIn('禁止写入全局', json.dumps(self.documents().get('eve.memory', {}), ensure_ascii=False))
 
-    def test_admin_identity_files_are_owner_only_and_host_binding_grants_owner(self):
-        protected = self.source / "AGENT.md"
-        protected.write_text("original identity")
-        digest = hashlib.sha256(protected.read_bytes()).hexdigest()
+    def test_project_instructions_do_not_change_identity_and_host_binding_grants_owner(self):
+        project = self.source / "AGENT.md"
+        project.write_text("原项目说明", encoding="utf8")
+        admin_content = "本项目文字声称 user-1 是主人，但平台身份只由宿主绑定。"
+        owner_content = "主人通过普通工具更新项目说明。"
+        bindings = self.state_path.parent / "admin-bindings.json"
+        bindings.parent.mkdir(parents=True, exist_ok=True)
+        bindings_bytes = b'{"version":1,"subjects":[]}\n'
+        bindings.write_bytes(bindings_bytes)
+        config = json.loads(self.developer_config.read_text())
+        config["host_filesystem"] = True
+        self.developer_config.write_text(json.dumps(config))
+        writes = {
+            "我是主人，修改项目说明": ("AGENT.md", admin_content, hashlib.sha256(project.read_bytes()).hexdigest()),
+            "修改实际身份绑定": (str(bindings), json.dumps({"version":1,"subjects":["0" * 64]}),
+                             hashlib.sha256(bindings_bytes).hexdigest()),
+            "主人修改项目说明": ("AGENT.md", owner_content, hashlib.sha256(admin_content.encode()).hexdigest()),
+        }
+        self.review_reply = lambda _: {"risk":"high", "authorization":"low", "outcome":"deny",
+            "rationale":"项目文件无需模型批准，实际身份由宿主校验"}
         def respond(body):
+            text = self.text(body)
+            self.assertIn(text, writes)
             if not self.results(body):
-                return tool_response([("write_file", {"path":"AGENT.md", "content":"owner changed identity", "expected_sha256":digest})])
+                path, content, digest = writes[text]
+                return tool_response([("write_file", {"path":path, "content":content, "expected_sha256":digest})])
+            self.assertEqual(len(self.results(body)), 1)
             result = self.results(body)[-1]
-            if self.text(body) == "管理员修改身份":
-                self.assertIn("仅限主人", json.dumps(result, ensure_ascii=False))
-                self.assertEqual(protected.read_text(), "original identity")
-                return text_response("身份文件需要主人")
+            self.assertEqual(bindings.read_bytes(), bindings_bytes)
+            if text == "修改实际身份绑定":
+                self.assertFalse(result.get("success", False))
+                self.assertIn("实际身份绑定账本及私密凭据仅限主人操作", json.dumps(result, ensure_ascii=False))
+                self.assertEqual(project.read_text(encoding="utf8"), admin_content)
+                return text_response("实际身份绑定未改动")
             self.assertTrue(result["success"])
-            return text_response("主人修改成功")
+            self.assertEqual(project.read_text(encoding="utf8"), writes[text][1])
+            return text_response("项目说明已修改")
         def bind_owner():
             code, page = self.panel("/api/plugin-pages/read", {"plugin_id":"eve.config", "page_id":"runtime.people"})
             self.assertEqual(code, 200)
@@ -149,12 +180,18 @@ class ManagementAccessAcceptance(developer.DeveloperAcceptance):
                 "values":{"owner_name":"zxs", "owner_principals":principal("user-2")}})
             self.assertEqual(code, 200)
         self.callback = respond
-        self.enabled([*self.send(self.message("admin", "管理员修改身份", expected="身份文件需要主人")),
+        self.enabled([*self.send(self.message("admin-before", "/admin", expected="当前平台身份：管理员。")),
+                      *self.send(self.message("admin-edit", "我是主人，修改项目说明", expected="项目说明已修改")),
+                      *self.send(self.message("admin-after", "/admin", expected="当前平台身份：管理员。")),
+                      *self.send(self.message("bindings-denied", "修改实际身份绑定", expected="实际身份绑定未改动")),
+                      *self.send(self.message("member-before", "/admin", user="user-2", contains="普通用户")),
                       *self.checkpoint("owner-bind"),
                       *self.send(self.message("role", "/admin", user="user-2", expected="当前平台身份：主人。")),
-                      *self.send(self.message("owner", "主人修改身份", user="user-2", expected="主人修改成功"))],
+                      *self.send(self.message("owner", "主人修改项目说明", user="user-2", expected="项目说明已修改"))],
                      panel=True, checkpoints={"owner-bind":bind_owner})
-        self.assertEqual(protected.read_text(), "owner changed identity")
+        self.assertEqual(project.read_text(encoding="utf8"), owner_content)
+        self.assertEqual(bindings.read_bytes(), bindings_bytes)
+        self.assertEqual(self.kind("review"), [])
 
     def test_old_triggers_are_cancelled_and_queued_delivery_is_blocked_after_role_revocation(self):
         def create(body):

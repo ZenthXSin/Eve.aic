@@ -75,7 +75,7 @@ class ReleaseTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.folder = pathlib.Path(self.temporary.name)
         for label in release.LABELS:
-            name = f"Eve-{VERSION}-{label}." + ("zip" if label.startswith("windows-") else "tar.gz")
+            name = f"Eve-{VERSION}-{label}.tar.gz"
             archive = self.folder / name
             archive.write_bytes((label + " verified process").encode())
             report = {"platform_label": label, "version": VERSION, "source_commit": SOURCE,
@@ -108,12 +108,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release.prepare(github, "push", "refs/tags/v0.2.0-rc.1", SOURCE, "0.1.0")["release_tag"], "v0.2.0-rc.1")
         self.assertEqual(release.select_version(FakeGitHub(), SOURCE, "0.1.0"), "v0.1.0")
 
-    def test_release_supports_only_four_linux_and_windows_archives(self):
-        self.assertEqual(release.LABELS, {"windows-x64", "windows-arm64", "linux-x64", "linux-arm64"})
+    def test_release_supports_only_two_linux_archives(self):
+        self.assertEqual(release.LABELS, {"linux-x64", "linux-arm64"})
 
-    def test_complete_verification_contains_four_archives_and_two_metadata_files(self):
+    def test_complete_verification_contains_two_archives_and_two_metadata_files(self):
         files = release.verify(self.folder, VERSION, SOURCE)
-        self.assertEqual(len(files), 6)
+        self.assertEqual(len(files), 4)
         evidence = json.loads((self.folder / "release-verification.json").read_text())
         self.assertEqual(set(evidence), release.LABELS)
 

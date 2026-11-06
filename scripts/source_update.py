@@ -262,7 +262,7 @@ class GitBuilder:
             raise ValueError('auto_update_invalid_build_metadata') from None
         common = ['--release', '--locked', '--target-dir', str(target)]
         stages = [
-            (1, 'format', ['fmt', '--all', '--', '--check']),
+            (1, 'format', ['fmt', '--', '--check']),
             (2, 'libraries', ['build', '--workspace', '--lib', *common]),
             (2, 'clippy', ['clippy', '--workspace', '--all-targets', *common, '--', '-D', 'warnings']),
             (3, 'test_compile', ['test', '--workspace', '--no-run', *common]),

@@ -101,7 +101,7 @@ function validate(config) {
 }
 
 async function main() {
-  if (!['linux', 'win32'].includes(process.platform)) throw new Error('便携启动器仅支持 Linux 和 Windows。');
+  if (process.platform !== 'linux') throw new Error('便携启动器仅支持 Linux。');
   if (!['qq', 'console', 'web', 'panel', 'update'].includes(mode)) throw new Error('仅支持 qq / console / web / panel / update 模式。');
   if (mode === 'update') {
     const updater = createUpdater(root);

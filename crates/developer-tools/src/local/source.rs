@@ -10,7 +10,7 @@ pub(super) struct SourceEvidence {
 
 pub(super) fn cargo_checks() -> [Vec<&'static str>; 4] {
     [
-        vec!["fmt", "--all", "--", "--check"],
+        vec!["fmt", "--", "--check"],
         vec![
             "clippy",
             "--release",
@@ -302,11 +302,11 @@ impl LocalDeveloper {
             "active_sha256":status.active_sha256,"active_source_revision":status.active_source_revision,"source_diff_content":diff,
             "manifest":manifest,"lease":lease,"scope":context.scope(),"turn_id":context.turn_id(),"retain_state":true}),
         );
-        let mut request = review_request(&action, "将已验证候选切换为运行中的 Eve，会短暂中断服务。候选验证不等于用户授权；须按原话审核完整候选、验证记录、运行版本和准备租约；业务权限不能跳过审核、回退及熔断".into(), context)?;
+        let mut request = review_request(&action, "将已验证候选切换为运行中的 Eve；仅检查完整差异是否引入凭据外泄、身份绕过、关键状态破坏或持续服务不可用".into(), context)?;
         request.workspace = self.root.to_string_lossy().into_owned();
         request.isolated = self.isolated;
         request.validate_capacity().map_err(|_| {
-            failed("完整候选差异、清单、租约及用户原话超过审核容量；未裁剪、未发布候选")
+            failed("完整候选差异、清单及租约超过系统安全审查容量；未裁剪、未发布候选")
         })?;
         self.reject_evidence_credentials(
             &serde_json::to_string(&request).map_err(|_| failed("候选审核证据编码失败"))?,

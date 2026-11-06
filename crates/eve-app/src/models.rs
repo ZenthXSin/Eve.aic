@@ -1,11 +1,12 @@
 //! 核心主模型的每轮解析实现；读取公开配置契约，不把模型配置交给 Kernel。
 use crate::config;
+use crate::model_provider::{ModelCatalog, ProviderConfig, ProviderOptions};
 use eve_config_api::{
     ConfigService, ConfigSnapshot, ConfigSource, MODELS_NAMESPACE, MODELS_SCHEMA_VERSION,
     ModelProfile, ModelRole, ModelRolesConfig,
 };
 use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
-use eve_llm_openai::{OpenAiProvider, StreamTimeoutPolicy};
+use eve_llm_openai::StreamTimeoutPolicy;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -43,6 +44,25 @@ impl CapturedModel {
             eve_llm_api::CredentialPurpose::Auxiliary
         } else {
             eve_llm_api::CredentialPurpose::Primary
+        }
+    }
+
+    fn credential(
+        &self,
+        credentials: &dyn eve_llm_api::ModelCredentials,
+    ) -> Result<Option<eve_llm_api::CredentialLease>, LlmError> {
+        let reference = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.credential_ref.as_deref());
+        if self.credential_purpose() == eve_llm_api::CredentialPurpose::Auxiliary
+            && reference == Some(crate::model_credentials::ANONYMOUS)
+        {
+            Ok(None)
+        } else {
+            crate::model_credentials::resolve(credentials, self.credential_purpose(), reference)
+                .map(Some)
+                .map_err(|error| LlmError::Configuration(error.to_string()))
         }
     }
 }
@@ -104,6 +124,7 @@ pub(crate) struct ModelSummary {
     pub(crate) model_namespace: &'static str,
     pub(crate) model_field: String,
     pub(crate) model: String,
+    pub(crate) adapter: &'static str,
     pub(crate) protocol: &'static str,
     pub(crate) max_output_tokens: Option<u32>,
     /// 单次输出上限取自哪个配置键（命名空间.字段）。
@@ -143,19 +164,17 @@ pub(crate) fn summary(
         config_revision: captured.provider.revision,
         model_namespace,
         model_field,
-        model: config.model,
-        protocol: match config.protocol {
-            eve_llm_openai::OpenAiProtocol::Responses => "responses",
-            eve_llm_openai::OpenAiProtocol::ChatCompletions => "chat",
-        },
-        max_output_tokens: config.max_output_tokens,
+        model: config.model().into(),
+        adapter: config.adapter(),
+        protocol: config.protocol(),
+        max_output_tokens: config.max_output_tokens(),
         max_output_tokens_source: settings.field_source(namespace, &field).ok(),
         max_output_tokens_key: format!("{namespace}.{field}"),
     })
 }
 
 /// 所选对话模型配置叠加用途上限；不改变角色、端点或期限。
-fn selected_config(captured: &CapturedModel) -> Result<eve_llm_openai::OpenAiConfig, LlmError> {
+fn selected_config(captured: &CapturedModel) -> Result<ProviderConfig, LlmError> {
     let mut config = config::provider_config_for(
         &captured.provider,
         captured.profile.as_ref(),
@@ -163,9 +182,111 @@ fn selected_config(captured: &CapturedModel) -> Result<eve_llm_openai::OpenAiCon
     )
     .map_err(|error| LlmError::Configuration(error.to_string()))?;
     if let Some(limit) = captured.use_limit {
-        config.max_output_tokens = Some(limit);
+        config.set_max_output_tokens(Some(limit));
     }
     Ok(config)
+}
+
+/// 单次识图捕获主模型的实现、配置与凭据；模型覆盖不会重新读取其他修订。
+pub(crate) struct ImageModel {
+    settings: Arc<dyn ConfigService>,
+    captured: CapturedModel,
+    config: ProviderConfig,
+    credential: Option<eve_llm_api::CredentialLease>,
+}
+
+impl ImageModel {
+    pub(crate) fn capture(
+        settings: Arc<dyn ConfigService>,
+        credentials: &dyn eve_llm_api::ModelCredentials,
+    ) -> Result<Self, LlmError> {
+        // 识图遵循当前主角色，不拿 dialogue 用途的辅助路由或自然对话改写。
+        let captured = capture(settings.as_ref(), None)?;
+        let config = selected_config(&captured)?;
+        let credential = captured.credential(credentials)?;
+        Ok(Self {
+            settings,
+            captured,
+            config,
+            credential,
+        })
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        self.config.model()
+    }
+
+    pub(crate) fn adapter(&self) -> &'static str {
+        self.config.adapter()
+    }
+
+    pub(crate) fn protocol(&self) -> &'static str {
+        self.config.protocol()
+    }
+
+    pub(crate) fn cache_scope(&self) -> String {
+        format!("{}:{}", self.config.adapter(), self.config.endpoint())
+    }
+
+    pub(crate) fn catalog(&self) -> Result<ModelCatalog, LlmError> {
+        self.config.catalog(
+            self.credential
+                .as_ref()
+                .map(|credential| credential.expose()),
+        )
+    }
+
+    pub(crate) fn select(mut self, model: String) -> Result<ModelSelection, LlmError> {
+        self.config.set_model(model);
+        let provider_timeout = self.config.request_timeout()
+            + if self.config.uses_sse(self.captured.streamed_completions) {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            };
+        let usage = USAGE.get().cloned();
+        let mut provider = self.config.build(
+            self.credential
+                .as_ref()
+                .map(|credential| credential.expose()),
+            &ProviderOptions {
+                streamed_completions: self.captured.streamed_completions,
+                // 沿用识图单次尝试的既有语义；失败候选交给模型显式选择。
+                usage: usage
+                    .as_ref()
+                    .map(|observer| (observer.clone(), "vision".into())),
+                ..ProviderOptions::default()
+            },
+        )?;
+        if let Some(observer) = usage {
+            provider = Arc::new(eve_model_health::PrefixProbe::new(
+                provider, "vision", observer,
+            ));
+        }
+        // 识图作为对话工具执行，进入这一步前本轮主模型调用已释放模型槽。
+        // 与核心解析一样，先验证候选再更新共享准入。
+        let gate = self
+            .captured
+            .selected_role
+            .zip(self.captured.profile.as_ref())
+            .map(|(role, profile)| {
+                crate::model_concurrency::gate(
+                    &self.settings,
+                    role,
+                    profile.max_concurrent_requests,
+                    self.captured.provider.revision,
+                )
+            })
+            .transpose()?;
+        provider = crate::model_concurrency::global(&self.settings)?.wrap(provider);
+        if let Some(gate) = gate {
+            provider = gate.wrap(provider);
+        }
+        Ok(ModelSelection {
+            provider_timeout,
+            provider,
+        })
+    }
 }
 
 fn capture(
@@ -252,8 +373,11 @@ fn capture(
                 ));
             }
         };
+        let codex = profile
+            .as_ref()
+            .is_some_and(|profile| profile.provider == "codex");
         let stream_timeouts =
-            if streamed_completions && matches!(use_name, Some("dialogue" | "digest")) {
+            if (streamed_completions || codex) && matches!(use_name, Some("dialogue" | "digest")) {
                 let purpose = if role == Some(ModelRole::AuxiliarySmall) {
                     eve_llm_api::CredentialPurpose::Auxiliary
                 } else {
@@ -261,7 +385,7 @@ fn capture(
                 };
                 let config = config::provider_config_for(&provider, profile.as_ref(), purpose)
                     .map_err(|e| LlmError::Configuration(e.to_string()))?;
-                let mut policy = stream_timeout_policy(config.request_timeout)?;
+                let mut policy = stream_timeout_policy(config.request_timeout())?;
                 if use_name == Some("digest") {
                     policy.total = policy.total.min(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT);
                     policy.first_response = policy.first_response.min(policy.total);
@@ -316,27 +440,7 @@ impl LlmModelResolver for CoreModelResolver {
             .credentials
             .as_ref()
             .map_err(|error| LlmError::Configuration(error.to_string()))?;
-        let anonymous = captured.credential_purpose() == eve_llm_api::CredentialPurpose::Auxiliary
-            && captured
-                .profile
-                .as_ref()
-                .and_then(|p| p.credential_ref.as_deref())
-                == Some(crate::model_credentials::ANONYMOUS);
-        let credential = if anonymous {
-            None
-        } else {
-            Some(
-                crate::model_credentials::resolve(
-                    credentials.as_ref(),
-                    captured.credential_purpose(),
-                    captured
-                        .profile
-                        .as_ref()
-                        .and_then(|profile| profile.credential_ref.as_deref()),
-                )
-                .map_err(|error| LlmError::Configuration(error.to_string()))?,
-            )
-        };
+        let credential = captured.credential(credentials.as_ref())?;
         let credential_version = credential.as_ref().map_or(0, |c| c.version());
         let mut cached = self
             .cached
@@ -350,7 +454,7 @@ impl LlmModelResolver for CoreModelResolver {
         }
         let mut config = selected_config(&captured)?;
         if let Some(cap) = self.timeout_cap {
-            config.request_timeout = config.request_timeout.min(cap);
+            config.cap_timeout(cap);
         }
         let mut stream_timeouts = captured.stream_timeouts;
         if let (Some(policy), Some(cap)) = (&mut stream_timeouts, self.timeout_cap) {
@@ -360,47 +464,40 @@ impl LlmModelResolver for CoreModelResolver {
         }
         // 所有 SSE 用途都让适配器先结束统计尾流或报告超时；外层仅作略晚的安全期限。
         // 提供方内部的总期限与用途 cap 不变，避免同期限的外层取消吞掉完整结果。
-        let transport_timeout = stream_timeouts.map_or(config.request_timeout, |p| p.total);
-        let provider_timeout = if captured.streamed_completions {
+        let transport_timeout = stream_timeouts.map_or(config.request_timeout(), |p| p.total);
+        let provider_timeout = if config.uses_sse(captured.streamed_completions) {
             transport_timeout + Duration::from_secs(1)
         } else {
             transport_timeout
         };
-        let mut provider = if let Some(credential) = &credential {
-            OpenAiProvider::new(config, credential.expose())?
-        } else {
-            OpenAiProvider::anonymous(config)?
-        };
-        if let Some(policy) = stream_timeouts {
-            if timing_enabled() {
-                eprintln!(
-                    "EVE_MODEL_STREAM_TIMEOUTS {}",
-                    serde_json::json!({
-                        "first_response_ms":policy.first_response.as_millis(),
-                        "idle_ms":policy.idle.as_millis(),"total_ms":policy.total.as_millis(),
-                        "host_timeout_ms":provider_timeout.as_millis(),
-                        "use_name":self.use_name,
-                    })
-                );
-            }
-            provider = provider.with_stream_timeout_policy(policy)?;
-        }
-        if captured.streamed_completions {
-            provider = provider.with_streamed_completions();
-        }
-        // 对话与后台任务执行共用主链路：瞬时错误（超时/429/5xx）按底层有界重试处理。
-        if captured.transient_retries {
-            provider = provider.with_transient_retries();
-        }
-        if matches!(self.use_name.as_deref(), Some("dialogue" | "digest")) && timing_enabled() {
-            provider = provider.with_timing_diagnostics();
+        if let Some(policy) = stream_timeouts
+            && timing_enabled()
+        {
+            eprintln!(
+                "EVE_MODEL_STREAM_TIMEOUTS {}",
+                serde_json::json!({
+                    "first_response_ms":policy.first_response.as_millis(),
+                    "idle_ms":policy.idle.as_millis(),"total_ms":policy.total.as_millis(),
+                    "host_timeout_ms":provider_timeout.as_millis(),
+                    "use_name":self.use_name,
+                })
+            );
         }
         let role = self.use_name.as_deref().unwrap_or("dialogue");
         let usage = USAGE.get().cloned();
-        if let Some(observer) = &usage {
-            provider = provider.with_usage_observer(observer.clone(), role);
-        }
-        let mut provider: Arc<dyn eve_llm_api::LlmProvider> = Arc::new(provider);
+        let mut provider = config.build(
+            credential.as_ref().map(|credential| credential.expose()),
+            &ProviderOptions {
+                streamed_completions: captured.streamed_completions,
+                transient_retries: captured.transient_retries,
+                stream_timeouts,
+                timing_diagnostics: matches!(self.use_name.as_deref(), Some("dialogue" | "digest"))
+                    && timing_enabled(),
+                usage: usage
+                    .as_ref()
+                    .map(|observer| (observer.clone(), role.into())),
+            },
+        )?;
         // 探针紧贴实际发出的请求（在接话约束等改写之后），只测量不修改。
         if let Some(observer) = usage {
             provider = Arc::new(eve_model_health::PrefixProbe::new(provider, role, observer));

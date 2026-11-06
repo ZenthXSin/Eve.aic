@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex};
 struct Captured {
     scope: Option<ContextScope>,
     originals: Vec<String>,
+    originals_available: bool,
     delegated: bool,
+    turn_id: Option<u64>,
+    call_id: Option<String>,
 }
 #[derive(Default)]
 struct Capture(Mutex<Vec<Captured>>);
@@ -32,7 +35,10 @@ impl Tool for Capture {
         self.0.lock().unwrap().push(Captured {
             scope: context.scope().cloned(),
             originals: context.review_user_messages().unwrap_or_default().to_vec(),
+            originals_available: context.review_user_messages().is_some(),
             delegated: context.is_delegated(),
+            turn_id: context.turn_id(),
+            call_id: context.call_id().map(str::to_owned),
         });
         Box::pin(async { Ok(serde_json::json!({"observed":true})) })
     }
@@ -46,6 +52,28 @@ impl ReviewUserMessageSource for AnchoredSource {
     fn read_at(&self, scope: &ContextScope, anchor: &str) -> Result<Option<Vec<String>>, LlmError> {
         self.0.lock().unwrap().push((scope.clone(), anchor.into()));
         Ok(Some(vec![format!("完整原文@{anchor}")]))
+    }
+    fn read_window_at(
+        &self,
+        scope: &ContextScope,
+        anchor: &str,
+    ) -> Result<Option<ReviewUserMessageWindow>, LlmError> {
+        if anchor == "missing-originals" {
+            let expected = request("unused").session.key;
+            if scope.session_id != expected.session_id || scope.user_id != expected.user_id {
+                return Err(LlmError::Context("原文缺口身份不一致".into()));
+            }
+            self.0.lock().unwrap().push((scope.clone(), anchor.into()));
+            return Ok(Some(ReviewUserMessageWindow::MissingOriginals));
+        }
+        self.read_at(scope, anchor)
+            .map(|messages| messages.map(ReviewUserMessageWindow::Complete))
+    }
+    fn is_current(&self, scope: &ContextScope, anchor: &str) -> Result<bool, LlmError> {
+        let expected = request("unused").session.key;
+        Ok(scope.session_id == expected.session_id
+            && scope.user_id == expected.user_id
+            && anchor == "missing-originals")
     }
 }
 fn request(task: &str) -> ControlInput {
@@ -182,7 +210,10 @@ async fn frozen_trigger_originals_reach_tools_without_reading_current_channel_or
         vec![Captured {
             scope: Some(expected_scope),
             originals,
-            delegated: true
+            originals_available: true,
+            delegated: true,
+            turn_id: Some(1),
+            call_id: Some("capture".into()),
         }]
     );
     assert!(source.0.lock().unwrap().is_empty());
@@ -191,7 +222,7 @@ async fn frozen_trigger_originals_reach_tools_without_reading_current_channel_or
 
 #[tokio::test]
 async fn concrete_channel_anchors_and_delegation_do_not_leak_between_generations() {
-    let (rig, control, capture, source) = setup(3).await;
+    let (rig, control, capture, source) = setup(4).await;
     let cases = [
         (
             "first",
@@ -200,6 +231,10 @@ async fn concrete_channel_anchors_and_delegation_do_not_leak_between_generations
         (
             "trigger",
             ControlReviewEvidence::FrozenDelegation(vec!["创建任务时的旧原话".into()]),
+        ),
+        (
+            "gap",
+            ControlReviewEvidence::ChannelAnchor("missing-originals".into()),
         ),
         (
             "third",
@@ -222,7 +257,7 @@ async fn concrete_channel_anchors_and_delegation_do_not_leak_between_generations
     let captured = capture.0.lock().unwrap().clone();
     assert_eq!(
         captured.iter().map(|c| c.delegated).collect::<Vec<_>>(),
-        vec![false, true, false]
+        vec![false, true, false, false]
     );
     assert_eq!(
         captured
@@ -232,8 +267,25 @@ async fn concrete_channel_anchors_and_delegation_do_not_leak_between_generations
         vec![
             vec!["完整原文@message-one".to_string()],
             vec!["创建任务时的旧原话".to_string()],
+            vec![],
             vec!["完整原文@message-three".to_string()],
         ]
+    );
+    assert_eq!(
+        captured
+            .iter()
+            .map(|c| c.originals_available)
+            .collect::<Vec<_>>(),
+        vec![true, true, false, true]
+    );
+    assert_eq!(
+        captured.iter().map(|c| c.turn_id).collect::<Vec<_>>(),
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+    assert!(
+        captured
+            .iter()
+            .all(|c| c.call_id.as_deref() == Some("capture"))
     );
     assert_eq!(
         source
@@ -243,7 +295,7 @@ async fn concrete_channel_anchors_and_delegation_do_not_leak_between_generations
             .iter()
             .map(|(_, anchor)| anchor.as_str())
             .collect::<Vec<_>>(),
-        vec!["message-one", "message-three"]
+        vec!["message-one", "missing-originals", "message-three"]
     );
     rig.stop().await;
 }

@@ -103,6 +103,9 @@ impl TaskAdmin for TaskController {
         self.service()?.get_owned(owner, id)
     }
     fn strategy_guidance(&self, task: &Task) -> TaskResult<Option<TaskStrategyGuidance>> {
+        if task.is_exploration() {
+            return Ok(None);
+        }
         self.strategies
             .as_ref()
             .map_or(Ok(None), |strategies| strategies.prepare(task))
@@ -156,6 +159,34 @@ impl TaskAdmin for TaskController {
             deadline_at_ms,
             now_ms,
         )
+    }
+    fn create_exploration(
+        &self,
+        owner: &TaskOwner,
+        spec: TaskSpec,
+        source: &str,
+        review_messages: Vec<String>,
+        deadline_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?.create_exploration(
+            owner,
+            spec,
+            source,
+            review_messages,
+            deadline_at_ms,
+            now_ms,
+        )
+    }
+    fn acknowledge_exploration(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .acknowledge_exploration(owner, id, finished_at_ms, now_ms)
     }
     fn checkpoint(
         &self,

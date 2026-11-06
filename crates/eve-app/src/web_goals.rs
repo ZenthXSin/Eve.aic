@@ -1,7 +1,6 @@
 //! 独立 Web 的待办、研究与计划组合，复用已有控制器和持久执行器。
 use crate::{AppError, CoreBootstrap, qq_cognition, qq_plan, qq_practice, qq_research};
 use eve_cognition_api::{CognitionAdmin, CognitionReader};
-use eve_developer_api::ActionReviewer;
 use eve_knowledge_api::{KnowledgeAdmin, SourceFetcher, SourcePolicy};
 use eve_llm_api::LlmModelResolver;
 use eve_plan_api::{CapabilitySpec, PlanJournal, PlanProposer};
@@ -32,7 +31,6 @@ impl Assembly {
         kernel: &eve_kernel::Kernel,
         bootstrap: &mut CoreBootstrap,
         admin: Arc<crate::qq_admin::Admin>,
-        reviewer: Option<Arc<dyn ActionReviewer>>,
         corpus: Option<&crate::qq_capability_profile::DiscoveredCorpus>,
         source: Arc<dyn SourceFetcher>,
         runner: Option<Arc<dyn PracticeRunner>>,
@@ -67,13 +65,12 @@ impl Assembly {
             commands: goals.clone(),
             review: crate::qq_natural_goals::Review {
                 admin: admin.clone(),
-                reviewer: reviewer.clone(),
             },
         }));
         if !capabilities.is_empty() {
             bootstrap.tools.push(Arc::new(qq_plan::ManageTool {
                 commands: commands.clone(),
-                review: crate::qq_natural_goals::Review { admin, reviewer },
+                review: crate::qq_natural_goals::Review { admin },
             }));
         }
         Ok(Self {

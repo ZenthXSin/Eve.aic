@@ -67,6 +67,7 @@ pub(crate) fn progress_text(task: &Task, now_ms: u64) -> String {
         TaskStatus::Blocked => "本次执行已停止，等待补充信息或解除阻塞".into(),
         TaskStatus::Cancelled => "已停止并取消".into(),
         TaskStatus::Completed => "任务已结束并保存结果".into(),
+        TaskStatus::SessionEnded => "探索会话已结束".into(),
         TaskStatus::Failed => "执行已停止，任务未完成".into(),
         TaskStatus::Interrupted => "执行已中断，任务未完成".into(),
     };

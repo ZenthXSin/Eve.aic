@@ -85,6 +85,7 @@ impl InvitationComposer for ModelInvitationComposer {
             validate_facts(&request.facts)?;
             let input = serde_json::to_string(&request).map_err(|_| OutreachError::InvalidInput)?;
             let model_request = ModelRequest {
+                session: request.model_session.clone(),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),
@@ -146,6 +147,7 @@ impl TimingJudge for ModelTimingJudge {
             }
             let input = serde_json::to_string(&request).map_err(|_| OutreachError::InvalidInput)?;
             let model_request = ModelRequest {
+                session: request.model_session.clone(),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, JUDGE_PROMPT),
                     ChatMessage::text(ChatRole::User, input),
@@ -209,6 +211,7 @@ impl ResponseJudge for ModelResponseJudge {
             }
             let input = serde_json::to_string(&request).map_err(|_| OutreachError::InvalidInput)?;
             let model_request = ModelRequest {
+                session: request.model_session.clone(),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, RESPONSE_PROMPT),
                     ChatMessage::text(ChatRole::User, input),

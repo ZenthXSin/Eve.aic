@@ -1,0 +1,80 @@
+name: Debian 12 固定源码生产构建
+
+on:
+  # 新工作流尚未进入 main 时，也可对同仓 PR 的准确头显式发起一次构建。
+  # 标签必须为 debian12-<完整 40 位 head SHA>；更新 PR 不自动重跑大构建。
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: 已通过组合验收的完整 40 位源码提交
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debian12-release-${{ inputs.source_revision || github.event.pull_request.head.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.label.name == format('debian12-{0}', github.event.pull_request.head.sha))
+    runs-on: ubuntu-24.04
+    # 单次优化构建及真实发布二进制验收；不改变已有 Stable/MSRV/QQ 的期限。
+    timeout-minutes: 60
+    container:
+      image: rust:1.95.0-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb
+      # 脚本和自我升级用例需要真实 mount/user/PID/network namespace。
+      options: --privileged
+    env:
+      EVE_RELEASE_REVISION: ${{ inputs.source_revision || github.event.pull_request.head.sha }}
+      EVE_RELEASE_IMAGE: rust:1.95.0-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+      DEBIAN_FRONTEND: noninteractive
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出显式指定的源码提交
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.EVE_RELEASE_REVISION }}
+          persist-credentials: false
+      - name: 安装 Debian 12 验收环境及固定 Node
+        run: |
+          export EVE_RELEASE_OUTPUT="$RUNNER_TEMP/eve-debian12-release"
+          printf 'EVE_RELEASE_OUTPUT=%s\n' "$EVE_RELEASE_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$EVE_RELEASE_OUTPUT/evidence"
+          bash scripts/setup-debian12-release.sh 2>&1 | tee "$EVE_RELEASE_OUTPUT/evidence/environment.txt"
+      - name: 验证来源绑定、失败产物拒绝和超时停止
+        run: python3 -B scripts/test-debian12-release.py
+      - name: 核对来源并构建三个生产入口
+        run: python3 -B scripts/debian12-release.py build
+      - name: 使用实际发布二进制验证协议、探索、恢复及系统兼容性
+        run: python3 -B scripts/debian12-release.py verify
+      - name: 绑定源码、依赖、原文件和验收记录并打包
+        run: python3 -B scripts/debian12-release.py package
+      - name: 上传已验收的生产二进制及来源记录
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-debian12-x64-${{ env.EVE_RELEASE_REVISION }}
+          path: ${{ env.EVE_RELEASE_OUTPUT }}/artifact/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: 保留原始构建与验收日志
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-debian12-evidence-${{ env.EVE_RELEASE_REVISION }}-${{ github.run_attempt }}
+          path: ${{ env.EVE_RELEASE_OUTPUT }}/evidence/*
+          if-no-files-found: error
+          retention-days: 14

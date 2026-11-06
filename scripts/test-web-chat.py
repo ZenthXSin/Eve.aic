@@ -59,6 +59,7 @@ class WebChatAcceptance(developer.DeveloperAcceptance):
             if self.child.poll() is not None:
                 self.fail(f'Web 宿主提前退出 {self.child.returncode}：'+self.log_path.read_text())
             if ready:
+                self.assert_startup_complete(lines)
                 self.url=ready
                 try:
                     status, _ = self.web('/api/chat')
@@ -68,6 +69,31 @@ class WebChatAcceptance(developer.DeveloperAcceptance):
                     pass
             time.sleep(.02)
         self.fail(f'Web 宿主没有就绪，退出码 {self.child.poll()}：'+self.log_path.read_text())
+
+    def startup_events(self, lines):
+        events = []
+        for line in lines:
+            if line.startswith('EVE_WEB_READY '):
+                break
+            if line.startswith('EVE_WEB_STARTUP ') and line.endswith('\n'):
+                event = json.loads(line.split(' ', 1)[1])
+                self.assertEqual(set(event), {'stage', 'event', 'elapsed_ms'}, event)
+                self.assertIs(type(event['elapsed_ms']), int)
+                self.assertGreaterEqual(event['elapsed_ms'], 0)
+                events.append((event['stage'], event['event']))
+        return events
+
+    def assert_startup_complete(self, lines):
+        expected = []
+        for stage in ('bootstrap', 'state_store', 'ingress', 'context_plugin'):
+            expected.extend([(stage, 'started'), (stage, 'completed')])
+        expected.append(('autonomy_install', 'started'))
+        for stage in ('resource_discovery', 'browser_runtime'):
+            expected.extend([(stage, 'started'), (stage, 'completed')])
+        expected.append(('autonomy_install', 'completed'))
+        for stage in ('core_services', 'background_start', 'restore_receipts', 'panel_bind', 'activate'):
+            expected.extend([(stage, 'started'), (stage, 'completed')])
+        self.assertEqual(self.startup_events(lines), expected, self.log_path.read_text())
 
     def stop_web(self, graceful=False, signum=signal.SIGINT):
         if self.child and self.child.poll() is None:
@@ -105,6 +131,22 @@ class WebChatAcceptance(developer.DeveloperAcceptance):
             if state['status'] in ('completed','failed','unknown'):return state
             time.sleep(.03)
         self.fail('Web 对话未结束：'+json.dumps(state,ensure_ascii=False))
+
+    def test_corrupt_state_preserves_last_startup_stage_and_never_reports_ready(self):
+        state = self.work / 'state'
+        state.mkdir()
+        snapshot = state / 'state.json'
+        snapshot.write_bytes(b'{broken')
+        with self.assertRaisesRegex(AssertionError, 'Web 宿主提前退出'):
+            self.start_web()
+        lines = self.log_path.read_text().splitlines(keepends=True)
+        self.assertEqual(self.startup_events(lines), [
+            ('bootstrap', 'started'), ('bootstrap', 'completed'), ('state_store', 'started')])
+        self.assertFalse(any(line.startswith('EVE_WEB_READY ') for line in lines))
+        self.assertIsNotNone(self.child.poll())
+        self.assertNotEqual(self.child.returncode, 0)
+        self.assertEqual(snapshot.read_bytes(), b'{broken')
+        self.assertEqual(self.chat_rounds, 0)
 
     def test_owner_tools_duplicate_requests_restart_and_history(self):
         def respond(body):

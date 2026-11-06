@@ -19,14 +19,22 @@ pub(crate) fn validate_interest_updates(
                 .ok_or(SubjectError::InvalidInput)?;
             new_experience |= matches!(
                 evidence.kind.as_str(),
-                "task_result" | "completed_conversation"
+                "task_result" | "completed_conversation" | "exploration_experience"
             ) && old.is_none_or(|old| !old.consumed_evidence.contains(id))
                 && observation
                     .interest_consumed
                     .get(&update.key)
                     .is_none_or(|used| !used.contains(id));
         }
-        if old.is_none_or(|old| &old.current != update) && !new_experience {
+        // 放下或休息是自己的选择，不必为减少兴趣虚构新的外界证据。
+        // 这条路径不能增加强度，或把零工具感想包装成兴趣增长。
+        let subjective_rest = old.is_some_and(|old| {
+            matches!(
+                update.phase,
+                SelfInterestPhase::Resting | SelfInterestPhase::Dropped
+            ) && update.strength <= old.current.strength
+        });
+        if old.is_none_or(|old| &old.current != update) && !new_experience && !subjective_rest {
             return Err(SubjectError::InvalidInput);
         }
         if old.is_some_and(|old| {
@@ -55,6 +63,21 @@ pub(crate) fn validate_interest_updates(
         if !interest.phase.motivates_action() {
             return Err(SubjectError::InvalidInput);
         }
+    }
+    if let Some(key) = result
+        .exploration
+        .as_ref()
+        .and_then(|exploration| exploration.interest_key.as_ref())
+        && !result
+            .interest_updates
+            .iter()
+            .any(|interest| &interest.key == key)
+        && !observation
+            .self_interests
+            .iter()
+            .any(|record| &record.current.key == key)
+    {
+        return Err(SubjectError::InvalidInput);
     }
     Ok(())
 }

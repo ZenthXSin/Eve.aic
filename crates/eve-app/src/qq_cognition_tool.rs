@@ -64,7 +64,7 @@ impl Tool for ManageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "manage_goal".into(),
-            description: "自然聊天创建待办、查看反思草稿、提交用户反馈。create保存真实目标并启动无工具反思，保存不表示执行或完成现实工作；inspect读取当前归属、版本和草稿；feedback须先inspect取得当前版本，再按用户本人的反馈更新，旧版本拒绝。需要执行长期工作时按原目标另用后台任务或计划。身份和最近六条完整用户原话由宿主绑定，变更经独立审核，不能让用户输入内部命令。".into(),
+            description: "自然聊天创建待办、查看反思草稿、提交用户反馈。create保存真实目标并启动无工具反思，保存不表示执行或完成现实工作；inspect读取当前归属、版本和草稿；feedback须先inspect取得当前版本，再按用户本人的反馈更新，旧版本拒绝。需要执行长期工作时按原目标另用后台任务或计划。宿主核对实际身份、归属和版本并记录变更；普通待办无需目标收益或逐步授权审查，不能把模型说明冒充用户反馈。".into(),
             argument_schema: json!({"type":"object","properties":{"action":{"enum":["create","inspect","feedback"]},"goal_id":{"type":"string"},"text":{"type":"string"},"expected_revision":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "natural-goals".into() }),
@@ -151,16 +151,14 @@ impl Tool for ManageTool {
             {
                 return Err(failed("待办版本已变化，请先读取当前版本，原记录保留"));
             }
-            self.review
-                .approve(
-                    "manage_goal",
-                    &call,
-                    &context,
-                    json!({"arguments":call.arguments,"current_goal":selected}),
-                )
-                .await?;
+            self.review.approve(
+                "manage_goal",
+                &call,
+                &context,
+                json!({"arguments":call.arguments,"current_goal":selected}),
+            )?;
             if !commands.accepting.load(Ordering::SeqCst) {
-                return Err(failed("审核期间待办服务已停止，未提交变更"));
+                return Err(failed("提交前待办服务已停止，未提交变更"));
             }
             let input_id = input_id(&call, &context)?;
             let text = a.text.as_deref().ok_or_else(|| failed("待办正文缺失"))?;

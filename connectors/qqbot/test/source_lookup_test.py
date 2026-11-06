@@ -29,10 +29,14 @@ def legacy_receipt(case):
         'eve.channel.qqbot': {'receipts.v1': list(json.dumps(receipt, ensure_ascii=False).encode())}}}))
 
 
-def lookup(case, body):
+def lookup(case, body, *, code_available=False):
     names = {t['function']['name'] for t in body.get('tools', [])}
     case.assertLessEqual({'search_reference', 'read_reference', 'read_source'}, names)
-    case.assertFalse({'run_command', 'write_file', 'run_tool_code', 'dispatch_background_task'} & names)
+    case.assertFalse({'run_command', 'write_file', 'dispatch_background_task'} & names)
+    if code_available:
+        case.assertIn('run_tool_code', names, '可信旧会话的原文缺口不应隐藏普通编排工具')
+    else:
+        case.assertNotIn('run_tool_code', names, '群观察身份仍只提供公开源码查询')
     results = [json.loads(m['content']) for m in body['messages'] if m['role'] == 'tool']
     if not results:
         return dialogue.tool_response([('search_reference', {'root': 'mindustry', 'query': 'Seq<Building>'})])
@@ -55,12 +59,32 @@ class LegacySourceLookupAcceptance(live.LiveToolAcceptance):
     def test_first_new_message_in_legacy_scope_can_search_read_and_reply_once(self):
         references = reference(self)
         legacy_receipt(self)
+        self.review_reply = lambda _: {'risk':'high', 'authorization':'low', 'outcome':'deny',
+            'rationale':'可信原文缺口不阻挡普通源码查询和工具编排'}
+        unavailable_file = 'legacy-unavailable-write.txt'
 
         def respond(body):
-            response = lookup(self, body)
+            response = lookup(self, body, code_available=True)
             if response is not None:
                 return response
-            if len(self.all_results(body)) == 2:
+            results = self.all_results(body)
+            if len(results) == 2:
+                hit = results[0]['hits'][0]
+                arguments = {'root':hit['root'], 'path':hit['path'],
+                             'start_line':hit['line'], 'max_lines':1}
+                return self.choose('run_tool_code', {'tools':['read_reference'], 'arguments':arguments,
+                    'code':'const result=await tools.read_reference(args); text(result.text);'})
+            self.assertTrue(results[2]['success'], results[2])
+            self.assertEqual(results[2]['result'], {'output':[results[1]['text']]})
+            self.assertEqual([(item['target'], item['status']) for item in results[2]['evidence']],
+                             [('read_reference', 'succeeded')])
+            if len(results) == 3:
+                return self.choose('run_tool_code', {'tools':['write_file'],
+                    'arguments':{'path':unavailable_file, 'content':'不能凭编排扩权', 'expected_sha256':''},
+                    'code':'text(await tools.write_file(args));'})
+            self.assertFalse(results[3].get('success', False))
+            self.assertIn('缺少可信身份或叶子工具', json.dumps(results[3], ensure_ascii=False))
+            if len(results) == 4:
                 return self.choose('send_message', {'text': '已查到集合 all，见 mindustry/PowerGraph.java:2'})
             return dialogue.text_response('{"action":"silence"}')
 
@@ -70,14 +94,22 @@ class LegacySourceLookupAcceptance(live.LiveToolAcceptance):
                          ['已查到集合 all，见 mindustry/PowerGraph.java:2'])
         with closing(sqlite3.connect(self.work / 'state/qq-receipts.sqlite3')) as db:
             self.assertEqual(db.execute('SELECT count(*) FROM qq_originals').fetchone()[0], 1)
+        self.assertIsNone(self.receipt('legacy')['message'].get('original_text'),
+                          '不能给旧加工正文补造授权原话')
+        self.assertEqual(self.kind('review'), [], '公开源码查询与编排不调用模型审批')
+        self.assertFalse(list(self.work.rglob(unavailable_file)), '不可见写入叶子不能借编排执行')
         turn = self.turn('查一下电网的建筑集合字段')
         self.assertEqual([c['name'] for m in turn['status']['messages'] for c in m.get('tool_calls', [])],
-                         ['search_reference', 'read_reference', 'send_message'])
+                         ['search_reference', 'read_reference', 'run_tool_code', 'run_tool_code', 'send_message'])
+        before_turn = turn.copy()
         before = self.chat_rounds
         self.run_live([{'send': self.message('lookup', '查一下电网的建筑集合字段')},
                        self.wait_command('lookup', 'finish')], more=references)
         self.assertEqual(self.chat_rounds, before)
         self.assertFalse(self.progress('lookup'))
+        self.assertEqual(self.turn('查一下电网的建筑集合字段'), before_turn)
+        self.assertFalse(list(self.work.rglob(unavailable_file)))
+        self.assertEqual(self.kind('review'), [])
 
     def test_legacy_scope_can_inspect_its_current_raw_message(self):
         legacy_receipt(self)

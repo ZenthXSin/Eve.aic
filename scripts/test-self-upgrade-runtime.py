@@ -1,4 +1,5 @@
 """创建自己的真实子进程，验证升级协议；不连接 QQ 或调用真实模型。"""
+import copy
 import ctypes
 import hashlib
 import importlib.util
@@ -99,6 +100,222 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(runtime.without_removed_flags(old),
                          ['eve','--interest-learning','--practice-mindustry-server','s.jar','--research-corpus','corpus'])
         self.assertEqual(runtime.without_removed_flags(['eve','--training']),['eve','--training'])
+
+class ExplorationIdleGateTests(unittest.TestCase):
+    """直接读取合成热账本/冷档案并调用真实空闲门，不构建或启动 Eve。"""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='eve-exploration-upgrade-')
+        self.addCleanup(self.temporary.cleanup)
+        self.state = Path(self.temporary.name) / 'state.json'
+        self.archive = self.state.parent / 'task-archive'
+        self.archive.mkdir()
+
+    def ended(self, result='暂时休息，之后可以换个方向'):
+        owner = {'session_id': 'exploration-session', 'user_id': 'owner'}
+        source = 'subject-explore:upgrade-fixture'
+        identity = hashlib.sha256()
+        for part in ('eve.task:v1', owner['user_id'], source):
+            raw = part.encode()
+            identity.update(len(raw).to_bytes(8, 'big'))
+            identity.update(raw)
+        checkpoint = dict(version=1, scope=owner, messages=[dict(role='User', text='自由看看',
+            tool_calls=[], tool_results=[])], pending_calls=[], used_tool_calls=0, provider_requests=1,
+            tool_batches=0, remaining=None, continuation_checks=0, closing=False, result=result)
+        return dict(id='task-' + identity.hexdigest(), owner=owner, source=source,
+            spec=dict(title='探索会话', instructions='可以没有发现，也可以休息。', max_steps=4),
+            created_at_ms=10, status='SessionEnded', cancel_requested=False, started_at_ms=20,
+            finished_at_ms=40, usage=dict(tool_calls=0, model_requests=1),
+            result=result if result is not None else '', failure=None, notice=None,
+            execution=dict(kind='exploration', session_end_reason='natural_stop', checkpoint=checkpoint,
+                recoveries=0, resume_at_ms=None, deadline_at_ms=None, last_finished_at_ms=40))
+
+    def save(self, tasks, version):
+        entries = []
+        for task in tasks:
+            if version == 4:
+                raw = json.dumps(task, ensure_ascii=False).encode()
+                digest = hashlib.sha256(raw).hexdigest()
+                (self.archive / (digest + '.json')).write_bytes(raw)
+                directory = copy.deepcopy(task)
+                directory['spec'].pop('context', None)
+                directory['result'] = directory['failure'] = None
+                if isinstance(directory.get('execution'), dict):
+                    directory['execution']['checkpoint'] = None
+                    directory['execution'].pop('review_messages', None)
+                entries.append(dict(directory=directory, record=dict(hash=digest, bytes=len(raw))))
+            else:
+                entries.append(task)
+        ledger = dict(format_version=version, tasks=entries)
+        runtime.atomic(self.state, dict(version=1, entries={
+            'eve.session': {'sessions.v1': list(json.dumps(dict(format_version=1, sessions={})).encode())},
+            'eve.channel.qqbot': {'receipts.v1': list(json.dumps(dict(version=2, entries=[])).encode())},
+            'eve.task': {'tasks.v1': list(json.dumps(ledger).encode())}}))
+        return ledger
+
+    def snapshot(self):
+        return {str(path.relative_to(self.state.parent)): path.read_bytes()
+                for path in self.state.parent.rglob('*') if path.is_file()}
+
+    def assert_gate(self, tasks, version, idle):
+        self.save(tasks, version)
+        before = self.snapshot()
+        # 重新从宿主实际 JSON 字节读取，不能只验测试夹具或 mock 解析器。
+        ledger = json.loads(bytes(runtime.read_json(self.state)['entries']['eve.task']['tasks.v1']),
+                            object_pairs_hook=runtime.unique_object)
+        self.assertEqual(list(runtime.task_documents(self.state, ledger)), tasks)
+        self.assertIs(runtime.runtime_idle_gate(self.state), idle)
+        self.assertEqual(self.snapshot(), before)
+
+    def assert_rejected(self, task, version):
+        self.save([task], version)
+        before = self.snapshot()
+        ledger = json.loads(bytes(runtime.read_json(self.state)['entries']['eve.task']['tasks.v1']),
+                            object_pairs_hook=runtime.unique_object)
+        with self.assertRaises(ValueError):
+            list(runtime.task_documents(self.state, ledger))
+        with self.assertRaises(ValueError):
+            runtime.runtime_idle_gate(self.state)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_session_ended_hot_and_cold_records_are_idle_with_or_without_experience_ack(self):
+        for version in (2, 3, 4):
+            for acknowledged in (None, 40, 50):
+                with self.subTest(version=version, acknowledged=acknowledged):
+                    task = self.ended()
+                    if acknowledged is not None:
+                        task['execution']['exploration_acknowledged_at_ms'] = acknowledged
+                    self.assert_gate([task], version, True)
+
+    def test_resource_stops_without_summary_and_delegated_usage_remain_idle(self):
+        for version in (2, 3, 4):
+            for reason in ('natural_stop', 'tool_budget_exhausted', 'deadline_expired', 'recovery_limit_reached'):
+                with self.subTest(version=version, reason=reason):
+                    task = self.ended(result=None)
+                    execution, checkpoint = task['execution'], task['execution']['checkpoint']
+                    execution['session_end_reason'] = reason
+                    if reason == 'tool_budget_exhausted':
+                        checkpoint.update(version=2, delegated_tool_calls=4, delegated_model_requests=2)
+                        task['usage'].update(tool_calls=4, model_requests=3)
+                    elif reason == 'deadline_expired':
+                        execution['deadline_at_ms'] = 30
+                    elif reason == 'recovery_limit_reached':
+                        execution['recoveries'] = 3
+                    self.assert_gate([task], version, True)
+
+    def test_saved_summary_keeps_natural_stop_after_deadline_and_long_summary_is_preserved(self):
+        task = self.ended('  保留原文空格  ')
+        task['execution']['deadline_at_ms'] = 30
+        self.assert_gate([task], 4, True)
+        task = self.ended('猫' * 6000)
+        task['result'] = '猫' * 5455 + '…（已截断）'
+        self.assert_gate([task], 4, True)
+
+    def test_finished_exploration_does_not_hide_busy_act_or_delivery(self):
+        for version in (2, 3, 4):
+            for status, idle in (('Queued', False), ('Running', False), ('Completed', True),
+                                 ('Failed', True), ('Cancelled', True), ('Interrupted', True)):
+                with self.subTest(version=version, status=status):
+                    # 旧任务的执行标记可以省略，继续沿用现有状态判定。
+                    act = dict(id='legacy-act', status=status, spec={}, result=None, failure=None)
+                    self.assert_gate([self.ended(), act], version, idle)
+            if version >= 3:
+                self.assert_gate([self.ended(), dict(id='legacy-act', status='Blocked', spec={},
+                    result=None, failure=None)], version, True)
+            self.assert_gate([self.ended(), dict(id='legacy-act', status='Completed', spec={},
+                result=None, failure=None, notice=dict(status='Delivering'))], version, False)
+
+    def test_unknown_status_and_malformed_session_ended_records_are_rejected_without_writes(self):
+        mutations = [
+            ('unknown status', lambda t: t.update(status='Resting')),
+            ('missing execution', lambda t: t.pop('execution')),
+            ('unknown execution', lambda t: t.update(execution='exploration')),
+            ('act execution', lambda t: t['execution'].update(kind='task')),
+            ('missing kind', lambda t: t['execution'].pop('kind')),
+            ('unknown reason', lambda t: t['execution'].update(session_end_reason='success')),
+            ('missing reason', lambda t: t['execution'].pop('session_end_reason')),
+            ('false budget end', lambda t: t['execution'].update(session_end_reason='tool_budget_exhausted')),
+            ('completion contract', lambda t: t['execution'].update(completion_contract={})),
+            ('progress notification', lambda t: t['execution'].update(progress_notices=[{}])),
+            ('completion notification', lambda t: t.update(notice={'status': 'Delivered'})),
+            ('cancelled', lambda t: t.update(cancel_requested=True)),
+            ('failed', lambda t: t.update(failure='failed')),
+            ('missing start', lambda t: t.update(started_at_ms=None)),
+            ('missing end', lambda t: t.update(finished_at_ms=None)),
+            ('time reversal', lambda t: t.update(finished_at_ms=19)),
+            ('boolean timestamp', lambda t: t.update(created_at_ms=True)),
+            ('wrong last finish', lambda t: t['execution'].update(last_finished_at_ms=39)),
+            ('premature acknowledgement', lambda t: t['execution'].update(exploration_acknowledged_at_ms=39)),
+            ('future resume', lambda t: t['execution'].update(resume_at_ms=50)),
+            ('missing checkpoint', lambda t: t['execution'].update(checkpoint=None)),
+            ('unknown checkpoint', lambda t: t['execution']['checkpoint'].update(version=3)),
+            ('wrong scope', lambda t: t['execution']['checkpoint'].update(scope={'session_id': 'other', 'user_id': 'owner'})),
+            ('pending tool', lambda t: t['execution']['checkpoint'].update(pending_calls=[{}])),
+            ('pending request with result', lambda t: t['execution']['checkpoint'].update(pending_model_request=1)),
+            ('orphan request fingerprint', lambda t: t['execution']['checkpoint'].update(pending_request_fingerprint='0' * 64)),
+            ('missing usage', lambda t: t.update(usage=None)),
+            ('wrong usage', lambda t: t['usage'].update(tool_calls=1)),
+            ('boolean usage', lambda t: t['usage'].update(model_requests=True)),
+            ('missing messages', lambda t: t['execution']['checkpoint'].update(messages=[])),
+            ('malformed message', lambda t: t['execution']['checkpoint'].update(messages=[{}])),
+            ('missing message text', lambda t: t['execution']['checkpoint']['messages'][0].update(text=None)),
+            ('unknown closing flag', lambda t: t['execution']['checkpoint'].update(closing='false')),
+            ('wrong result', lambda t: t.update(result='编造的小结')),
+        ]
+        for version in (2, 3, 4):
+            for label, mutate in mutations:
+                with self.subTest(version=version, problem=label):
+                    task = self.ended()
+                    mutate(task)
+                    self.assert_rejected(task, version)
+        self.assert_rejected(self.ended(), 1)
+        self.assert_rejected(self.ended(), 5)
+
+    def tool_end(self, output):
+        task = self.ended()
+        checkpoint = task['execution']['checkpoint']
+        checkpoint['messages'].extend([
+            dict(role='Assistant', text=None, tool_calls=[dict(id='read', name='read_file',
+                arguments={'path': 'notes.txt'})], tool_results=[]),
+            dict(role='Tool', text=None, tool_calls=[], tool_results=[dict(call_id='read', output=output)])])
+        checkpoint.update(used_tool_calls=1, provider_requests=2, tool_batches=1)
+        task['usage'].update(tool_calls=1, model_requests=2)
+        return task
+
+    def test_tool_receipts_must_be_paired_and_have_no_unknown_effect(self):
+        for version in (2, 4):
+            self.assert_gate([self.tool_end({'Success': {'text': '真实材料'}})], version, True)
+            self.assert_gate([self.tool_end({'Failure': {'code': 'PermissionDenied', 'message': '范围拒绝'}})], version, True)
+            for code in ('TimedOut', 'Cancelled', 'ExecutionFailed', 'NewFailure'):
+                with self.subTest(version=version, code=code):
+                    self.assert_rejected(self.tool_end({'Failure': {'code': code, 'message': '未知效果'}}), version)
+            task = self.tool_end({'Success': {}})
+            task['execution']['checkpoint']['messages'][-1]['tool_results'][0]['call_id'] = 'foreign'
+            self.assert_rejected(task, version)
+            task = self.tool_end({'Success': {}})
+            task['execution']['checkpoint']['messages'].insert(-1, dict(role='User', text='不能隔断回执',
+                tool_calls=[], tool_results=[]))
+            self.assert_rejected(task, version)
+
+    def test_cold_session_ended_still_requires_exact_archive_and_directory(self):
+        ledger = self.save([self.ended()], 4)
+        record = ledger['tasks'][0]['record']
+        path = self.archive / (record['hash'] + '.json')
+        original = path.read_bytes()
+        path.write_bytes(original[:-1] + b' ')
+        with self.assertRaisesRegex(ValueError, 'task_archive_digest_mismatch'):
+            runtime.runtime_idle_gate(self.state)
+        path.write_bytes(original)
+        ledger['tasks'][0]['directory']['execution']['session_end_reason'] = 'deadline_expired'
+        state = runtime.read_json(self.state)
+        state['entries']['eve.task']['tasks.v1'] = list(json.dumps(ledger).encode())
+        runtime.atomic(self.state, state)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'task_archive_directory_mismatch'):
+            list(runtime.task_documents(self.state, ledger))
+        with self.assertRaisesRegex(ValueError, 'task_archive_directory_mismatch'):
+            runtime.runtime_idle_gate(self.state)
+        self.assertEqual(self.snapshot(), before)
+
 
 class UpgradeRuntimeTests(unittest.TestCase):
     @classmethod

@@ -6,7 +6,6 @@ export const MAX_ARCHIVE_BYTES = 160 * 1024 * 1024;
 export const MAX_UNPACKED_BYTES = 512 * 1024 * 1024;
 export const MAX_FILES = 12000;
 export const TARGETS = {
-  'windows-x64': 'x86_64-pc-windows-msvc', 'windows-arm64': 'aarch64-pc-windows-msvc',
   'linux-x64': 'x86_64-unknown-linux-gnu', 'linux-arm64': 'aarch64-unknown-linux-gnu',
 };
 
@@ -36,7 +35,7 @@ export function updatePlan(release, current) {
   currentManifest(current);
   if (!release || release.draft !== false || release.prerelease !== false || !stableVersion(release.tag_name)) throw new Error('最新发行不是公开稳定版本。');
   if (compareVersions(release.tag_name, current.version) <= 0) return null;
-  const extension = current.platform_label.startsWith('windows-') ? '.zip' : '.tar.gz';
+  const extension = '.tar.gz';
   const name = `Eve-${release.tag_name}-${current.platform_label}${extension}`;
   const asset = release.assets?.find(item => item.name === name);
   const digest = /^sha256:([a-f0-9]{64})$/.exec(asset?.digest ?? '');
@@ -68,11 +67,10 @@ export function verifyManifest(manifest, plan, names) {
     const parts = name.split('/');
     for (let i = 1; i < parts.length; i++) if (Object.hasOwn(manifest.files_sha256, parts.slice(0, i).join('/'))) throw new Error('更新文件和目录冲突。');
   }
-  const extension = plan.label.startsWith('windows-') ? '.exe' : '';
   const required = ['Launch.mjs', 'Updater.mjs', 'update-contract.mjs', 'update-archive.mjs', 'AGENT.md', 'config.example.json',
-    `runtime/${extension ? 'node.exe' : 'bin/node'}`, 'connectors/qqbot/bridge.mjs',
+    'runtime/bin/node', 'connectors/qqbot/bridge.mjs',
     'connectors/qqbot/node_modules/@tencent-connect/qqbot-nodejs/package.json',
-    ...['eve', 'eve-qqbot', 'eve-cognition', 'eve-memory', 'eve-message-evaluate'].map(name => name + extension)];
+    'eve', 'eve-qqbot', 'eve-cognition', 'eve-memory', 'eve-message-evaluate'];
   if (required.some(name => !Object.hasOwn(manifest.files_sha256, name))) throw new Error('新版运行包不完整。');
   if (names && (names.length !== entries.length + 1 || names.some(name => name !== 'build-info.json' && !Object.hasOwn(manifest.files_sha256, name)))) throw new Error('更新包与文件清单不一致。');
   return entries;

@@ -225,12 +225,12 @@ test('不支持的平台在读取用户配置或启动宿主前明确拒绝', { 
   const f = await fixture(t);
   const original = JSON.stringify(f.config);
   await fs.writeFile(path.join(f.root, 'config.json'), original);
-  for (const platform of ['darwin', 'freebsd']) {
+  for (const platform of ['win32', 'darwin', 'freebsd']) {
     const result = spawnSync(process.execPath, ['--input-type=module', '-e',
       `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} }); await import(${JSON.stringify(pathToFileURL(path.join(f.root, 'Launch.mjs')).href)});`],
     { encoding: 'utf8', timeout: 10000 });
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /仅支持 Linux 和 Windows/);
+    assert.match(result.stderr, /仅支持 Linux/);
     assert.equal(await fs.readFile(path.join(f.root, 'config.json'), 'utf8'), original);
     await assert.rejects(fs.stat(path.join(f.root, 'captured.json')), { code: 'ENOENT' });
   }

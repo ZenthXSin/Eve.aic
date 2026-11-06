@@ -126,6 +126,7 @@ eve-plan-plugin = { path = "../plan-plugin" }
 eve-learning-plugin = { path = "../learning-plugin" }
 eve-llm-api = { path = "../llm-api" }
 eve-llm-openai = { path = "../llm-openai" }
+eve-llm-codex = { path = "../llm-codex" }
 eve-message-api = { path = "../message-api" }
 eve-message-plugin = { path = "../message-plugin" }
 eve-memory-api = { path = "../memory-api" }

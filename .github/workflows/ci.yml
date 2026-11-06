@@ -15,19 +15,14 @@ concurrency:
 
 jobs:
   stable:
-    name: Stable / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Stable / ubuntu-latest
+    runs-on: ubuntu-latest
     # 统一编译示例，避免 cargo run 改变包特征后重复编译。
-    # Windows 全项测试与进程验收实测超过 41 分钟；为较慢的文件持久化保留有界余量。
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 55 || 40 }}
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
     defaults:
       run:
         shell: pwsh
@@ -42,31 +37,41 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default stable
       - name: 检查代码格式
-        run: cargo fmt --all -- --check
+        run: cargo fmt -- --check
       - name: 安装与便携包一致的 Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22.22.0'
       - name: 准备 Linux 脚本与成员项目的真实隔离环境
         if: runner.os == 'Linux'
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          sudo apt-get install -y bubblewrap python3 nodejs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          sudo apt-get install -y --no-install-recommends bubblewrap python3
+          # 固定路径的隔离执行器复用 setup-node 的版本，避免再下载一份系统 Node。
+          ci_node="$(readlink -f -- "$(command -v node)")"
+          test "$("$ci_node" --version)" = v22.22.0
+          if [ "$ci_node" != /usr/bin/node ]; then
+            sudo ln -sfnT -- "$ci_node" /usr/bin/node
+          fi
           # Ubuntu 24.04 的 AppArmor 默认限制非特权用户命名空间；与成员项目验收保持一致。
-          if (Test-Path "/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          fi
           bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           /usr/bin/python3 --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          /usr/bin/node --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          test "$(/usr/bin/node --version)" = v22.22.0
+          node_mounts=(--ro-bind /usr/lib /usr/lib --ro-bind /lib /lib)
+          if [ -d /lib64 ]; then node_mounts+=(--ro-bind /lib64 /lib64); fi
+          bwrap --unshare-all --cap-drop ALL --clearenv "${node_mounts[@]}" \
+            --proc /proc --dev /dev --ro-bind "$ci_node" /runtime/node \
+            /runtime/node --no-addons --jitless --max-old-space-size=64 --max-semi-space-size=4 \
+            -e 'if (process.version !== "v22.22.0") process.exit(1); console.log(process.version)'
       - name: 验证自动发行的版本与恢复语义
         run: python -X utf8 scripts/test-release-portable.py
+      - name: 验证 Debian 12 生产证据与失败产物拒绝
+        run: python -X utf8 scripts/test-debian12-release.py
       - name: 验证打包下载总期限、容量和小文件归档
         run: python -X utf8 scripts/test-package-portable.py
       - name: 验证客户端更新、资产校验与失败恢复
@@ -111,7 +116,10 @@ jobs:
       - name: 检查 Clippy 警告
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
-        run: cargo test --workspace --locked --no-fail-fast
+        run: |
+          cargo tree --workspace -e features -i serde_json --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --locked --no-fail-fast
       - name: 验证预编译目标的参数与失败传播
         run: python -X utf8 scripts/test-run-prebuilt.py
       - name: 统一编译进程验收入口和示例
@@ -121,19 +129,19 @@ jobs:
       - name: 验证后台策略通过真实文件回执学习与恢复
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/examples/task_strategy.exe" } else { "target/debug/examples/task_strategy" }
+          $env:EVE_QQBOT_BINARY = "target/debug/examples/task_strategy"
           python -X utf8 connectors/qqbot/test/task_strategy_process_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证 Web 插件页、配置恢复与 QQ 插件启停
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $qqBinary = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          $qqBinary = "target/debug/eve-qqbot"
           python -X utf8 scripts/test-web-plugins.py $qqBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证群聊插话的判断与完整回复链路
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $chimeBinary = if ($IsWindows) { "target/debug/eve-chime.exe" } else { "target/debug/eve-chime" }
+          $chimeBinary = "target/debug/eve-chime"
           python -X utf8 scripts/test-chime.py $chimeBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证引用和附件消息的记忆采集及重启不重放
@@ -141,13 +149,13 @@ jobs:
         run: |
           python -X utf8 connectors/qqbot/test/snapshot_reader_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
           python -X utf8 connectors/qqbot/test/memory_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证自主发言、等待、提醒与真实投递凭据
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
           python -X utf8 connectors/qqbot/test/progress_narration_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/live_dialogue_test.py
@@ -156,14 +164,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/task_progress_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not $IsWindows) {
-            python -X utf8 connectors/qqbot/test/default_goal_journey_test.py
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          python -X utf8 connectors/qqbot/test/default_goal_journey_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证主人跨群账号、撤权与旧身份兼容
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
           python -X utf8 connectors/qqbot/test/owner_account_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/public_source_test.py
@@ -173,14 +179,23 @@ jobs:
       - name: 验证自然待办、计划确认与原状态恢复
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
           python -X utf8 connectors/qqbot/test/natural_goal_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证独立 Web 自然待办、研究计划与重启证据
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $env:EVE_WEB_BINARY = if ($IsWindows) { "target/debug/eve-web.exe" } else { "target/debug/eve-web" }
+          $env:EVE_WEB_BINARY = "target/debug/eve-web"
           python -X utf8 scripts/test-web-goals.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证 QQ 与独立 Web 适配器切换的实际协议和重启去重
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' && runner.os == 'Linux' }}
+        run: |
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
+          $env:EVE_WEB_BINARY = "target/debug/eve-web"
+          python -X utf8 connectors/qqbot/test/model_adapter_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 scripts/test-web-model-adapter.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证浏览器中的插件配置、冲突、启停与窄屏
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' && runner.os == 'Linux' }}
@@ -199,7 +214,7 @@ jobs:
       - name: 验证 150k 上下文主动压缩与重启复用
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
-          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
           python -X utf8 connectors/qqbot/test/context_compaction_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/compaction_stream_test.py
@@ -539,15 +554,57 @@ jobs:
           Assert-SavedCounter $stateDirectory "[50]"
 
   msrv:
-    name: 最低 Rust 版本 / 1.89.0
+    name: 最低 Rust 版本 / 1.95.0
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 包含原 Codex 依赖的首次编译及定向回归；真实 QQ/Web 进程复用 qqbot.yml 的 1.95 作业。
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: 核对保留的 Codex 原文件
+        run: python3 scripts/verify-codex-upstream.py
       - name: 安装最低支持版本
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustc +1.95.0 --version --verbose
+          cargo +1.95.0 --version
       - name: 检查最低版本的所有构建目标
-        run: cargo +1.89.0 check --workspace --all-targets --locked
+        id: msrv-targets
+        run: cargo +1.95.0 check --workspace --all-targets --locked
+      - name: 验证最低版本的公共模型会话契约
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-llm-api --lib --locked
+      - name: 验证最低版本的原 Codex Responses 传输与恢复
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-llm-codex --lib --test responses --locked
+      - name: 验证最低版本的原 OpenAI Chat、Responses 与会话回归
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: |
+          cargo +1.95.0 tree -p eve-llm-openai -e features -i serde_json --locked
+          cargo +1.95.0 test -p eve-llm-openai --locked
+      - name: 验证最低版本的主辅选择、九组合与识图入口
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-app --lib models::tests --locked
+      - name: 验证最低版本的适配器切换身份、事务与推理参数
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-app --lib qq_model --locked
+      - name: 验证最低版本的会话持久化、请求恢复与工具零重放
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: |
+          cargo +1.95.0 test -p eve-runtime --locked \
+            --test llm_host --test session_host --test session_http \
+            --test model_resolver --test context_compaction \
+            --test openai_provider --test streaming
+      - name: 检查最低版本受影响包的 Clippy 警告
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: |
+          cargo +1.95.0 clippy --all-targets --locked \
+            -p eve-llm-api -p eve-llm-openai -p eve-llm-codex \
+            -p eve-runtime -p eve-app -p eve-developer-tools -p eve-web-panel-api \
+            -- -D warnings

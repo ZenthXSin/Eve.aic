@@ -162,17 +162,7 @@ async fn operator_reads_writes_searches_patches_and_runs_outside_default_project
         Path::new(output["cwd"].as_str().unwrap()),
         outside.path().canonicalize().unwrap()
     );
-    let requests = reviewed.requests.lock().unwrap();
-    assert_eq!(requests.len(), 4);
-    assert!(
-        requests
-            .iter()
-            .all(|r| r.user_messages == ["读写并验证明确指定的工程外文件"] && !r.isolated)
-    );
-    assert_eq!(
-        Path::new(&requests.last().unwrap().cwd),
-        outside.path().canonicalize().unwrap()
-    );
+    assert!(reviewed.requests.lock().unwrap().is_empty());
     assert!(fs::read_dir(project.path()).unwrap().next().is_none());
 }
 
@@ -239,13 +229,7 @@ async fn disabled_ordinary_member_and_revoked_operator_cannot_gain_host_paths() 
             .await
             .is_err()
     );
-    access.0.store(true, Ordering::SeqCst);
-    let revoke = access.clone();
-    let reviewer = Arc::new(Reviewer {
-        requests: Mutex::new(vec![]),
-        change: Some(Box::new(move || revoke.0.store(false, Ordering::SeqCst))),
-    });
-    let member = member.with_action_reviewer(reviewer);
+    access.0.store(false, Ordering::SeqCst);
     assert!(
         member
             .execute(
@@ -485,7 +469,7 @@ async fn external_edit_write_and_patch_move_preserve_permissions_and_owner() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn host_links_bind_reviewed_target_and_protected_targets_never_reach_model() {
+async fn host_links_bind_real_target_without_review_and_protected_targets_stay_private() {
     let project = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let journal = tempfile::tempdir().unwrap();
@@ -495,15 +479,7 @@ async fn host_links_bind_reviewed_target_and_protected_targets_never_reach_model
     fs::create_dir(&replacement).unwrap();
     let alias = outside.path().join("data");
     std::os::unix::fs::symlink(&original, &alias).unwrap();
-    let a = alias.clone();
-    let to = replacement.clone();
-    let reviewer = Arc::new(Reviewer {
-        requests: Mutex::new(vec![]),
-        change: Some(Box::new(move || {
-            fs::remove_file(&a).unwrap();
-            std::os::unix::fs::symlink(&to, &a).unwrap();
-        })),
-    });
+    let reviewer = reviewer();
     let backend = LocalDeveloper::new(config(project.path()), journal.path().into(), None)
         .unwrap()
         .with_action_reviewer(reviewer.clone());
@@ -519,12 +495,7 @@ async fn host_links_bind_reviewed_target_and_protected_targets_never_reach_model
         "reviewed"
     );
     assert!(!replacement.join("created.txt").exists());
-    let request = reviewer.requests.lock().unwrap()[0].clone();
-    let payload: Value = serde_json::from_str(&request.arguments[0]).unwrap();
-    assert_eq!(
-        Path::new(payload["path"].as_str().unwrap()),
-        original.join("created.txt")
-    );
+    assert!(reviewer.requests.lock().unwrap().is_empty());
     let mut settings = config(project.path());
     let protected = outside.path().join("runtime.json");
     fs::write(&protected, "synthetic protected content").unwrap();

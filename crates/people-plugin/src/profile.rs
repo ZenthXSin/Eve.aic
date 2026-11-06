@@ -45,6 +45,15 @@ impl ProfileConsolidator for ModelProfileConsolidator {
                 .collect();
             let input = serde_json::json!({ "sources": sources }).to_string();
             let request = ModelRequest {
+                session: Some(match request.model_session {
+                    Some(session) => session,
+                    None => eve_llm_api::ModelSession::anchored(
+                        "profile-consolidation",
+                        None,
+                        &request.participant,
+                    )
+                    .map_err(|e| failure(&e.to_string()))?,
+                }),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),

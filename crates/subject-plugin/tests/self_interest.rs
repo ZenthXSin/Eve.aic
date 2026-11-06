@@ -51,6 +51,7 @@ fn reflection(updates: Vec<SelfInterest>) -> IdleReflection {
         judgments: vec![],
         interest_updates: updates,
         action: None,
+        exploration: None,
         revisit_after_minutes: 30,
     }
 }

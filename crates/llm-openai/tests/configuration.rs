@@ -63,6 +63,7 @@ async fn explicit_model_options_are_sent_and_defaults_are_omitted() {
     ])
     .await;
     let request = || ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "test")],
         tools: vec![],
     };

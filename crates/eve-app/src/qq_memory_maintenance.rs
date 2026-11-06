@@ -182,8 +182,19 @@ impl ContextAssembler for Context {
         input: TurnInput,
         identity: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, identity, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        identity: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut context = self.inner.assemble_scoped(input, identity.clone()).await?;
+            let mut context = self
+                .inner
+                .assemble_with_model_session(input, identity.clone(), model_session.clone())
+                .await?;
             if let Some(identity) = identity {
                 let receipts = self
                     .learning

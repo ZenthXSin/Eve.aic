@@ -20,6 +20,8 @@ mod history;
 mod image;
 mod journal;
 mod protocol;
+mod request_fingerprint;
+mod session;
 mod steering;
 mod usage;
 pub use budget::{BudgetUsage, ExecutionLimits, SharedStepUsage, SharedToolSteps, TurnBudget};
@@ -34,8 +36,10 @@ pub use image::{
 };
 pub use journal::{MAX_CHECKPOINT_BYTES, TurnCheckpoint, TurnJournal};
 pub use protocol::ProtocolFailureKind;
+pub use request_fingerprint::ModelRequestFingerprint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use session::ModelSession;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -221,10 +225,16 @@ impl ChatMessage {
 pub struct ModelRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
+    /// 宿主显式绑定，不能从提示词推断。None 仅用于本地协议转换/估算或旧的非会话调用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ModelSession>,
 }
 
 impl ModelRequest {
     pub fn validate(&self) -> Result<(), LlmError> {
+        if let Some(session) = &self.session {
+            session.validate()?;
+        }
         Self::validate_parts(&self.messages, &self.tools)
     }
     /// 按同一协议直接核验借用的消息和工具定义，不复制正文或工具回执。
@@ -589,6 +599,18 @@ impl std::error::Error for LlmError {}
 pub trait LlmProvider: Send + Sync {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse>;
 
+    /// Runtime 在发送 complete/stream 前只读计算；不能访问网络、执行模型或修改请求状态。
+    /// 必须覆盖实际正文、目的地与固定配置，不含 x-client-request-id 或凭据。
+    /// 只有两次 Some 指纹相同才可复用待恢复请求 ID；None 表示无法证明，宿主分配新序号。
+    /// 修改正文的包装器必须按同一转换计算或保留 None，不能直接透传旧指纹。
+    fn request_fingerprint(
+        &self,
+        _request: &ModelRequest,
+        _mode: ResponseMode,
+    ) -> Result<Option<ModelRequestFingerprint>, LlmError> {
+        Ok(None)
+    }
+
     /// 请求 JSON 对象文本；实现可启用模型的 JSON 模式。兼容旧 Provider 时仍沿用
     /// complete；调用方必须自行严格检查 JSON、字段及业务约束，不能信任格式承诺。
     fn complete_json(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
@@ -722,6 +744,15 @@ pub struct ContextScope {
     pub user_id: String,
 }
 
+/// 可信原文窗口与授权证据可用性分开记录，不能把缺口重建成加工正文或空的完整证据。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReviewUserMessageWindow {
+    Complete(Vec<String>),
+    /// 来源已核对持久库绑定、完整身份和指定消息；只有原文缺失或已登记的旧历史缺口。
+    /// 不表示任何新权限。损坏、身份不符、未知锚点或来源不可用必须返回错误。
+    MissingOriginals,
+}
+
 /// 通道验证和持久化后的独立用户原文来源。引用、附件提示、模型上下文不是授权证据。
 /// None 表示此来源不处理该通道；Some(empty) 表示该范围没有可用的真实用户原话。
 pub trait ReviewUserMessageSource: Send + Sync {
@@ -735,6 +766,16 @@ pub trait ReviewUserMessageSource: Send + Sync {
         Err(LlmError::Context(
             "原话来源不支持可信消息锚点；未回退到可变最新消息".into(),
         ))
+    }
+    /// 前台执行独立核对原文窗口；明确缺口不关闭普通工具，身份变更仍须完整原话。
+    /// 默认沿用严格原文读取；只有已验证上述缺口类别的来源才能返回 MissingOriginals。
+    fn read_window_at(
+        &self,
+        scope: &ContextScope,
+        anchor: &str,
+    ) -> Result<Option<ReviewUserMessageWindow>, LlmError> {
+        self.read_at(scope, anchor)
+            .map(|messages| messages.map(ReviewUserMessageWindow::Complete))
     }
     /// 只核对最新可信入站消息是否仍为已消费的锚点，不读取或提前消费新授权正文。
     fn is_current(&self, _scope: &ContextScope, _anchor: &str) -> Result<bool, LlmError> {
@@ -769,6 +810,17 @@ pub trait ContextAssembler: Send + Sync {
     ) -> LlmFuture<'_, ContextSnapshot> {
         self.assemble(input)
     }
+
+    /// 宿主模型会话与输入正文独立传递。组合装配器必须继续向下传递，
+    /// 内部相关性/召回模型由此派生独立用途；旧叶子实现可以不使用它。
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        _session: Option<ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_scoped(input, scope)
+    }
 }
 
 #[derive(Clone)]
@@ -778,6 +830,7 @@ pub struct ToolExecutionContext {
     turn_id: Option<u64>,
     call_id: Option<String>,
     background_task_id: Option<String>,
+    model_session: Option<ModelSession>,
     continuation: TaskContinuation,
     conversation: Option<Arc<Vec<ChatMessage>>>,
     review_user_messages: Option<Arc<Vec<String>>>,
@@ -817,6 +870,7 @@ impl ToolExecutionContext {
             turn_id: None,
             call_id: None,
             background_task_id: None,
+            model_session: None,
             continuation: TaskContinuation::default(),
             conversation: None,
             review_user_messages: None,
@@ -858,6 +912,37 @@ impl ToolExecutionContext {
     }
     pub fn background_task_id(&self) -> Option<&str> {
         self.background_task_id.as_deref()
+    }
+    /// 可信运行宿主绑定的模型会话；工具内模型用途应 fork 独立角色，不能修改父会话。
+    pub fn with_model_session(mut self, session: ModelSession) -> Self {
+        self.model_session = Some(session);
+        self
+    }
+    pub fn model_session(&self) -> Option<&ModelSession> {
+        self.model_session.as_ref()
+    }
+    /// 工具内的独立模型用途。长期会话按可信 scope/role 隔离，当前工具轮次
+    /// 取自宿主绑定的父轮次与调用 ID，不读取工具参数或用户正文。
+    pub fn model_session_for(&self, role: &str) -> Result<Option<ModelSession>, LlmError> {
+        let session = match (&self.scope, &self.model_session) {
+            (scope, Some(parent)) => {
+                parent.validate_scope(scope.as_ref())?;
+                Some(parent.fork(role, None)?)
+            }
+            (Some(scope), None) => Some(ModelSession::scoped(role, scope)?),
+            (None, None) => None,
+        };
+        session
+            .map(|session| {
+                if let Some(turn) = self.model_session.as_ref().and_then(ModelSession::turn_id) {
+                    session.with_turn(&format!("{turn}:{}", self.call_id.as_deref().unwrap_or("")))
+                } else if let Some(turn) = self.turn_id {
+                    session.with_turn(&format!("{turn}:{}", self.call_id.as_deref().unwrap_or("")))
+                } else {
+                    Ok(session)
+                }
+            })
+            .transpose()
     }
     pub fn with_continuation(mut self, continuation: TaskContinuation) -> Self {
         self.continuation = continuation;
@@ -1067,6 +1152,7 @@ mod tests {
 
     fn request(messages: Vec<ChatMessage>) -> ModelRequest {
         ModelRequest {
+            session: None,
             messages,
             tools: vec![],
         }
@@ -1196,6 +1282,7 @@ mod tests {
         };
 
         let request = ModelRequest {
+            session: None,
             messages: vec![ChatMessage::text(ChatRole::User, "run")],
             tools: vec![definition("demo"), definition("demo")],
         };

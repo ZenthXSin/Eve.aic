@@ -719,6 +719,7 @@ impl Inbox {
         {
             let task_service = tasks.ok_or(PanelError::Unavailable)?;
             if !web_owner(&entry.owner.session_id, &entry.owner.user_id)
+                || entry.kind == eve_task_api::TaskExecutionKind::Exploration
                 || entry
                     .source
                     .starts_with(eve_task_api::IDLE_TASK_SOURCE_PREFIX)
@@ -927,6 +928,7 @@ fn task_status(status: TaskStatus) -> &'static str {
         TaskStatus::Queued => "queued",
         TaskStatus::Running => "running",
         TaskStatus::Completed => "completed",
+        TaskStatus::SessionEnded => "session_ended",
         TaskStatus::Blocked => "blocked",
         TaskStatus::Failed => "failed",
         TaskStatus::Cancelled => "cancelled",

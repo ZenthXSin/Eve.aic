@@ -45,8 +45,8 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: 安装 Rust 并构建核心
         run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo +1.95.0 build -p eve-app --bin eve-qqbot --locked
       - name: 运行交互窗口
         env:
           QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}

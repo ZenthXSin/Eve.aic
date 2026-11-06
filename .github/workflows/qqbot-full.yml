@@ -46,8 +46,8 @@ jobs:
       - name: 构建不含凭据的运行包
         run: |
           npm --prefix connectors/qqbot ci --ignore-scripts --no-audit --no-fund
-          rustup toolchain install 1.89.0 --profile minimal
-          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo +1.95.0 build -p eve-app --bin eve-qqbot --locked
           tar -czf "$RUNNER_TEMP/qqbot-runtime.tar.gz" target/debug/eve-qqbot connectors/qqbot/node_modules
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

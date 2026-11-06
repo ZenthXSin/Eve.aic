@@ -47,6 +47,7 @@ fn stream(chunks: Vec<(Duration, Vec<u8>)>) -> Reply {
 }
 fn request() -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "fixture")],
         tools: vec![],
     }

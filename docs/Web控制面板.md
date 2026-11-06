@@ -2,6 +2,8 @@
 
 面板可独立运行：`eve-web --listen 127.0.0.1:8765` 不需要 QQBot AppID、密钥、账号绑定或 Node。也可继续使用 `eve-qqbot --web-listen 127.0.0.1:8765`，在 QQ 宿主中同时聊天和管理。设置独立 `EVE_WEB_TOKEN`（32–256 字节可见 ASCII）与原有模型配置，浏览器访问启动输出的 `EVE_WEB_READY` 地址并输入令牌。令牌不是模型或 QQ 密钥，不放在 URL、命令参数或页面源码中。
 
+独立 `eve-web` 在就绪前输出有限的 `EVE_WEB_STARTUP` JSON 行，字段仅为固定 `stage`、`event`（`started` / `completed`）与该阶段的 `elapsed_ms`，不含配置值、路径、凭据或消息正文。最后一个未完成阶段可定位状态打开、资源发现及浏览器探测、核心装配、后台恢复或面板绑定等启动位置；失败保留原错误与数据，不补发 `completed` 或 `EVE_WEB_READY`。这些日志只用于诊断，不延长启动期限、不重试启动，也不代表既有启动超时已修复。
+
 ## 直接对话
 
 登录后默认进入“直接对话”。Web 使用主人身份，由服务端固定为 `web:owner`，会话键为 `web:chat:<32 位编号>`；HTTP 不接受用户、角色或任意 SessionKey 来改变身份，也不继承或覆盖 QQ 用户的会话。浏览器访问令牌仍是使用这个主人入口的认证依据，不能仅凭打开页面发起模型请求。
@@ -163,7 +165,7 @@ QQ 面板中的配置插件提供 `provider.openai`、`provider.jev`、`runtime.
 
 本机状态、会话、取消操作、实时判断诊断、认知目标与记忆偏好只读页、目标的多步计划查看与撤销、插件启停与插件配置页面已交付；接下来推进偏好撤销等范围明确的管理操作。模型健康已按用途显示在“运行就绪”区块（本进程实际请求的结局，重启清零），见[模型健康与就绪状态](./模型健康与就绪状态.md)；判断置信度数值尚未进入公开观察契约，页面不显示。远程认证授权、事件流和人工批准任务执行在其后实现；不把未实现的暂停恢复、重试或模型健康数据画成可操作按钮。
 
-验收覆盖真实环回 HTTP、实际 Eve+QQ 替身子进程和浏览器交互，结果记录在 PR 中。`python scripts/test-web-plugins.py target/debug/eve-qqbot` 可重现插件管理、配置恢复与分段启停验收；加 `--browser` 并安装 `playwright-core` 可执行网页交互。CI 在 Ubuntu 和 Windows 执行子进程验收。本切片不通过工作流连接真实 QQ 或真实模型。
+验收覆盖真实环回 HTTP、实际 Eve+QQ 替身子进程和浏览器交互，结果记录在 PR 中。`python scripts/test-web-plugins.py target/debug/eve-qqbot` 可重现插件管理、配置恢复与分段启停验收；加 `--browser` 并安装 `playwright-core` 可执行网页交互。CI 在 Ubuntu 执行子进程验收。本切片不通过工作流连接真实 QQ 或真实模型。
 
 ## 可编辑工作便笺
 

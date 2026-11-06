@@ -54,8 +54,15 @@ impl EmbeddingProvider for DeferredEmbeddings {
             .map_or(&self.unset, |provider| provider.profile())
     }
     fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
+        self.embed_with_model_session(inputs, None)
+    }
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
         match self.inner.get() {
-            Some(provider) => provider.embed(inputs),
+            Some(provider) => provider.embed_with_model_session(inputs, session),
             None => Box::pin(async { Err(EmbeddingError::Provider) }),
         }
     }
@@ -134,6 +141,13 @@ impl EmbeddingProvider for QueryRecallEmbeddings {
         self.foreground.profile()
     }
     fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
+        self.embed_with_model_session(inputs, None)
+    }
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
         Box::pin(async move {
             let background: bool = self
                 .foreground
@@ -141,9 +155,13 @@ impl EmbeddingProvider for QueryRecallEmbeddings {
                 .get("semantic_query_background")
                 .map_err(|_| EmbeddingError::Provider)?;
             if background {
-                self.background.embed(inputs).await
+                self.background
+                    .embed_with_model_session(inputs, session)
+                    .await
             } else {
-                self.foreground.embed(inputs).await
+                self.foreground
+                    .embed_with_model_session(inputs, session)
+                    .await
             }
         })
     }
@@ -153,10 +171,17 @@ impl EmbeddingProvider for QueryEmbeddings {
         self.inner.profile()
     }
     fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
+        self.embed_with_model_session(inputs, None)
+    }
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
         Box::pin(async move {
             let budget = self.use_query_budget.then(|| self.budget()).transpose()?;
             let mut trace = QueryTiming::new(self.timing, budget);
-            let request = self.inner.embed(inputs);
+            let request = self.inner.embed_with_model_session(inputs, session);
             let result = match budget {
                 Some(budget) => tokio::time::timeout(budget, request)
                     .await

@@ -206,6 +206,7 @@ mod tests {
     fn internal_record_is_labelled_in_both_wire_protocols_without_rewriting_history() {
         let raw = ChatMessage::internal_text("没有发出的草稿");
         let request = ModelRequest {
+            session: None,
             messages: vec![
                 ChatMessage::text(ChatRole::User, "先别说"),
                 raw.clone(),
@@ -237,6 +238,7 @@ mod tests {
         let body = encode_request(
             "model",
             ModelRequest {
+                session: None,
                 messages: vec![
                     ChatMessage::text(ChatRole::System, "规则"),
                     ChatMessage::text(ChatRole::User, "问题"),
@@ -409,6 +411,7 @@ mod tests {
         let body = encode_request(
             "m",
             ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::text(ChatRole::User, "看看").with_images(vec![image])],
                 tools: vec![],
             },

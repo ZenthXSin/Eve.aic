@@ -84,6 +84,12 @@ pub(crate) struct State {
     current: Option<String>,
 }
 
+/// 持久摘要作用域与调用方模型会话成对传入；临时摘要仍保留模型会话。
+pub(crate) struct DigestContext<'a> {
+    pub(crate) scope: Option<&'a ContextScope>,
+    pub(crate) model_session: Option<&'a eve_llm_api::ModelSession>,
+}
+
 impl State {
     pub(crate) fn new(
         context: &mut ContextSnapshot,
@@ -217,9 +223,13 @@ impl State {
         tools: &[ToolDefinition],
         policy: ContextCompactionPolicy,
         service: &dyn HistoryDigests,
-        scope: Option<&ContextScope>,
+        context: DigestContext<'_>,
         fallback_trigger: Option<usize>,
     ) -> Result<(), LlmError> {
+        let DigestContext {
+            scope,
+            model_session,
+        } = context;
         let before = estimate_request(messages, tools)?;
         if before < policy.trigger_tokens {
             return Ok(());
@@ -244,7 +254,7 @@ impl State {
             }
             let end = groups[..count].iter().map(|g| g.len()).sum::<usize>();
             let digest = service
-                .compact(scope, &self.original[..end])
+                .compact_with_session(scope, &self.original[..end], model_session)
                 .await?
                 .filter(|d| valid(d, count) && d.covered_turns == count)
                 .ok_or_else(|| {
@@ -303,7 +313,7 @@ impl State {
                 }
                 let turns = history_turns(&ephemeral).len();
                 let digest = service
-                    .compact(None, &ephemeral)
+                    .compact_with_session(None, &ephemeral, model_session)
                     .await?
                     .filter(|d| valid(d, turns) && d.covered_turns == turns)
                     .ok_or_else(|| {
@@ -394,6 +404,7 @@ mod tests {
             concurrency: None,
         }];
         let owned = ModelRequest {
+            session: None,
             messages: messages.clone(),
             tools: tools.clone(),
         };
@@ -480,7 +491,17 @@ mod tests {
         let policy = state.adaptive_policy(&messages, &[], 200000).unwrap();
         assert!(state.has_work(&messages));
         state
-            .compact(&mut messages, &[], policy, &service, None, Some(200000))
+            .compact(
+                &mut messages,
+                &[],
+                policy,
+                &service,
+                DigestContext {
+                    scope: None,
+                    model_session: None,
+                },
+                Some(200000),
+            )
             .await
             .unwrap();
         assert_eq!(service.0.load(Ordering::SeqCst), 1);
@@ -499,6 +520,7 @@ mod tests {
         );
         assert_eq!(original[3].tool_calls[0].id, "once");
         ModelRequest {
+            session: None,
             messages,
             tools: vec![],
         }
@@ -553,6 +575,7 @@ mod tests {
                 ChatMessage::text(ChatRole::User, "current request"),
             ];
             let base = estimate(&ModelRequest {
+                session: None,
                 messages: template.clone(),
                 tools: vec![],
             })
@@ -564,6 +587,7 @@ mod tests {
             messages[2] = context.history[0].clone();
             assert_eq!(
                 estimate(&ModelRequest {
+                    session: None,
                     messages: messages.clone(),
                     tools: vec![]
                 })
@@ -572,7 +596,17 @@ mod tests {
             );
             let before = messages.clone();
             state
-                .compact(&mut messages, &[], policy, &service, None, None)
+                .compact(
+                    &mut messages,
+                    &[],
+                    policy,
+                    &service,
+                    DigestContext {
+                        scope: None,
+                        model_session: None,
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -585,6 +619,7 @@ mod tests {
             } else {
                 assert!(
                     estimate(&ModelRequest {
+                        session: None,
                         messages: messages.clone(),
                         tools: vec![]
                     })
@@ -625,7 +660,10 @@ mod tests {
                         target_tokens: 100000
                     },
                     &service,
-                    None,
+                    DigestContext {
+                        scope: None,
+                        model_session: None,
+                    },
                     None
                 )
                 .await

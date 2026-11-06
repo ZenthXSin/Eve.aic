@@ -81,7 +81,7 @@ fn version_one_migration_is_atomic_and_invalid_old_schema_is_not_rewritten() {
     let path = temporary.path().join("mind.sqlite3");
     drop(SqliteIdleMemory::open(&path).unwrap());
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE host_authorizations; DROP TABLE autonomy_problems; DROP TABLE reconciled_tasks; UPDATE metadata SET version=1;").unwrap();
+    db.execute_batch("DROP TABLE host_authorizations; DROP TABLE autonomy_problems; DROP TABLE reconciled_tasks; DROP TABLE exploration_sources; DROP TABLE exploration_experiences; UPDATE metadata SET version=1;").unwrap();
     drop(db);
     let migrated = SqliteIdleMemory::open(&path).unwrap();
     migrated
@@ -92,9 +92,9 @@ fn version_one_migration_is_atomic_and_invalid_old_schema_is_not_rewritten() {
     assert_eq!(
         db.query_row("SELECT version FROM metadata", [], |r| r.get::<_, u32>(0))
             .unwrap(),
-        2
+        3
     );
-    db.execute_batch("DROP TABLE host_authorizations; DROP TABLE autonomy_problems; DROP TABLE reconciled_tasks; UPDATE metadata SET version=1; DROP TABLE consumed;").unwrap();
+    db.execute_batch("DROP TABLE host_authorizations; DROP TABLE autonomy_problems; DROP TABLE reconciled_tasks; DROP TABLE exploration_sources; DROP TABLE exploration_experiences; UPDATE metadata SET version=1; DROP TABLE consumed;").unwrap();
     drop(db);
     let before = std::fs::read(&path).unwrap();
     assert!(matches!(

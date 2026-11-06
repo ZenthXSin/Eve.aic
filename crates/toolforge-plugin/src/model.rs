@@ -32,6 +32,15 @@ impl ToolForger for ModelToolForger {
             }
             let input = serde_json::to_string(&request).map_err(|_| ToolError::InvalidInput)?;
             let model_request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::owned(
+                        "tool-forger",
+                        &request.owner,
+                        &request.forge_id,
+                    )
+                    .and_then(|s| s.with_turn(&request.forge_id))
+                    .map_err(provider_error)?,
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, FORGE_PROMPT),
                     ChatMessage::text(ChatRole::User, input),

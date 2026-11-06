@@ -1,6 +1,7 @@
 use eve_history_digest::{DigestRequest, DigestTurn, HistoryDigester, ModelHistoryDigester};
 use eve_llm_api::{
-    LlmError, LlmFuture, LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelSelection,
+    LlmError, LlmFuture, LlmModelResolver, LlmProvider, ModelRequest, ModelResponse,
+    ModelSelection, ModelSession,
 };
 use std::{
     collections::VecDeque,
@@ -62,6 +63,12 @@ fn text(value: &str, seconds: u64) -> Reply {
 }
 fn request() -> DigestRequest {
     DigestRequest {
+        model_session: Some(
+            ModelSession::anchored("history-digest", None, "persisted-task-19")
+                .unwrap()
+                .with_turn("digest-batch-4")
+                .unwrap(),
+        ),
         previous_turns: 0,
         previous: vec![],
         turns: vec![DigestTurn {
@@ -86,6 +93,12 @@ async fn prose_gets_one_repair_from_the_original_data_without_tools_or_bad_outpu
     assert_eq!(requests.len(), 2);
     assert_eq!(*provider.json_requests.lock().unwrap(), 2);
     assert_eq!(requests[0].messages[1], requests[1].messages[1]);
+    let first = requests[0].session.as_ref().unwrap();
+    let repair = requests[1].session.as_ref().unwrap();
+    assert_eq!(first.session_id(), repair.session_id());
+    assert_eq!(first.prompt_cache_key(), repair.prompt_cache_key());
+    assert_eq!(first.turn_id(), repair.turn_id());
+    assert_ne!(first.client_request_id(), repair.client_request_id());
     for request in &*requests {
         assert!(request.tools.is_empty());
         assert!(
@@ -174,6 +187,13 @@ async fn transient_digest_failure_retries_original_input_once_without_tools() {
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].messages[1], requests[1].messages[1]);
+        let first = requests[0].session.as_ref().unwrap();
+        let retry = requests[1].session.as_ref().unwrap();
+        assert_eq!(first.session_id(), retry.session_id());
+        assert_eq!(first.prompt_cache_key(), retry.prompt_cache_key());
+        assert_eq!(first.turn_id(), retry.turn_id());
+        // 摘要器在第二次调用追加修复指令，属于新逻辑请求；传输重试由 Provider 原样重发。
+        assert_ne!(first.client_request_id(), retry.client_request_id());
         assert!(requests.iter().all(|r| r.tools.is_empty()));
     }
 }

@@ -50,6 +50,7 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
             self.assertEqual(result['purpose'], 'dialogue')
             self.assertEqual(result['configured']['role'], 'primary')
             self.assertEqual(result['configured']['model'], 'role-a')
+            self.assertEqual(result['configured']['adapter'], 'openai')
             self.assertEqual(result['configured']['max_output_tokens'], 128)
             self.assertEqual(result['configured']['max_concurrent_requests'], 5)
             self.assertEqual(result['admission']['limit'], 5)

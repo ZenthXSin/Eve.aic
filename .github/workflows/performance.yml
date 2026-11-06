@@ -41,8 +41,8 @@ jobs:
           python3 -m unittest discover -s benchmarks/cognition -p 'test_*.py'
       - name: 构建认知入口
         run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          cargo +1.89.0 build -p eve-app --bin eve-cognition --locked
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo +1.95.0 build -p eve-app --bin eve-cognition --locked
       - name: 运行本机替身认知场景评估
         run: |
           python3 benchmarks/cognition/evaluate.py \
@@ -76,8 +76,8 @@ jobs:
           node --check connectors/qqbot/test/performance-bridge.mjs
       - name: 构建 Release 版 Eve
         run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          cargo +1.89.0 build -p eve-app --bin eve-qqbot --release --locked
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo +1.95.0 build -p eve-app --bin eve-qqbot --release --locked
       - name: 运行通道、工具、持久化与恢复性能测试
         run: |
           python3 connectors/qqbot/test/performance.py \
@@ -85,7 +85,7 @@ jobs:
             --output "$RUNNER_TEMP/eve-performance/acceptance.json"
       - name: 构建并验收有界认知循环 Release 性能
         run: |
-          cargo +1.89.0 build -p eve-runtime --example cognition_loop --release --locked
+          cargo +1.95.0 build -p eve-runtime --example cognition_loop --release --locked
           python3 benchmarks/cognition.py --binary target/release/examples/cognition_loop --output "$RUNNER_TEMP/eve-performance/cognition.json"
       - name: 保存无正文性能报告
         if: always()

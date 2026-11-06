@@ -12,10 +12,7 @@ use eve_qqbot_plugin::{
     QqOutreachResult,
 };
 use serde_json::Value;
-use std::{
-    path::{Component, Path},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 fn public_tool(name: &str) -> bool {
     matches!(
@@ -90,19 +87,8 @@ fn public_tool(name: &str) -> bool {
 fn source_lookup_tool(name: &str) -> bool {
     matches!(name, "search_reference" | "read_reference" | "read_source")
 }
-pub(crate) fn owner_file(path: &str, write: bool) -> bool {
-    Path::new(path).components().any(|c| match c {
-        Component::Normal(s) => {
-            let s = s.to_string_lossy().to_ascii_lowercase();
-            write && matches!(s.as_str(), "agent.md" | "agents.md" | "rule.md" | "user.md")
-                || matches!(s.as_str(), ".env" | "private")
-                || s.contains("secret")
-                || s.contains("credential")
-                || s.ends_with(".pem")
-                || s.ends_with(".key")
-        }
-        _ => false,
-    })
+pub(crate) fn owner_file(path: &str, _write: bool) -> bool {
+    eve_developer_api::credential_path(path)
 }
 /// 补丁里的任一路径（含移动目标）属于主人专用文件，或补丁无法解析而无法核对时为真。
 fn patch_touches_owner_file(patch: &str) -> bool {
@@ -137,7 +123,7 @@ impl Tool for GuardedTool {
             || self.public_github && definition.name == "github_api")
         {
             definition.description.push_str(
-                " 此管理能力需要主人或管理员授权；普通用户不可调用，也不可通过后台或子代理代办。",
+                " 此管理能力依据宿主绑定的主人或管理员身份开放；后台和子代理沿用原会话身份及实际权限，不能自行扩权。",
             );
         }
         definition
@@ -189,7 +175,7 @@ pub(crate) fn authorize_tool(
     if !(owner || administrator || public_tool(name) || public_github && name == "github_api") {
         return Err(ToolExecutionError::Failed("此操作需要主人或管理员授权；普通成员的项目开发权限不包括宿主部署、全局管理、后台派发或定时主动消息".into()));
     }
-    // 管理员不能借补丁改动身份规则文件与私密凭据；补丁里的每个路径都要核对。
+    // 管理员不能借补丁改动实际身份绑定账本与私密凭据；补丁里的每个路径都要核对。
     if !owner
         && administrator
         && name == "apply_patch"
@@ -199,7 +185,7 @@ pub(crate) fn authorize_tool(
             .is_some_and(patch_touches_owner_file)
     {
         return Err(ToolExecutionError::Failed(
-            "身份规则文件及私密凭据仅限主人操作".into(),
+            "实际身份绑定账本及私密凭据仅限主人操作".into(),
         ));
     }
     if !owner
@@ -214,7 +200,7 @@ pub(crate) fn authorize_tool(
             .is_some_and(|path| owner_file(path, matches!(name, "write_file" | "edit_file")))
     {
         return Err(ToolExecutionError::Failed(
-            "身份规则文件及私密凭据仅限主人操作".into(),
+            "实际身份绑定账本及私密凭据仅限主人操作".into(),
         ));
     }
     Ok(())
@@ -659,7 +645,7 @@ mod tests {
         assert!(!policy.tool_allowed_without_review(&group, "read_raw_message"));
     }
     #[test]
-    fn resolved_file_permissions_keep_members_own_project_rules_editable() {
+    fn resolved_file_permissions_allow_project_sources_and_keep_real_credentials_private() {
         let directory = tempfile::tempdir().unwrap();
         let admin = Admin::open(
             directory.path(),
@@ -676,11 +662,38 @@ mod tests {
             session_id: "s".into(),
             user_id: "member".into(),
         };
-        for name in ["AGENT.md", "USER.md"] {
+        for name in [
+            "AGENT.md",
+            "AGENTS.md",
+            "USER.md",
+            "rules/RULE.md",
+            "src/credential.rs",
+            "src/secret_parser.rs",
+            "src/credentials/mod.rs",
+            "src/credentials",
+            "tests/secrets",
+            "src/credential_schema.json",
+            "docs/secret-handling.txt",
+            "docs/secret-handling.md",
+            ".cargo/config.toml",
+        ] {
             let path = directory.path().join(name);
-            assert!(!admin.permits_file(&administrator, &path, true));
+            assert!(admin.permits_file(&administrator, &path, true), "{name}");
             assert!(admin.permits_file(&administrator, &path, false));
             assert!(admin.permits_file(&member, &path, true));
+        }
+        for name in [
+            ".env",
+            ".ssh/id_ed25519",
+            "credentials.json",
+            "admin-bindings.json",
+            "business-permissions.json",
+            ".config/gh/hosts.yml",
+            ".kube/config",
+        ] {
+            let path = directory.path().join(name);
+            assert!(!admin.permits_file(&administrator, &path, true), "{name}");
+            assert!(!admin.permits_file(&administrator, &path, false), "{name}");
         }
         assert!(admin.permits_file(&administrator, &directory.path().join("source.rs"), true));
     }
@@ -777,22 +790,44 @@ mod tests {
         }
         assert!(public_tool("read_reference"));
         for p in [
-            "AGENT.md",
-            "rules/RULE.md",
-            "USER.md",
             "private/token",
             "tls/server.key",
+            "admin-bindings.json",
+            "business-permissions.json",
+            ".ssh/id_ed25519",
+            "credentials.json",
         ] {
             assert!(owner_file(p, true));
         }
-        assert!(!owner_file("src/config.rs", true));
-        assert!(!owner_file("AGENT.md", false));
+        for p in [
+            "src/config.rs",
+            "AGENT.md",
+            "rules/RULE.md",
+            "USER.md",
+            "src/credential.rs",
+            "src/secret_parser.rs",
+            "src/credentials/mod.rs",
+            "src/credentials",
+            "tests/secrets",
+            "src/credential_schema.json",
+            "docs/secret-handling.txt",
+            "tests/secrets/parser.rs",
+        ] {
+            assert!(!owner_file(p, true), "{p}");
+            assert!(!owner_file(p, false), "{p}");
+        }
         let patch = |body: &str| format!("*** Begin Patch\n{body}\n*** End Patch");
         assert!(!patch_touches_owner_file(&patch(
             "*** Add File: src/a.rs\n+x"
         )));
-        assert!(patch_touches_owner_file(&patch(
+        assert!(!patch_touches_owner_file(&patch(
             "*** Add File: src/a.rs\n+x\n*** Delete File: AGENT.md"
+        )));
+        assert!(!patch_touches_owner_file(&patch(
+            "*** Update File: src/a.rs\n*** Move to: src/credentials/mod.rs\n@@\n-x\n+y"
+        )));
+        assert!(patch_touches_owner_file(&patch(
+            "*** Delete File: admin-bindings.json"
         )));
         assert!(patch_touches_owner_file(&patch(
             "*** Update File: src/a.rs\n*** Move to: private/a.rs\n@@\n-x\n+y"

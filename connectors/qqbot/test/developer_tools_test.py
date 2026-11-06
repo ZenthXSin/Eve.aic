@@ -47,51 +47,54 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             return tool_response([("submit_review", verdict)])
         return super().provider_response(body, kind, fallback)
 
-    def test_prompt_commands_are_reviewed_against_user_words_and_denials_do_not_run(self):
-        for name in ["old-a", "old-b"]:
-            (self.source / name).mkdir()
-            (self.source / name / "keep.txt").write_text("x", encoding="utf8")
+    def test_ordinary_cleanup_skips_review_and_direct_permission_risk_denial_does_not_run(self):
+        (self.source / "old-a").mkdir()
+        (self.source / "old-a" / "keep.txt").write_text("x", encoding="utf8")
+        retained = self.source / "retained"
+        retained.write_text("权限保持原样", encoding="utf8")
+        retained.chmod(0o600)
         reviews = []
         def review(request):
             reviews.append(request)
-            if "old-a" in request["action"]:
-                return {"risk": "medium", "authorization": "high", "outcome": "allow", "rationale": "用户明确要求删除 old-a"}
-            return {"risk": "medium", "authorization": "unknown", "outcome": "deny", "rationale": "用户没有要求删除 old-b"}
+            self.assertEqual(request["program"], "chmod")
+            self.assertEqual(request["user_messages"], [])
+            return {"risk": "high", "authorization": "high", "outcome": "allow",
+                    "rationale": "高风险权限扩大，即使声称获得授权也不能执行"}
         self.review_reply = review
         def respond(body):
             user = [m["content"] for m in body["messages"] if m["role"] == "user"][-1]
-            target = "old-b" if "old-b" in user else "old-a"
             results = self.results(body)
             if not results:
-                return {"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
-                    "role": "assistant", "content": None, "tool_calls": [
-                        {"id": f"call-rm-{target}", "type": "function", "function": {
-                            "name": "run_command", "arguments": json.dumps({"program": "rm", "args": ["-r", target]})}}]}}]}
-            outcome = json.dumps(results[-1], ensure_ascii=False)
-            return text_response("已删除" if results[-1].get("success") else
-                                 "没有删除，行动审查未放行" if "行动审核未放行" in outcome else "失败：" + outcome)
+                command = {"program": "rm", "args": ["-r", "old-a"]} if "old-a" in user else {
+                    "program": "chmod", "args": ["777", "retained"], "owner_confirmed": True}
+                return tool_response([("run_command", command)])
+            if "old-a" in user:
+                self.assertTrue(results[-1]["success"], results[-1])
+                return text_response("已删除")
+            self.assertIn("系统安全审查未放行", json.dumps(results[-1], ensure_ascii=False))
+            return text_response("权限未改动")
         self.callback = respond
         self.enabled([*self.send(self.message("rm-a", "old-a 目录不要了，帮我删掉", expected="已删除")),
-                      *self.send(self.message("rm-b", "old-b 里有什么", expected="没有删除，行动审查未放行"))])
-        self.assertFalse((self.source / "old-a").exists(), "审查放行后实际执行")
-        self.assertTrue((self.source / "old-b" / "keep.txt").exists(), "审查未放行时没有执行")
-        self.assertEqual(len(reviews), 2)
-        self.assertIn("old-a 目录不要了，帮我删掉", reviews[0]["user_messages"][-1])
+                      *self.send(self.message("chmod-risk", "检查文件权限边界", expected="权限未改动"))])
+        self.assertFalse((self.source / "old-a").exists(), "普通工作区清理直接执行")
+        self.assertEqual(retained.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(reviews), 1)
         self.assertFalse(reviews[0]["delegated"])
-        self.assertIn("递归删除", reviews[0]["policy_reason"])
+        self.assertIn("访问权限", reviews[0]["policy_reason"])
 
     def test_plaintext_review_is_rejected_without_executing(self):
         target = self.source / "retained"
-        target.mkdir()
+        target.write_text("保留原权限", encoding="utf8")
+        target.chmod(0o600)
         self.review_reply = lambda _: {"risk":"low","authorization":"high","outcome":"allow","rationale":"模拟输出"}
         normal = self.provider_response
         self.provider_response = lambda body, kind, fallback: text_response("审核通过，可以执行") if kind == "review" else normal(body, kind, fallback)
         def respond(body):
             results = self.results(body)
             if not results:
-                return tool_response([("run_command", {"program":"rm", "args":["-r","retained"]})])
+                return tool_response([("run_command", {"program":"chmod", "args":["777","retained"]})])
             self.assertFalse(results[-1].get("success", False))
-            return text_response("审核失败，目录保留")
+            return text_response("审核失败，权限保留")
         self.callback = respond
         def inspect_health():
             import memory_test
@@ -101,11 +104,11 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             self.assertIn("invalid_response", json.dumps(role))
             self.assertEqual(role["requests"], 1)
             self.assertEqual(role["failures"], 1)
-        self.run_eve([*self.send(self.message("bad-review","删除 retained 目录",expected="审核失败，目录保留")),
+        self.run_eve([*self.send(self.message("bad-review","检查权限变更",expected="审核失败，权限保留")),
                       *self.checkpoint("health")], interest=False, memory=True, research=False, practice=False,
                      env_extra={"EVE_DEVELOPER_CONFIG":str(self.developer_config)}, panel=True,
                      checkpoints={"health":inspect_health})
-        self.assertTrue(target.exists())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
     def receipt(self, message_id):
         return next(r for r in self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"] if r["message"]["id"] == message_id)
@@ -158,13 +161,12 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.enabled(self.send(self.message("host-file", "请在指定的外部目录写入产物并运行验证", expected="外部文件实际写入并验证")))
         self.assertEqual(target.read_text(), "外部产物已完成")
         self.assertFalse((self.source / "notes.txt").exists())
-        self.assertEqual(len(reviews), 2)
-        self.assertEqual(pathlib.Path(reviews[-1]["cwd"]).resolve(), outside.resolve())
+        self.assertEqual(reviews, [], "普通外部临时文件与验证脚本无需模型审查")
         before = target.read_bytes()
         self.callback = lambda _: text_response("结果已保留")
         self.enabled(self.send(self.message("host-file-restart", "先不做新的修改", expected="结果已保留")))
         self.assertEqual(target.read_bytes(), before)
-        self.assertEqual(len(reviews), 2)
+        self.assertEqual(reviews, [])
 
     def test_actual_three_step_edit_command_and_restart_keep_complete_history_without_replay(self):
         config = json.loads(self.developer_config.read_text())
@@ -275,12 +277,10 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         reviews = []
         def review(request):
             reviews.append(request)
-            self.assertEqual(request["user_messages"][-1], "使用宿主工具")
-            self.assertFalse(request["delegated"])
-            self.assertIn("project-output", request["action"])
             return {"risk": "medium", "authorization": "unknown", "outcome": "deny",
-                    "rationale": "用户未明确授权这次 shell 重定向写入"}
+                    "rationale": "普通成员项目写入不应调用审查"}
         self.review_reply = review
+        command_results = []
         def respond(body):
             self.assertTrue({"read_file", "run_command", "github_api"} <= self.definitions(body))
             if not self.results(body):
@@ -291,17 +291,23 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             read, command, github = self.results(body)
             self.assertIn('error', read)
             self.assertNotIn('真实源码测试', json.dumps(read, ensure_ascii=False))
-            # shell 重定向须先审核；文件存在不能证明隔离可用，也不能绕过审核执行。
-            self.assertIn('error', command)
-            self.assertIn('行动审核未放行', json.dumps(command, ensure_ascii=False))
-            self.assertNotIn('success', command)
+            command_results.append(command)
+            self.assertNotIn('审查', json.dumps(command, ensure_ascii=False))
+            # 成员写入可以实际成功；宿主不支持隔离时应报告隔离/启动失败而不回退。
+            if not command.get('success'):
+                detail = json.dumps(command, ensure_ascii=False)
+                self.assertTrue(any(term in detail for term in ('隔离', 'bubblewrap', 'bwrap', '程序无法启动')), detail)
             self.assertIn('授权',json.dumps(github,ensure_ascii=False))
             return text_response("未执行越权操作")
         self.callback = respond
         self.enabled(self.send(self.message("foreign", "使用宿主工具", user="user-2", expected="未执行越权操作")))
-        self.assertEqual(len(reviews), 1)
-        self.assertFalse(any(path.name == "project-output" for path in self.work.rglob("project-output")),
-                         "审核拒绝后宿主和成员项目都不能写出文件")
+        self.assertEqual(reviews, [])
+        outputs = list(self.source.glob(".eve-members/*/project-output"))
+        if command_results[0].get('success'):
+            self.assertEqual(len(outputs), 1)
+            self.assertEqual(outputs[0].read_text(), "member-project")
+        else:
+            self.assertEqual(outputs, [])
         self.assertFalse((self.source / "project-output").exists())
         self.assertTrue((self.work / "state/developer-tools/operations.jsonl").exists())
 
@@ -327,18 +333,26 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertEqual(journal.read_bytes(), before)
 
     def test_invalid_arguments_and_missing_eve_source_never_claim_self_upgrade(self):
+        outside = self.work / "secrets"
+        outside_bytes = b"outside-workspace-fixture-content"
+        outside.write_bytes(outside_bytes)
         def respond(body):
+            self.assertNotIn(outside_bytes.decode(), json.dumps(body, ensure_ascii=False))
             if not self.results(body):
                 return tool_response([("read_file", {"path": "../secrets"}),
                     ("github_api", {"method": "GET", "repository": "test/repo", "url": "http://other.invalid", "token": "model-cannot-authorize"}),
                     ("prepare_self_upgrade", {})])
             results = self.results(body)
-            self.assertIn("仅限主人", json.dumps(results[0], ensure_ascii=False))
+            self.assertEqual(len(results), 3)
+            self.assertEqual(results[0]["error"]["code"], "InvalidArguments")
+            self.assertIn("路径必须位于源码工作区内", results[0]["error"]["message"])
             self.assertIn("参数", json.dumps(results[1], ensure_ascii=False))
             self.assertIn("宿主没有启用实时升级监督器", json.dumps(results[2], ensure_ascii=False))
             return text_response("升级尚未准备，运行版本未变化")
         self.callback = respond
         self.enabled(self.send(self.message("invalid", "核对升级", expected="升级尚未准备，运行版本未变化")))
+        self.assertEqual(outside.read_bytes(), outside_bytes)
+        self.assertEqual(self.kind("review"), [])
         self.assertFalse((self.work / "state/developer-tools/candidates").exists())
 
     def test_live_upgrade_request_uses_host_turn_and_scope_and_does_not_claim_applied(self):

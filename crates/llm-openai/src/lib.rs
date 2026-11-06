@@ -2,8 +2,8 @@
 //!
 //! 网络和转换均在返回的 Future 中执行。取消等待会丢弃本地请求，不保证远端停止。
 use eve_llm_api::{
-    LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ProviderFailure,
-    ProviderFailureKind,
+    LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelSession, ModelTextSink,
+    ProviderFailure, ProviderFailureKind,
 };
 use reqwest::{Client, Url, header::HeaderValue, redirect::Policy};
 use std::time::Duration;
@@ -113,6 +113,27 @@ impl OpenAiProvider {
             headers.insert(reqwest::header::AUTHORIZATION, value.clone());
         }
         headers
+    }
+    fn model_headers(
+        &self,
+        session: Option<&ModelSession>,
+    ) -> Result<reqwest::header::HeaderMap, LlmError> {
+        let mut headers = self.authentication_headers();
+        if let Some(session) = session {
+            session.validate()?;
+            for (name, value) in [
+                ("session-id", session.session_id()),
+                ("thread-id", session.thread_id()),
+                ("x-client-request-id", session.client_request_id()),
+            ] {
+                headers.insert(
+                    name,
+                    HeaderValue::from_str(value)
+                        .map_err(|_| LlmError::Configuration("模型会话请求头无效".into()))?,
+                );
+            }
+        }
+        Ok(headers)
     }
     pub fn new(config: OpenAiConfig, api_key: impl AsRef<str>) -> Result<Self, LlmError> {
         Self::build(config, Some(api_key.as_ref()))
@@ -241,7 +262,19 @@ impl OpenAiProvider {
         media_type: &str,
         image: &[u8],
     ) -> Result<String, LlmError> {
-        let body = vision::encode_vision_request(
+        self.describe_image_with_session(prompt, media_type, image, None)
+            .await
+    }
+
+    /// 有会话的视觉用途须由宿主传入独立绑定；图片正文不用于推断缓存身份。
+    pub async fn describe_image_with_session(
+        &self,
+        prompt: &str,
+        media_type: &str,
+        image: &[u8],
+        session: Option<&ModelSession>,
+    ) -> Result<String, LlmError> {
+        let mut body = vision::encode_vision_request(
             &self.config.model,
             self.config.protocol,
             prompt,
@@ -250,10 +283,14 @@ impl OpenAiProvider {
             self.config.reasoning_effort.as_deref(),
             self.config.max_output_tokens,
         )?;
+        let headers = self.model_headers(session)?;
+        if let Some(session) = session {
+            body["prompt_cache_key"] = serde_json::json!(session.prompt_cache_key());
+        }
         let response = self
             .client
             .post(self.endpoint.clone())
-            .headers(self.authentication_headers())
+            .headers(headers)
             .json(&body)
             .timeout(self.config.request_timeout)
             .send()
@@ -373,18 +410,59 @@ impl OpenAiProvider {
         sink: Option<&dyn ModelTextSink>,
         json_output: bool,
     ) -> Result<ModelResponse, LlmError> {
+        let headers = self.model_headers(request.session.as_ref())?;
         let complete = sink.is_none();
         let discard = DiscardText;
         let sink = sink.or_else(|| {
             self.streamed_completions
                 .then_some(&discard as &dyn ModelTextSink)
         });
+        let body = self.request_body(request, sink.is_some(), json_output)?;
+        let mut diagnostics =
+            timing::CallDiagnostics::start(self.usage.as_ref().map(|(_, role)| role.as_str()));
+        let total = self.total_timeout(sink.is_some());
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + total;
+        let completed = tokio::time::timeout_at(deadline, async {
+            if self.transient_retries && complete {
+                self.request_retried(&body, &headers, sink, deadline, &mut diagnostics)
+                    .await
+            } else {
+                self.request_once(&body, &headers, sink, &mut None, diagnostics.next_attempt())
+                    .await
+            }
+        })
+        .await;
+        let completed = completed.map_err(|_| {
+            timeouts::expired("total", total, started, None, diagnostics.identity())
+        })??;
+        // 模型结果已经完整校验并离开重试范围。统计尾流不得把成功变成失败；
+        // 由持有结果的这一层处理原总期限，避免外层 timeout 丢弃已完成结果。
+        let (response, usage) = completed.finish(deadline).await;
+        self.report_usage(usage);
+        Ok(response)
+    }
+
+    // 发送与恢复指纹共用编码，避免配置变化后仍复用原请求 ID。
+    fn request_body(
+        &self,
+        request: ModelRequest,
+        streaming: bool,
+        json_output: bool,
+    ) -> Result<serde_json::Value, LlmError> {
+        let cache_key = request
+            .session
+            .as_ref()
+            .map(|session| session.prompt_cache_key().to_owned());
         let mut body = match self.config.protocol {
             OpenAiProtocol::Responses => wire::encode_request(&self.config.model, request)?,
             OpenAiProtocol::ChatCompletions => chat::encode_request(&self.config.model, request)?,
         };
-        body["stream"] = serde_json::json!(sink.is_some());
-        if sink.is_some() && self.config.protocol == OpenAiProtocol::ChatCompletions {
+        if let Some(key) = cache_key {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+        body["stream"] = serde_json::json!(streaming);
+        if streaming && self.config.protocol == OpenAiProtocol::ChatCompletions {
             body["stream_options"] = serde_json::json!({"include_usage": true});
         }
         if json_output {
@@ -414,32 +492,18 @@ impl OpenAiProvider {
             };
             body[field] = serde_json::json!(limit);
         }
-        let total = self.total_timeout(sink.is_some());
-        let started = std::time::Instant::now();
-        let deadline = tokio::time::Instant::now() + total;
-        let completed = tokio::time::timeout_at(deadline, async {
-            if self.transient_retries && complete {
-                self.request_retried(&body, sink, deadline).await
-            } else {
-                self.request_once(&body, sink, &mut None).await
-            }
-        })
-        .await
-        .map_err(|_| timeouts::expired("total", total, started, None))??;
-        // 模型结果已经完整校验并离开重试范围。统计尾流不得把成功变成失败；
-        // 由持有结果的这一层处理原总期限，避免外层 timeout 丢弃已完成结果。
-        let (response, usage) = completed.finish(deadline).await;
-        self.report_usage(usage);
-        Ok(response)
+        Ok(body)
     }
 
     async fn request_once(
         &self,
         body: &serde_json::Value,
+        headers: &reqwest::header::HeaderMap,
         sink: Option<&dyn ModelTextSink>,
         retry_after: &mut Option<Duration>,
+        identity: timing::RequestIdentity,
     ) -> Result<completion::CompletedRequest, LlmError> {
-        let mut timing = timing::RequestTiming::start(self.timing_diagnostics);
+        let mut timing = timing::RequestTiming::start(self.timing_diagnostics, identity);
         let started = std::time::Instant::now();
         let policy = sink.and(self.stream_timeouts);
         let first_deadline = tokio::time::Instant::now()
@@ -447,7 +511,7 @@ impl OpenAiProvider {
         let sending = self
             .client
             .post(self.endpoint.clone())
-            .headers(self.authentication_headers())
+            .headers(headers.clone())
             .json(body)
             .timeout(self.total_timeout(sink.is_some()))
             .send();
@@ -455,12 +519,23 @@ impl OpenAiProvider {
             tokio::time::timeout_at(first_deadline, sending)
                 .await
                 .map_err(|_| {
-                    timeouts::expired("first_response", policy.first_response, started, Some(0))
+                    timeouts::expired(
+                        "first_response",
+                        policy.first_response,
+                        started,
+                        Some(0),
+                        identity,
+                    )
                 })?
         } else {
             sending.await
         }
-        .map_err(transport_error)?;
+        .map_err(|error| {
+            if let Some(timing) = &timing {
+                timing.transport_failed(timing::TransportPhase::BeforeHeaders, &error);
+            }
+            transport_error(error)
+        })?;
         let status = response.status();
         if let Some(timing) = &timing {
             timing.record("headers", Some(status.as_u16()));
@@ -517,18 +592,22 @@ impl OpenAiProvider {
                             } else {
                                 ("stream_idle", policy.idle)
                             };
-                            timeouts::expired(phase, limit, started, Some(received))
+                            timeouts::expired(phase, limit, started, Some(received), identity)
                         })?
                 } else {
                     response.chunk().await
                 };
                 let Some(chunk) = next.map_err(|error| {
+                    if let Some(timing) = &timing {
+                        timing.transport_failed(timing::TransportPhase::StreamBody, &error);
+                    }
                     if error.is_timeout() {
                         timeouts::expired(
                             "total",
                             self.total_timeout(true),
                             started,
                             Some(received),
+                            identity,
                         )
                     } else {
                         transport_error(error)
@@ -607,7 +686,12 @@ impl OpenAiProvider {
             return Err(LlmError::Protocol("模型流在正常终态前结束".into()));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if let Some(timing) = &timing {
+                timing.transport_failed(timing::TransportPhase::ResponseBody, &error);
+            }
+            transport_error(error)
+        })? {
             if chunk.len() > self.config.max_response_bytes - bytes.len() {
                 return Err(failed(ProviderFailureKind::ResponseTooLarge));
             }
@@ -635,6 +719,23 @@ impl ModelTextSink for DiscardText {
 }
 
 impl LlmProvider for OpenAiProvider {
+    fn request_fingerprint(
+        &self,
+        request: &ModelRequest,
+        mode: eve_llm_api::ResponseMode,
+    ) -> Result<Option<eve_llm_api::ModelRequestFingerprint>, LlmError> {
+        let body = self.request_body(
+            request.clone(),
+            mode == eve_llm_api::ResponseMode::Stream || self.streamed_completions,
+            false,
+        )?;
+        eve_llm_api::ModelRequestFingerprint::from_json(
+            "openai-wire-v1",
+            &(self.endpoint.as_str(), body),
+        )
+        .map(Some)
+    }
+
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         Box::pin(self.request(request, None, false))
     }

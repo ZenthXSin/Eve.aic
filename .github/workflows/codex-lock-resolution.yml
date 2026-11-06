@@ -1,0 +1,210 @@
+# 锁尚未解析时的临时准备入口；只在适配器分支修改本文件后运行。
+# 固定检出待解析的实现提交，不构建、不修改远端仓库、不访问生产凭据。
+name: Codex 适配器 Rust 1.95 锁解析准备
+
+on:
+  push:
+    branches: [codex/eve-codex-adapter-20261106]
+    paths: [.github/workflows/codex-lock-resolution.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-lock-resolution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EXPECTED_SOURCE_COMMIT: 34a79cb6bac054b24a14dd880864283f12d2e7f3
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_NET_RETRY: "1"
+      CARGO_HTTP_TIMEOUT: "60"
+      CARGO_TERM_COLOR: never
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出固定实现提交
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.EXPECTED_SOURCE_COMMIT }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: 核对来源并保存原锁
+        run: |
+          set -euo pipefail
+          export EVE_LOCK_EVIDENCE="${RUNNER_TEMP}/eve-codex-lock-evidence"
+          printf '%s\n' "EVE_LOCK_EVIDENCE=${EVE_LOCK_EVIDENCE}" \
+            "CARGO_HOME=${RUNNER_TEMP}/eve-codex-lock-cargo" \
+            "CARGO_TARGET_DIR=${RUNNER_TEMP}/eve-codex-lock-target" >> "${GITHUB_ENV}"
+          mkdir -p "${EVE_LOCK_EVIDENCE}"
+          git rev-parse HEAD > "${EVE_LOCK_EVIDENCE}/source-head.txt"
+          test "$(cat "${EVE_LOCK_EVIDENCE}/source-head.txt")" = "${EXPECTED_SOURCE_COMMIT}"
+          git status --porcelain > "${EVE_LOCK_EVIDENCE}/initial-status.txt"
+          test ! -s "${EVE_LOCK_EVIDENCE}/initial-status.txt"
+          cp Cargo.lock "${EVE_LOCK_EVIDENCE}/Cargo.lock.before"
+          python3 scripts/verify-codex-upstream.py > "${EVE_LOCK_EVIDENCE}/vendor-before.txt"
+          df -B1 . > "${EVE_LOCK_EVIDENCE}/disk-before.txt"
+      - name: 安装并记录真实 Rust 1.95
+        id: toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal
+          rustc +1.95.0 --version --verbose | tee "${EVE_LOCK_EVIDENCE}/rustc.txt"
+          cargo +1.95.0 --version | tee "${EVE_LOCK_EVIDENCE}/cargo.txt"
+      - name: 沿用旧锁解析真实依赖闭包
+        id: resolve
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 metadata --format-version 1 \
+            > "${EVE_LOCK_EVIDENCE}/metadata-resolved.json" \
+            2> "${EVE_LOCK_EVIDENCE}/resolution.stderr"
+          cp Cargo.lock "${EVE_LOCK_EVIDENCE}/Cargo.lock.resolved"
+      - name: 离线核对锁与工作区目标
+        id: locked
+        run: |
+          set -euo pipefail
+          cargo +1.95.0 metadata --format-version 1 --locked --offline \
+            > "${EVE_LOCK_EVIDENCE}/metadata-locked.json" \
+            2> "${EVE_LOCK_EVIDENCE}/metadata-locked.stderr"
+          cmp Cargo.lock "${EVE_LOCK_EVIDENCE}/Cargo.lock.resolved"
+          cargo +1.95.0 metadata --no-deps --format-version 1 --locked --offline \
+            > "${EVE_LOCK_EVIDENCE}/workspace-targets.json"
+          git diff --exit-code -- . ':(exclude)Cargo.lock'
+          python3 scripts/verify-codex-upstream.py > "${EVE_LOCK_EVIDENCE}/vendor-after.txt"
+      - name: 列出逐包最低版本、固定 Git 来源与锁变化
+        id: inspect
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import tomllib
+
+          report = Path(os.environ["EVE_LOCK_EVIDENCE"])
+          if not (report / "rustc.txt").read_text().startswith("rustc 1.95.0 ") or not (report / "cargo.txt").read_text().startswith("cargo 1.95.0 "):
+              raise SystemExit("实际工具链版本不是 Rust/Cargo 1.95.0，停止候选锁验收。")
+          metadata = json.loads((report / "metadata-locked.json").read_text())
+          prior = tomllib.loads((report / "Cargo.lock.before").read_text())["package"]
+          current = tomllib.loads(Path("Cargo.lock").read_text())["package"]
+          package_key = lambda package: (package["name"], package["version"], package.get("source") or "")
+          before = set(map(package_key, prior))
+          after = set(map(package_key, current))
+          allowed_git = {
+              "tokio-tungstenite": ("https://github.com/openai-oss-forks/tokio-tungstenite", "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186"),
+              "tungstenite": ("https://github.com/openai-oss-forks/tungstenite-rs", "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f"),
+              "runfiles": ("https://github.com/dzbarsky/rules_rust", "b56cbaa8465e74127f1ea216f813cd377295ad81"),
+          }
+          packages = []
+          incompatible = []
+          undeclared = []
+          unexpected_git = []
+          verified_git = set()
+          for package in sorted(metadata["packages"], key=package_key):
+              row = {key: package.get(key) for key in ["name", "version", "source", "rust_version", "id"]}
+              packages.append(row)
+              version = row["rust_version"]
+              if version is None:
+                  undeclared.append(row)
+              elif tuple(map(int, version.split(".")[:2])) > (1, 95):
+                  incompatible.append(row)
+              source = row["source"] or ""
+              if source.startswith("git+"):
+                  expected = allowed_git.get(row["name"])
+                  if expected is None or source != f"git+{expected[0]}?rev={expected[1]}#{expected[1]}":
+                      unexpected_git.append(row)
+                  else:
+                      verified_git.add(row["name"])
+          missing_forks = sorted({"tokio-tungstenite", "tungstenite"} - verified_git)
+          (report / "packages.json").write_text(json.dumps(packages, ensure_ascii=False, indent=2) + "\n")
+          summary = {
+              "source_commit": os.environ["EXPECTED_SOURCE_COMMIT"],
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "lock_sha256": hashlib.sha256(Path("Cargo.lock").read_bytes()).hexdigest(),
+              "packages": len(packages),
+              "resolve_nodes": len(metadata["resolve"]["nodes"]),
+              "workspace_members": len(metadata["workspace_members"]),
+              "lock_added": sorted(after - before),
+              "lock_removed": sorted(before - after),
+              "rust_version_above_1_95": incompatible,
+              "rust_version_undeclared": undeclared,
+              "unexpected_git_sources": unexpected_git,
+              "missing_required_forks": missing_forks,
+              "verified_fixed_git_names": sorted(verified_git),
+              "build": "not_run",
+              "tests": "not_run",
+          }
+          (report / "dependency-summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+          print(json.dumps({key: summary[key] for key in ["source_commit", "lock_sha256", "packages", "resolve_nodes", "workspace_members", "verified_fixed_git_names"]}))
+          if incompatible or unexpected_git or missing_forks:
+              raise SystemExit("候选闭包仍有最低版本或 Git 来源问题，详见 dependency-summary.json；不自动更换依赖。")
+          PY
+      - name: 始终保存阶段、失败和候选锁证据
+        if: always() && steps.checkout.outcome == 'success'
+        env:
+          TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
+          RESOLVE_OUTCOME: ${{ steps.resolve.outcome }}
+          LOCKED_OUTCOME: ${{ steps.locked.outcome }}
+          INSPECT_OUTCOME: ${{ steps.inspect.outcome }}
+        run: |
+          set -euo pipefail
+          export EVE_LOCK_EVIDENCE="${RUNNER_TEMP}/eve-codex-lock-evidence"
+          mkdir -p "${EVE_LOCK_EVIDENCE}"
+          cp Cargo.lock "${EVE_LOCK_EVIDENCE}/Cargo.lock"
+          git diff -- Cargo.lock > "${EVE_LOCK_EVIDENCE}/lock.diff"
+          git status --porcelain > "${EVE_LOCK_EVIDENCE}/final-status.txt"
+          df -B1 . > "${EVE_LOCK_EVIDENCE}/disk-after.txt"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path(os.environ["EVE_LOCK_EVIDENCE"])
+          status = {
+              "source_commit": os.environ["EXPECTED_SOURCE_COMMIT"],
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "requested_rust": "1.95.0",
+              "toolchain": os.environ["TOOLCHAIN_OUTCOME"],
+              "resolve": os.environ["RESOLVE_OUTCOME"],
+              "locked": os.environ["LOCKED_OUTCOME"],
+              "inspect": os.environ["INSPECT_OUTCOME"],
+              "lock_sha256": hashlib.sha256((report / "Cargo.lock").read_bytes()).hexdigest(),
+              "build": "not_run",
+              "tests": "not_run",
+              "clippy": "not_run",
+              "real_model_requests": 0,
+              "production_changed": False,
+          }
+          (report / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n")
+          checksums = []
+          for path in sorted(report.iterdir()):
+              if path.is_file() and path.name != "evidence.sha256":
+                  checksums.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+          (report / "evidence.sha256").write_text("\n".join(checksums) + "\n")
+          print(json.dumps(status, ensure_ascii=False))
+          PY
+          if [ -f "${EVE_LOCK_EVIDENCE}/resolution.stderr" ]; then
+            tail -n 35 "${EVE_LOCK_EVIDENCE}/resolution.stderr"
+          fi
+      - name: 上传候选锁和阶段记录
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: eve-codex-lock-${{ env.EXPECTED_SOURCE_COMMIT }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eve-codex-lock-evidence/
+          if-no-files-found: error
+          retention-days: 7

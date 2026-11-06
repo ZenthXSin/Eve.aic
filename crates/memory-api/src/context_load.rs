@@ -19,6 +19,9 @@ pub struct ContextCandidate {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSelectionInput {
+    /// 可信宿主的独立相关性会话，不进入待判断的 JSON 正文。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub query: String,
     pub candidates: Vec<ContextCandidate>,
 }

@@ -12,6 +12,7 @@ struct Provider {
     active: Arc<AtomicUsize>,
     release: Semaphore,
     invalid: bool,
+    sessions: std::sync::Mutex<Vec<Option<eve_llm_api::ModelSession>>>,
 }
 impl Provider {
     fn new(invalid: bool) -> Arc<Self> {
@@ -24,6 +25,7 @@ impl Provider {
             active: Arc::default(),
             release: Semaphore::new(0),
             invalid,
+            sessions: std::sync::Mutex::new(vec![]),
         })
     }
 }
@@ -59,6 +61,66 @@ impl EmbeddingProvider for Provider {
                 .collect())
         })
     }
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
+        self.sessions.lock().unwrap().push(session.cloned());
+        self.embed(inputs)
+    }
+}
+
+#[tokio::test]
+async fn deferred_embeddings_preserve_the_binding_and_do_not_reuse_across_tasks() {
+    use eve_llm_api::{ContextScope, ModelSession};
+    let provider = Provider::new(false);
+    let cache = BackgroundEmbeddings::new(provider.clone());
+    let scope = ContextScope {
+        session_id: "session".into(),
+        user_id: "user".into(),
+    };
+    let first = ModelSession::anchored("embedding-query", Some(&scope), "task-a")
+        .unwrap()
+        .with_turn("1")
+        .unwrap();
+    let second = ModelSession::anchored("embedding-query", Some(&scope), "task-b")
+        .unwrap()
+        .with_turn("1")
+        .unwrap();
+    let query = vec!["完全相同的查询".into()];
+    assert_eq!(
+        cache.embed_with_model_session(&query, Some(&first)).await,
+        Err(EmbeddingError::Provider)
+    );
+    assert_eq!(
+        cache.embed_with_model_session(&query, Some(&second)).await,
+        Err(EmbeddingError::Provider)
+    );
+    until(|| provider.calls.load(Ordering::SeqCst) == 2).await;
+    {
+        let sessions = provider.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&Some(first.clone())));
+        assert!(sessions.contains(&Some(second.clone())));
+    }
+    provider.release.add_permits(2);
+    until(|| provider.active.load(Ordering::SeqCst) == 0).await;
+    let next_turn = first.with_turn("2").unwrap();
+    assert!(
+        cache
+            .embed_with_model_session(&query, Some(&next_turn))
+            .await
+            .is_ok()
+    );
+    assert!(
+        cache
+            .embed_with_model_session(&query, Some(&second))
+            .await
+            .is_ok()
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    cache.close().await.unwrap();
 }
 async fn until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {

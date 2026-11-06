@@ -590,6 +590,7 @@ impl LlmModelResolver for Fixed {
 
 fn compose_request() -> ComposeRequest {
     ComposeRequest {
+        model_session: None,
         request_id: clarification_id("goal-1", 1),
         composer_version: COMPOSER_VERSION.into(),
         stall: StallKind::PracticeUnverified,

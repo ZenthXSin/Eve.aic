@@ -37,6 +37,10 @@ impl PhraseLearner for ModelPhraseLearner {
         Box::pin(async move {
             let input = serde_json::json!({ "messages": batch.messages }).to_string();
             let request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::scoped("phrase-learning", &batch.scope)?
+                        .with_turn(&batch.id)?,
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, FORMAT_GUARD),

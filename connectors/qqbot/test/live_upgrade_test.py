@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,15 +25,52 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         if name.startswith('test_'):locals()[name]=None
     del name
 
+    def lifecycle(self):
+        fields = {
+            'supervisor.json': ('phase', 'pid', 'active_candidate_sha256', 'active_source_revision', 'result', 'error'),
+            'host-status.json': ('phase', 'pid', 'child_pid', 'candidate_sha256', 'trial_candidate_sha256', 'result', 'error'),
+            'host-handoff.json': ('phase', 'error'),
+            'last-failure.json': ('phase', 'error', 'candidate_sha256'),
+        }
+        result = {}
+        for name, keys in fields.items():
+            path = self.work / 'queue' / name
+            if not path.exists():
+                continue
+            try:
+                record = runtime.read_json(path)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as error:
+                result[name] = {'read_error': type(error).__name__}
+            else:
+                result[name] = ({key: record[key] for key in keys if key in record}
+                    if isinstance(record, dict) else {'read_error': 'invalid_status_shape'})
+        return result
+
     def wait_until(self, predicate, message, timeout=25):
-        deadline=time.monotonic()+timeout
+        started=time.monotonic()
+        deadline=started+timeout
+        previous=None
+        next_snapshot=started
         while not predicate():
-            if time.monotonic()>=deadline:
-                status=self.work/'queue/supervisor.json'
+            now=time.monotonic()
+            if now>=next_snapshot:
+                current=self.lifecycle()
+                if current!=previous:
+                    print('EVE_UPGRADE_TEST '+json.dumps({'waiting_for':message,
+                        'elapsed_ms':round((now-started)*1000),'lifecycle':current},sort_keys=True),
+                        file=sys.stderr,flush=True)
+                    previous=current
+                next_snapshot=now+.1
+            if now>=deadline:
                 log=self.work/'stderr'
-                self.fail(message+'; status='+(status.read_text() if status.exists() else 'missing')+
+                self.fail(message+'; lifecycle='+json.dumps(self.lifecycle(),sort_keys=True)+
                     '; stderr='+(log.read_text()[-3000:] if log.exists() else 'missing')+'; server_errors='+repr(self.errors))
             time.sleep(.02)
+        print('EVE_UPGRADE_TEST '+json.dumps({'completed':message,
+            'elapsed_ms':round((time.monotonic()-started)*1000),'lifecycle':self.lifecycle()},sort_keys=True),
+            file=sys.stderr,flush=True)
 
     def test_real_qq_turn_restarts_same_version_after_sent_without_replay(self):
         queue=self.work/'queue';queue.mkdir()
@@ -43,9 +81,9 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         reviews=[]
         def review(request):
             reviews.append(request)
-            allowed='重启一次' in request['user_messages'] and 'restart_self' in request['action']
-            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
-                    'outcome':'allow' if allowed else 'deny','rationale':'核对当前用户重启授权'}
+            allowed=request['user_messages']==[] and request['program']=='eve.restart_self'
+            return {'risk':'medium','authorization':'unknown',
+                    'outcome':'allow' if allowed else 'deny','rationale':'受监督器保护的短暂重启不造成状态丢失或持续不可用'}
         self.review_reply=review
         def respond(body):
             results=self.results(body)
@@ -68,9 +106,11 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         env.update(EVE_QQ_LIVE_INTERACTION='true',QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
             EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',
             EVE_LLM_RESPONSE_MODE='complete',EVE_DEVELOPER_CONFIG=str(self.developer_config))
+        # 只验证真实回执后的交接；显式隔离组合避免默认浏览器探测占用就绪期限。
+        # 开发工具权限来自本组配置，记忆与完整候选校验仍由真实宿主执行。
         command=[sys.executable,str(ROOT/'scripts/self_upgrade_runtime.py'),'--directory',str(queue),
             '--candidates',str(storage/'candidates'),'--ready-timeout','10','--stop-timeout','10',
-            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),
+            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),'--minimal-profile',
             '--state-dir',str(self.work/'state'),'--agent',str(ROOT/'AGENT.md'),
             '--bridge-script',str(FAKE),'--bridge-arg',str(scenario),'--memory']
         with (self.work/'stdout').open('w') as out,(self.work/'stderr').open('w') as err:
@@ -110,7 +150,9 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
             'connectors/qqbot/bridge-core.mjs','connectors/qqbot/package.json','connectors/qqbot/package-lock.json',
             *runtime.RUNTIME_SCRIPTS]}
         resources={name:hashlib.sha256(data).hexdigest() for name,data in files.items()}
-        binary=Path(BINARY).read_bytes();binary_sha=hashlib.sha256(binary).hexdigest()
+        binary=Path(BINARY);binary_sha=runtime.digest(binary)
+        print('EVE_UPGRADE_TEST '+json.dumps({'binary_bytes':binary.stat().st_size,'binary_sha256':binary_sha}),
+            file=sys.stderr,flush=True)
         patch=b'diff --git a/AGENT.md b/AGENT.md\n--- a/AGENT.md\n+++ b/AGENT.md\n@@ -1 +1 @@\n-old fixture\n+new fixture\n'
         source_diff=dict(path='source-diff.patch',sha256=hashlib.sha256(patch).hexdigest(),
                          base_revision='1'*40,target_revision=source['head'])
@@ -118,7 +160,7 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
                   'source_diff':source_diff,'runtime':runtime.RUNTIME_CONTRACT}
         candidate_id=hashlib.sha256(json.dumps(identity,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
         candidate=storage/'candidates'/candidate_id;candidate.mkdir()
-        target=candidate/'eve-qqbot';target.write_bytes(binary);target.chmod(0o700)
+        target=candidate/'eve-qqbot';shutil.copyfile(binary,target);target.chmod(0o700)
         (candidate/'source-diff.patch').write_bytes(patch)
         for name,data in files.items():
             p=candidate/'resources'/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
@@ -133,10 +175,10 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         def review(request):
             reviews.append(request)
             operation=json.loads(request['arguments'][0])
-            allowed=('应用合成候选' in request['user_messages'] and request['program']=='eve.apply_self_upgrade'
+            allowed=(request['user_messages']==[] and request['program']=='eve.apply_self_upgrade'
                      and operation.get('source_diff_content')==patch.decode())
-            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
-                    'outcome':'allow' if allowed else 'deny','rationale':'核对应用原话与完整冻结源码差异'}
+            return {'risk':'medium','authorization':'unknown',
+                    'outcome':'allow' if allowed else 'deny','rationale':'依据完整冻结源码差异核对实际系统影响，不要求逐步授权'}
         self.review_reply=review
         def respond(body):
             results=self.results(body)
@@ -159,10 +201,11 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         env.update(EVE_QQ_LIVE_INTERACTION='true',QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
             EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',
             EVE_LLM_RESPONSE_MODE='complete',EVE_DEVELOPER_CONFIG=str(self.developer_config))
+        # 与同版本重启保持相同显式组合，候选仍接续全部工具与平台回执。
         command=[sys.executable,'-I','-B',str(ROOT/'scripts/host_runtime_bridge.py'),
             '--supervisor',str(ROOT/'scripts/self_upgrade_runtime.py'),'--source-revision','1'*40,'--directory',str(queue),
             '--candidates',str(storage/'candidates'),'--ready-timeout','10','--stop-timeout','10',
-            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),
+            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),'--minimal-profile',
             '--state-dir',str(self.work/'state'),'--agent',str(ROOT/'AGENT.md'),
             '--bridge-script',str(FAKE),'--bridge-arg',str(scenario),'--memory']
         with (self.work/'stdout').open('w') as out,(self.work/'stderr').open('w') as err:

@@ -1,9 +1,11 @@
 //! 单一主体的有界持久账本；执行能力仍由宿主注入，不直接执行模型或外部副作用。
 mod autonomy;
 mod driver;
+mod exploration;
 mod idle;
 mod self_interest;
 pub use autonomy::advance_autonomy_window;
+pub use exploration::validate_exploration_evidence;
 pub use idle::{revise_idle_mind, validate_idle_reflection};
 mod opportunity;
 pub use opportunity::{Opportunity, decode_opportunity, encode_opportunity, select_opportunity};

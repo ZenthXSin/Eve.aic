@@ -98,6 +98,16 @@ pub trait HistoryDigests: Send + Sync {
     ) -> LlmFuture<'a, Option<HistoryDigest>> {
         Box::pin(async move { self.digest(scope, messages) })
     }
+
+    /// 模型会话与摘要存储作用域分别传递：临时压缩不落库，但仍属于原任务的独立摘要用途。
+    fn compact_with_session<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        messages: &'a [ChatMessage],
+        _session: Option<&'a crate::ModelSession>,
+    ) -> LlmFuture<'a, Option<HistoryDigest>> {
+        self.compact(scope, messages)
+    }
 }
 
 /// 把历史按完整轮次分组：每组从一条用户消息开始，包含其后的助手回复与工具往返。
@@ -140,4 +150,15 @@ pub trait HistoryContextPlanner: Send + Sync {
         input: &'a crate::TurnInput,
         history: &'a [ChatMessage],
     ) -> LlmFuture<'a, Option<HistoryContextPlan>>;
+
+    /// 原文只用于相关性；会话身份由宿主额外绑定，不能从 query、候选或摘要猜测。
+    fn plan_with_model_session<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        input: &'a crate::TurnInput,
+        history: &'a [ChatMessage],
+        _session: Option<&'a crate::ModelSession>,
+    ) -> LlmFuture<'a, Option<HistoryContextPlan>> {
+        self.plan(scope, input, history)
+    }
 }

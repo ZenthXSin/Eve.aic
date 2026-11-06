@@ -138,6 +138,9 @@ fn task() -> Task {
     let owner = scope().owner;
     let check = contract().checks.remove(0);
     let checkpoint = TurnCheckpoint {
+        pending_model_request: None,
+        pending_request_fingerprint: None,
+        model_session: None,
         version: 2,
         scope: ContextScope {
             session_id: owner.session_id.clone(),

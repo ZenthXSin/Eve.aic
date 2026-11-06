@@ -122,6 +122,58 @@ async fn active_compaction_covers_all_batches_persists_reuses_and_never_enqueues
 }
 
 #[tokio::test]
+async fn temporary_compaction_keeps_task_bindings_independent_and_legacy_unbound() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(directory.path(), Some(OPTIONS));
+    let seen: Seen = Arc::default();
+    service
+        .install_compactor(Arc::new(Scripted {
+            seen: seen.clone(),
+            reply: |r| {
+                Ok(vec![DigestPoint {
+                    text: "保留任务事实".into(),
+                    turns: vec![r.covered_turns()],
+                }])
+            },
+        }))
+        .unwrap();
+    let scope = scope();
+    let a = eve_llm_api::ModelSession::anchored("task", Some(&scope), "task-a")
+        .unwrap()
+        .with_turn("run-a")
+        .unwrap();
+    let b = eve_llm_api::ModelSession::anchored("task", Some(&scope), "task-b")
+        .unwrap()
+        .with_turn("run-b")
+        .unwrap();
+    let original = history(2);
+    for session in [&a, &b, &a] {
+        service
+            .compact_with_session(None, &original, Some(session))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    service.compact(None, &original).await.unwrap().unwrap();
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let first = requests[0].model_session.as_ref().unwrap();
+    let second = requests[1].model_session.as_ref().unwrap();
+    first.validate_scope(Some(&scope)).unwrap();
+    second.validate_scope(Some(&scope)).unwrap();
+    assert_eq!(
+        first,
+        &a.fork("history-digest", None).unwrap().for_request(2)
+    );
+    assert_ne!(first.session_id(), a.session_id());
+    assert_ne!(first.prompt_cache_key(), second.prompt_cache_key());
+    assert_eq!(requests[0].model_session, requests[2].model_session);
+    assert!(requests[3].model_session.is_none());
+    assert!(service.store().versions(&scope).unwrap().is_empty());
+    assert_eq!(service.pending_count(), 0);
+}
+
+#[tokio::test]
 async fn active_timeout_is_identified_as_compaction_and_oversized_turn_is_bounded() {
     let directory = tempfile::tempdir().unwrap();
     let service = service(
