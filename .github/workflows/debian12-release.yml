@@ -35,7 +35,6 @@ jobs:
     env:
       EVE_RELEASE_REVISION: ${{ inputs.source_revision || github.event.pull_request.head.sha }}
       EVE_RELEASE_IMAGE: rust:1.95.0-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb
-      EVE_RELEASE_OUTPUT: ${{ runner.temp }}/eve-debian12-release
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -50,7 +49,10 @@ jobs:
           ref: ${{ env.EVE_RELEASE_REVISION }}
           persist-credentials: false
       - name: 安装 Debian 12 验收环境及固定 Node
-        run: bash scripts/setup-debian12-release.sh
+        run: |
+          export EVE_RELEASE_OUTPUT="$RUNNER_TEMP/eve-debian12-release"
+          printf 'EVE_RELEASE_OUTPUT=%s\n' "$EVE_RELEASE_OUTPUT" >> "$GITHUB_ENV"
+          bash scripts/setup-debian12-release.sh
       - name: 验证来源绑定、失败产物拒绝和超时停止
         run: python3 -B scripts/test-debian12-release.py
       - name: 核对来源并构建三个生产入口

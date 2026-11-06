@@ -71,6 +71,7 @@ impl WebAutonomy {
             .push(Arc::new(crate::conversation_learning::Manage {
                 training: training.clone(),
             }));
+        let stage = crate::web_host::StartupStage::start("resource_discovery");
         let mut roots = vec![std::env::current_dir()?];
         if let Some(directory) = std::env::current_exe()?.parent()
             && !roots.iter().any(|root| root == directory)
@@ -81,6 +82,8 @@ impl WebAutonomy {
             &roots,
             std::env::var_os("PATH").as_deref(),
         );
+        stage.complete();
+        let stage = crate::web_host::StartupStage::start("browser_runtime");
         let practice_runner: Option<Arc<dyn eve_practice_api::PracticeRunner>> = resources
             .browser
             .as_ref()
@@ -89,6 +92,7 @@ impl WebAutonomy {
                     .map(|runner| Arc::new(runner) as Arc<dyn eve_practice_api::PracticeRunner>)
             })
             .transpose()?;
+        stage.complete();
         let runner = practice_runner.clone().map(|runner| {
             let slot = Arc::new(OnceLock::new());
             let _ = slot.set(runner);

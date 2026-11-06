@@ -28,6 +28,8 @@ class WebModelAdapterAcceptance(WireAcceptance):
     request = web_chat.WebChatAcceptance.request
     finish_web = web_chat.WebChatAcceptance.finish_web
     wait_web_ready = web_chat.WebChatAcceptance.wait_web_ready
+    startup_events = web_chat.WebChatAcceptance.startup_events
+    assert_startup_complete = web_chat.WebChatAcceptance.assert_startup_complete
     stop_web = web_chat.WebChatAcceptance.stop_web
 
     def setUp(self):

@@ -45,7 +45,39 @@ impl WebOptions {
         Ok(Some(options))
     }
 }
+/// 有限的启动阶段诊断；只输出固定标签和阶段耗时，不改变错误或恢复语义。
+pub(crate) struct StartupStage {
+    name: &'static str,
+    started: std::time::Instant,
+}
+impl StartupStage {
+    pub(crate) fn start(name: &'static str) -> Self {
+        let stage = Self {
+            name,
+            started: std::time::Instant::now(),
+        };
+        stage.record("started");
+        stage
+    }
+    pub(crate) fn complete(self) {
+        self.record("completed");
+    }
+    fn record(&self, event: &'static str) {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "EVE_WEB_STARTUP {}",
+            serde_json::json!({
+                "stage": self.name,
+                "event": event,
+                "elapsed_ms": self.started.elapsed().as_millis(),
+            })
+        );
+    }
+}
+
 pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
+    let stage = StartupStage::start("bootstrap");
     let token = std::env::var("EVE_WEB_TOKEN").map_err(|_| "开启 Web 需要 EVE_WEB_TOKEN")?;
     let config = eve_web_panel::PanelConfig {
         address: options.listen,
@@ -53,6 +85,8 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
     };
     config.validate()?;
     let mut bootstrap = crate::core_bootstrap(&options.agent_path)?;
+    stage.complete();
+    let stage = StartupStage::start("state_store");
     let backends = eve_kernel::KernelServices {
         state: crate::storage::open_state_store(
             &options.state_directory,
@@ -60,6 +94,8 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         )?,
         ..Default::default()
     };
+    stage.complete();
+    let stage = StartupStage::start("ingress");
     let registry = backends.registry.clone();
     let state_store = backends.state.clone();
     let permissions = backends.permissions.clone();
@@ -79,8 +115,10 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         &options.state_directory,
     )?);
     bootstrap.review_source = Some(ingress.clone());
+    stage.complete();
     let mut background: Option<crate::web_autonomy::WebRuntime> = None;
     let result = async {
+        let stage = StartupStage::start("context_plugin");
         let permit = eve_web_panel_api::PageWritePermit::default();
         let plugin = eve_context_plugin::ContextPlugin::new(Arc::new(
             eve_context_plugin::FileContextArchive::open(
@@ -106,6 +144,8 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
                 .unwrap_or_else(crate::services::default_context),
             admin: notes.clone(),
         }));
+        stage.complete();
+        let stage = StartupStage::start("autonomy_install");
         let autonomy = crate::web_autonomy::WebAutonomy::install(
             &kernel,
             registry.clone(),
@@ -115,6 +155,8 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
             health.clone(),
         )
         .await?;
+        stage.complete();
+        let stage = StartupStage::start("core_services");
         bootstrap.context = Some(Arc::new(crate::web_chat::WebContext {
             inner: bootstrap.context.take().ok_or("Web 上下文缺失")?,
             web: None,
@@ -139,6 +181,8 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
             .0
             .clone();
         let settings = crate::qq_tasks::config_service(registry.as_ref())?;
+        stage.complete();
+        let stage = StartupStage::start("background_start");
         let runtime = autonomy
             .start(
                 &kernel,
@@ -156,6 +200,8 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         let recovery = runtime.recovery.clone();
         let cognition = runtime.goals.reader()?;
         background = Some(runtime);
+        stage.complete();
+        let stage = StartupStage::start("restore_receipts");
         let inbox = Arc::new(
             crate::web_notifications::Inbox::open(&options.state_directory)
                 .map_err(|_| "Web 通知账本不可用；保留原记录")?,
@@ -181,6 +227,8 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         );
         chat.recover_memory()
             .map_err(|_| "Web 交流记忆恢复状态保存失败；保留原记录")?;
+        stage.complete();
+        let stage = StartupStage::start("panel_bind");
         let panel = eve_web_panel::LocalPanel::bind(
             config,
             Arc::new(crate::web_panel::QqPanel {
@@ -218,8 +266,11 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
             }),
         )
         .await?;
+        stage.complete();
+        let stage = StartupStage::start("activate");
         let runtime = background.as_ref().ok_or("Web 后台未装配")?;
         runtime.activate()?;
+        stage.complete();
         eprintln!("EVE_WEB_READY http://{}", panel.address());
         let mut finished = panel.finished();
         let workers = wait_background(runtime.finished());

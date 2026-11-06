@@ -48,6 +48,10 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         *, live=True, message_id="package-chat", expected_turns=1):
     config_path = root / "config.json"
     before = config_path.read_bytes()
+    events_path = scenario.with_suffix(".events.jsonl")
+    scenario_data = json.loads(scenario.read_text(encoding="utf-8"))
+    scenario_data["events_file"] = str(events_path)
+    scenario.write_text(json.dumps(scenario_data), encoding="utf-8")
     node = root / "runtime/bin/node"
     command = [str(node), str(root / "Launch.mjs"), "qq",
                "--no-prompt", "--no-check-updates", "--bridge-script", str(bridge), "--bridge-arg", str(scenario)]
@@ -142,7 +146,15 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         child.wait(timeout=30)
         for reader in readers:
             reader.join(timeout=3)
+        events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()] if events_path.exists() else []
+        commands = [event for event in events if event.get("direction") == "out"]
+        finishes = sum(event.get("type") == "finish" and event.get("id") == message_id for event in commands)
+        print(json.dumps({"portable_bridge_phase": "closed", "exit_code": child.returncode,
+                          "commands": [event.get("type") for event in commands][-16:],
+                          "finish_count": finishes}), flush=True)
         require(child.returncode == 0, "原生启动器退出失败：" + "".join(lines))
+        if live:
+            require(finishes == 1, "桥接没有恰好一次收到本轮 finish 结束命令")
         require(config_path.read_bytes() == before, "启动器重写了现有配置")
         output = "".join(lines)
         if updated is not None:
@@ -281,7 +293,8 @@ def main():
                 if restart:
                     steps += [{"wait_command": {"id": message["id"], "type": "finish"}}]
                 else:
-                    steps += [{"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": message["id"], "state": "Handled"}}]
+                    steps += [{"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": message["id"], "state": "Handled"}},
+                              {"wait_command": {"id": message["id"], "type": "finish"}}]
                 steps += [{"wait_file": str(stop_gate)}]
                 scenario.write_text(json.dumps({"script": steps}), encoding="utf-8")
                 run(root, config, bridge, scenario, stop_gate, requests, 3, manifest["platform_label"])
