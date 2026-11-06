@@ -1,4 +1,5 @@
 // Tencent SDK adaptation; stdout is reserved for the versioned JSONL protocol.
+import { createIngressDiagnostics } from "./ingress-diagnostics.mjs";
 export const MAX_FRAME = 65536;
 // Raw SDK body and display text are separate; JSON escaping can expand both by 6x.
 export const MAX_INBOUND_FRAME = 512 * 1024;
@@ -35,6 +36,21 @@ const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
   Buffer.byteLength(v) <= MAX_MESSAGE_ID_BYTES && !/[\p{Cc}]/u.test(v);
 const validText = v => typeof v === "string" && v.trim() && Buffer.byteLength(v) <= 32768;
+// 顺序与原来的联合校验相同，只拆出固定拒绝原因，不推断或修补可信路由。
+function routeOrTextRejection(msg) {
+  const target = msg.replyTarget;
+  if (!validMessageId(msg.messageId)) return "message_id";
+  if (!validId(msg.senderId)) return "sender_id";
+  if (!target) return "reply_target";
+  if (target.scope !== msg.kind) return "target_scope";
+  if (target.msgId !== msg.messageId) return "target_message_id";
+  if (!validId(target.targetId)) return "target_id";
+  if (typeof msg.content !== "string") return "content_type";
+  if (Buffer.byteLength(msg.content) > 32768) return "content_bytes";
+  if (msg.kind === "c2c" && target.targetId !== msg.senderId) return "c2c_target";
+  if (msg.kind === "group" && target.targetId !== msg.groupOpenid) return "group_target";
+  return null;
+}
 function isGroupAt(msg, appId) {
   if (msg.rawEventType === "GROUP_AT_MESSAGE_CREATE") return true;
   if (msg.rawEventType !== "GROUP_MESSAGE_CREATE") return false;
@@ -72,12 +88,16 @@ function userText(msg, appId) {
       if (validId(id)) own.add(id);
     }
   }
+  let removedOwnMention = false;
   while (true) {
     const match = /^<@!?([A-Za-z0-9_-]{1,128})>\s*/.exec(text);
     if (!match || !own.has(match[1])) break;
+    removedOwnMention = true;
     text = text.slice(match[0].length).trimStart();
   }
-  return text;
+  // 纯自身 @ 也是明确呼叫。保留本人实际发出的提及文本供 Eve 判断，
+  // 不把空白、引用或附件说明补成用户的话；original_text 仍在信封上原样保存。
+  return !text && removedOwnMention && isGroupAt(msg, appId) ? msg.content.trim() : text;
 }
 function rawMessage(msg) {
   const source = msg.raw && typeof msg.raw === "object" ? msg.raw : msg;
@@ -218,6 +238,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   const warn = code => {
     if (!warned.has(code)) { warned.add(code); send({ type: "warning", code }); }
   };
+  const ingress = createIngressDiagnostics(send, now, timers);
   const replyMention = item => group.mention !== false && item.target.scope === "group" ? item.senderId : undefined;
   function mentionedText(target, text, mention) {
     if (mention === undefined || mention === null) return text;
@@ -255,6 +276,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   }
   const stop = () => {
     if (closed) return;
+    ingress.close();
     closed = true;
     pending.clear();
     passiveWindows.clear();
@@ -274,18 +296,16 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     const target = msg.replyTarget;
     const attachments = ownAttachments(msg);
     const quoted = quotedMessage(msg);
-    if (!validMessageId(msg.messageId) || !validId(msg.senderId) || !target ||
-        target.scope !== msg.kind || target.msgId !== msg.messageId ||
-        !validId(target.targetId) || (typeof msg.content !== "string" || Buffer.byteLength(msg.content) > 32768) ||
-        (msg.kind === "c2c" && target.targetId !== msg.senderId) ||
-        (msg.kind === "group" && target.targetId !== msg.groupOpenid)) {
-      warn("invalid_route_or_text"); return;
-    }
+    const rejected = routeOrTextRejection(msg);
+    if (rejected) { ingress.reject(rejected, msg, attachments); return; }
     if (pending.has(msg.messageId)) { warn("duplicate_pending"); return; }
     const restrictionOnly = pending.size >= limit;
     if (restrictionOnly) warn("pending_limit");
     const text = userText(msg, bot.appId);
-    if (!validText(text) && !attachments.length) { warn("invalid_route_or_text"); return; }
+    if (!validText(text) && !attachments.length) {
+      ingress.reject(text.trim() ? "normalized_text_bytes" : "normalized_text_empty", msg, attachments, text);
+      return;
+    }
     const senderName = typeof msg.senderName === "string" ? msg.senderName.trim() : "";
     const validName = senderName && Buffer.byteLength(senderName) <= 128 && [...senderName].length <= 48 && !/[\p{Cc}]/u.test(senderName);
     const frame = { type: restrictionOnly ? "restriction_only" : "message", id: msg.messageId, scope: msg.kind,
