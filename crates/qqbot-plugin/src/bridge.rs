@@ -42,6 +42,12 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+#[path = "foreground_speech.rs"]
+mod foreground_speech;
+#[path = "speech_retry.rs"]
+mod speech_retry;
+use foreground_speech::{ForegroundActivity, ForegroundInput};
+
 /// /train words 的回复：按学到次数列出编号、词语或场合、含义与原话摘录。
 fn phrase_list(phrases: &[eve_training_api::LearnedPhrase]) -> String {
     if phrases.is_empty() {
@@ -403,7 +409,19 @@ fn outreach_result(frame: &Value, ok: bool) -> QqOutreachResult {
         }
     } else if delivery_unknown(frame) {
         QqOutreachResult::Unknown
-    } else if frame.get("failure_kind").and_then(Value::as_str) == Some("stale_decision") {
+    } else if frame
+        .get("failure_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| {
+            matches!(
+                kind,
+                "stale_decision"
+                    | "passive_window_elapsed"
+                    | "passive_quota_exhausted"
+                    | "passive_window_missing"
+            )
+        })
+    {
         QqOutreachResult::NotSent
     } else {
         QqOutreachResult::Failed {
@@ -503,6 +521,7 @@ struct ChannelEvents {
     progress: mpsc::Sender<ControlEvent>,
     /// 慢步骤记录只是提示依据，队列满时丢弃，不影响本轮。
     steps: mpsc::Sender<ControlEvent>,
+    foreground_activity: Arc<ForegroundActivity>,
 }
 impl ChannelEvents {
     fn is_closed(&self) -> bool {
@@ -535,6 +554,7 @@ impl ControlEventSink for ChannelEvents {
             if self.is_closed() {
                 Err(LlmError::Cancelled)
             } else {
+                self.foreground_activity.observe(&event);
                 if matches!(
                     event.event.kind,
                     TurnEventKind::ToolProgress { .. }
@@ -638,14 +658,29 @@ type SpeechFuture = std::pin::Pin<
             > + Send,
     >,
 >;
+struct PassiveWindow {
+    remaining: usize,
+    session: SessionKey,
+    anchor: String,
+    deadline: tokio::time::Instant,
+}
+fn speech_source_id(candidate: &crate::QqOutreachCandidate, passive: bool) -> String {
+    format!(
+        "outreach:{}{}:{}",
+        if passive { "passive:" } else { "" },
+        candidate.id,
+        candidate.version
+    )
+}
 struct ConsideringSpeech {
     event: crate::QqSpeechEvent,
-    candidate: Option<crate::QqOutreachCandidate>,
+    candidate: Option<(crate::QqOutreachCandidate, bool)>,
+    started: tokio::time::Instant,
     wait: SpeechFuture,
 }
 struct ReadySpeech {
     event: crate::QqSpeechEvent,
-    candidate: Option<crate::QqOutreachCandidate>,
+    candidate: Option<(crate::QqOutreachCandidate, bool)>,
     text: String,
 }
 async fn considered(
@@ -681,6 +716,7 @@ fn source_event(
     app: &str,
     conversations: &crate::QqConversations,
     candidate: &crate::QqOutreachCandidate,
+    passive: bool,
 ) -> PluginResult<Option<crate::QqSpeechEvent>> {
     let session = match &candidate.session {
         Some(session) if session.user_id == candidate.user_id => Some(session.clone()),
@@ -699,7 +735,7 @@ fn source_event(
         return Ok(None);
     };
     Ok(Some(crate::QqSpeechEvent {
-        id: format!("outreach:{}:{}", candidate.id, candidate.version),
+        id: speech_source_id(candidate, passive),
         session,
         anchor,
         facts: candidate.facts.clone(),
@@ -1238,6 +1274,7 @@ pub(crate) async fn run(
     let (closed, receiver) = watch::channel(false);
     let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let (steps_tx, mut steps_rx) = mpsc::channel::<ControlEvent>(256);
+    let foreground_activity = Arc::new(ForegroundActivity::default());
     let sink = Arc::new(ChannelEvents {
         signal: signal.clone(),
         stop: stop.clone(),
@@ -1245,6 +1282,7 @@ pub(crate) async fn run(
         timing_diagnostics,
         progress: progress_tx,
         steps: steps_tx,
+        foreground_activity: foreground_activity.clone(),
     });
     let mut command = Command::new(&config.node_program);
     command
@@ -1330,6 +1368,12 @@ pub(crate) async fn run(
     let mut pushing_speech: Option<crate::QqSpeechEvent> = None;
     let mut considering_speech: Option<ConsideringSpeech> = None;
     let mut ready_speech: Option<ReadySpeech> = None;
+    let mut speech_retries = speech_retry::SpeechRetry::default();
+    let mut passive_windows: BTreeMap<String, PassiveWindow> = BTreeMap::new();
+    let mut foreground_inputs: BTreeMap<String, ForegroundInput> = BTreeMap::new();
+    let mut foreground_windows: BTreeMap<String, PassiveWindow> = BTreeMap::new();
+    let mut considering_foreground: Option<ConsideringSpeech> = None;
+    let mut ready_foreground: Option<ReadySpeech> = None;
     let mut sending_file: Option<AuxiliaryDelivery> = None;
     let mut pending_file = None;
     // 每个目标独立等待附带邀请的时机判断。
@@ -1359,6 +1403,21 @@ pub(crate) async fn run(
             slow_steps.retain(|id, step| active.iter().any(|a| &a.message.id == id && a.key == step.event.key));
             slow_reported.retain(|id| active.iter().any(|a| &a.message.id == id));
             last_progress.retain(|id, _| active.iter().any(|a| &a.message.id == id));
+            // 工具结束、运行时消费输入或新原话到来后，旧交流决定立即失效。
+            let stale_foreground: Vec<_> = foreground_inputs.iter().filter_map(|(anchor,input)| {
+                let current=live_dialogue.as_ref().is_some_and(|live| input.current(live,&foreground_activity,control.as_ref()))
+                    && conversations.latest_message_id(&input.key.session).ok().flatten().as_deref()==Some(anchor)
+                    && foreground_windows.get(anchor).is_none_or(|window|tokio::time::Instant::now()<window.deadline);
+                (!current).then_some(anchor.clone())
+            }).collect();
+            for anchor in stale_foreground {
+                let input=foreground_inputs.remove(&anchor).expect("已知前台输入");
+                if let Some(speaker)=&speech {speaker.retire(&input.event)?;}
+                foreground_windows.remove(&anchor);
+                if considering_foreground.as_ref().is_some_and(|c|c.event.id==input.event.id) {considering_foreground=None;}
+                if ready_foreground.as_ref().is_some_and(|c|c.event.id==input.event.id) {ready_foreground=None;}
+                write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor})).await?;
+            }
             let stages = slow_progress.as_ref().is_some_and(|p| p.stage_updates());
             let min_interval = slow_progress.as_ref().map_or(Duration::from_secs(15), |p| p.min_interval());
             let slow_after = if live_dialogue.is_none() { slow_progress.as_ref().and_then(|policy| policy.after()) } else { None };
@@ -2117,9 +2176,68 @@ pub(crate) async fn run(
                 && delivering.is_empty() && progress_delivery.is_empty()
                 && judging.is_empty() && replies.is_empty() && status.borrow().ready;
             let push_ready = push_interval.is_some() && channel_idle;
+            // 前台新输入的交流不等待长工具返回；独立无工具决定仍需原窗口和真实活动。
+            if let (Some(speaker),Some(live))=(&speech,&live_dialogue) {
+                if channel_idle && commands.is_empty() && routing.is_empty()
+                    && let Some(ready)=ready_foreground.take() {
+                    let current=foreground_inputs.get(&ready.event.anchor).is_some_and(|input| !input.resolved
+                        && input.event==ready.event && input.current(live,&foreground_activity,control.as_ref()));
+                    let window=foreground_windows.get(&ready.event.anchor).is_some_and(|window|
+                        window.remaining>0 && window.session==ready.event.session && tokio::time::Instant::now()<window.deadline);
+                    let scope=eve_llm_api::ContextScope {session_id:ready.event.session.session_id.clone(),user_id:ready.event.session.user_id.clone()};
+                    if !current || !window || !valid_outreach_text(&ready.text)
+                        || !conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false) {
+                        speaker.retire(&ready.event)?;
+                        if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
+                        continue;
+                    }
+                    let index=ledger.find(&config.app_id,&ready.event.anchor).ok_or_else(||failure("前台交流原消息回执缺失"))?;
+                    let route=&ledger.entries[index].message;
+                    if route.scope!="c2c" || route.session_key(&config.app_id)?!=ready.event.session {
+                        return Err(failure("前台交流身份不匹配"));
+                    }
+                    let id=format!("speech-{}",ready.event.id.strip_prefix("foreground-input:").expect("前台事实编号"));
+                    speaker.dispatched(&ready.event)?;
+                    if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
+                    if let Some(window)=foreground_windows.get_mut(&ready.event.anchor) {window.remaining-=1;}
+                    // 本地取消仍可能与已经开始的平台操作相遇；写出后的未知结局不会重发。
+                    if !foreground_inputs.get(&ready.event.anchor).is_some_and(|input|input.current(live,&foreground_activity,control.as_ref())) {
+                        speaker.delivered(&ready.event,QqOutreachResult::NotSent)?;
+                        speaker.retire(&ready.event)?;
+                        continue;
+                    }
+                    write(&mut stdin,json!({"type":"passive_push","version":1,"id":id,"scope":"c2c","target_id":route.target_id,
+                        "text":ready.text,"based_on_message_id":ready.event.anchor,"sender_id":route.user_id,"foreground":true})).await?;
+                    pushing=Some(AuxiliaryDelivery{id,scope:route.scope.clone(),target:route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
+                    pushing_speech=Some(ready.event);
+                    continue;
+                }
+                if considering_foreground.is_none() && ready_foreground.is_none() {
+                    let now=tokio::time::Instant::now();
+                    let events=foreground_inputs.values().filter(|input| !input.resolved && input.next<=now
+                        && foreground_windows.get(&input.event.anchor).is_some_and(|window|window.remaining>0 && now<window.deadline))
+                        .map(|input|input.event.clone()).collect();
+                    for event in speech_retries.order(events) {
+                        if !speech_retries.eligible(&event,now) {continue;}
+                        let Some(input)=foreground_inputs.get_mut(&event.anchor) else {continue};
+                        if !input.current(live,&foreground_activity,control.as_ref()) {continue;}
+                        input.next=now+Duration::from_secs(2);
+                        speech_retries.started(&event);
+                        let service=speaker.clone();let value=event.clone();
+                        considering_foreground=Some(ConsideringSpeech{event,candidate:None,started:now,wait:Box::pin(async move{service.consider(value).await})});
+                        break;
+                    }
+                }
+            }
             if let Some(speaker)=&speech && channel_idle && active.is_empty() && queue.is_empty() && commands.is_empty() && routing.is_empty() && !conversations.wakeup_claimed() {
                 if let Some(ready)=ready_speech.take() {
+                    let passive = ready.candidate.as_ref().is_some_and(|(_, passive)| *passive);
+                    if passive && !passive_windows.get(&ready.event.anchor).is_some_and(|w| w.remaining > 0 && w.session == ready.event.session && tokio::time::Instant::now() < w.deadline) {
+                        speaker.retire(&ready.event)?;
+                        continue;
+                    }
                     if conversations.latest_message_id(&ready.event.session)?.as_deref()!=Some(&ready.event.anchor) {
+                        if passive {speaker.retire(&ready.event)?;continue;}
                         // 源仍未认领，新消息参与下一次重新判断。
                         let mut event=ready.event;
                         if let Some(anchor)=conversations.latest_message_id(&event.session)? {event.anchor=anchor;speaker.enqueue(event)?;} else {speaker.postpone(&event,60_000)?;}
@@ -2132,9 +2250,10 @@ pub(crate) async fn run(
                     }
                     let route=route_for(&ledger,&config.app_id,&ready.event.session)?;
                     if let Some(route)=route.filter(|_|valid_outreach_text(&ready.text)) {
-                        let id=if let Some(candidate)=&ready.candidate {
+                        let id=if let Some((candidate, passive))=&ready.candidate {
                             let Some(hook)=&outreach else {speaker.retire(&ready.event)?;continue};
-                            let claimed=match hook.inner.claim_candidate(candidate,&ready.text,&ready.event.anchor) {
+                            let claim=if *passive {hook.inner.claim_passive_candidate(candidate,&ready.text,&ready.event.anchor)} else {hook.inner.claim_candidate(candidate,&ready.text,&ready.event.anchor)};
+                            let claimed=match claim {
                                 Ok(Some(claimed))=>claimed,
                                 Ok(None)=>{speaker.postpone(&ready.event,60_000)?;continue},
                                 Err(_)=>{warn(&ctx,"speech_source_claim_unavailable");speaker.postpone(&ready.event,60_000)?;continue},
@@ -2150,8 +2269,9 @@ pub(crate) async fn run(
                             if ready.candidate.is_some() && let Some(hook)=&outreach {report(hook,&ctx,&id,QqOutreachResult::NotSent);}
                             return Err(error);
                         }
+                        if passive && let Some(window) = passive_windows.get_mut(&ready.event.anchor) {window.remaining -= 1;}
                         write(&mut stdin,json!({"type":"restore_anchor","version":1,"scope":route.scope,"target_id":route.target_id,"sender_id":route.user_id,"message_id":ready.event.anchor})).await?;
-                        let mut frame=json!({"type":"push","version":1,"id":id,"scope":route.scope,"target_id":route.target_id,"text":ready.text,
+                        let mut frame=json!({"type":if passive {"passive_push"} else {"push"},"version":1,"id":id,"scope":route.scope,"target_id":route.target_id,"text":ready.text,
                             "based_on_message_id":ready.event.anchor,"sender_id":route.user_id});
                         if route.scope=="group" {frame["mention_user_id"]=json!(route.user_id);}
                         write(&mut stdin,frame).await?;
@@ -2162,22 +2282,48 @@ pub(crate) async fn run(
                 }
                 if considering_speech.is_none() && tokio::time::Instant::now()>=next_push {
                     next_push=tokio::time::Instant::now()+Duration::from_secs(2);
-                    let candidates=match &outreach {Some(hook)=>match hook.inner.candidates(){Ok(rows)=>rows,Err(_)=>{warn(&ctx,"speech_sources_unavailable");vec![]}},None=>vec![]};
-                    for candidate in &candidates {if let Some(event)=source_event(&ledger,&config.app_id,&conversations,candidate)? {
+                    passive_windows.retain(|_, window| window.remaining > 0 && tokio::time::Instant::now() < window.deadline
+                        && conversations.latest_message_id(&window.session).ok().flatten().as_deref() == Some(&window.anchor));
+                    let mut candidates = Vec::new();
+                    if let Some(hook) = &outreach {
+                        for window in passive_windows.values() {
+                            match hook.inner.passive_candidates(&window.session, &window.anchor) {
+                                Ok(rows) => candidates.extend(rows.into_iter().filter(|c| c.session.as_ref() == Some(&window.session) && c.user_id == window.session.user_id).map(|c| (c, true))),
+                                Err(_) => warn(&ctx, "speech_passive_sources_unavailable"),
+                            }
+                        }
+                        match hook.inner.candidates() {
+                            Ok(rows) => for candidate in rows {
+                                if !candidates.iter().any(|(c, _)| c.id == candidate.id && c.session == candidate.session) { candidates.push((candidate, false)); }
+                            },
+                            Err(_) => warn(&ctx, "speech_sources_unavailable"),
+                        }
+                    }
+                    for (candidate, passive) in &candidates {if let Some(event)=source_event(&ledger,&config.app_id,&conversations,candidate,*passive)? {
                         if speaker.silenced(&event)? {
                             if let Some(hook)=&outreach && hook.inner.silence_candidate(candidate).is_err() {warn(&ctx,"speech_silence_source_unavailable");}
                         } else {speaker.enqueue(event)?;}
                     }}
-                    for mut event in speaker.pending()? {
+                    for mut event in speech_retries.order(speaker.pending()?) {
+                        // 前台事实仅由内存中仍有效的工具/输入组合提供；重启不重放。
+                        if event.id.starts_with("foreground-input:") {
+                            if !foreground_inputs.values().any(|input|!input.resolved && input.event==event) {speaker.retire(&event)?;}
+                            continue;
+                        }
                         let candidate=if event.id.starts_with("outreach:") {
-                            let Some(candidate)=candidates.iter().find(|c|event.id==format!("outreach:{}:{}",c.id,c.version)) else {speaker.retire(&event)?;continue};
+                            let Some(candidate)=candidates.iter().find(|(c, passive)| event.id == speech_source_id(c, *passive)) else {speaker.retire(&event)?;continue};
                             Some(candidate.clone())
                         } else {None};
                         let Some(anchor)=conversations.latest_message_id(&event.session)? else {speaker.postpone(&event,60_000)?;continue};
                         if route_for(&ledger,&config.app_id,&event.session)?.is_none() {speaker.postpone(&event,60_000)?;continue;}
-                        if event.anchor!=anchor {event.anchor=anchor;speaker.enqueue(event.clone())?;}
+                        if event.anchor!=anchor {
+                            if candidate.as_ref().is_some_and(|(_, passive)| *passive) {speaker.retire(&event)?;continue;}
+                            event.anchor=anchor;speaker.enqueue(event.clone())?;
+                        }
+                        if !speech_retries.eligible(&event, tokio::time::Instant::now()) {continue;}
+                        speech_retries.started(&event);
                         let service=speaker.clone();let input=event.clone();
-                        considering_speech=Some(ConsideringSpeech{event,candidate,wait:Box::pin(async move {service.consider(input).await})});
+                        considering_speech=Some(ConsideringSpeech{event,candidate,started:tokio::time::Instant::now(),wait:Box::pin(async move {service.consider(input).await})});
                         break;
                     }
                 }
@@ -2249,7 +2395,8 @@ pub(crate) async fn run(
                 continue;
             }
             conversations.set_idle(active.is_empty() && queue.is_empty() && routing.is_empty() && commands.is_empty()
-                && replies.is_empty() && channel_idle && !narrating && progress_queue.is_empty());
+                && replies.is_empty() && channel_idle && !narrating && progress_queue.is_empty()
+                && considering_speech.is_none() && ready_speech.is_none() && considering_foreground.is_none() && ready_foreground.is_none());
             let deadline = delivering.iter().filter(|d| d.awaiting()).map(|d| d.deadline)
                 .chain(progress_delivery.iter().map(|p| p.deadline))
                 .chain(pushing.iter().chain(sending_file.iter()).map(|d| d.deadline))
@@ -2258,14 +2405,42 @@ pub(crate) async fn run(
             let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
             tokio::select! {
                 biased;
+                result=considered(&mut considering_foreground), if considering_foreground.is_some()=>{
+                    let pending=considering_foreground.take().expect("前台交流决定");
+                    let current=foreground_inputs.get(&pending.event.anchor).is_some_and(|input|
+                        input.event==pending.event && live_dialogue.as_ref().is_some_and(|live|input.current(live,&foreground_activity,control.as_ref())));
+                    if !current {
+                        if let Some(speaker)=&speech {speaker.retire(&pending.event)?;}
+                        continue;
+                    }
+                    if result.is_ok() {speech_retries.succeeded(&pending.event);}
+                    match result {
+                        Ok(Some(crate::QqSpeechDecision::Speak{text,..}))=>ready_foreground=Some(ReadySpeech{event:pending.event,candidate:None,text}),
+                        Ok(Some(crate::QqSpeechDecision::Silence{}))=>{
+                            if let Some(input)=foreground_inputs.get_mut(&pending.event.anchor) {input.resolved=true;}
+                        },
+                        Ok(_)=>{},
+                        Err(error)=>{
+                            let retry=speech_retries.failed(&pending.event,tokio::time::Instant::now());
+                            let postponed=speech.as_ref().is_some_and(|speaker|speaker.postpone(&pending.event,retry.as_millis() as u64).is_ok());
+                            let _=ctx.log(speech_retry::failure_log(&pending.event,&error,pending.started.elapsed(),retry,postponed));
+                        },
+                    }
+                }
                 result=considered(&mut considering_speech), if considering_speech.is_some()=>{
                     let pending=considering_speech.take().expect("发言审视");
+                    if result.is_ok() {speech_retries.succeeded(&pending.event);}
                     match result {
                         Ok(Some(crate::QqSpeechDecision::Speak{text,..}))=>ready_speech=Some(ReadySpeech{event:pending.event,candidate:pending.candidate,text}),
                         Ok(Some(crate::QqSpeechDecision::Silence {}))=>{
-                            if let (Some(hook),Some(candidate))=(&outreach,&pending.candidate) && hook.inner.silence_candidate(candidate).is_err(){warn(&ctx,"speech_silence_source_unavailable");}
+                            if let (Some(hook),Some((candidate,_)))=(&outreach,&pending.candidate) && hook.inner.silence_candidate(candidate).is_err(){warn(&ctx,"speech_silence_source_unavailable");}
                         }
-                        Ok(_)=>{},Err(_)=>warn(&ctx,"speech_decision_unavailable"),
+                        Ok(_)=>{},
+                        Err(error)=>{
+                            let retry=speech_retries.failed(&pending.event,tokio::time::Instant::now());
+                            let postponed=speech.as_ref().is_some_and(|speaker|speaker.postpone(&pending.event,retry.as_millis() as u64).is_ok());
+                            let _=ctx.log(speech_retry::failure_log(&pending.event,&error,pending.started.elapsed(),retry,postponed));
+                        },
                     }
                 }
                 _ = signal.cancelled() => break Ok(()),
@@ -2446,7 +2621,11 @@ pub(crate) async fn run(
                             }
                         }
                         status.send_modify(|s| s.completed += 1);
-                        finish(&mut stdin, &current.message.id).await?;
+                        if speech.is_some() && outreach.is_some() && current.ordinary && current.message.scope == "c2c"
+                            && !explicit(&current.message.text) && !spoken.is_empty() {
+                            // Node 只保留本次真实输入仍有效的剩余额度，并回报原窗口期限。
+                            write(&mut stdin, json!({"type":"finish","version":1,"id":current.message.id,"keep_passive":true})).await?;
+                        } else { finish(&mut stdin, &current.message.id).await?; }
                         continue;
                     }
                     let guard = ReplyGuard::Completed(ControlEvent { key: report.key.clone(), event: TurnEvent {
@@ -2489,7 +2668,8 @@ pub(crate) async fn run(
                     conversations.set_idle(false);
                     let Some(frame) = frame? else {
                         if !active.is_empty() || !routing.is_empty() || !delivering.is_empty() || pushing.is_some() || sending_file.is_some() || pending_file.is_some() || !progress_delivery.is_empty() || !judging.is_empty() || !queue.is_empty()
-                            || !commands.is_empty() || !replies.is_empty() || !status.borrow().ready {
+                            || !commands.is_empty() || !replies.is_empty() || considering_speech.is_some() || ready_speech.is_some()
+                            || considering_foreground.is_some() || ready_foreground.is_some() || !status.borrow().ready {
                             break Err(failure("QQBot 在未完成交互时断开；保留状态"));
                         }
                         break Ok(());
@@ -2500,6 +2680,39 @@ pub(crate) async fn run(
                     }
                     match frame.get("type").and_then(Value::as_str) {
                         Some("ready") => { status.send_modify(|s| s.ready = true); }
+                        Some("foreground_window") if speech.is_some() && live_dialogue.is_some() => {
+                            let Some(id)=frame.get("id").and_then(Value::as_str).filter(|id|valid_message_id(id)) else {continue};
+                            let Some(input)=foreground_inputs.get(id) else {
+                                write(&mut stdin,json!({"type":"close_foreground","version":1,"id":id})).await?;
+                                continue;
+                            };
+                            let Some(remaining)=frame.get("remaining_ms").and_then(Value::as_u64).filter(|ms|(1..=240_000).contains(ms)) else {continue};
+                            let Some(slots)=frame.get("remaining").and_then(Value::as_u64).filter(|n|(1..=4).contains(n)) else {continue};
+                            let Some(index)=ledger.find(&config.app_id,id) else {continue};
+                            let entry=&ledger.entries[index];
+                            if entry.state!=ReceiptState::Merged || entry.message.scope!="c2c"
+                                || entry.message.session_key(&config.app_id)?!=input.key.session
+                                || conversations.latest_message_id(&input.key.session)?.as_deref()!=Some(id) {continue;}
+                            foreground_windows.insert(id.into(),PassiveWindow {
+                                remaining:slots as usize,session:input.key.session.clone(),anchor:id.into(),
+                                deadline:tokio::time::Instant::now()+Duration::from_millis(remaining),
+                            });
+                        }
+                        Some("passive_window") if speech.is_some() && outreach.is_some() => {
+                            let Some(id) = frame.get("id").and_then(Value::as_str).filter(|id| valid_message_id(id)) else {continue};
+                            let Some(remaining) = frame.get("remaining_ms").and_then(Value::as_u64).filter(|ms| (1..=240_000).contains(ms)) else {continue};
+                            let Some(slots) = frame.get("remaining").and_then(Value::as_u64).filter(|n| (1..=4).contains(n)) else {continue};
+                            let Some(index) = ledger.find(&config.app_id, id) else {continue};
+                            let entry = &ledger.entries[index];
+                            if entry.state != ReceiptState::Handled || entry.message.scope != "c2c" || explicit(&entry.message.text) || entry.spoken_text().is_empty() {continue;}
+                            let session = entry.message.session_key(&config.app_id)?;
+                            if conversations.latest_message_id(&session)?.as_deref() != Some(id) {continue;}
+                            passive_windows.retain(|_, window| window.session != session && tokio::time::Instant::now() < window.deadline);
+                            if passive_windows.len() < 128 {
+                                passive_windows.insert(id.into(), PassiveWindow {remaining:slots as usize,session, anchor:id.into(), deadline:tokio::time::Instant::now()+Duration::from_millis(remaining)});
+                                next_push = tokio::time::Instant::now();
+                            }
+                        }
                         Some("warning") => {
                             let code = match frame.get("code").and_then(Value::as_str) {
                                 Some("invalid_route_or_text") => "bridge_invalid_route_or_text",
@@ -2853,7 +3066,13 @@ pub(crate) async fn run(
                                                 ledger.steer(&ctx, &config.app_id, &message.id, &parent_id)?;
                                                 conversations.advance_review_anchor(&config.app_id, &message)
                                             })? {
-                                                finish(&mut stdin, &message.id).await?;
+                                                if message.scope=="c2c" && let Some(speaker)=&speech
+                                                    && let Some(batch)=foreground_activity.current(&current_key,turn_id) {
+                                                    let input=ForegroundInput::new(batch,message.id.clone());
+                                                    speaker.enqueue(input.event.clone())?;
+                                                    foreground_inputs.insert(message.id.clone(),input);
+                                                    write(&mut stdin,json!({"type":"finish","version":1,"id":message.id,"keep_foreground":true})).await?;
+                                                } else {finish(&mut stdin, &message.id).await?;}
                                                 continue;
                                             }
                                         }
@@ -2916,6 +3135,49 @@ pub(crate) async fn run(
     // 先等路由收尾，再查询目标会话最新代，随后取消并等待全部本地执行器。
     closed.send_replace(true);
     let mut cleanup_error = None;
+    // 前台资格随通道停止失效；先撤销事实，再丢弃审视 future，避免取消守卫复活旧决定。
+    let mut retiring_foreground: BTreeMap<_, _> = foreground_inputs
+        .values()
+        .map(|input| (input.event.id.clone(), input.event.clone()))
+        .collect();
+    // 主循环可能在移除输入后的持久化步骤失败，槽中的事实仍必须清理。
+    for event in considering_foreground
+        .as_ref()
+        .map(|pending| &pending.event)
+        .into_iter()
+        .chain(ready_foreground.as_ref().map(|ready| &ready.event))
+    {
+        retiring_foreground.insert(event.id.clone(), event.clone());
+    }
+    if let Some(speaker) = &speech {
+        for event in retiring_foreground.values() {
+            if speaker.retire(event).is_err() {
+                warn(&ctx, "foreground_speech_retire_failed");
+                cleanup_error = Some(failure("QQBot 前台交流事实撤销失败；保留原记录"));
+            }
+        }
+    }
+    drop(considering_foreground);
+    drop(ready_foreground);
+    // 后台事实仍可跨插件重启等待；由服务的取消守卫恢复，不将事实或未知投递标为失效。
+    drop(considering_speech);
+    drop(ready_speech);
+    foreground_windows.clear();
+    for event in retiring_foreground.values() {
+        if write(
+            &mut stdin,
+            json!({"type":"close_foreground","version":1,"id":event.anchor}),
+        )
+        .await
+        .is_err()
+        {
+            warn(&ctx, "foreground_window_close_failed");
+            cleanup_error = Some(failure("QQBot 前台被动窗口关闭失败"));
+            // 管道已不可用，后续 stop/kill 会销毁全部窗口；仍须完成控制器收尾。
+            break;
+        }
+    }
+    foreground_inputs.clear();
     for route in routing {
         if route.wait.await.is_err() {
             cleanup_error = Some(failure("QQBot 消息控制收尾失败"));

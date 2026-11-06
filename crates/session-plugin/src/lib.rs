@@ -327,6 +327,33 @@ impl StoredSessions {
     }
 }
 impl SessionService for StoredSessions {
+    fn recent_turns(
+        &self,
+        key: &SessionKey,
+        before: Option<u64>,
+        limit: usize,
+    ) -> SessionResult<Vec<SessionTurn>> {
+        key.validate()?;
+        if !(1..=MAX_SESSION_TURN_PAGE).contains(&limit) {
+            return Err(SessionError::InvalidInput);
+        }
+        let inner = self.lock()?;
+        let Some(snapshot) = inner.document.sessions.get(&key.session_id) else {
+            return Ok(vec![]);
+        };
+        if snapshot.key != *key {
+            return Err(SessionError::OwnerMismatch);
+        }
+        let end = before
+            .map(|id| usize::try_from(id.saturating_sub(1)).unwrap_or(usize::MAX))
+            .unwrap_or(snapshot.turns.len())
+            .min(snapshot.turns.len());
+        Ok(snapshot.turns[end.saturating_sub(limit)..end]
+            .iter()
+            .rev()
+            .cloned()
+            .collect())
+    }
     fn scan_turns(&self, key: &SessionKey) -> SessionResult<Option<Box<dyn SessionTurnCursor>>> {
         key.validate()?;
         let inner = self.lock()?;

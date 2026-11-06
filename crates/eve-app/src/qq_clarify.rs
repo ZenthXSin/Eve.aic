@@ -724,6 +724,41 @@ impl QqOutreach for Combined {
             None => Ok(false),
         }
     }
+    fn passive_candidates(
+        &self,
+        session: &SessionKey,
+        anchor: &str,
+    ) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let mut candidates = Vec::new();
+        for (prefix, source) in &self.0 {
+            match source.passive_candidates(session, anchor) {
+                Ok(rows)
+                    if rows.iter().all(|c| {
+                        c.id.starts_with(prefix) && c.session.as_ref() == Some(session)
+                    }) =>
+                {
+                    candidates.extend(rows)
+                }
+                _ => eprintln!("Eve 被动事实来源暂不可用：{prefix}"),
+            }
+        }
+        Ok(candidates)
+    }
+    fn claim_passive_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        match self
+            .0
+            .iter()
+            .find(|(prefix, _)| candidate.id.starts_with(prefix))
+        {
+            Some((_, source)) => source.claim_passive_candidate(candidate, text, anchor),
+            None => Ok(None),
+        }
+    }
     fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
         let mut candidates = Vec::new();
         for (prefix, source) in &self.0 {
