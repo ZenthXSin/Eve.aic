@@ -117,14 +117,16 @@ const FILE_TYPES = new Set(["text/plain", "application/pdf", "application/zip",
 function allowedType(type) {
   return /^image\/[a-z0-9.+-]{1,64}$/i.test(type) || FILE_TYPES.has(type.toLowerCase());
 }
-function attachment(raw) {
-  if (!raw || typeof raw !== "object") return null;
+function attachment(raw, reject) {
+  if (!raw || typeof raw !== "object") { reject?.("invalid_shape"); return null; }
   const type = typeof raw.content_type === "string" && raw.content_type
     ? raw.content_type
     : typeof raw.contentType === "string" && raw.contentType ? raw.contentType : "application/octet-stream";
-  if (!allowedType(type)) return null;
+  if (!allowedType(type)) { reject?.("unsupported_type"); return null; }
   const url = typeof raw.url === "string" ? raw.url : "";
-  if (url && (url.length > 4096 || !/^https:\/\/[^/\s]+\//.test(url) || /[\p{Cc}]/u.test(url))) return null;
+  if (url && (url.length > 4096 || !/^https:\/\/[^/\s]+\//.test(url) || /[\p{Cc}]/u.test(url))) {
+    reject?.("invalid_url"); return null;
+  }
   const out = { content_type: type.toLowerCase() };
   if (url) out.url = url;
   const name = raw.filename ?? raw.file_name ?? raw.fileName;
@@ -134,26 +136,47 @@ function attachment(raw) {
 }
 // 本条自己的附件。信封上没有时，文件经常只出现在 msg_elements 里，
 // 引用消息的元素带 msg_idx，不并进本条。
-function ownAttachments(msg) {
+function ownAttachments(msg, rejections) {
   const found = [];
+  // 只保留本次实际筛选分支的固定计数，不保留 MIME、地址或原附件对象。
+  const reject = (reason, amount = 1) => {
+    if (amount > 0) rejections[reason] = Math.min(Number.MAX_SAFE_INTEGER, (rejections[reason] ?? 0) + amount);
+  };
   const push = raw => {
-    const item = attachment(raw);
-    if (item && found.length < 4 && !found.some(saved =>
+    const item = attachment(raw, reject);
+    if (!item) return;
+    if (found.length >= 4) { reject("limit"); return; }
+    if (found.some(saved =>
         saved.content_type === item.content_type && saved.url === item.url && saved.filename === item.filename)) {
-      found.push(item);
+      reject("duplicate"); return;
     }
+    found.push(item);
   };
   for (const raw of Array.isArray(msg.attachments) ? msg.attachments : []) push(raw);
   const elements = field(msg, "msg_elements", "msgElements");
   const quoted = Number(field(msg, "msg_type", "msgType")) === 103;
   if (!found.length && Array.isArray(elements)) {
-    const own = elements.filter((element, index) => element && typeof element === "object" &&
-      field(element, "msg_idx", "msgIdx") == null && !(quoted && index === 0));
+    const own = elements.filter((element, index) => {
+      if (!element || typeof element !== "object") return false;
+      if (field(element, "msg_idx", "msgIdx") != null || (quoted && index === 0)) {
+        reject("quoted", Array.isArray(element.attachments) ? element.attachments.length : 0);
+        return false;
+      }
+      return true;
+    });
     const current = (typeof msg.content === "string" ? msg.content : "").trim();
     const textual = own.filter(element => typeof element.content === "string" && element.content.trim());
     const selected = textual.length
       ? textual.filter(element => !current || element.content.trim() === current)
       : own;
+    if (textual.length) {
+      const selectedSet = new Set(selected);
+      for (const element of own) {
+        if (!selectedSet.has(element)) {
+          reject("element_not_selected", Array.isArray(element.attachments) ? element.attachments.length : 0);
+        }
+      }
+    }
     for (const element of selected) {
       for (const raw of Array.isArray(element.attachments) ? element.attachments : []) push(raw);
     }
@@ -294,16 +317,17 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
-    const attachments = ownAttachments(msg);
+    const attachmentRejections = {};
+    const attachments = ownAttachments(msg, attachmentRejections);
     const quoted = quotedMessage(msg);
     const rejected = routeOrTextRejection(msg);
-    if (rejected) { ingress.reject(rejected, msg, attachments); return; }
+    if (rejected) { ingress.reject(rejected, msg, attachments, undefined, attachmentRejections); return; }
     if (pending.has(msg.messageId)) { warn("duplicate_pending"); return; }
     const restrictionOnly = pending.size >= limit;
     if (restrictionOnly) warn("pending_limit");
     const text = userText(msg, bot.appId);
     if (!validText(text) && !attachments.length) {
-      ingress.reject(text.trim() ? "normalized_text_bytes" : "normalized_text_empty", msg, attachments, text);
+      ingress.reject(text.trim() ? "normalized_text_bytes" : "normalized_text_empty", msg, attachments, text, attachmentRejections);
       return;
     }
     const senderName = typeof msg.senderName === "string" ? msg.senderName.trim() : "";

@@ -17,6 +17,15 @@ const REASONS: &[&str] = &[
     "normalized_text_empty",
     "normalized_text_bytes",
 ];
+const ATTACHMENT_REJECTION_REASONS: &[&str] = &[
+    "invalid_shape",
+    "unsupported_type",
+    "invalid_url",
+    "quoted",
+    "element_not_selected",
+    "duplicate",
+    "limit",
+];
 const VALUE_TYPES: &[&str] = &[
     "undefined",
     "null",
@@ -131,6 +140,20 @@ pub(super) fn entry(frame: &Value) -> Option<LogEntry> {
             None => {}
         }
     }
+    if let Some(rejections) = last.get("attachment_rejections").and_then(Value::as_object) {
+        for reason in ATTACHMENT_REJECTION_REASONS {
+            if let Some(value) = rejections
+                .get(*reason)
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0 && *value <= MAX_SAFE_INTEGER)
+            {
+                entry = entry.with_field(
+                    format!("ingress_last_attachment_rejected_{reason}"),
+                    value.to_string(),
+                );
+            }
+        }
+    }
     Some(entry)
 }
 
@@ -180,6 +203,62 @@ mod tests {
         assert_eq!(entry.fields.len(), 3);
         assert_eq!(entry.fields["ingress_stage"], "envelope");
         assert!(!format!("{entry:?}").contains("PRIVATE"));
+    }
+
+    #[test]
+    fn attachment_rejections_keep_only_fixed_reasons_and_positive_bounded_counts() {
+        let frame = json!({"code":"invalid_route_or_text", "ingress": {
+            "version":1, "reason":"normalized_text_empty", "last": {
+                "accepted_attachment_count":0,
+                "attachment_rejections": {
+                    "invalid_shape":1, "unsupported_type":2, "invalid_url":3, "quoted":4,
+                    "element_not_selected":5, "duplicate":6, "limit":9_007_199_254_740_991_u64,
+                    "audio/PRIVATE_MIME":1, "url":"https://PRIVATE_HOST/PRIVATE_TOKEN"
+                }
+            }
+        }});
+        let entry = entry(&frame).unwrap();
+        assert_eq!(entry.fields.len(), 11);
+        for (reason, count) in [
+            ("invalid_shape", "1"),
+            ("unsupported_type", "2"),
+            ("invalid_url", "3"),
+            ("quoted", "4"),
+            ("element_not_selected", "5"),
+            ("duplicate", "6"),
+            ("limit", "9007199254740991"),
+        ] {
+            assert_eq!(
+                entry.fields[&format!("ingress_last_attachment_rejected_{reason}")],
+                count
+            );
+        }
+        assert!(!format!("{entry:?}").contains("PRIVATE"));
+    }
+
+    #[test]
+    fn malformed_attachment_counts_do_not_replace_the_original_warning() {
+        for rejections in [
+            json!(null),
+            json!([{"unsupported_type":1}]),
+            json!("PRIVATE"),
+            json!({
+                "invalid_shape":-1, "unsupported_type":"PRIVATE", "invalid_url":1.5,
+                "quoted":0, "element_not_selected":null, "duplicate":true,
+                "limit":9_007_199_254_740_992_u64, "PRIVATE":1
+            }),
+        ] {
+            let frame = json!({"code":"invalid_route_or_text", "ingress": {
+                "version":1, "reason":"normalized_text_empty", "count":1,
+                "last":{"accepted_attachment_count":0,"attachment_rejections":rejections}
+            }});
+            let entry = entry(&frame).unwrap();
+            assert_eq!(entry.message, "bridge_invalid_route_or_text");
+            assert_eq!(entry.fields.len(), 5);
+            assert_eq!(entry.fields["ingress_reason"], "normalized_text_empty");
+            assert_eq!(entry.fields["ingress_count"], "1");
+            assert!(!format!("{entry:?}").contains("PRIVATE"));
+        }
     }
 
     #[test]
