@@ -183,10 +183,10 @@ jobs:
           python -X utf8 scripts/test-web-goals.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证 QQ 与独立 Web 适配器切换的实际协议和重启去重
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' && runner.os == 'Linux' }}
         run: |
-          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
-          $env:EVE_WEB_BINARY = if ($IsWindows) { "target/debug/eve-web.exe" } else { "target/debug/eve-web" }
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
+          $env:EVE_WEB_BINARY = "target/debug/eve-web"
           python -X utf8 connectors/qqbot/test/model_adapter_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 scripts/test-web-model-adapter.py

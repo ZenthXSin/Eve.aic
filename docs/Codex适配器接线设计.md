@@ -1,6 +1,6 @@
 # Codex 适配器接线设计
 
-本文记录原 Codex 适配器、主/辅模型共同构造、识图入口和显式切换工具的实现。尚未运行 Cargo、Rust 1.95 依赖解析与构建、新的 Rust 测试或新 QQ/Web 进程用例，也未切换生产或向真实 Codex 端点请求。基础会话 API 来自 `a2eb9e52c135ae03e36233541242f6fe287a8a91`，其最终验收提交 `c0ede7efed0a3b2ee2676b37c578fc8eb6c6da85` 已正式合并；原适配器草稿提交为 `78f2b526404a9d0dc3c939a428e51abfa642542d`。静态实现不算运行验收完成。
+本文记录原 Codex 适配器、主/辅模型共同构造、识图入口和显式切换工具的实现。远端真实 Rust 1.95 已完成 metadata、离线锁核对与原文件校验，准确锁已原样取回，见[锁解析记录](Codex依赖锁解析记录.md)；构建、新的 Rust 测试和新 QQ/Web 进程用例尚未完成，也未切换生产或向真实 Codex 端点请求。基础会话 API 来自 `a2eb9e52c135ae03e36233541242f6fe287a8a91`，其最终验收提交 `c0ede7efed0a3b2ee2676b37c578fc8eb6c6da85` 已正式合并。解析成功不算运行验收完成。
 
 目标是在保留现有 Chat 默认路径的前提下，为主模型和辅助模型提供显式的原 Codex Responses 实现。模型名称、端点、协议和实现选择分开处理；失败不自动切换模型、协议、凭据或实现。
 
@@ -97,7 +97,7 @@ HTTP 重试复用当前 request ID；进程恢复时仅相同指纹可复用检�
 
 另外新增 4 个真实宿主进程用例，尚未执行：QQ 指令切 Codex 后由普通对话实际发送 Responses SSE，模型调用切换工具后当前轮仍走 Codex、下一轮走 Chat，重启后重复入站不重放配置写入；独立 eve-web 经 `/api/chat/send` 在两个方向调用真实工具切换，验证当前轮、下一轮、两个独立 Web 会话和两次重启。两种入口各自检查可信身份与伪造参数拒绝，逐条捕获 HTTP 请求核对工具定义、high、无 temperature、模型名、输出上限、稳定会话/缓存键和独立请求 ID。请求总数必须恰好等于正常模型/工具往返，不容许额外目录探测、模型审查或失败回退。这些夹具使用本地合成模型响应，不代表外部供应商兼容性或真实模型自主能力已验收。
 
-CI 已按实际 1.95 版本拆分：最低版本任务运行定向 Rust 回归与受影响包的严格 Clippy，QQBot 通道任务编译两种宿主并运行上述 4 个进程用例，Stable 两个平台继续完整回归。最低版本任务在依赖构建前校验原文件，关闭调试信息和增量编译，限时 45 分钟；各任务的实际结果仍待取得。
+CI 已按实际 1.95 版本拆分：最低版本任务运行定向 Rust 回归与受影响包的严格 Clippy，QQBot 通道任务编译两种宿主并运行上述 4 个进程用例，Stable 的 Linux 任务继续完整回归。新增适配器进程验收仅在 Linux 执行；Windows 支持已按用户要求停止，原仓库共享矩阵的移除另行处理。最低版本任务在依赖构建前校验原文件，关闭调试信息和增量编译，限时 45 分钟；各任务的实际结果仍待取得。
 
 最小动态验收命令（先完成候选锁文件解析，再由真实 Rust 1.95 验证）：
 
@@ -117,12 +117,12 @@ EVE_QQBOT_BINARY=target/debug/eve-qqbot python3 connectors/qqbot/test/model_adap
 EVE_WEB_BINARY=target/debug/eve-web python3 scripts/test-web-model-adapter.py
 ```
 
-随后运行现有工作区测试、示例、QQ 模型切换/模型健康/工具目录/识图实际进程及 Web 宿主回归。当前 Cargo.lock 的原 Codex 依赖闭包尚未解析，不能把上述命令标成已通过。
+随后运行现有工作区测试、示例、QQ 模型切换/模型健康/工具目录/识图实际进程及 Web 宿主回归。当前 Cargo.lock 已由真实 Rust 1.95 解析并核验，不能据此把上述构建与运行命令标成已通过。
 
 ## 工具链与原文件保留
 
 原 Codex workspace 声明 Rust 1.95。Eve 顶层及适配器统一最低版本为 1.95，CI 的 MSRV、各实际进程工作流、发行构建和便携包元数据同步；不修改 vendor manifest 降版本，不使用可选 feature 回避全工作区编译。过去的 1.89 成功记录保持历史版本，不冒充 1.95 结果。
 
-格式检查在 Eve workspace 根目录执行 `cargo fmt -- --check`。`--all` 会递归 path dependencies，进入应保持原文的 Codex vendor；根目录默认模式依据 `metadata --no-deps` 检查 Eve 的全部 workspace targets。实际 metadata 与格式 target 清单仍须在 Rust 1.95 验证窗口核对，证明没有遗漏 Eve 成员或格式化 vendor；目前只有直接 rustfmt 的自有文件静态结果。
+格式检查在 Eve workspace 根目录执行 `cargo fmt -- --check`。`--all` 会递归 path dependencies，进入应保持原文的 Codex vendor；根目录默认模式依据 `metadata --no-deps` 检查 Eve 的全部 workspace targets。真实 1.95 metadata 已确认 Eve 的 106 个成员、330 个目标，vendor 不在 workspace_members 内；格式命令的实际目标仍需后续 1.95 CI 核对，目前自有文件仅有直接 rustfmt 静态结果。
 
 原包来源检查覆盖 577 文件、6171502 字节、24 个本地 package，Apache-2.0 与 NOTICE 保留。上游原 prompt 的一处行尾空白也忠实保留。这里使用的是 Codex 原 Responses 请求、HTTP、重试和 SSE 代码，不等于整个 Codex core：OAuth 刷新、WebSocket continuation、加密 reasoning 的持久历史、原生非函数工具和全部多模态输出不在当前 Eve 契约范围内。
