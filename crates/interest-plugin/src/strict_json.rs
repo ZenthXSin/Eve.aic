@@ -1,69 +1,64 @@
 //! 拒绝重复键，避免兴趣观察字段被 serde_json::Value 静默覆盖。
 use serde::{
-    Deserialize, Deserializer,
+    Deserializer,
     de::{self, MapAccess, SeqAccess, Visitor},
 };
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value, value::RawValue};
 use std::fmt;
 
+// serde_json 默认最多接受 127 层容器；RawValue 分层解析也必须共享同一深度预算。
+const MAX_CONTAINER_DEPTH: usize = 127;
+
 pub(crate) fn from_slice(bytes: &[u8]) -> Result<Value, serde_json::Error> {
-    let mut parser = serde_json::Deserializer::from_slice(bytes);
-    let value = StrictValue::deserialize(&mut parser)?.0;
+    let raw = serde_json::from_slice::<&RawValue>(bytes)?;
+    from_raw(raw, MAX_CONTAINER_DEPTH)
+}
+
+fn from_raw(raw: &RawValue, remaining_depth: usize) -> Result<Value, serde_json::Error> {
+    // 根据真实 JSON token 区分容器与标量，不把高精度数字的内部表示当成对象，
+    // 也不把用户提供的同名私有字段解释成数字或 RawValue。
+    if !matches!(raw.get().as_bytes().first(), Some(b'[' | b'{')) {
+        return serde_json::from_str(raw.get());
+    }
+    if remaining_depth == 0 {
+        return Err(de::Error::custom("recursion limit exceeded"));
+    }
+    let mut parser = serde_json::Deserializer::from_str(raw.get());
+    let value = parser.deserialize_any(StrictVisitor {
+        remaining_depth: remaining_depth - 1,
+    })?;
     parser.end()?;
     Ok(value)
 }
-struct StrictValue(Value);
-impl<'de> Deserialize<'de> for StrictValue {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(StrictVisitor).map(Self)
-    }
+
+struct StrictVisitor {
+    remaining_depth: usize,
 }
-struct StrictVisitor;
+
 impl<'de> Visitor<'de> for StrictVisitor {
     type Value = Value;
+
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("JSON without duplicate keys")
     }
-    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
-        Ok(Value::Bool(value))
-    }
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
-        Number::from_f64(value)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("invalid number"))
-    }
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
-        Ok(Value::String(value.into()))
-    }
-    fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
-        Ok(Value::String(value))
-    }
-    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
+
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
         let mut array = Vec::new();
-        while let Some(value) = seq.next_element::<StrictValue>()? {
-            array.push(value.0);
+        while let Some(raw) = seq.next_element::<&RawValue>()? {
+            array.push(from_raw(raw, self.remaining_depth).map_err(de::Error::custom)?);
         }
         Ok(Value::Array(array))
     }
+
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
         let mut object = Map::new();
         while let Some(key) = map.next_key::<String>()? {
             if object.contains_key(&key) {
                 return Err(de::Error::custom("duplicate JSON key"));
             }
-            object.insert(key, map.next_value::<StrictValue>()?.0);
+            let raw = map.next_value::<&RawValue>()?;
+            let value = from_raw(raw, self.remaining_depth).map_err(de::Error::custom)?;
+            object.insert(key, value);
         }
         Ok(Value::Object(object))
     }

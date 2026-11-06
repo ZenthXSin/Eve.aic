@@ -51,11 +51,16 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         self.remaining_invalid_digests = invalid
         failed = stall or invalid >= 2
         self.dialogue_calls = 0
-        # 工具目录扩展后仍给前 15 次调用留足余量，35 次后才越过原 150k 阈值。
-        # 不修改生产阈值、重试次数或超时；避免把夹具贴边当作模型服务停滞。
-        (self.source / "README.md").write_text("中文结果" * 500, encoding="utf8")
+        self.digest_dialogue_rounds = []
+        # 前两批只读短文件，把大结果集中到第三批，避免工具目录增长提前触发压缩。
+        # 第三批正文自身按生产估算已有 432000 token，明确越过原 150k 阈值。
+        # 不修改生产阈值、工具次数、重试次数或超时；下方核对真实请求与持久回执。
+        (self.source / "README.md").write_text("预备核验", encoding="utf8")
+        (self.source / "compaction-payload.txt").write_text("中文结果" * 2700, encoding="utf8")
         def respond(body):
             if body["messages"][0]["content"].startswith(digest.DIGEST_PROMPT):
+                self.digest_dialogue_rounds.append(self.dialogue_calls)
+                self.assertEqual(self.dialogue_calls, 3, "摘要只能在第三批工具后触发")
                 self.assertEqual(body.get("response_format"), {"type": "json_object"})
                 if self.remaining_invalid_digests:
                     self.remaining_invalid_digests -= 1
@@ -65,7 +70,13 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
                 return text_response(json.dumps({"points":[{"text":"35 次文件核验已执行，保留当前目标并交付结果", "turns":[covered]}]}, ensure_ascii=False))
             self.dialogue_calls += 1
             if self.dialogue_calls <= 3:
-                response = tool_response([("read_file", {"path":"README.md"})] * [1, 14, 20][self.dialogue_calls-1])
+                self.assertFalse(self.digest_requests(), "前 15 次工具之后仍低于压缩阈值")
+                results = self.results(body)
+                self.assertEqual(len(results), [0, 1, 15][self.dialogue_calls - 1])
+                self.assertTrue(all(result.get("content") == "预备核验" and not result.get("truncated")
+                                    for result in results), "前两批均收到完整短文件")
+                path = "compaction-payload.txt" if self.dialogue_calls == 3 else "README.md"
+                response = tool_response([("read_file", {"path":path})] * [1, 14, 20][self.dialogue_calls-1])
                 for call in response["choices"][0]["message"]["tool_calls"]:
                     call["id"] += f"-batch-{self.dialogue_calls}"
                 return response
@@ -100,18 +111,42 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         if failed:
             self.assertEqual(status["failure"]["code"], "Context")
             self.assertEqual(status["failure"]["started_tools"], 35)
+            tool_results = status["failure"]["evidence"]["tool_results"]
         else:
             self.assertEqual(status["state"], "Completed")
             self.assertEqual(sum(len(m.get("tool_calls", [])) for m in status["messages"]), 35)
+            tool_results = [result for message in status["messages"] for result in message.get("tool_results", [])]
+        self.assertEqual(len(tool_results), 35, "压缩成功或失败都保留全部已完成工具回执")
+        self.assertEqual(len({result["call_id"] for result in tool_results}), 35, "原工具调用没有重放")
+        for index, result in enumerate(tool_results):
+            self.assertIn("Success", result["output"], f"第 {index + 1} 次读取成功")
+            output = result["output"]["Success"]
+            expected_content = "预备核验" if index < 15 else "中文结果" * 2700
+            self.assertTrue(output.get("content") == expected_content and not output.get("truncated"),
+                            f"第 {index + 1} 次读取保留完整预期文件")
+        self.assertEqual(self.digest_dialogue_rounds, [3] * len(self.digest_requests()))
         log = self.panel_stderr.read_text()
         self.assertIn('"use_name":"digest"', log)
         self.assertEqual(self.dialogue_calls, 3 if failed else 4)
+        events = [json.loads(line.split(" ", 1)[1]) for line in log.splitlines()
+                  if line.startswith("EVE_CONTEXT_COMPACTION ")]
+        if not failed:
+            self.assertTrue(events, "必须保留实际压缩前后的估算证据")
+            for event in events:
+                self.assertEqual((event["trigger_tokens"], event["target_tokens"]), (150000, 100000))
+                self.assertGreaterEqual(event["estimated_before"], 150000)
+                self.assertLess(event["estimated_after"], 150000)
+                self.assertLess(event["estimated_after"], event["estimated_before"])
         if invalid:
             batches = Counter(r["messages"][1]["content"] for r in self.digest_requests())
             self.assertEqual(list(batches.values()).count(2), 1, "只有无效摘要所在批次纠错一次")
             self.assertLessEqual(max(batches.values()), 2, "同一批摘要不无限重试")
             if failed:
                 self.assertEqual(len(self.digest_requests()), 2)
+        print("EVE_COMPACTION_FIXTURE " + json.dumps({"case": self._testMethodName,
+              "results_before_third_batch": 15, "tool_receipts": len(tool_results),
+              "digest_dialogue_rounds": self.digest_dialogue_rounds,
+              "compaction_events": events}, ensure_ascii=False), flush=True)
 
     def test_single_primary_slot_allows_progress_digest_and_dialogue_without_deadlock(self):
         self.exercise(False, primary_role=True)

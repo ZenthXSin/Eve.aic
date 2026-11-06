@@ -371,6 +371,11 @@ impl WebAutonomy {
             .push(Arc::new(crate::qq_model::ReasoningTool(reasoning.clone())));
         bootstrap
             .tools
+            .push(Arc::new(crate::qq_model_adapter::AdapterTool(
+                reasoning.clone(),
+            )));
+        bootstrap
+            .tools
             .push(Arc::new(crate::qq_model_status::StatusTool(
                 reasoning.clone(),
             )));

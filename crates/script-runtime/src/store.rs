@@ -641,67 +641,74 @@ fn validate_ledger(ledger: &Ledger, directory: &Path) -> Result<()> {
 
 /// serde_json 默认接受重复 map 键；账本与进程协议必须拒绝。
 pub(crate) fn strict_json(bytes: &[u8]) -> Result<Value> {
-    struct Strict;
-    impl<'de> serde::de::Visitor<'de> for Strict {
+    strict::from_slice(bytes).map_err(fail)
+}
+
+mod strict {
+    use serde::{
+        Deserializer,
+        de::{self, MapAccess, SeqAccess, Visitor},
+    };
+    use serde_json::{Map, Value, value::RawValue};
+    use std::fmt;
+
+    // serde_json 默认最多接受 127 层容器；RawValue 分层解析也必须共享同一深度预算。
+    const MAX_CONTAINER_DEPTH: usize = 127;
+
+    pub(crate) fn from_slice(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+        let raw = serde_json::from_slice::<&RawValue>(bytes)?;
+        from_raw(raw, MAX_CONTAINER_DEPTH)
+    }
+
+    fn from_raw(raw: &RawValue, remaining_depth: usize) -> Result<Value, serde_json::Error> {
+        // 根据真实 JSON token 区分容器与标量，不把高精度数字的内部表示当成对象，
+        // 也不把用户提供的同名私有字段解释成数字或 RawValue。
+        if !matches!(raw.get().as_bytes().first(), Some(b'[' | b'{')) {
+            return serde_json::from_str(raw.get());
+        }
+        if remaining_depth == 0 {
+            return Err(de::Error::custom("recursion limit exceeded"));
+        }
+        let mut parser = serde_json::Deserializer::from_str(raw.get());
+        let value = parser.deserialize_any(StrictVisitor {
+            remaining_depth: remaining_depth - 1,
+        })?;
+        parser.end()?;
+        Ok(value)
+    }
+
+    struct StrictVisitor {
+        remaining_depth: usize,
+    }
+
+    impl<'de> Visitor<'de> for StrictVisitor {
         type Value = Value;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("无重复键的 JSON")
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("无重复键的 JSON")
         }
-        fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<Value, E> {
-            Ok(Value::Bool(v))
-        }
-        fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Value, E> {
-            Ok(v.into())
-        }
-        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Value, E> {
-            Ok(v.into())
-        }
-        fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Value, E> {
-            serde_json::Number::from_f64(v)
-                .map(Value::Number)
-                .ok_or_else(|| E::custom("无效数字"))
-        }
-        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Value, E> {
-            Ok(v.into())
-        }
-        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Value, E> {
-            Ok(Value::Null)
-        }
-        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Value, E> {
-            Ok(Value::Null)
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> std::result::Result<Value, A::Error> {
-            let mut items = Vec::new();
-            while let Some(item) = seq.next_element::<StrictValue>()? {
-                items.push(item.0);
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+            let mut array = Vec::new();
+            while let Some(raw) = seq.next_element::<&RawValue>()? {
+                array.push(from_raw(raw, self.remaining_depth).map_err(de::Error::custom)?);
             }
-            Ok(Value::Array(items))
+            Ok(Value::Array(array))
         }
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> std::result::Result<Value, A::Error> {
-            let mut object = serde_json::Map::new();
-            while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
-                if object.insert(key, value.0).is_some() {
-                    return Err(serde::de::Error::custom("重复 JSON 键"));
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut object = Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if object.contains_key(&key) {
+                    return Err(de::Error::custom("重复 JSON 键"));
                 }
+                let raw = map.next_value::<&RawValue>()?;
+                let value = from_raw(raw, self.remaining_depth).map_err(de::Error::custom)?;
+                object.insert(key, value);
             }
             Ok(Value::Object(object))
         }
     }
-    struct StrictValue(Value);
-    impl<'de> Deserialize<'de> for StrictValue {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-            d.deserialize_any(Strict).map(Self)
-        }
-    }
-    serde_json::from_slice::<StrictValue>(bytes)
-        .map(|value| value.0)
-        .map_err(fail)
 }
 
 #[cfg(test)]
@@ -809,6 +816,54 @@ mod tests {
             failure_diagnostic: None,
         }
     }
+    #[test]
+    fn cold_receipt_numbers_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = fixture_version();
+        let store = ScriptStore::open(dir.path()).unwrap();
+        store.publish(&version.owner, version.spec.clone()).unwrap();
+        store
+            .activate(&version.owner, &version.reference, None)
+            .unwrap();
+        let mut receipt = fixture_receipt(&version, "numbers", ReceiptStatus::Running);
+        store.begin(receipt.clone()).unwrap();
+        receipt.result = Some(serde_json::json!({"embedding":[1.0,0.5],"scale":1.0}));
+        receipt.status = ReceiptStatus::Succeeded;
+        store.complete(&receipt, None).unwrap();
+        store
+            .read(|ledger| {
+                assert!(ledger.receipts["numbers"].hot.is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.receipt(&version.owner, "numbers").unwrap(), receipt);
+        drop(store);
+        let store = ScriptStore::open(dir.path()).unwrap();
+        assert_eq!(store.receipt(&version.owner, "numbers").unwrap(), receipt);
+        assert!(store.begin(receipt).is_err());
+    }
+
+    #[test]
+    fn process_json_rejects_escaped_duplicates_and_preserves_decimal_types() {
+        #[derive(serde::Deserialize)]
+        struct Reply {
+            values: Vec<f32>,
+        }
+        let reply: Reply =
+            serde_json::from_value(strict_json(br#"{"values":[1.0,0.5]}"#).unwrap()).unwrap();
+        assert_eq!(reply.values, vec![1.0, 0.5]);
+        let literal = strict_json(br#"{"$serde_json::private::Number":"1.25"}"#).unwrap();
+        assert!(literal.is_object());
+        assert_eq!(literal["$serde_json::private::Number"], "1.25");
+        for text in [
+            r#"{"nested":{"a":1.0,"\u0061":0.5}}"#,
+            r#"{"$serde_json::private::Number":"1.0","$serde_json::private::Number":"0.5"}"#,
+            r#"{"values":[1.0]} {}"#,
+        ] {
+            assert!(strict_json(text.as_bytes()).is_err());
+        }
+    }
+
     #[test]
     fn legacy_migration_cools_source_and_terminal_receipts_without_replaying() {
         let dir = tempfile::tempdir().unwrap();

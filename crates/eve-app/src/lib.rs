@@ -23,6 +23,7 @@ mod memory_cli_view;
 mod message_evaluation;
 mod model_concurrency;
 mod model_credentials;
+mod model_provider;
 mod models;
 mod qq_access;
 mod qq_admin;
@@ -65,6 +66,7 @@ mod qq_memory_observer;
 mod qq_memory_sharing;
 mod qq_message_judge;
 mod qq_model;
+mod qq_model_adapter;
 mod qq_model_status;
 mod qq_natural_goals;
 #[cfg(test)]

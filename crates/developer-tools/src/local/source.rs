@@ -10,7 +10,7 @@ pub(super) struct SourceEvidence {
 
 pub(super) fn cargo_checks() -> [Vec<&'static str>; 4] {
     [
-        vec!["fmt", "--all", "--", "--check"],
+        vec!["fmt", "--", "--check"],
         vec![
             "clippy",
             "--release",

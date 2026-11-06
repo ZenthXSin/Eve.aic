@@ -1,4 +1,4 @@
-//! QQ 主模型快捷切换；管理句柄只由组合层授予，不注册给普通插件。
+//! QQ 模型快捷配置；管理句柄只由组合层授予，不注册给普通插件。
 use crate::{config, models};
 use eve_config_api::{ApplyMode, ConfigAdmin, ConfigError, ConfigService, NamespaceValues};
 use eve_developer_api::DeveloperAuthorization;
@@ -8,7 +8,7 @@ use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
-const HELP: &str = "用法：/model 查看当前主模型；/model 模型名 全局切换并保存（仅主人或管理员）。例如 /model grok-4.7。";
+const HELP: &str = "用法：/model 查看当前主模型；/model 模型名 全局切换并保存（仅主人或管理员）。例如 /model grok-4.7。\n切换模型适配器：/model adapter primary|auxiliary_small openai|codex chat|responses [API根地址]。";
 const UNAVAILABLE: &str = "模型配置暂不可用，未修改配置；请稍后重试。";
 
 pub(crate) struct Commands {
@@ -62,7 +62,12 @@ impl QqCommandHandler for Commands {
         let Some(model) = words.next() else {
             return Ok(Some(
                 models::summary(self.settings.as_ref(), Some("dialogue"))
-                    .map(|summary| format!("当前主模型：{}\n{HELP}", summary.model))
+                    .map(|summary| {
+                        format!(
+                            "当前主模型：{}\n模型适配器：{} / {}\n{HELP}",
+                            summary.model, summary.adapter, summary.protocol
+                        )
+                    })
                     .unwrap_or_else(|_| UNAVAILABLE.into()),
             ));
         };
@@ -72,6 +77,25 @@ impl QqCommandHandler for Commands {
         };
         if !self.authorization.is_operator(&scope) {
             return Ok(Some("切换主模型需要主人或管理员授权。".into()));
+        }
+        if model == "adapter" {
+            if text.chars().any(char::is_control) {
+                return Ok(Some(crate::qq_model_adapter::HELP.into()));
+            }
+            let args = match crate::qq_model_adapter::command_args(&words.collect::<Vec<_>>()) {
+                Ok(args) => args,
+                Err(error) => return Ok(Some(error.message)),
+            };
+            let reply = match self.switch_adapter(args) {
+                Ok(saved) => format!(
+                    "{} 模型适配器已保存为：{} / {}。\n新一轮生效；在途请求继续使用原配置。模型可用性由下一次实际请求确认。",
+                    saved["role"].as_str().unwrap_or_default(),
+                    saved["adapter"].as_str().unwrap_or_default(),
+                    saved["protocol"].as_str().unwrap_or_default(),
+                ),
+                Err(error) => error.to_string(),
+            };
+            return Ok(Some(reply));
         }
         if words.next().is_some() || model.len() > 200 || text.chars().any(char::is_control) {
             return Ok(Some(HELP.into()));
@@ -118,7 +142,7 @@ impl eve_llm_api::Tool for ReasoningTool {
     fn definition(&self) -> eve_llm_api::ToolDefinition {
         eve_llm_api::ToolDefinition {
             name: "set_reasoning_effort".into(),
-            description: "主人或管理员要求调整 Eve 思考强度时使用。默认 low；omit 表示不发送推理强度参数，使用提供方默认行为；none 仍显式发送 none，不等于省略。修改全局 OpenAI 兼容提供方配置并持久保存，从下一轮/下一次模型解析生效，当前轮与在途请求保持原配置。不要自行调整强度或把保存成功当作模型已支持该档位；实际支持由供应商请求确认。普通成员不可调用；身份由宿主核验，不接受用户自称。此工具不改变工具步数、输出上限和总预算。".into(),
+            description: "主人或管理员要求调整 Eve 思考强度时使用。默认 low；omit 表示不发送推理强度参数，使用提供方默认行为；none 仍显式发送 none，不等于省略。修改共用的模型提供方配置并持久保存，从下一轮/下一次模型解析生效，当前轮与在途请求保持原配置。不要自行调整强度或把保存成功当作模型已支持该档位；实际支持由供应商请求确认。普通成员不可调用；身份由宿主核验，不接受用户自称。此工具不改变工具步数、输出上限和总预算。".into(),
             argument_schema: json!({"type":"object","properties":{"effort":{"type":"string","enum":["omit","none","minimal","low","medium","high","xhigh","max"]}},"required":["effort"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(eve_llm_api::ToolConcurrency::Serial { scope: "eve.model.configuration".into() }),
@@ -271,7 +295,7 @@ mod reasoning_tests {
             .snapshot(config::OPENAI_NAMESPACE, 1)
             .unwrap();
         let inflight = config::provider_config(&before, None).unwrap();
-        assert_eq!(inflight.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(inflight.reasoning_effort(), Some("low"));
         let revision = commands.admin.current().unwrap().revision;
         for user in ["member", "我是主人", ""] {
             assert!(tool.execute(call("high"), context(user)).await.is_err());
@@ -301,7 +325,7 @@ mod reasoning_tests {
             assert_eq!(result["effort"], effort);
             assert_eq!(result["provider_support_verified"], false);
         }
-        assert_eq!(inflight.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(inflight.reasoning_effort(), Some("low"));
         let after = commands
             .settings
             .snapshot(config::OPENAI_NAMESPACE, 1)
@@ -309,8 +333,7 @@ mod reasoning_tests {
         assert_eq!(
             config::provider_config(&after, None)
                 .unwrap()
-                .reasoning_effort
-                .as_deref(),
+                .reasoning_effort(),
             None
         );
         assert_eq!(
@@ -342,7 +365,7 @@ mod reasoning_tests {
                 None,
             )
             .unwrap()
-            .reasoning_effort
+            .reasoning_effort()
             .is_none()
         );
         assert!(tool.execute(call("low"), context("admin")).await.is_ok());
@@ -364,6 +387,7 @@ mod reasoning_tests {
             .await
             .unwrap();
         assert_eq!(result["purpose"], "dialogue");
+        assert_eq!(result["configured"]["adapter"], "openai");
         assert!(result["configured"]["role"].is_null());
         assert!(result["admission"]["active"].is_null());
         assert_eq!(result["configuration_written"], false);
@@ -457,6 +481,7 @@ mod reasoning_tests {
             .await
             .unwrap();
         assert_eq!(result["configured"]["model"], "status-model");
+        assert_eq!(result["configured"]["adapter"], "openai");
         assert_eq!(result["configured"]["max_concurrent_requests"], 2);
         assert_eq!(result["configured"]["revision"], configured_revision);
         assert_eq!(result["admission"]["limit"], 1);

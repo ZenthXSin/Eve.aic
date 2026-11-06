@@ -1,4 +1,4 @@
-use crate::AppError;
+use crate::{AppError, model_provider::ProviderConfig};
 use eve_config_api::{
     ConfigField, ConfigKind, ConfigSchema, ConfigSnapshot, ModelProfile, ModelRole,
 };
@@ -391,7 +391,7 @@ pub(crate) fn configured_role(snapshot: &ConfigSnapshot) -> Result<Option<ModelR
 pub(crate) fn provider_config(
     snapshot: &ConfigSnapshot,
     primary: Option<&ModelProfile>,
-) -> Result<OpenAiConfig, AppError> {
+) -> Result<ProviderConfig, AppError> {
     provider_config_for(snapshot, primary, eve_llm_api::CredentialPurpose::Primary)
 }
 
@@ -399,10 +399,10 @@ pub(crate) fn provider_config_for(
     snapshot: &ConfigSnapshot,
     primary: Option<&ModelProfile>,
     purpose: eve_llm_api::CredentialPurpose,
-) -> Result<OpenAiConfig, AppError> {
+) -> Result<ProviderConfig, AppError> {
     if let Some(profile) = primary {
-        if profile.provider != "openai" {
-            return Err("所选对话模型角色当前只支持 provider=openai。".into());
+        if !matches!(profile.provider.as_str(), "openai" | "codex") {
+            return Err("所选对话模型角色只支持 provider=openai 或 codex。".into());
         }
         crate::model_credentials::reference(purpose, profile.credential_ref.as_deref())?;
         if profile.timeout_ms == 0 || profile.timeout_ms > 600_000 {
@@ -436,6 +436,12 @@ pub(crate) fn provider_config_for(
             protocol = independent;
         }
     }
+    let adapter = primary.map_or("openai", |profile| profile.provider.as_str());
+    if adapter == "codex" && protocol != "responses" {
+        return Err(
+            "Codex 原适配器仅支持 responses；请在同一配置事务中切换 provider、协议与端点。".into(),
+        );
+    }
     let config = match protocol.as_str() {
         "chat" => OpenAiConfig::chat(model),
         "responses" => OpenAiConfig::new(model),
@@ -456,7 +462,23 @@ pub(crate) fn provider_config_for(
         "" => Some("low".into()),
         _ => Some(effort),
     };
-    Ok(config)
+    if adapter == "codex" {
+        let config = eve_llm_codex::CodexConfig {
+            model: config.model,
+            responses_url: config.responses_url,
+            request_timeout: config.request_timeout,
+            max_response_bytes: config.max_response_bytes,
+            reasoning_effort: config.reasoning_effort,
+            max_output_tokens: config.max_output_tokens,
+        };
+        let anonymous = purpose == eve_llm_api::CredentialPurpose::Auxiliary
+            && primary.and_then(|profile| profile.credential_ref.as_deref())
+                == Some(crate::model_credentials::ANONYMOUS);
+        config.validate(!anonymous)?;
+        Ok(ProviderConfig::Codex(config))
+    } else {
+        Ok(ProviderConfig::OpenAi(config))
+    }
 }
 
 #[cfg(test)]
@@ -510,7 +532,14 @@ mod tests {
         // URI 解析不等同于传输允许；Provider 构造在网络请求前拒绝不支持的 scheme。
         let invalid_transport =
             provider_config_for(&provider, Some(&profile), CredentialPurpose::Auxiliary).unwrap();
-        assert!(eve_llm_openai::OpenAiProvider::new(invalid_transport, "synthetic-key").is_err());
+        assert!(
+            invalid_transport
+                .build(
+                    Some("synthetic-key"),
+                    &crate::model_provider::ProviderOptions::default()
+                )
+                .is_err()
+        );
         provider
             .values
             .insert("auxiliary_base_url".into(), json!("not a url"));
@@ -691,10 +720,7 @@ mod tests {
             let mut settings = snapshot();
             settings.values.insert("protocol".into(), json!(protocol));
             assert_eq!(
-                provider_config(&settings, None)
-                    .unwrap()
-                    .reasoning_effort
-                    .as_deref(),
+                provider_config(&settings, None).unwrap().reasoning_effort(),
                 Some("low")
             );
             for (value, expected) in [
@@ -707,10 +733,7 @@ mod tests {
                     .values
                     .insert("reasoning_effort".into(), json!(value));
                 assert_eq!(
-                    provider_config(&settings, None)
-                        .unwrap()
-                        .reasoning_effort
-                        .as_deref(),
+                    provider_config(&settings, None).unwrap().reasoning_effort(),
                     expected
                 );
             }
@@ -734,19 +757,19 @@ mod tests {
         let direct = snapshot();
         assert_eq!(configured_role(&direct).unwrap(), None);
         let legacy = provider_config(&direct, None).unwrap();
-        assert_eq!(legacy.model, "deepseek-v4.1-flash");
-        assert_eq!(legacy.request_timeout, Duration::from_secs(120));
-        assert_eq!(legacy.max_output_tokens, None);
+        assert_eq!(legacy.model(), "deepseek-v4.1-flash");
+        assert_eq!(legacy.request_timeout(), Duration::from_secs(120));
+        assert_eq!(legacy.max_output_tokens(), None);
         let mut primary = profile();
         let selected = provider_config(&direct, Some(&primary)).unwrap();
-        assert_eq!(selected.model, "role-model");
-        assert_eq!(selected.request_timeout, Duration::from_millis(1250));
-        assert_eq!(selected.max_output_tokens, None);
+        assert_eq!(selected.model(), "role-model");
+        assert_eq!(selected.request_timeout(), Duration::from_millis(1250));
+        assert_eq!(selected.max_output_tokens(), None);
         primary.max_output_tokens = Some(96);
         assert_eq!(
             provider_config(&direct, Some(&primary))
                 .unwrap()
-                .max_output_tokens,
+                .max_output_tokens(),
             Some(96)
         );
     }

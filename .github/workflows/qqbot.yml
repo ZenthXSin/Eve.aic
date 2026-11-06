@@ -7,6 +7,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/*cargo*.py"
+      - "scripts/test-web-model-adapter.py"
       - ".github/workflows/qqbot.yml"
       - ".github/workflows/qqbot-training.yml"
       - ".github/qqbot-training-request.json"
@@ -23,6 +24,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/*cargo*.py"
+      - "scripts/test-web-model-adapter.py"
       - ".github/workflows/qqbot.yml"
       - ".github/workflows/qqbot-training.yml"
       - ".github/qqbot-training-request.json"
@@ -38,6 +40,11 @@ jobs:
     runs-on: ubuntu-latest
     # 全量验收含真实离线Cargo编译；实测主场景及浏览器约40分钟，保留最后热更新验收时间。
     timeout-minutes: 50
+    # 与 Stable/MSRV 一致；完整交接会多次校验可执行文件，不把调试信息作为验收负载。
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -60,11 +67,11 @@ jobs:
       - name: 独立生图适配器本地上游验收
         run: python3 imgadapter/test_adapter.py
       - name: 安装 Rust
-        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
       - name: 验证通道依赖构建
         run: |
-          cargo +1.89.0 fmt --all -- --check
-          cargo +1.89.0 check --workspace --all-targets --locked
+          cargo +1.95.0 fmt -- --check
+          cargo +1.95.0 check --workspace --all-targets --locked
       - name: 准备并验证实际脚本隔离环境
         run: |
           sudo apt-get update
@@ -74,17 +81,43 @@ jobs:
           fi
           bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
       - name: 编译实际 Eve QQBot、Web 与记忆进程
-        id: process-binaries
+        id: adapter-process-binaries
         run: |
           set -x
-          cargo +1.89.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
+          cargo +1.95.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
       - name: 实际自由探索、静默结束与经历恢复验收
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         env:
           EVE_QQBOT_BINARY: target/debug/eve-qqbot
         run: python3 connectors/qqbot/test/free_exploration_test.py
+      - name: 实际独立 Web 适配器切换、会话与身份验收
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/eve-adapter-process-evidence"
+          python3 scripts/test-web-model-adapter.py 2>&1 | tee "${RUNNER_TEMP}/eve-adapter-process-evidence/web.log"
+      - name: 实际 QQ 适配器指令、工具切换与身份验收
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/eve-adapter-process-evidence"
+          python3 connectors/qqbot/test/model_adapter_test.py 2>&1 | tee "${RUNNER_TEMP}/eve-adapter-process-evidence/qq.log"
+      - name: 实际 QQ 热更新交接与回执去重验收
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/eve-adapter-process-evidence"
+          python3 connectors/qqbot/test/live_upgrade_test.py 2>&1 | tee "${RUNNER_TEMP}/eve-adapter-process-evidence/live-upgrade.log"
+      - name: 保存适配器与热更新进程的小型原始结果
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: adapter-process-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eve-adapter-process-evidence/*.log
+          if-no-files-found: error
+          retention-days: 7
       - name: 进程验收：Web 与基础对话
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 scripts/test-web-chat.py
@@ -101,7 +134,7 @@ jobs:
           python3 connectors/qqbot/test/cognition_test.py
           python3 connectors/qqbot/test/goal_feedback_test.py
       - name: 进程验收：记忆、学习与能力形成
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/memory_test.py
@@ -118,7 +151,7 @@ jobs:
           python3 connectors/qqbot/test/skill_test.py
           python3 connectors/qqbot/first-goal-acceptance.py --help
       - name: 进程验收：工具执行、隔离与桥接
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/toolforge_test.py
@@ -126,16 +159,15 @@ jobs:
           python3 connectors/qqbot/test/developer_tools_test.py
           python3 connectors/qqbot/test/business_restriction_ingress_test.py
           python3 connectors/qqbot/test/trusted_review_originals_test.py
-          EVE_TEST_PLUGIN_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/script_runtime_test.py
+          EVE_TEST_PLUGIN_TOOLCHAIN=1.95.0 python3 connectors/qqbot/test/script_runtime_test.py
           python3 connectors/qqbot/test/file_import_test.py
           python3 connectors/qqbot/test/workflow_tools_test.py
           python3 connectors/qqbot/test/vision_test.py
           python3 connectors/qqbot/test/sticker_test.py
-          python3 connectors/qqbot/test/live_upgrade_test.py
-          EVE_TEST_UPGRADE_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/self_upgrade_timeout_test.py
+          EVE_TEST_UPGRADE_TOOLCHAIN=1.95.0 python3 connectors/qqbot/test/self_upgrade_timeout_test.py
           python3 connectors/qqbot/test/transport_test.py
       - name: 进程验收：模型请求、缓存与执行进展
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/people_test.py
@@ -153,7 +185,7 @@ jobs:
           python3 connectors/qqbot/test/slow_progress_test.py
           python3 connectors/qqbot/test/stage_feedback_test.py
       - name: 进程验收：上下文、源码查阅与自主探索
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/history_window_test.py
@@ -175,7 +207,7 @@ jobs:
           python3 connectors/qqbot/test/idle_loop_test.py
           python3 connectors/qqbot/test/continuous_autonomy_test.py
       - name: 进程验收：后台任务与群聊记忆
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/background_task_test.py
@@ -196,7 +228,7 @@ jobs:
           python3 connectors/qqbot/test/group_digest_test.py
           python3 connectors/qqbot/test/group_recall_test.py
       - name: 进程验收：恢复、管理与模型传输
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/background_recovery_test.py
@@ -213,7 +245,7 @@ jobs:
           python3 connectors/qqbot/test/permission_inspection_test.py
           python3 connectors/qqbot/test/delivery_recovery_test.py
       - name: 进程验收：持续任务与训练评审
-        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/compaction_stream_test.py
@@ -232,9 +264,9 @@ jobs:
         run: |
           export EVE_TEST_BROWSER="$(command -v google-chrome)"
           "$EVE_TEST_BROWSER" --version
-          cargo +1.89.0 test -p eve-practice-browser --test real --locked -- --ignored --nocapture
+          cargo +1.95.0 test -p eve-practice-browser --test real --locked -- --ignored --nocapture
           python3 connectors/qqbot/test/holdout_test.py
       - name: 真实离线 Cargo 编译、热切换与 QQ 进程恢复
         env:
-          RUSTUP_TOOLCHAIN: "1.89.0"
+          RUSTUP_TOOLCHAIN: "1.95.0"
         run: python3 scripts/test-cargo-isolation.py

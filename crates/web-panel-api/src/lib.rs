@@ -73,6 +73,8 @@ pub struct ChannelReadiness {
 pub struct ModelConfigView {
     pub model: String,
     pub protocol: String,
+    /// 当前配置选择的实现；与线协议独立。
+    pub adapter: String,
     /// 每次请求发送的单次输出上限；为空时不发送，由服务端决定。
     pub max_output_tokens: Option<u32>,
     /// 上限取自哪个配置键。
@@ -104,6 +106,7 @@ pub struct ModelRoleHealth {
     /// 当前配置，不代表在途旧快照已经切换。
     pub configured_model: Option<String>,
     pub configured_protocol: Option<String>,
+    pub configured_adapter: Option<String>,
     pub state: ModelState,
     pub requests: u64,
     pub failures: u64,
