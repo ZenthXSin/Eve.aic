@@ -87,6 +87,14 @@ impl ContextAssembler for ExperienceContext {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
             let mut query: String = input.text.chars().filter(|c| !c.is_control()).collect();
             let mut end = query.len().min(MAX_RECALL_QUERY_BYTES);
@@ -94,7 +102,10 @@ impl ContextAssembler for ExperienceContext {
                 end -= 1;
             }
             query.truncate(end);
-            let mut context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
+            let mut context = self
+                .wrapped
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             let Some(scope) = scope else {
                 return Ok(context);
             };

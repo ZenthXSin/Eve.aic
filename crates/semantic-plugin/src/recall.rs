@@ -87,12 +87,36 @@ struct HybridReader {
 
 impl AsyncMemoryRecallService for HybridReader {
     fn recall<'a>(&'a self, request: &'a MemoryRecallRequest) -> RecallFuture<'a> {
+        self.recall_with_model_session(request, None)
+    }
+    fn recall_with_model_session<'a>(
+        &'a self,
+        request: &'a MemoryRecallRequest,
+        parent: Option<&'a eve_llm_api::ModelSession>,
+    ) -> RecallFuture<'a> {
         Box::pin(async move {
             request.validate()?;
+            let session = match parent {
+                Some(parent) => {
+                    parent
+                        .validate_scope(Some(&eve_llm_api::ContextScope {
+                            session_id: self.scope.session_id.clone(),
+                            user_id: self.scope.user_id.clone(),
+                        }))
+                        .map_err(|_| MemoryError::InvalidInput)?;
+                    parent.fork("embedding-query", Some(&self.scope.channel))
+                }
+                None => eve_llm_api::ModelSession::anchored(
+                    "embedding-query",
+                    None,
+                    &scope_key(&self.scope),
+                ),
+            }
+            .map_err(|_| MemoryError::InvalidInput)?;
             let query = prefix(&request.query, MAX_EMBED_INPUT_BYTES).to_string();
             let mut vectors = self
                 .embedder
-                .embed(std::slice::from_ref(&query))
+                .embed_with_model_session(std::slice::from_ref(&query), Some(&session))
                 .await
                 .map_err(|_| MemoryError::Unavailable)?;
             eve_semantic_api::validate_vectors(self.embedder.profile(), 1, &vectors)

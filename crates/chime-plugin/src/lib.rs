@@ -19,6 +19,13 @@ pub use digest::ModelGroupDigester;
 pub use judges::{CHIME_FORMAT_GUARD, ModelChimeJudge, QuietJudge};
 pub use relation::{GroupRelationPipeline, ModelGroupRelationReviewer};
 
+fn model_session(
+    role: &str,
+    message: &GroupMessage,
+) -> Result<eve_llm_api::ModelSession, LlmError> {
+    eve_llm_api::ModelSession::anchored(role, None, &message.conversation)?.with_turn(&message.id)
+}
+
 const HOUR_MS: u64 = 3_600_000;
 /// 每个群保留的最近决定条数。
 const MAX_DECISIONS: usize = 64;

@@ -781,6 +781,9 @@ pub struct SelectionCandidate {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub run_id: String,
     pub selector_version: String,
     pub brief: String,
@@ -821,6 +824,9 @@ pub struct ExtractionDocument {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractionRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub run_id: String,
     pub extractor_version: String,
     pub brief: String,

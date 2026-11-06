@@ -83,6 +83,11 @@ impl ConversationLearner for ModelConversationLearner {
             let response = tokio::time::timeout(
                 selection.provider_timeout,
                 selection.provider.complete_json(ModelRequest {
+                    session: Some(
+                        eve_llm_api::ModelSession::scoped("conversation-learning", &batch.scope)?
+                            .with_turn(&batch.id)?
+                            .for_request(u64::from(batch.attempt)),
+                    ),
                     messages: vec![
                         ChatMessage::text(ChatRole::System, PROMPT),
                         ChatMessage::text(ChatRole::User, data),

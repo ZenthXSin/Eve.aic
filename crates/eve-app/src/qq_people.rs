@@ -259,8 +259,19 @@ impl ContextAssembler for Context {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
+            let mut context = self
+                .wrapped
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             let Some(scope) = scope else {
                 return Ok(context);
             };
@@ -294,11 +305,21 @@ impl ContextAssembler for Context {
                 // 画像只在依据指纹与当前一致时使用，代替本会话与他处的逐条印象；
                 // 过期或缺失时排队整理，本轮照常用逐条印象。
                 let profile = match self.people.profile_request(&scope.user_id, &*self.links) {
-                    Ok(Some(request)) => match self.people.profile(&scope.user_id) {
+                    Ok(Some(mut request)) => match self.people.profile(&scope.user_id) {
                         Ok(Some(profile)) if profile.fingerprint == request.fingerprint => {
                             Some(profile).filter(|p| !p.facts.is_empty())
                         }
                         _ => {
+                            request.model_session = Some(match &model_session {
+                                Some(session) => {
+                                    session.validate_scope(Some(&scope))?;
+                                    session.fork("profile-consolidation", None)?
+                                }
+                                None => eve_llm_api::ModelSession::scoped(
+                                    "profile-consolidation",
+                                    &scope,
+                                )?,
+                            });
                             self.profiles.offer(request);
                             None
                         }

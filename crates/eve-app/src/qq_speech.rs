@@ -499,17 +499,20 @@ impl Speech {
             session_id: event.session.session_id.clone(),
             user_id: event.session.user_id.clone(),
         };
+        let model_session =
+            eve_llm_api::ModelSession::scoped("speech", &scope)?.with_turn(&event.id)?;
         let current_text = self
             .conversations
             .original_message_at(&event.session, &event.anchor)
             .map_err(context_error)?;
         let context = self
             .context
-            .assemble_scoped(
+            .assemble_with_model_session(
                 TurnInput {
                     text: "审视刚发生的宿主事实，自己决定是否开口。".into(),
                 },
                 Some(scope.clone()),
+                Some(model_session.clone()),
             )
             .await?;
         let prompt = match &self.host.live_prompt_source {
@@ -566,6 +569,7 @@ impl Speech {
                 .provider_timeout
                 .min(std::time::Duration::from_secs(60)),
             model.provider.complete_json(ModelRequest {
+                session: Some(model_session),
                 messages,
                 tools: vec![],
             }),
@@ -701,8 +705,19 @@ impl ContextAssembler for Context {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut context = self.inner.assemble_scoped(input, scope.clone()).await?;
+            let mut context = self
+                .inner
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             if let Some(scope) = scope {
                 let records = self.store.recent(&scope).map_err(context_error)?;
                 if !records.is_empty() {

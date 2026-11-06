@@ -456,6 +456,14 @@ impl ContextAssembler for Context {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
             // 先冻结准入锚点，再等待下层上下文；后发消息和另一成员的轮次不能改写本轮。
             let binding = match scope.as_ref().filter(|s| s.user_id != USER) {
@@ -483,7 +491,10 @@ impl ContextAssembler for Context {
                 }
                 _ => None,
             };
-            let mut context = self.wrapped.assemble_scoped(input, scope).await?;
+            let mut context = self
+                .wrapped
+                .assemble_with_model_session(input, scope, model_session.clone())
+                .await?;
             // 插话引擎已在自己的请求中冻结目标与窗口，不再叠加全群最新消息。
             let Some(anchor) = binding else {
                 return Ok(context);

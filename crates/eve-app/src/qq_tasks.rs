@@ -204,6 +204,7 @@ pub(crate) struct WorkerRun {
 }
 
 struct WorkerRequest {
+    model_session: Option<eve_llm_api::ModelSession>,
     idle_review: bool,
     idle_input: Option<String>,
     instructions: String,
@@ -435,6 +436,7 @@ impl Worker {
 
     async fn run_request(&self, request: WorkerRequest) -> WorkerRun {
         let WorkerRequest {
+            model_session,
             idle_review,
             idle_input,
             instructions,
@@ -525,6 +527,39 @@ impl Worker {
             }
         };
         let host = host.with_shared_steps(steps_pool.clone()).delegated();
+        let host = if let Some(session) = model_session {
+            host.with_model_session(session)
+        } else if let Some(id) = &background_task_id {
+            let role = if idle_review {
+                "idle-review"
+            } else if subject_plan.is_some() {
+                "subject-plan"
+            } else {
+                "task"
+            };
+            match eve_llm_api::ModelSession::anchored(role, scope.as_ref(), id)
+                .and_then(|session| session.with_turn(id))
+            {
+                Ok(session) => host.with_model_session(session),
+                Err(_) => {
+                    return WorkerRun {
+                        end: TaskEnd::Failed {
+                            reason: "后台任务缺少有效模型会话绑定；未请求模型".into(),
+                        },
+                        usage: TaskUsage::default(),
+                        retryable: false,
+                    };
+                }
+            }
+        } else {
+            return WorkerRun {
+                end: TaskEnd::Failed {
+                    reason: "独立执行缺少模型会话绑定；未请求模型".into(),
+                },
+                usage: TaskUsage::default(),
+                retryable: false,
+            };
+        };
         let host = match background_task_id {
             Some(id) => host.with_background_task_id(id),
             None => host,
@@ -1085,6 +1120,7 @@ fn instructions_with_context(
     let messages: Vec<eve_llm_api::ChatMessage> = serde_json::from_str(&context.messages_json)
         .map_err(|_| failed("委派上下文格式无效；未执行"))?;
     eve_llm_api::ModelRequest {
+        session: None,
         messages,
         tools: vec![],
     }
@@ -1472,6 +1508,22 @@ impl Tool for SubagentTool {
                 return Err(failed("等待并发槽已耗尽子代理期限；未启动模型"));
             }
             let running = worker.run_request(WorkerRequest {
+                // call ID 来自当前执行器绑定，不采用工具参数中的 agent_id 当会话标识。
+                // 父轮次和 call ID 合起来是该独立子代理的稳定锚点。
+                model_session: Some({
+                    let parent = context
+                        .model_session()
+                        .ok_or_else(|| failed("子代理缺少可信父模型会话"))?;
+                    let turn = parent
+                        .turn_id()
+                        .ok_or_else(|| failed("子代理缺少可信父轮次"))?;
+                    let call_id = context
+                        .call_id()
+                        .ok_or_else(|| failed("子代理缺少宿主工具调用编号"))?;
+                    parent
+                        .fork("subagent", Some(&format!("{turn}:{call_id}")))
+                        .map_err(failed)?
+                }),
                 idle_review: false,
                 idle_input: None,
                 instructions,
@@ -1584,8 +1636,19 @@ impl ContextAssembler for TaskContext {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
+            let mut context = self
+                .wrapped
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             let Some(scope) = scope else {
                 return Ok(context);
             };
@@ -2090,6 +2153,7 @@ async fn run(
                         Ok(text) => {
                             worker
                                 .run_request(WorkerRequest {
+                                    model_session: None,
                                     idle_review,
                                     idle_input,
                                     instructions: text,
@@ -2410,6 +2474,9 @@ mod tests {
         let mut task = task(TaskStatus::Failed);
         task.result = None;
         let checkpoint = eve_llm_api::TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 2,
             scope: ContextScope {
                 session_id: task.owner.session_id.clone(),

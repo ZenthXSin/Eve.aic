@@ -45,6 +45,9 @@ async fn resumed_parent_keeps_child_charges_and_refuses_a_batch_beyond_remaining
         arguments: json!({}),
     };
     let frame = TurnCheckpoint {
+        pending_model_request: None,
+        pending_request_fingerprint: None,
+        model_session: None,
         version: 2,
         scope: scope.clone(),
         messages: vec![

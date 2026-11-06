@@ -406,6 +406,11 @@ async fn compose(
     stopped: &mut watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let input = ComposeRequest {
+        model_session: Some(
+            eve_llm_api::ModelSession::owned("clarify-composer", &request.owner, &request.id)
+                .and_then(|s| s.with_turn(&request.id))
+                .map_err(|_| ClarifyError::InvalidInput)?,
+        ),
         request_id: request.id.clone(),
         composer_version: request.composer_version.clone(),
         stall: request.stall.kind,
@@ -547,6 +552,17 @@ impl QqOutreach for ChannelAdapter {
                 .begin_judgement(&request.id, &moment.message_id, now)
                 .map_err(plugin_error)?;
             let input = JudgeRequest {
+                model_session: Some(
+                    eve_llm_api::ModelSession::scoped(
+                        "clarify-timing",
+                        &eve_llm_api::ContextScope {
+                            session_id: moment.session.session_id.clone(),
+                            user_id: moment.session.user_id.clone(),
+                        },
+                    )
+                    .and_then(|s| s.with_turn(&moment.message_id))
+                    .map_err(|_| plugin_error(ClarifyError::InvalidInput))?,
+                ),
                 invitation_id: request.id.clone(),
                 judge_version: judge.version().into(),
                 invitation: prefix(

@@ -62,10 +62,13 @@ impl ContextRelevanceSelector for JevRelationJudge {
             {
                 return Err(MemoryError::InvalidInput);
             }
-            let bytes = tokio::time::timeout(self.config.timeout, self.group_request(body))
-                .await
-                .map_err(|_| MemoryError::Unavailable)?
-                .map_err(|_| MemoryError::Unavailable)?;
+            let bytes = tokio::time::timeout(
+                self.config.timeout,
+                self.group_request(body, input.model_session.as_ref()),
+            )
+            .await
+            .map_err(|_| MemoryError::Unavailable)?
+            .map_err(|_| MemoryError::Unavailable)?;
             parse(&bytes, &input)
         })
     }
@@ -77,6 +80,7 @@ mod tests {
     #[test]
     fn opaque_candidate_selection_never_accepts_forged_ids_or_bad_probabilities() {
         let input = ContextSelectionInput {
+            model_session: None,
             query: "恢复任务".into(),
             candidates: vec![
                 ContextCandidate {
@@ -130,9 +134,16 @@ mod tests {
             (200, b"not-json".to_vec(), false),
             (503, b"provider-unavailable".to_vec(), false),
         ] {
-            let (url, received, server) = crate::tests::server(status, body, "").await;
+            let session =
+                eve_llm_api::ModelSession::anchored("context-selector", None, "PRIVATE-TASK-ID")
+                    .unwrap()
+                    .with_turn("PRIVATE-MESSAGE-ID")
+                    .unwrap();
+            let (url, received, server) =
+                crate::tests::server_with_session(status, body, "", Some(session.clone())).await;
             let judge = crate::tests::judge(url);
             let input = ContextSelectionInput {
+                model_session: Some(session),
                 query: "atlas版本".into(),
                 candidates: vec![ContextCandidate {
                     id: "opaque-0".into(),
@@ -147,6 +158,7 @@ mod tests {
             let request = received.await.unwrap();
             assert_eq!(request["questions"]["c0"]["type"], "noul");
             assert!(request["state"].get("principal").is_none());
+            assert!(request.get("prompt_cache_key").is_none());
             server.await.unwrap();
         }
     }

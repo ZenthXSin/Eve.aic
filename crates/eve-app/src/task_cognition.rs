@@ -426,6 +426,9 @@ mod tests {
         });
         task.execution = Some(TaskExecution {
             checkpoint: Some(TurnCheckpoint {
+                pending_model_request: None,
+                pending_request_fingerprint: None,
+                model_session: None,
                 version: 1,
                 scope: ContextScope {
                     user_id: task.owner.user_id.clone(),

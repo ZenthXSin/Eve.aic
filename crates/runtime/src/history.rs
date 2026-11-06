@@ -193,6 +193,7 @@ mod tests {
         .unwrap();
         assert_eq!(context.history, retained);
         ModelRequest {
+            session: None,
             messages: context.history,
             tools: vec![],
         }

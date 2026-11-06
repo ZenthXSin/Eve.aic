@@ -41,6 +41,7 @@ impl ClarificationComposer for ModelClarificationComposer {
             validate_facts(&request.facts)?;
             let input = serde_json::to_string(&request).map_err(|_| ClarifyError::InvalidInput)?;
             let model_request = ModelRequest {
+                session: request.model_session.clone(),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),

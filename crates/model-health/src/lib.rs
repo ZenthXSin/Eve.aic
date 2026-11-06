@@ -262,6 +262,14 @@ impl ObservedProvider {
 }
 
 impl LlmProvider for ObservedProvider {
+    fn request_fingerprint(
+        &self,
+        request: &ModelRequest,
+        mode: eve_llm_api::ResponseMode,
+    ) -> Result<Option<eve_llm_api::ModelRequestFingerprint>, LlmError> {
+        self.inner.request_fingerprint(request, mode)
+    }
+
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         Box::pin(async move {
             let result = self.inner.complete(request).await;

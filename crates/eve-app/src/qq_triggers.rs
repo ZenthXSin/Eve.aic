@@ -1948,6 +1948,9 @@ mod tests {
             .with_background_task_id(task.id.clone())
             .with_call_id(call.id.clone());
         let mut frame = TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope,
             messages: vec![ChatMessage::text(ChatRole::User, "检查构建后继续")],
@@ -2214,6 +2217,9 @@ mod tests {
             user_id: "u".into(),
         };
         let mut frame = TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: scope.clone(),
             messages: vec![ChatMessage::text(ChatRole::User, "构建完成后检查")],
@@ -2340,6 +2346,9 @@ mod tests {
             .unwrap();
         tasks.start(&task.id, now).unwrap();
         let frame = eve_llm_api::TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: ContextScope {
                 session_id: owner.session_id.clone(),

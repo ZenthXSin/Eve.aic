@@ -152,6 +152,9 @@ pub enum ReviewAuthorization {
 /// 交给审查者的一次行动。只有 `user_messages` 是可信的用户原话；其余都是待核对的数据。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActionReviewRequest {
+    /// 宿主绑定的独立审查会话；不进入送审正文或模型参数。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     /// 有界行动摘要；不得据此替代下面完整的程序、参数或业务操作。
     pub action: String,
     /// 命令的真实程序；业务动作使用 eve.xxx 名称，并在 arguments[0] 提供完整 JSON 操作。

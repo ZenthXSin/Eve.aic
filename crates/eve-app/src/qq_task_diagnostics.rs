@@ -304,6 +304,9 @@ mod tests {
         }
         let batches = usize::from(complete > 0) + usize::from(pending > 0);
         TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 2,
             scope: ContextScope {
                 session_id: "s".into(),

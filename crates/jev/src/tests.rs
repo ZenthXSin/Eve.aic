@@ -50,6 +50,19 @@ pub(super) async fn server(
     oneshot::Receiver<Value>,
     tokio::task::JoinHandle<()>,
 ) {
+    server_with_session(status, body, extra, None).await
+}
+
+pub(super) async fn server_with_session(
+    status: u16,
+    body: Vec<u8>,
+    extra: &str,
+    expected_session: Option<eve_llm_api::ModelSession>,
+) -> (
+    String,
+    oneshot::Receiver<Value>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (sender, receiver) = oneshot::channel();
@@ -73,6 +86,23 @@ pub(super) async fn server(
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-jev-secret\r\n")
         );
+        if let Some(session) = expected_session {
+            let headers = headers.to_ascii_lowercase();
+            for (name, value) in [
+                ("session-id", session.session_id()),
+                ("thread-id", session.thread_id()),
+                ("x-client-request-id", session.client_request_id()),
+            ] {
+                assert!(headers.contains(&format!("\r\n{name}: {value}\r\n")));
+            }
+            for marker in [
+                "private-session-id",
+                "private-user-id",
+                "private-message-id",
+            ] {
+                assert!(!headers.contains(marker));
+            }
+        }
         let length: usize = headers
             .lines()
             .find_map(|line| {
@@ -112,9 +142,24 @@ pub(super) fn judge(base_url: String) -> JevRelationJudge {
 
 #[tokio::test]
 async fn actual_http_sends_only_scoped_text_and_binds_whole_utf8_input_locally() {
-    let (url, request, task) =
-        server(200, serde_json::to_vec(&output("correction")).unwrap(), "").await;
     let input = input();
+    let session = eve_llm_api::ModelSession::scoped(
+        "jev-relation",
+        &eve_llm_api::ContextScope {
+            session_id: input.message.target.session.session_id.clone(),
+            user_id: input.message.target.session.user_id.clone(),
+        },
+    )
+    .unwrap()
+    .with_turn(&input.message.message_id)
+    .unwrap();
+    let (url, request, task) = server_with_session(
+        200,
+        serde_json::to_vec(&output("correction")).unwrap(),
+        "",
+        Some(session),
+    )
+    .await;
     let result = judge(url).judge(input.clone()).await.unwrap();
     result.validate(&input).unwrap();
     assert_eq!(result.parts[0].intent, MessageIntent::Correction);
@@ -142,6 +187,7 @@ async fn actual_http_sends_only_scoped_text_and_binds_whole_utf8_input_locally()
         assert!(!sent.to_string().contains(marker));
     }
     assert!(sent.get("tools").is_none());
+    assert!(sent.get("prompt_cache_key").is_none());
     task.await.unwrap();
 }
 

@@ -10,6 +10,17 @@ pub const MAX_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 pub struct TurnCheckpoint {
     pub version: u32,
     pub scope: ContextScope,
+    /// 不透明模型会话；恢复须与宿主按同一 scope/task ID 重建的绑定严格相同。
+    /// 旧记录缺省 None，不根据消息正文反推标识。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_session: Option<crate::ModelSession>,
+    /// 已保存但尚未提交完整模型结果的逻辑请求序号；恢复网络请求复用其请求 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_model_request: Option<u64>,
+    /// 同一实际请求的正文/配置摘要，只用来判断是否可复用 pending 序号，不派生身份。
+    /// 旧记录缺少时恢复采用新序号；不复制持久化第二份请求正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_request_fingerprint: Option<crate::ModelRequestFingerprint>,
     /// 已配对的完整消息，只供恢复本任务，不写入主会话历史。
     pub messages: Vec<ChatMessage>,
     /// 先记下待执行批次，再开始工具；非空时只能人工核对，不能自动重放。
@@ -76,12 +87,19 @@ impl TurnCheckpoint {
                 .as_ref()
                 .is_some_and(|s| s.trim().is_empty() || s.len() > 2048)
             || self.result.as_ref().is_some_and(|s| s.trim().is_empty())
+            || self.pending_model_request.is_some_and(|request| {
+                request == 0 || request > self.provider_requests as u64 || self.result.is_some()
+            })
+            || (self.pending_request_fingerprint.is_some() && self.pending_model_request.is_none())
             || (self.result.is_some()
                 && (!self.resumable() || self.remaining.is_some() && !self.closing))
         {
             return Err(invalid());
         }
         ModelRequest::validate_parts(&self.messages, &[])?;
+        if let Some(session) = &self.model_session {
+            session.validate_scope(Some(&self.scope))?;
+        }
         let mut ids = HashSet::new();
         let mut count = 0;
         for call in self
@@ -143,6 +161,9 @@ mod tests {
 
     fn checkpoint() -> TurnCheckpoint {
         TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: ContextScope {
                 session_id: "s".into(),
@@ -215,5 +236,51 @@ mod tests {
         checkpoint.messages.last_mut().unwrap().tool_results[0].call_id = "call".into();
         checkpoint.validate(1).unwrap();
         assert!(checkpoint.resumable());
+    }
+
+    #[test]
+    fn pending_request_and_binding_survive_serialization_and_reject_mismatches() {
+        let mut frame = checkpoint();
+        let legacy = serde_json::to_value(&frame).unwrap();
+        assert!(legacy.get("model_session").is_none());
+        assert!(legacy.get("pending_model_request").is_none());
+        assert!(legacy.get("pending_request_fingerprint").is_none());
+        serde_json::from_value::<TurnCheckpoint>(legacy)
+            .unwrap()
+            .validate(0)
+            .unwrap();
+        frame.model_session = Some(
+            crate::ModelSession::scoped("main", &frame.scope)
+                .unwrap()
+                .with_turn("1")
+                .unwrap(),
+        );
+        frame.pending_model_request = Some(1);
+        frame.pending_request_fingerprint = Some(
+            crate::ModelRequestFingerprint::from_json(
+                "fixture",
+                &serde_json::json!({"input":"原文"}),
+            )
+            .unwrap(),
+        );
+        let restored: TurnCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&frame).unwrap()).unwrap();
+        assert_eq!(restored, frame);
+        frame.validate(0).unwrap();
+        let mut malformed = serde_json::to_value(&frame).unwrap();
+        malformed["pending_request_fingerprint"] = serde_json::json!("not-a-valid-digest");
+        assert!(serde_json::from_value::<TurnCheckpoint>(malformed).is_err());
+        frame.pending_model_request = None;
+        assert!(frame.validate(0).is_err());
+        for invalid in [0, 2] {
+            frame.pending_model_request = Some(invalid);
+            assert!(frame.validate(0).is_err());
+        }
+        frame.pending_model_request = Some(1);
+        frame.result = Some("已完成".into());
+        assert!(frame.validate(0).is_err());
+        frame.result = None;
+        frame.scope.user_id = "foreign-user".into();
+        assert!(frame.validate(0).is_err());
     }
 }

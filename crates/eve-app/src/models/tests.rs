@@ -262,6 +262,7 @@ fn streamed_auxiliary_usage_tail_preserves_success_under_host_deadline() {
                 let selected = resolver.resolve().unwrap();
                 assert_eq!(selected.provider_timeout, Duration::from_millis(1300));
                 let request = ModelRequest {
+                    session: None,
                     messages: vec![ChatMessage::text(ChatRole::User, "synthetic input")],
                     tools: vec![],
                 };
@@ -574,6 +575,7 @@ async fn explicit_primary_reference_rotates_only_new_selections_and_preserves_in
         selection
             .provider
             .complete(ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::text(ChatRole::User, "验证凭据快照")],
                 tools: vec![],
             })
@@ -756,6 +758,7 @@ async fn independent_auxiliary_endpoint_and_chat_protocol_never_receive_primary_
         .resolve()
         .unwrap();
     let request = || ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "独立端点验证")],
         tools: vec![],
     };
@@ -897,6 +900,7 @@ async fn auxiliary_use_routes_real_requests_keeps_old_selections_and_isolates_cr
         selected
             .provider
             .complete(ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::text(ChatRole::User, "路由验证")],
                 tools: vec![],
             })
@@ -1164,6 +1168,7 @@ async fn anonymous_auxiliary_route_uses_no_key_and_cannot_be_selected_as_primary
     selected
         .provider
         .complete(ModelRequest {
+            session: None,
             messages: vec![ChatMessage::text(ChatRole::User, "合成材料")],
             tools: vec![],
         })
