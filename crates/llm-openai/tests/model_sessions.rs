@@ -469,9 +469,17 @@ async fn serialized_binding_survives_a_real_process_restart_and_reaches_http_unc
         let url = server.url.clone();
         let serialized = serde_json::to_string(&session).unwrap();
         let output = tokio::task::spawn_blocking(move || {
-            Command::new(std::env::current_exe().unwrap())
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args(["--exact", "restored_session_http_child", "--nocapture"])
-                .env_clear()
+                .env_clear();
+            // Windows 的系统网络组件需要 SystemRoot；其余环境仍只由夹具显式传入。
+            #[cfg(windows)]
+            command.env(
+                "SystemRoot",
+                std::env::var_os("SystemRoot").expect("Windows 验收宿主缺少 SystemRoot"),
+            );
+            command
                 .env("EVE_SESSION_FIXTURE_URL", url)
                 .env("EVE_SESSION_FIXTURE_RECORD", serialized)
                 .env(
