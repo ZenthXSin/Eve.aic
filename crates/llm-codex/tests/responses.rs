@@ -2,7 +2,7 @@
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextScope, LlmError, LlmFuture, LlmProvider, ModelRequest,
     ModelResponse, ModelSession, ModelTextSink, ModelUsage, ModelUsageObserver,
-    ProviderFailureKind, ToolCall, ToolDefinition, ToolFailureCode, ToolResult,
+    ProviderFailureKind, ResponseMode, ToolCall, ToolDefinition, ToolFailureCode, ToolResult,
 };
 use eve_llm_codex::{CodexConfig, CodexProvider, StreamTimeoutPolicy};
 use serde_json::{Value, json};
@@ -262,6 +262,113 @@ impl ModelTextSink for Sink {
         self.0.lock().unwrap().push_str(&text);
         Box::pin(async { Ok(()) })
     }
+}
+
+#[tokio::test]
+async fn recovery_fingerprint_matches_actual_wire_without_token_or_request_ordinal() {
+    let fixture = Fixture::start(vec![
+        Reply::text("第一轮完成").turn_token("synthetic-turn-token"),
+        Reply::text("第二轮完成"),
+    ])
+    .await;
+    let provider = fixture.provider();
+    let original = request(session());
+    let fingerprint = provider
+        .request_fingerprint(&original, ResponseMode::Complete)
+        .unwrap()
+        .unwrap();
+    assert!(fixture.captures().is_empty(), "计算指纹不能连接服务端");
+    assert_eq!(
+        Some(fingerprint.clone()),
+        provider
+            .request_fingerprint(&original, ResponseMode::Stream)
+            .unwrap()
+    );
+    let mut same_destination = fixture.config();
+    same_destination.responses_url.push('/');
+    assert_eq!(
+        Some(fingerprint.clone()),
+        CodexProvider::anonymous(same_destination)
+            .unwrap()
+            .request_fingerprint(&original, ResponseMode::Complete)
+            .unwrap(),
+        "URL规范化不改变实际端点"
+    );
+    provider.complete(original.clone()).await.unwrap();
+    let second = request(session().for_request(2));
+    assert_eq!(
+        Some(fingerprint.clone()),
+        provider
+            .request_fingerprint(&second, ResponseMode::Complete)
+            .unwrap(),
+        "取得服务器token和改变请求序号不改变原请求正文"
+    );
+    provider.complete(second).await.unwrap();
+    let captures = fixture.captures();
+    assert_eq!(captures.len(), 2);
+    assert_eq!(captures[0].body, captures[1].body);
+    assert_ne!(
+        captures[0].headers["x-client-request-id"],
+        captures[1].headers["x-client-request-id"]
+    );
+    assert!(!captures[0].headers.contains_key("x-codex-turn-state"));
+    assert_eq!(
+        captures[1].headers["x-codex-turn-state"],
+        "synthetic-turn-token"
+    );
+    assert_eq!(
+        fingerprint,
+        eve_llm_api::ModelRequestFingerprint::from_json(
+            "codex-responses-wire-v1",
+            &(fixture.config().responses_url, &captures[0].body),
+        )
+        .unwrap(),
+        "恢复摘要必须对应实际发出的编码正文和端点"
+    );
+
+    let mut changed = original.clone();
+    changed.messages[0].text = Some("用户刚刚纠正了输入".into());
+    assert_ne!(
+        Some(fingerprint.clone()),
+        provider
+            .request_fingerprint(&changed, ResponseMode::Complete)
+            .unwrap()
+    );
+    let mut changed_tools = original.clone();
+    changed_tools.tools[0].description = "新的工具说明".into();
+    assert_ne!(
+        Some(fingerprint.clone()),
+        provider
+            .request_fingerprint(&changed_tools, ResponseMode::Complete)
+            .unwrap()
+    );
+    let mut configured = fixture.config();
+    configured.max_output_tokens = Some(1024);
+    assert_ne!(
+        Some(fingerprint.clone()),
+        CodexProvider::anonymous(configured)
+            .unwrap()
+            .request_fingerprint(&original, ResponseMode::Complete)
+            .unwrap()
+    );
+    let mut destination = fixture.config();
+    destination.responses_url = format!("{}/different/responses", fixture.base);
+    assert_ne!(
+        Some(fingerprint.clone()),
+        CodexProvider::anonymous(destination)
+            .unwrap()
+            .request_fingerprint(&original, ResponseMode::Complete)
+            .unwrap()
+    );
+    assert_eq!(
+        Some(fingerprint),
+        CodexProvider::new(fixture.config(), "synthetic-credential")
+            .unwrap()
+            .request_fingerprint(&original, ResponseMode::Complete)
+            .unwrap(),
+        "凭据不进入恢复摘要"
+    );
+    assert_eq!(fixture.captures().len(), 2, "指纹比较不发额外请求");
 }
 
 #[tokio::test]

@@ -15,8 +15,8 @@ use codex_api::{Compression, ResponsesClient};
 use codex_client::{CodexHttpClient, Provider, ReqwestTransport, RetryConfig};
 pub use config::{CodexConfig, StreamTimeoutPolicy};
 use eve_llm_api::{
-    LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelTextSink,
-    ModelUsageObserver,
+    LlmError, LlmFuture, LlmProvider, ModelRequest, ModelRequestFingerprint, ModelResponse,
+    ModelTextSink, ModelUsageObserver, ResponseMode,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout_at};
@@ -192,6 +192,25 @@ impl CodexProvider {
 }
 
 impl LlmProvider for CodexProvider {
+    fn request_fingerprint(
+        &self,
+        request: &ModelRequest,
+        _mode: ResponseMode,
+    ) -> Result<Option<ModelRequestFingerprint>, LlmError> {
+        let session = request.session.as_ref().ok_or_else(|| {
+            LlmError::Configuration(
+                "Codex 原适配器需要宿主提供独立 ModelSession；不能使用随机或全局会话".into(),
+            )
+        })?;
+        // complete 与 stream 都走同一原 Responses SSE 正文；sink 不改变线协议。
+        // 只做与实际请求相同的编码，不取得轮次缓存、锁或服务器 token，不发网络请求。
+        // complete_json 不是 Runtime 的 ResponseMode，不参与待恢复普通请求的指纹。
+        let body = mapping::encode(&self.config, request, session, false)?;
+        // 与原 Provider::url_for_path("/responses") 相同；配置可能带末尾斜线或大小写。
+        let endpoint = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        ModelRequestFingerprint::from_json("codex-responses-wire-v1", &(endpoint, body)).map(Some)
+    }
+
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         Box::pin(self.request(request, false, None))
     }
