@@ -162,8 +162,10 @@ if (scenario.script) {
       if (!message) throw new Error("wrong_reply_id");
       if (cmd.type === "progress") {
         commands.push(cmd);
-        if (!message.hold_progress) send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: !message.fail_progress, message_id: "progress-" + cmd.id + "-" + cmd.index,
-          ...(message.progress_diagnostic ?? {}) });
+        // 单独控制每个真实 progress 序号；用于旧窗口失败、新锚点成功和未回执恢复的宿主验收。
+        const { hold = false, ...diagnostic } = message.progress_diagnostics?.[cmd.index] ?? message.progress_diagnostic ?? {};
+        if (!message.hold_progress && !hold) send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: !message.fail_progress, message_id: "progress-" + cmd.id + "-" + cmd.index,
+          ...diagnostic });
         continue;
       }
       if (cmd.type === "sticker") {

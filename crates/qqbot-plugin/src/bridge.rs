@@ -9,8 +9,8 @@ use crate::{
         QqOutreachMoment, QqOutreachResult, valid_text as valid_outreach_text,
     },
     state::{
-        Ledger, Message, Part, PartState, Progress, ReceiptState, Segments, StickerPart,
-        passive_progress, valid_message_id,
+        Ledger, Message, Part, PartState, Progress, Receipt, ReceiptState, Segments, StickerPart,
+        passive_progress, passive_progress_at, valid_message_id,
     },
 };
 use eve_control_api::{
@@ -149,6 +149,25 @@ fn delivery_log(ctx: &PluginContext, code: &str, frame: &Value) {
         LogLevel::Warn
     };
     if let Ok(mut entry) = LogEntry::new(level, "eve.qqbot", code) {
+        if let Some(id) = frame
+            .get("input_message_id")
+            .or_else(|| frame.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| valid_message_id(id))
+        {
+            entry = entry.with_field("input_message_id", id);
+        }
+        if let Some(index) = frame
+            .get("progress_index")
+            .or_else(|| {
+                (frame.get("progress").and_then(Value::as_bool) == Some(true))
+                    .then(|| frame.get("index"))
+                    .flatten()
+            })
+            .and_then(Value::as_u64)
+        {
+            entry = entry.with_field("progress_index", index.to_string());
+        }
         for name in [
             "http_status",
             "biz_code",
@@ -175,6 +194,12 @@ fn delivery_log(ctx: &PluginContext, code: &str, frame: &Value) {
                     "connection",
                     "tls",
                     "passive_window_elapsed",
+                    "passive_window_missing",
+                    "passive_quota_exhausted",
+                    "stale_decision",
+                    "duplicate_text",
+                    "reply_anchor_mismatch",
+                    "progress_limit",
                     "passive",
                     "proactive",
                     "sent",
@@ -196,6 +221,67 @@ fn passive_limit(message: &Message) -> usize {
     } else {
         crate::QQ_MAX_SEGMENTS
     }
+}
+/// 新被动窗口只能属于已持久并入当前轮的同群、同用户真实消息。
+fn live_group_reply_anchor(
+    ledger: &Ledger,
+    app: &str,
+    parent: &Message,
+    session: &SessionKey,
+    latest: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let mismatch = "reply_anchor_mismatch";
+    let latest = latest.filter(|id| valid_message_id(id)).ok_or(mismatch)?;
+    let parent_index = ledger.find(app, &parent.id).ok_or(mismatch)?;
+    let original = &ledger.entries[parent_index];
+    let same_route = |message: &Message| {
+        message.scope == "group"
+            && message.scope == parent.scope
+            && message.target_id == parent.target_id
+            && message.user_id == parent.user_id
+            && message.session_key(app).is_ok_and(|key| &key == session)
+    };
+    if original.state != ReceiptState::Processing || !same_route(&original.message) {
+        return Err(mismatch);
+    }
+    if latest == parent.id {
+        return Ok(None);
+    }
+    let child = &ledger.entries[ledger.find(app, latest).ok_or(mismatch)?];
+    if child.state != ReceiptState::Merged
+        || child.merged_into.as_deref() != Some(parent.id.as_str())
+        || !same_route(&child.message)
+    {
+        return Err(mismatch);
+    }
+    Ok(Some(latest.into()))
+}
+/// 只有明确未进入 SDK 的窗口拒发，才允许模型在另一个真实窗口重新决定同文发送。
+fn duplicate_progress(
+    entry: &Receipt,
+    text: &str,
+    image_path: Option<&str>,
+    reply_anchor: Option<&str>,
+    decision_id: Option<&str>,
+    rejected_before_send: &BTreeSet<(String, usize)>,
+) -> bool {
+    entry.progress.iter().enumerate().any(|(part, previous)| {
+        previous.text.trim() == text.trim()
+            && previous.image_path.as_deref() == image_path
+            && !(previous.state == PartState::Failed
+                && reply_anchor.is_some()
+                && previous.reply_anchor.as_deref() != reply_anchor
+                && decision_id.is_some()
+                && previous.decision_id.as_deref() != decision_id
+                && rejected_before_send.contains(&(entry.message.id.clone(), part)))
+    })
+}
+fn progress_rejected_before_send(frame: &Value) -> bool {
+    frame.get("ok").and_then(Value::as_bool) == Some(false)
+        && matches!(
+            frame.get("failure_kind").and_then(Value::as_str),
+            Some("passive_window_elapsed" | "passive_window_missing" | "passive_quota_exhausted")
+        )
 }
 fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
     if enabled {
@@ -1047,6 +1133,13 @@ fn mark_failed(ledger: &mut Ledger, ctx: &PluginContext, app: &str, id: &str) ->
 async fn finish(stdin: &mut ChildStdin, id: &str) -> PluginResult<()> {
     write(stdin, json!({"type":"finish","version":1,"id":id})).await
 }
+async fn finish_live_reply(stdin: &mut ChildStdin, id: &str, parent_id: &str) -> PluginResult<()> {
+    write(
+        stdin,
+        json!({"type":"finish","version":1,"id":id,"keep_live_reply":true,"parent_id":parent_id}),
+    )
+    .await
+}
 async fn completed(
     active: &mut [Active],
     eligible: &[bool],
@@ -1368,6 +1461,8 @@ pub(crate) async fn run(
     let (narrated_tx, mut narrated_rx) = mpsc::channel(1);
     let mut narrating = false;
     let mut live_waiting: BTreeMap<String, crate::live::LiveSend> = BTreeMap::new();
+    // 仅当前进程确认尚未进入 SDK 的拒发；未知/旧失败不恢复为可重发。
+    let mut rejected_before_send: BTreeSet<(String, usize)> = BTreeSet::new();
     // 按原始消息 ID 记录的当前步骤；只用于慢步骤进度，不持久化。
     let mut slow_steps: BTreeMap<String, SlowStep> = BTreeMap::new();
     let mut slow_reported = BTreeSet::new();
@@ -1420,6 +1515,7 @@ pub(crate) async fn run(
             slow_steps.retain(|id, step| active.iter().any(|a| &a.message.id == id && a.key == step.event.key));
             slow_reported.retain(|id| active.iter().any(|a| &a.message.id == id));
             last_progress.retain(|id, _| active.iter().any(|a| &a.message.id == id));
+            rejected_before_send.retain(|(id, _)| active.iter().any(|a| &a.message.id == id));
             // 工具结束、运行时消费输入或新原话到来后，旧交流决定立即失效。
             let stale_foreground: Vec<_> = foreground_inputs.iter().filter_map(|(anchor,input)| {
                 let current=live_dialogue.as_ref().is_some_and(|live| input.current(live,&foreground_activity,control.as_ref()))
@@ -1761,6 +1857,21 @@ pub(crate) async fn run(
                         || stages || slow_progress.as_ref().is_some_and(|policy| policy.tool_milestones()))
                     && let Some(text) = text.or_else(|| progress_text(&event.event.kind)) {
                     let index = ledger.find(&config.app_id, &message.id).expect("active receipt");
+                    let explicit_send = live_waiting.contains_key(&message.id);
+                    // 持久回执和 Node 命令共用同一次读取的锚点，不能落盘后再借另一个窗口。
+                    let based_on_message_id = conversations.latest_message_id(&event.key.session)?;
+                    let reply_anchor = if explicit_send && message.scope == "group" {
+                        match live_group_reply_anchor(&ledger, &config.app_id, &message,
+                            &event.key.session, based_on_message_id.as_deref()) {
+                            Ok(anchor) => anchor,
+                            Err(reason) => {
+                                delivery_log(&ctx, "progress_not_sent", &json!({"id":message.id,
+                                    "progress_index":ledger.entries[index].progress.len(),"failure_kind":reason,"ok":false}));
+                                if let Some(outgoing) = live_waiting.remove(&message.id) { outgoing.complete(LiveDelivery::not_sent(Some(reason))); }
+                                continue;
+                            }
+                        }
+                    } else {None};
                     let entry = &mut ledger.entries[index];
                     let automatic_start = matches!(&event.event.kind, TurnEventKind::ToolBatchStarted { calls }
                         if !calls.iter().any(|c| c.name == "send_message")
@@ -1772,9 +1883,11 @@ pub(crate) async fn run(
                     let interval_ok = necessary_question || matches!(event.event.kind, TurnEventKind::AssistantMessage { .. }) || !stages || entry.progress.is_empty()
                         || last_progress.get(&message.id).is_none_or(|last| last.elapsed() >= min_interval)
                         || matches!(event.event.kind, TurnEventKind::ContextCompactionStarted);
-                    // 未知/失败的正文不重发；新的进度只冷却一分钟，不永久禁言整轮。
+                    // 未知结果始终不重发；明确窗口拒发仅允许在新真实锚点由模型作出新的发送决定。
                     let image_path=live_waiting.get(&message.id).and_then(|s|s.image.clone());
-                    let duplicate = entry.progress.iter().any(|p| p.text.trim() == text.trim() && p.image_path==image_path);
+                    let decision_id = live_waiting.get(&message.id).map(|send| send.call_id.clone());
+                    let duplicate = duplicate_progress(entry, &text, image_path.as_deref(),
+                        reply_anchor.as_deref(), decision_id.as_deref(), &rejected_before_send);
                     let cooling_down = !matches!(event.event.kind, TurnEventKind::AssistantMessage { .. })
                         && entry.progress.last().is_some_and(|p| matches!(p.state, PartState::Failed | PartState::Unknown))
                         && last_progress.get(&message.id).is_some_and(|last| last.elapsed() < Duration::from_secs(60));
@@ -1784,27 +1897,35 @@ pub(crate) async fn run(
                             completed_calls >= [1, 30, 70].get(entry.progress.len()).copied().unwrap_or(usize::MAX),
                         _ => true,
                     };
-                    let explicit_send = live_waiting.contains_key(&message.id);
                     let scope_budget = explicit_send || message.scope == "c2c" || necessary_question || ordinary_count < 2;
+                    let progress_limit = if explicit_send || stages {64} else {3};
+                    if explicit_send && (duplicate || entry.progress.len() >= progress_limit) {
+                        let reason = if duplicate {"duplicate_text"} else {"progress_limit"};
+                        delivery_log(&ctx, "progress_not_sent", &json!({"id":message.id,
+                            "progress_index":entry.progress.len(),"failure_kind":reason,"ok":false}));
+                        if let Some(outgoing) = live_waiting.remove(&message.id) { outgoing.complete(LiveDelivery::not_sent(Some(reason))); }
+                        continue;
+                    }
                     if scope_budget && entry.state == ReceiptState::Processing && !skip_start && interval_ok && legacy_milestone
-                        && !duplicate && !cooling_down && entry.progress.len() < if explicit_send || stages {64} else {3} {
+                        && !duplicate && !cooling_down && entry.progress.len() < progress_limit {
                         let part = entry.progress.len();
                         // 系统进度不能把紧接着的正式答复挤到主动发送；仍留一个原被动名额。
                         let passive_threshold = if explicit_send && entry.progress.iter().any(|p| p.decision_id.is_none()) {3} else {2};
                         let proactive = message.scope == "c2c" && (explicit_send || stages) && (passive_progress(entry) >= passive_threshold || elapsed >= Duration::from_secs(230));
-                        let decision_id = live_waiting.get(&message.id).map(|send| send.call_id.clone());
-                        if !proactive && passive_progress(entry) >= 3 {
-                            if let Some(outgoing) = live_waiting.remove(&message.id) { outgoing.complete(LiveDelivery::NotSent); }
+                        if !proactive && passive_progress_at(entry, reply_anchor.as_deref().unwrap_or(&message.id)) >= 3 {
+                            delivery_log(&ctx, "progress_not_sent", &json!({"id":message.id,
+                                "progress_index":part,"failure_kind":"passive_quota_exhausted","ok":false}));
+                            if let Some(outgoing) = live_waiting.remove(&message.id) { outgoing.complete(LiveDelivery::not_sent(Some("passive_quota_exhausted"))); }
                             continue;
                         }
                         entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive, necessary: necessary_question,
-                            decision_id, platform_message_id: None,image_path:image_path.clone() });
+                            decision_id, platform_message_id: None,image_path:image_path.clone(), reply_anchor });
                         last_progress.insert(message.id.clone(), tokio::time::Instant::now());
                         ledger.save(&ctx)?;
                         // 同步落盘后再次核验；写出后未知结果不会自动补发。
                         if control.accepts(&event) && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested))
                             && live_waiting.get(&message.id).is_none_or(|send| send.current()) {
-                            let mut frame=json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text,"proactive":proactive,"explicit":explicit_send,"based_on_message_id":conversations.latest_message_id(&event.key.session)?});
+                            let mut frame=json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text,"proactive":proactive,"explicit":explicit_send,"based_on_message_id":based_on_message_id});
                             if let Some(path)=image_path {frame["image_path"]=json!(path);}
                             write(&mut stdin,frame).await?;
                             progress_delivery.push(ProgressDelivery { message: message.clone(), part, host_activity: false,
@@ -1856,7 +1977,7 @@ pub(crate) async fn run(
                 let part = ledger.entries[index].progress.len();
                 ledger.entries[index].progress.push(Progress {
                     text: notice.text.clone(), state: PartState::Sending, proactive: false,
-                    necessary: false, decision_id: None, platform_message_id: None, image_path: None,
+                    necessary: false, decision_id: None, platform_message_id: None, image_path: None, reply_anchor: None,
                 });
                 ledger.save(&ctx)?;
                 if host_progress.current(&notice)
@@ -2819,6 +2940,9 @@ pub(crate) async fn run(
                             ledger.entries[index].progress[part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.entries[index].progress[part].platform_message_id = if ok && ledger.entries[index].progress[part].decision_id.is_some() { frame.get("message_id").and_then(Value::as_str).map(str::to_owned) } else { None };
                             ledger.save(&ctx)?;
+                            if progress_rejected_before_send(&frame) {
+                                rejected_before_send.insert((id.clone(), part));
+                            }
                             if progress.host_activity {
                                 host_progress::log_delivery(&ctx,&config.app_id,id,part,
                                     ledger.entries[index].progress[part].state,frame.get("message_id").and_then(Value::as_str));
@@ -2833,7 +2957,7 @@ pub(crate) async fn run(
                                 .is_some_and(|decision| live_waiting.get(id).is_some_and(|send| send.call_id == decision))
                                 && let Some(outgoing) = live_waiting.remove(id) {
                                 outgoing.complete(if ok { LiveDelivery::Sent(frame["message_id"].as_str().unwrap().to_owned()) }
-                                    else if delivery_unknown(&frame) { LiveDelivery::Unknown } else if frame.get("failure_kind").and_then(Value::as_str)==Some("stale_decision") {LiveDelivery::Stale} else { LiveDelivery::NotSent });
+                                    else if delivery_unknown(&frame) { LiveDelivery::Unknown } else if frame.get("failure_kind").and_then(Value::as_str)==Some("stale_decision") {LiveDelivery::Stale} else { LiveDelivery::not_sent(frame.get("failure_kind").and_then(Value::as_str)) });
                             }
                             progress_delivery.remove(position);
                         }
@@ -3145,7 +3269,9 @@ pub(crate) async fn run(
                                                 ledger.steer(&ctx, &config.app_id, &message.id, &parent_id)?;
                                                 conversations.advance_review_anchor(&config.app_id, &message)
                                             })? {
-                                                if message.scope=="c2c" && let Some(speaker)=&speech
+                                                if message.scope=="group" {
+                                                    finish_live_reply(&mut stdin, &message.id, &parent_id).await?;
+                                                } else if message.scope=="c2c" && let Some(speaker)=&speech
                                                     && let Some(batch)=foreground_activity.current(&current_key,turn_id) {
                                                     let input=ForegroundInput::new(batch,message.id.clone());
                                                     speaker.enqueue(input.event.clone())?;
@@ -3300,6 +3426,180 @@ mod authored_tests;
 #[cfg(test)]
 mod tests {
     use super::preempts_natural;
+
+    fn live_anchor_ledger() -> super::Ledger {
+        let mut ledger = super::Ledger::default();
+        for (id, state, merged_into) in [
+            ("parent", "Processing", None),
+            ("child", "Merged", Some("parent")),
+        ] {
+            ledger.entries.push(
+                serde_json::from_value(serde_json::json!({
+                    "app_id":"app", "message": {
+                        "id":id,"scope":"group","target_id":"group","user_id":"user","text":"原话"
+                    }, "state":state,"reply":null,"merged_into":merged_into
+                }))
+                .unwrap(),
+            );
+        }
+        ledger
+    }
+
+    #[test]
+    fn live_group_anchor_accepts_only_current_parent_or_its_merged_input() {
+        let ledger = live_anchor_ledger();
+        let parent = &ledger.entries[0].message;
+        let session = parent.session_key("app").unwrap();
+        assert_eq!(
+            super::live_group_reply_anchor(&ledger, "app", parent, &session, Some("parent")),
+            Ok(None)
+        );
+        assert_eq!(
+            super::live_group_reply_anchor(&ledger, "app", parent, &session, Some("child")),
+            Ok(Some("child".into()))
+        );
+        for invalid in [None, Some("missing"), Some("bad\nanchor")] {
+            assert_eq!(
+                super::live_group_reply_anchor(&ledger, "app", parent, &session, invalid),
+                Err("reply_anchor_mismatch")
+            );
+        }
+        let other_session = eve_session_api::SessionKey::new("other", "other").unwrap();
+        assert_eq!(
+            super::live_group_reply_anchor(&ledger, "app", parent, &other_session, Some("child")),
+            Err("reply_anchor_mismatch")
+        );
+    }
+
+    #[test]
+    fn live_group_anchor_rejects_cross_identity_and_uncommitted_or_retired_routes() {
+        for field in [
+            "app",
+            "scope",
+            "target",
+            "user",
+            "state",
+            "merged_into",
+            "parent",
+        ] {
+            let mut ledger = live_anchor_ledger();
+            let parent = ledger.entries[0].message.clone();
+            let session = parent.session_key("app").unwrap();
+            let child = &mut ledger.entries[1];
+            match field {
+                "app" => child.app_id = "other".into(),
+                "scope" => child.message.scope = "c2c".into(),
+                "target" => child.message.target_id = "other-group".into(),
+                "user" => child.message.user_id = "other-user".into(),
+                "state" => child.state = super::ReceiptState::Processing,
+                "merged_into" => child.merged_into = Some("other-parent".into()),
+                "parent" => ledger.entries[0].state = super::ReceiptState::Handled,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                super::live_group_reply_anchor(&ledger, "app", &parent, &session, Some("child")),
+                Err("reply_anchor_mismatch"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_text_needs_new_call_and_new_anchor_after_confirmed_preflight_rejection() {
+        let mut ledger = live_anchor_ledger();
+        let entry = &mut ledger.entries[0];
+        entry.progress.push(super::Progress {
+            text: "已核对的结果".into(),
+            state: super::PartState::Failed,
+            proactive: false,
+            necessary: false,
+            decision_id: Some("old-call".into()),
+            platform_message_id: None,
+            image_path: None,
+            reply_anchor: None,
+        });
+        let confirmed = super::BTreeSet::from([("parent".into(), 0)]);
+        let missing = super::BTreeSet::new();
+        assert!(!super::duplicate_progress(
+            entry,
+            "已核对的结果",
+            None,
+            Some("child"),
+            Some("new-call"),
+            &confirmed,
+        ));
+        for (anchor, call, known) in [
+            (None, Some("new-call"), &confirmed),
+            (Some("child"), Some("old-call"), &confirmed),
+            (Some("child"), None, &confirmed),
+            (Some("child"), Some("new-call"), &missing),
+        ] {
+            assert!(super::duplicate_progress(
+                entry,
+                "已核对的结果",
+                None,
+                anchor,
+                call,
+                known,
+            ));
+        }
+        entry.progress[0].reply_anchor = Some("child".into());
+        assert!(super::duplicate_progress(
+            entry,
+            "已核对的结果",
+            None,
+            Some("child"),
+            Some("new-call"),
+            &confirmed,
+        ));
+        entry.progress[0].reply_anchor = None;
+        for state in [
+            super::PartState::Sent,
+            super::PartState::Unknown,
+            super::PartState::Sending,
+        ] {
+            entry.progress[0].state = state;
+            assert!(super::duplicate_progress(
+                entry,
+                "已核对的结果",
+                None,
+                Some("child"),
+                Some("new-call"),
+                &confirmed,
+            ));
+        }
+    }
+
+    #[test]
+    fn only_explicit_window_preflight_failures_are_known_unsent() {
+        for kind in [
+            "passive_window_elapsed",
+            "passive_window_missing",
+            "passive_quota_exhausted",
+        ] {
+            assert!(super::progress_rejected_before_send(&serde_json::json!({
+                "ok":false,"failure_kind":kind
+            })));
+            assert!(!super::progress_rejected_before_send(&serde_json::json!({
+                "ok":true,"failure_kind":kind
+            })));
+        }
+        for kind in [
+            "http",
+            "timeout",
+            "connection",
+            "transport_unknown",
+            "stale_decision",
+            "new-kind",
+        ] {
+            assert!(!super::progress_rejected_before_send(&serde_json::json!({
+                "ok":false,"failure_kind":kind,"http_status":500
+            })));
+        }
+        assert!(!super::progress_rejected_before_send(
+            &serde_json::json!({"ok":false})
+        ));
+    }
 
     #[derive(Default)]
     struct RawCapture(std::sync::Mutex<Vec<crate::QqRawMessage>>);

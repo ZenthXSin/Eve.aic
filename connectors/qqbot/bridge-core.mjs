@@ -233,6 +233,9 @@ export function optionsFromEnv(env) {
 export function createBridge(bot, emit, limit = 128, now = () => performance.now(), group = {}, timers = {}) {
   const pending = new Map();
   const passiveWindows = new Map();
+  // 群内合入长轮次的新输入保留原始窗口；账本仍属于父输入。
+  const liveReplies = new Map();
+  const retiredLiveInputs = new Map();
   const latestInput = new Map();
   const routeKey = (scope, target, sender) => JSON.stringify([scope,target,sender]);
   const pushing = new Set();
@@ -262,6 +265,14 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (!warned.has(code)) { warned.add(code); send({ type: "warning", code }); }
   };
   const ingress = createIngressDiagnostics(send, now, timers);
+  function clearLiveReplies(parentId) {
+    liveReplies.delete(parentId);
+    for (const [id, parent] of retiredLiveInputs) if (parent === parentId) retiredLiveInputs.delete(id);
+  }
+  function forgetPending(id) {
+    clearLiveReplies(id);
+    pending.delete(id);
+  }
   const replyMention = item => group.mention !== false && item.target.scope === "group" ? item.senderId : undefined;
   function mentionedText(target, text, mention) {
     if (mention === undefined || mention === null) return text;
@@ -303,6 +314,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     closed = true;
     pending.clear();
     passiveWindows.clear();
+    liveReplies.clear();
+    retiredLiveInputs.clear();
     latestInput.clear();
     bot.stop();
   };
@@ -322,7 +335,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     const quoted = quotedMessage(msg);
     const rejected = routeOrTextRejection(msg);
     if (rejected) { ingress.reject(rejected, msg, attachments, undefined, attachmentRejections); return; }
-    if (pending.has(msg.messageId)) { warn("duplicate_pending"); return; }
+    if (pending.has(msg.messageId) || retiredLiveInputs.has(msg.messageId)) { warn("duplicate_pending"); return; }
     const restrictionOnly = pending.size >= limit;
     if (restrictionOnly) warn("pending_limit");
     const text = userText(msg, bot.appId);
@@ -349,6 +362,10 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     latestInput.set(inputKey,msg.messageId);
     for (const [id, item] of passiveWindows) {
       if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS || routeKey(item.target.scope,item.target.targetId,item.senderId) === inputKey) passiveWindows.delete(id);
+    }
+    for (const [parentId, window] of liveReplies) {
+      const item = window.item;
+      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS || routeKey(item.target.scope,item.target.targetId,item.senderId) === inputKey) liveReplies.delete(parentId);
     }
     if (msg.kind === "group") {
       const groupKey=routeKey("group",target.targetId,"*");
@@ -379,7 +396,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   // One part at a time, strictly in order; a failed or final part ends the reply.
   function reject(id, index) {
     warn("invalid_reply_text");
-    pending.delete(id);
+    forgetPending(id);
     send({ type: "delivery", id, ...(index === undefined ? {} : { index }), ok: false });
   }
   // A late final answer uses the original conversation's proactive route once.
@@ -421,7 +438,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       item.next = index + 1;
       // 最后一段之后还有表情包时保留本条，供随后的 sticker 帧使用同一个被动目标。
       if (ok && item.next === count && frame.sticker_follows === true && !item.finished) item.awaitSticker = true;
-      else if (!ok || item.next === count || item.finished) pending.delete(frame.id);
+      else if (!ok || item.next === count || item.finished) forgetPending(frame.id);
     }
   }
   // 正文发完后的一张表情包：只走原消息的被动窗口，过期或失败都不重试、不改走主动消息。
@@ -431,7 +448,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     item.awaitSticker = false;
     if (typeof path !== "string" || !path || path.length > 4096 || /[\p{Cc}]/u.test(path)) {
       warn("invalid_sticker");
-      pending.delete(frame.id);
+      forgetPending(frame.id);
       send({ type: "delivery", id: frame.id, sticker: true, ok: false });
       return;
     }
@@ -449,11 +466,65 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       send({ type: "delivery", id: frame.id, sticker: true, ok: false, ...diagnostic(err) });
     } finally {
       item.sending = false;
-      pending.delete(frame.id);
+      forgetPending(frame.id);
+    }
+  }
+  // 新窗口只替换实际平台路由；父输入的序号继续递增，原窗口额度不跟着增长。
+  async function liveReplyProgress(frame, parent) {
+    const index = parent.progress ?? 0;
+    if (parent.sending || parent.next !== undefined || frame.index !== index || index >= 64) {
+      warn("invalid_progress"); return;
+    }
+    parent.passiveProgress ??= index;
+    parent.progress = index + 1;
+    const window = liveReplies.get(frame.id);
+    const item = window?.item;
+    const elapsed = item ? Math.max(0, Math.floor(now() - item.receivedAt)) : undefined;
+    const reject = failure_kind => send({type:"delivery",id:frame.id,progress:true,index,ok:false,
+      delivery_mode:"passive",...(elapsed === undefined ? {} : {elapsed_ms:elapsed}),failure_kind});
+    if (!validMessageId(frame.based_on_message_id)) {reject("stale_decision");return;}
+    if (!window || window.anchor !== frame.based_on_message_id) {reject("passive_window_missing");return;}
+    if (window.parent !== parent || parent.finished || frame.proactive === true || frame.host_activity === true ||
+        item.target.scope !== "group" || item.target.targetId !== parent.target.targetId || item.senderId !== parent.senderId ||
+        latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) !== window.anchor) {
+      reject("stale_decision");return;
+    }
+    const used = item.passiveProgress ?? item.progress ?? 0;
+    if (used >= 3) {reject("passive_quota_exhausted");return;}
+    // 与宿主持久回执一致：确认失败和未知也占一次尝试，不退回额度。
+    item.passiveProgress = used + 1;
+    if (elapsed >= PASSIVE_REPLY_WINDOW_MS) {reject("passive_window_elapsed");return;}
+    const image = frame.image_path;
+    if (!validText(frame.text) || Buffer.byteLength(frame.text) > 32768 ||
+        (image !== undefined && (typeof image !== "string" || !image || image.length > 4096 || /[\p{Cc}]/u.test(image)))) {
+      reject("reply_limit");return;
+    }
+    parent.sending = true;
+    item.sending = true;
+    try {
+      const guard = () => !closed && pending.get(frame.id) === parent && !parent.finished && parent.next === undefined &&
+        liveReplies.get(frame.id) === window && now() - item.receivedAt < PASSIVE_REPLY_WINDOW_MS &&
+        latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) === window.anchor;
+      const result = image === undefined
+        ? await sendText(item.target,frame.text,replyMention(item),SEND_TIMEOUT_MS,guard)
+        : await sendImage(item.target,image,guard);
+      if (image === undefined) item.explicitTextSent = true;
+      send({type:"delivery",id:frame.id,progress:true,index,ok:true,delivery_mode:"passive",elapsed_ms:elapsed,
+        message_id:image === undefined ? result.id : result.message.id});
+    } catch (err) {
+      send({type:"delivery",id:frame.id,progress:true,index,ok:false,delivery_mode:"passive",elapsed_ms:elapsed,...diagnostic(err)});
+    } finally {
+      parent.sending = false;
+      item.sending = false;
+      if (parent.finished) forgetPending(frame.id);
     }
   }
   // Progress consumes the original passive window, but never completes its reply.
   async function progress(frame, item) {
+    if (frame.explicit === true && item.target.scope === "group" &&
+        frame.based_on_message_id !== undefined && frame.based_on_message_id !== frame.id) {
+      await liveReplyProgress(frame,item);return;
+    }
     const hostActivity = frame.host_activity === true;
     const index = item.progress ?? 0;
     if (item.sending || item.next !== undefined || frame.index !== index || index >= 64 || (frame.proactive !== true && (item.passiveProgress ?? index) >= 3)) {
@@ -511,7 +582,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       send({ type: "delivery", id: frame.id, progress: true, index, ok: false, ...diagnostic(err) });
     } finally {
       item.sending = false;
-      if (item.finished) pending.delete(frame.id);
+      if (item.finished) forgetPending(frame.id);
     }
   }
   // 文件走主动投递：目标由 Rust 从已确认的回执推出，路径由宿主解析好，这里只校验形状。
@@ -639,9 +710,32 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if (frame.type === "passive_push") { await passivePush(frame); return; }
       if (frame.type === "push") { await push(frame); return; }
       if (frame.type === "file") { await pushFile(frame); return; }
+      if (frame.type === "finish") {
+        const parentId = retiredLiveInputs.get(frame.id);
+        if (parentId !== undefined) {
+          if (frame.keep_live_reply !== true && liveReplies.get(parentId)?.anchor === frame.id) liveReplies.delete(parentId);
+          return; // 已合并的输入不能靠重复 finish 恢复窗口、时间或额度。
+        }
+        clearLiveReplies(frame.id);
+      }
       const item = pending.get(frame.id);
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
+        if (frame.keep_live_reply === true) {
+          const parent = validMessageId(frame.parent_id) && frame.parent_id !== frame.id ? pending.get(frame.parent_id) : undefined;
+          if (parent && parent.target.scope === "group" && item.target.scope === "group" &&
+              parent.target.targetId === item.target.targetId && parent.senderId === item.senderId &&
+              !parent.finished && parent.next === undefined && !item.sending && !item.finished && item.next === undefined &&
+              latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) === frame.id &&
+              now() - item.receivedAt < PASSIVE_REPLY_WINDOW_MS && (item.passiveProgress ?? item.progress ?? 0) < 3 &&
+              (liveReplies.has(frame.parent_id) || liveReplies.size < limit) && retiredLiveInputs.size < 8192) {
+            liveReplies.set(frame.parent_id,{anchor:frame.id,parent,item});
+            retiredLiveInputs.set(frame.id,frame.parent_id);
+            pending.delete(frame.id); // 转移同一对象，保留真实接收时间及已消费额度。
+          } else if (!item.sending) forgetPending(frame.id);
+          else item.finished = true;
+          return;
+        }
         // 已并入长工具轮次的新输入保留自己的原被动额度，不复用父轮或重置接收时刻。
         const foreground = frame.keep_foreground === true;
         if ((foreground || (frame.keep_passive === true && item.explicitTextSent === true)) && !item.sending && !item.finished && item.next === undefined && item.target.scope === "c2c") {
@@ -655,13 +749,13 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
             }
           }
         }
-        if (!item.sending) pending.delete(frame.id);
+        if (!item.sending) forgetPending(frame.id);
         else item.finished = true;
         return;
       }
       if (frame.type === "capacity") {
         if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
-        pending.delete(frame.id);
+        forgetPending(frame.id);
         send({ type: "delivery", id: frame.id, capacity_notice: true, ok: false, failure_kind: "receipt_capacity" });
         return;
       }
@@ -682,7 +776,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       } finally {
         item.sending = false;
         if (ok && frame.sticker_follows === true && !item.finished) item.awaitSticker = true;
-        else pending.delete(frame.id);
+        else forgetPending(frame.id);
       }
     },
   };

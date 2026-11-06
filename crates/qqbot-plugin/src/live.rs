@@ -45,7 +45,29 @@ pub(crate) enum LiveDelivery {
     Sent(String),
     Unknown,
     NotSent,
+    NotSentReason(&'static str),
     Stale,
+}
+impl LiveDelivery {
+    /// 只交给模型固定原因，不透传 SDK 原始错误或改变未知投递语义。
+    pub(crate) fn not_sent(reason: Option<&str>) -> Self {
+        let reason = match reason {
+            Some("passive_window_elapsed") => "passive_window_elapsed",
+            Some("passive_window_missing") => "passive_window_missing",
+            Some("passive_quota_exhausted") => "passive_quota_exhausted",
+            Some("reply_anchor_mismatch") => "reply_anchor_mismatch",
+            Some("duplicate_text") => "duplicate_text",
+            Some("progress_limit") => "progress_limit",
+            Some("progress_rate_limit") => "progress_rate_limit",
+            Some("reply_limit") => "reply_limit",
+            Some("outbound_limit") => "outbound_limit",
+            Some("http") => "http",
+            Some("dns") => "dns",
+            Some("tls") => "tls",
+            _ => return Self::NotSent,
+        };
+        Self::NotSentReason(reason)
+    }
 }
 impl LiveSend {
     pub fn cancelled(&self) -> bool {
@@ -267,7 +289,7 @@ impl Tool for SendMessage {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "由你决定在当前会话说什么；用于闲聊、提问、进展和最终回应。只在你想说且内容值得说时调用，没有固定汇报次数。普通 final 只结束内部处理，不自动发送。每次一条完整消息，最多 32768 UTF-8 字节；长内容自行决定分条。after_ms 可选择 0 至 10000 毫秒后再说，默认现在；期间有新消息则旧决定不发，返回 stale，交给你重新考虑。不会结束当前任务。只向可信的原会话发送，不接受地址。sent=true 且有 message_id 才确认送达；unknown 不重发；not_sent/stale 没有发出。不要把未完成说成完成，不重复已说过的话。".into(),
+            description: "由你决定在当前会话说什么；用于闲聊、提问、进展和最终回应。只在你想说且内容值得说时调用，没有固定汇报次数。普通 final 只结束内部处理，不自动发送。每次一条完整消息，最多 32768 UTF-8 字节；长内容自行决定分条。after_ms 可选择 0 至 10000 毫秒后再说，默认现在；期间有新消息则旧决定不发，返回 stale，交给你重新考虑。不会结束当前任务。只向可信的原会话发送，不接受地址。sent=true 且有 message_id 才确认送达；unknown 不重发；not_sent/stale 没有确认送达。not_sent 的 failure_kind 若为 passive_window_elapsed / passive_window_missing / passive_quota_exhausted，需等待同一用户的新输入带来有效回复窗口，不要改写正文反复尝试；duplicate_text 表示已有相同正文的投递记录，不重放。不要把未完成说成完成，不重复已说过的话。".into(),
             argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":32768},"after_ms":{"type":"integer","minimum":0,"maximum":10000},"purpose":{"type":"string","enum":["conversation","progress","question","authorization","answer"]}},"required":["text"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "eve.qq.live-send".into() }),
@@ -401,13 +423,18 @@ impl Tool for SendMessage {
 }
 
 fn delivery_json(result: LiveDelivery, session_id: &str) -> Value {
-    let (status, message_id) = match result {
-        LiveDelivery::Sent(id) => ("sent", Some(id)),
-        LiveDelivery::Unknown => ("unknown", None),
-        LiveDelivery::NotSent => ("not_sent", None),
-        LiveDelivery::Stale => ("stale", None),
+    let (status, message_id, reason) = match result {
+        LiveDelivery::Sent(id) => ("sent", Some(id), None),
+        LiveDelivery::Unknown => ("unknown", None, None),
+        LiveDelivery::NotSent => ("not_sent", None, None),
+        LiveDelivery::NotSentReason(reason) => ("not_sent", None, Some(reason)),
+        LiveDelivery::Stale => ("stale", None, None),
     };
-    json!({"sent":message_id.is_some(),"message_id":message_id,"session_id":session_id,"delivery_status":status})
+    let mut value = json!({"sent":message_id.is_some(),"message_id":message_id,"session_id":session_id,"delivery_status":status});
+    if let Some(reason) = reason {
+        value["failure_kind"] = json!(reason);
+    }
+    value
 }
 
 struct WaitForInput(Arc<LiveDialogue>);
@@ -473,6 +500,48 @@ impl Tool for WaitForInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn confirmed_delivery_rejection_exposes_reason_without_claiming_sent() {
+        let live = Arc::new(LiveDialogue::default());
+        let scope = ContextScope {
+            session_id: "trusted-session".into(),
+            user_id: "owner".into(),
+        };
+        let _turn = live.open(&scope, 7).unwrap();
+        let tool = live.send_tool();
+        let call = ToolCall {
+            id: "expired-window".into(),
+            name: "send_message".into(),
+            arguments: json!({"text":"处理结果"}),
+        };
+        let context = ToolExecutionContext::new()
+            .with_scope(Some(scope))
+            .with_turn_id(Some(7));
+        let sending = tokio::spawn(async move { tool.execute(call, context).await });
+        let outgoing = loop {
+            if let Some(outgoing) = live.next() {
+                break outgoing;
+            }
+            tokio::task::yield_now().await;
+        };
+        outgoing.complete(LiveDelivery::not_sent(Some("passive_window_elapsed")));
+        let result = sending.await.unwrap().unwrap();
+        assert_eq!(result["sent"], false);
+        assert!(result["message_id"].is_null());
+        assert_eq!(result["session_id"], "trusted-session");
+        assert_eq!(result["delivery_status"], "not_sent");
+        assert_eq!(result["failure_kind"], "passive_window_elapsed");
+        let unknown = delivery_json(LiveDelivery::Unknown, "trusted-session");
+        assert_eq!(unknown["delivery_status"], "unknown");
+        assert!(unknown.get("failure_kind").is_none());
+        let unrecognized = delivery_json(
+            LiveDelivery::not_sent(Some("untrusted raw SDK error")),
+            "trusted-session",
+        );
+        assert_eq!(unrecognized["delivery_status"], "not_sent");
+        assert!(unrecognized.get("failure_kind").is_none());
+    }
 
     #[tokio::test]
     async fn question_send_stays_in_live_turn_and_success_returns_both_bound_ids() {

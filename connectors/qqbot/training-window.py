@@ -16,7 +16,8 @@ import tarfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from self_upgrade_runtime import session_turns, validate_receipt_archive
+from self_upgrade_runtime import (session_turns, unique_object, validate_receipt_archive,
+                                  validate_receipt_anchor_version, validate_receipt_entries)
 
 MAGIC = b"EVE-QQ-TRAINING-1\n"
 MAX_ARCHIVE = 32 * 1024 * 1024
@@ -84,11 +85,15 @@ def evidence_documents(state_path):
     if state.get("version") != 1:
         raise ValueError("state_version")
     entries = state["entries"]
-    receipts = json.loads(bytes(entries.get("eve.channel.qqbot", {}).get("receipts.v1", b'{"version":1,"entries":[]}')))
+    receipts = json.loads(bytes(entries.get("eve.channel.qqbot", {}).get("receipts.v1", b'{"version":1,"entries":[]}')),
+                          object_pairs_hook=unique_object)
     sessions = json.loads(bytes(entries.get("eve.session", {}).get("sessions.v1", b'{"format_version":1,"sessions":{}}')))
-    if receipts.get("version") not in range(1, 10) or sessions.get("format_version") not in (1, 2):
+    if type(receipts.get("version")) is not int or receipts["version"] not in range(1, 11) or sessions.get("format_version") not in (1, 2):
         raise ValueError("evidence_version")
     validate_receipt_archive(state_path, receipts)
+    validate_receipt_anchor_version(receipts)
+    if receipts["version"] == 10:
+        validate_receipt_entries(receipts)
     if "archive" in receipts:
         connection = sqlite3.connect((state_path.parent / "qq-receipts.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)
         try:
@@ -96,13 +101,20 @@ def evidence_documents(state_path):
             for app, message_id, payload in connection.execute("SELECT app,message_id,payload FROM receipts ORDER BY seq"):
                 if len(payload) > 16 * 1024 * 1024:
                     raise ValueError("receipt_archive_payload_invalid")
-                receipt = json.loads(payload)
+                receipt = json.loads(payload, object_pairs_hook=unique_object)
                 if receipt["app_id"] != app or receipt["message"]["id"] != message_id:
                     raise ValueError("receipt_archive_identity")
                 cold.append(receipt)
         finally:
             connection.close()
+        cold_document = {"version": receipts["version"], "entries": cold}
+        # 冷记录无独立版本。v10 门槛不能被改低，也不能拼上热记录后才让坏引用变合法。
+        validate_receipt_anchor_version(cold_document)
+        if receipts["version"] == 10:
+            validate_receipt_entries(cold_document)
         by_id = {(r["app_id"], r["message"]["id"]): r for r in cold}
+        if len(by_id) != len(cold):
+            raise ValueError("receipt_archive_identity")
         for receipt in receipts["entries"]:
             identity = (receipt["app_id"], receipt["message"]["id"])
             if identity in by_id and by_id[identity] != receipt:
@@ -164,7 +176,7 @@ def collect(state_path):
         routing = json.dumps([receipt["app_id"], msg["scope"], msg["target_id"], msg["user_id"]], ensure_ascii=False, separators=(",", ":")).encode()
         identity = "qq:" + hashlib.sha256(routing).hexdigest()
         deliveries = None
-        if receipts["version"] == 9 and status == "Handled":
+        if receipts["version"] in (9, 10) and status == "Handled":
             # 内部 final 不是发言。Control 轮次和平台回执同时吻合才采集正文。
             parts = [p for p in receipt.get("progress", []) if p.get("decision_id")]
             failed = any(p["state"] == "Failed" for p in parts)
@@ -184,6 +196,11 @@ def collect(state_path):
                 continue
             deliveries = [{"decision_id": p["decision_id"], "platform_message_id": p["platform_message_id"], "text": p["text"]}
                           for p in sent if p.get("image_path") is None]
+            if receipts["version"] == 10:
+                deliveries = [{"decision_id": p["decision_id"], "platform_message_id": p["platform_message_id"],
+                               "text": p["text"], "reply_anchor": None if p.get("proactive", False)
+                               else p.get("reply_anchor") or msg["id"], "proactive": p.get("proactive", False)}
+                              for p in sent if p.get("image_path") is None]
             reply = "\n\n".join(p["text"] for p in deliveries)
             if not reply:
                 continue

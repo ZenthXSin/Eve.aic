@@ -261,13 +261,13 @@ def receipt_fingerprint(receipt):
                                      separators=(',', ':')).encode()).hexdigest()
 
 def validate_receipt_archive(state_path, receipts):
-    if receipts['version'] != 6 and not (receipts['version'] in (7, 8, 9) and 'archive' in receipts):
+    if receipts['version'] != 6 and not (receipts['version'] in (7, 8, 9, 10) and 'archive' in receipts):
         if 'archive' in receipts:
             raise ValueError('unexpected_receipt_archive_binding')
         return
     import sqlite3
     binding = receipts.get('archive')
-    if not isinstance(binding, dict) or set(binding) != {'identity', 'records'} or not isinstance(binding['identity'], str) or len(binding['identity']) != 32 or type(binding['records']) is not int or binding['records'] <= 0:
+    if not isinstance(binding, dict) or set(binding) != {'identity', 'records'} or not isinstance(binding['identity'], str) or len(binding['identity']) != 32 or not all(c in '0123456789abcdefABCDEF' for c in binding['identity']) or type(binding['records']) is not int or binding['records'] <= 0:
         raise ValueError('invalid_receipt_archive_binding')
     database = state_path.parent / 'qq-receipts.sqlite3'
     if not database.is_file() or database.is_symlink():
@@ -292,10 +292,10 @@ def inherited_receipts(state_path):
     if raw is None:
         return frozenset()
     receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
-    if receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+    if receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
         raise ValueError('unknown_ledger_version')
     validate_receipt_archive(state_path, receipts)
-    validate_merged_receipts(receipts)
+    validate_receipt_entries(receipts)
     return frozenset(receipt_fingerprint(r) for r in receipts['entries']
                      if r['state'] in ('Processing', 'ReplyPending')
                      or any(p.get('state') == 'Sending' for p in r.get('progress', []))
@@ -369,7 +369,7 @@ def delivery_documents(state_path, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] not in (1, 2) or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+    if sessions['format_version'] not in (1, 2) or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
         raise ValueError('unknown_ledger_version')
     if sessions['format_version'] == 2:
         if set(sessions) != {'format_version', 'sessions'} or not isinstance(sessions['sessions'], dict):
@@ -383,37 +383,62 @@ def delivery_documents(state_path, inherited=frozenset()):
                            for value in session['key'].values())):
                 raise ValueError('invalid_session_index_identity')
     validate_receipt_archive(state_path, receipts)
-    validate_merged_receipts(receipts)
+    return sessions, receipts, validate_receipt_entries(receipts, inherited)
+
+def validate_receipt_anchor_version(receipts):
+    """格式 10 一经使用便保留；null 与 Rust 的 None 相同，不暗中升级旧账本。"""
+    if not isinstance(receipts.get('entries'), list):
+        raise ValueError('invalid_receipt_ledger')
+    for receipt in receipts['entries']:
+        if not isinstance(receipt, dict) or not isinstance(receipt.get('progress', []), list):
+            raise ValueError('invalid_progress_ledger')
+        if receipts['version'] < 10 and any(isinstance(part, dict) and part.get('reply_anchor') is not None
+                                          for part in receipt.get('progress', [])):
+            raise ValueError('invalid_reply_anchor_version')
+
+def validate_receipt_entries(receipts, inherited=frozenset()):
+    """只核对当前分区；热区不能借冷区补齐锚点，完整冷区也应单独调用。"""
+    version = receipts['version']
+    if type(version) is not int or version not in range(1, 11):
+        raise ValueError('unknown_ledger_version')
+    if not isinstance(receipts.get('entries'), list):
+        raise ValueError('invalid_receipt_ledger')
+    validate_receipt_anchor_version(receipts)
     settled = True
     for receipt in receipts['entries']:
+        if version == 10:
+            validate_anchored_receipt_shape(receipt)
         control_turn = receipt.get('control_turn_id')
-        if control_turn is not None and (receipts['version'] != 9 or type(control_turn) is not int
+        if control_turn is not None and (version < 9 or type(control_turn) is not int
                                         or control_turn <= 0 or receipt['state'] != 'Handled'):
             raise ValueError('invalid_handled_turn_binding')
         progress = receipt.get('progress', [])
-        if not isinstance(progress, list) or len(progress) > (64 if receipts['version'] >= 8 else 3):
+        if not isinstance(progress, list) or len(progress) > (64 if version >= 8 else 3):
             raise ValueError('invalid_progress_ledger')
-        if progress and receipts['version'] not in (3, 4, 5, 6, 7, 8, 9):
+        if progress and version < 3:
             raise ValueError('invalid_progress_ledger')
-        if sum(p.get('proactive') is not True for p in progress if isinstance(p, dict)) > 3:
+        if version < 10 and sum(p.get('proactive') is not True for p in progress if isinstance(p, dict)) > 3:
             raise ValueError('invalid_passive_progress_budget')
         sticker = receipt.get('sticker')
-        if sticker is not None and (receipts['version'] not in (5, 6, 7, 8, 9) or not isinstance(sticker, dict)
+        if sticker is not None and (version < 5 or not isinstance(sticker, dict)
                                     or set(sticker) != {'path', 'state'}
                                     or not isinstance(sticker['path'], str) or not sticker['path']
                                     or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped', 'Unknown')):
             raise ValueError('invalid_sticker_ledger')
         if sticker_in_flight(receipt) and receipt_fingerprint(receipt) not in inherited:
             settled = False
+        passive = {}
         for part in progress:
-            authored = receipts['version'] == 9 and isinstance(part, dict) and part.get('decision_id') is not None
-            allowed_fields = {'text', 'state', 'proactive', 'necessary'}
-            if receipts['version'] == 9:
+            authored = version >= 9 and isinstance(part, dict) and part.get('decision_id') is not None
+            allowed_fields = {'text', 'state', 'proactive', 'necessary', 'reply_anchor'}
+            if version >= 9:
                 allowed_fields |= {'decision_id', 'platform_message_id', 'image_path'}
             if (not isinstance(part, dict) or not {'text', 'state'} <= set(part)
                     or not set(part) <= allowed_fields
-                    or ('necessary' in part and part['necessary'] is not True)
-                    or ('proactive' in part and (receipts['version'] < 8 or part['proactive'] is not True))
+                    or ('necessary' in part and (type(part['necessary']) is not bool
+                        or version < 10 and part['necessary'] is not True))
+                    or ('proactive' in part and (version < 8 or type(part['proactive']) is not bool
+                        or version < 10 and part['proactive'] is not True))
                     or not isinstance(part['text'], str) or not part['text'].strip()
                     or len(part['text'].encode()) > (32768 if authored else 1024)
                     or part['state'] not in ('Sending', 'Sent', 'Failed', 'Unknown')):
@@ -425,17 +450,123 @@ def delivery_documents(state_path, inherited=frozenset()):
                 raise ValueError('invalid_expression_receipt')
             image = part.get('image_path')
             if image is not None and (not authored or not isinstance(image, str) or not image
-                    or len(image.encode()) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in image)):
+                    or len(image.encode()) > 4096 or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in image)):
                 raise ValueError('invalid_expression_image')
             if not authored and part.get('platform_message_id') is not None:
                 raise ValueError('unexpected_expression_receipt')
+            anchor = part.get('reply_anchor')
+            if anchor is not None and (not platform_id(anchor) or anchor == receipt['message']['id']
+                    or receipt['message']['scope'] != 'group' or part.get('proactive', False) or not authored):
+                raise ValueError('invalid_reply_anchor')
+            if version == 10 and not part.get('proactive', False):
+                effective = anchor if anchor is not None else receipt['message']['id']
+                passive[effective] = passive.get(effective, 0) + 1
+                if passive[effective] > 3:
+                    raise ValueError('invalid_passive_progress_budget')
             if part['state'] == 'Sending' and receipt_fingerprint(receipt) not in inherited:
                 settled = False
-    return sessions, receipts, settled
+        if version == 10:
+            original = passive.get(receipt['message']['id'], 0)
+            segments = receipt.get('segments')
+            if original + (len(segments['parts']) if segments is not None else 1) + int(sticker is not None) > 5:
+                raise ValueError('invalid_passive_progress_budget')
+    validate_merged_receipts(receipts)
+    return settled
 
 def platform_id(value):
     return (isinstance(value, str) and 0 < len(value.encode()) <= 253 and value.strip() == value
-            and not any(ord(c) < 32 or ord(c) == 127 for c in value))
+            and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value))
+
+def validate_anchored_receipt_shape(receipt):
+    """v10 的身份与原窗口结构；分段和表情也必须计入原窗口额度。"""
+    def qq_id(value):
+        return (isinstance(value, str) and 0 < len(value) <= 128
+                and all(c.isascii() and (c.isalnum() or c in '_-') for c in value))
+    if (not isinstance(receipt, dict) or not {'app_id', 'message', 'state'} <= set(receipt)
+            or not set(receipt) <= {'app_id', 'message', 'state', 'reply', 'control_turn_id',
+                                   'segments', 'progress', 'merged_into', 'sticker'}
+            or not qq_id(receipt['app_id']) or not isinstance(receipt['message'], dict)
+            or receipt['state'] not in ('Processing', 'ReplyPending', 'Sent', 'Failed', 'Unknown', 'Merged', 'Handled')):
+        raise ValueError('invalid_receipt_ledger')
+    message = receipt['message']
+    if (not {'id', 'scope', 'target_id', 'user_id', 'text'} <= set(message)
+            or not platform_id(message['id']) or message['scope'] not in ('c2c', 'group')
+            or not qq_id(message['target_id']) or not qq_id(message['user_id'])
+            or message['scope'] == 'c2c' and message['target_id'] != message['user_id']
+            or not isinstance(message['text'], str) or len(message['text'].encode()) > 32768):
+        raise ValueError('invalid_receipt_identity')
+    reply, segments, sticker = (receipt.get(key) for key in ('reply', 'segments', 'sticker'))
+    state = receipt['state']
+    into = receipt.get('merged_into')
+    if (reply is not None and (not isinstance(reply, str) or not reply.strip() or len(reply.encode()) > 32768)
+            or state in ('ReplyPending', 'Sent', 'Unknown') and reply is None
+            or state in ('Handled', 'Merged') and any(value is not None for value in (reply, segments, sticker))
+            or (state == 'Merged') != (into is not None)
+            or into is not None and (not platform_id(into) or into == message['id'])):
+        raise ValueError('invalid_receipt_ledger')
+    if sticker is not None:
+        if (not isinstance(sticker, dict) or not isinstance(sticker.get('path'), str)
+                or len(sticker['path'].encode()) > 4096
+                or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in sticker['path'])
+                or state not in ('ReplyPending', 'Sent', 'Failed', 'Unknown')
+                or state == 'ReplyPending' and sticker.get('state') != 'Pending'
+                or state == 'Failed' and sticker.get('state') not in ('Pending', 'Skipped')):
+            raise ValueError('invalid_sticker_ledger')
+    if segments is not None:
+        validate_receipt_segments(segments, reply, state)
+
+def validate_receipt_segments(segments, reply, state):
+    if (not isinstance(segments, dict) or set(segments) != {'planner', 'parts'}
+            or not isinstance(segments['planner'], str) or not 0 < len(segments['planner']) <= 64
+            or not all(c.isascii() and (c.isalnum() or c in '._-') for c in segments['planner'])
+            or not isinstance(segments['parts'], list) or not 2 <= len(segments['parts']) <= 8
+            or not isinstance(reply, str)):
+        raise ValueError('invalid_segment_ledger')
+    encoded, end, states, ranges = reply.encode(), 0, [], []
+    for part in segments['parts']:
+        if (not isinstance(part, dict) or set(part) != {'start', 'end', 'state'}
+                or type(part['start']) is not int or type(part['end']) is not int
+                or part['start'] < end or not part['start'] < part['end'] <= len(encoded)):
+            raise ValueError('invalid_segment_ledger')
+        try:
+            gap = encoded[end:part['start']].decode()
+            text = encoded[part['start']:part['end']].decode()
+        except UnicodeError as error:
+            raise ValueError('invalid_segment_ledger') from error
+        if gap.strip() or text.strip() != text or all(c.isspace() or c == '\ufeff' for c in text):
+            raise ValueError('invalid_segment_ledger')
+        end = part['end']
+        states.append(part['state'])
+        ranges.append((part['start'], part['end']))
+    sent = 0
+    while sent < len(states) and states[sent] == 'Sent':
+        sent += 1
+    rest = states[sent:]
+    pair = {'ReplyPending': ('Sending', 'Pending'), 'Failed': ('Failed', 'Skipped'),
+            'Unknown': ('Unknown', 'Skipped')}.get(state)
+    if encoded[end:].decode().strip() or not (state == 'Sent' and not rest or pair and rest
+            and all(value == pair[1] for value in (rest[1:] if rest[0] == pair[0] else rest))):
+        raise ValueError('invalid_segment_ledger')
+    # 与分段契约一致：完整代码围栏必须由同一片段覆盖。
+    spans, opened, offset = [], None, 0
+    for line in encoded.splitlines(keepends=True):
+        content = line.rstrip(b'\n\r')
+        body = content.lstrip(b' \t')
+        indent = len(content) - len(body)
+        marker = body[:1]
+        run = len(body) - len(body.lstrip(marker)) if marker in (b'`', b'~') else 0
+        if run >= 3:
+            info = body[run:]
+            if opened is None and (marker == b'~' or b'`' not in info):
+                opened = (offset + indent, marker, run)
+            elif opened is not None and marker == opened[1] and run >= opened[2] and not info.decode().strip():
+                spans.append((opened[0], offset + indent + run))
+                opened = None
+        offset += len(line)
+    if opened is not None:
+        spans.append((opened[0], len(reply.rstrip().encode())))
+    if any(not any(start <= left and right <= end for start, end in ranges) for left, right in spans):
+        raise ValueError('invalid_segment_ledger')
 
 def validate_ended_exploration(task, version):
     """只读核对探索终态；没有小结或经历确认不代表仍在执行。"""
@@ -761,17 +892,17 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         scope = 'qq:' + hashlib.sha256(identity).hexdigest()
         merged_text = '\n'.join([r['message']['text'] for r in receipts['entries']
             if r.get('merged_into') == msg.get('id') and r['app_id'] == receipt['app_id']]
-            + [msg['text']]) if receipts['version'] in (4, 5, 6, 7, 8, 9) else msg['text']
-        if receipts['version'] == 9 and msg['text'] == turn['input']:
+            + [msg['text']]) if receipts['version'] in (4, 5, 6, 7, 8, 9, 10) else msg['text']
+        if receipts['version'] in (9, 10) and msg['text'] == turn['input']:
             # 轮内补充保存在同一轮 messages 中，首条输入没有被自动合成替换。
             merged_text = msg['text']
-        bound_handled = (receipts['version'] == 9 and receipt['state'] == 'Handled'
+        bound_handled = (receipts['version'] in (9, 10) and receipt['state'] == 'Handled'
                          and receipt.get('control_turn_id') == request['turn_id'])
         if receipt['state'] != 'Merged' and scope == request['session_id'] and (bound_handled or merged_text == turn['input']):
             matching = receipt
         if receipt['state'] in ('Processing', 'ReplyPending'):
             return False
-    handled = (matching and receipts['version'] == 9 and matching['state'] == 'Handled'
+    handled = (matching and receipts['version'] in (9, 10) and matching['state'] == 'Handled'
                and matching.get('control_turn_id') == request['turn_id']
                and matching.get('reply') is None
                and not any(p['state'] == 'Sending' for p in matching.get('progress', [])))
@@ -795,8 +926,8 @@ def drain_stamp(state_path):
     return tuple(stamps)
 
 def validate_merged_receipts(receipts):
-    """格式 4 起的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
-    if receipts['version'] not in (4, 5, 6, 7, 8, 9):
+    """同分区、同身份的合并关系；格式 7 起允许后到输入并入原轮。"""
+    if receipts['version'] not in (4, 5, 6, 7, 8, 9, 10):
         return
     lookup = {}
     for index, entry in enumerate(receipts['entries']):
@@ -814,12 +945,24 @@ def validate_merged_receipts(receipts):
         if not isinstance(into, str):
             raise ValueError('invalid_merged_receipt')
         target = lookup.get((entry['app_id'], into))
-        if (not target or (receipts['version'] not in (7, 8, 9) and target[0] <= index) or target[0] == index or target[1]['state'] == 'Merged'
+        if (not target or (receipts['version'] < 7 and target[0] <= index) or target[0] == index or target[1]['state'] == 'Merged'
                 or any(entry['message'][key] != target[1]['message'][key]
                        for key in ('scope', 'target_id', 'user_id'))
                 or entry.get('reply') is not None or entry.get('segments') is not None
                 or entry.get('progress')):
             raise ValueError('invalid_merged_receipt')
+    if receipts['version'] == 10:
+        for entry in receipts['entries']:
+            for part in entry.get('progress', []):
+                anchor = part.get('reply_anchor')
+                if anchor is None:
+                    continue
+                source = lookup.get((entry['app_id'], anchor))
+                if (source is None or source[1]['state'] != 'Merged'
+                        or source[1].get('merged_into') != entry['message']['id']
+                        or any(source[1]['message'][key] != entry['message'][key]
+                               for key in ('scope', 'target_id', 'user_id'))):
+                    raise ValueError('invalid_reply_anchor_relation')
 
 def execution_command(command):
     """Linux 便携包可选的私有动态加载器；逻辑命令和候选摘要保持原样。"""
