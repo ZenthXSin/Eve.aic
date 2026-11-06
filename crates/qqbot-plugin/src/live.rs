@@ -118,6 +118,18 @@ impl LiveDialogue {
     pub(crate) fn next(&self) -> Option<LiveSend> {
         self.outgoing.lock().ok()?.pop_front()
     }
+    /// 只观察同一轮尚未被运行时消费的新输入，不取走正文或推进审核锚点。
+    pub(crate) fn pending_anchor(&self, scope: &ContextScope, turn_id: u64) -> Option<String> {
+        let turn = self.turns.lock().ok()?.get(&key(scope))?.upgrade()?;
+        if turn.id != turn_id {
+            return None;
+        }
+        let input = turn.input.lock().ok()?;
+        if !input.accepting {
+            return None;
+        }
+        input.messages.last()?.1.clone()
+    }
     pub fn send_tool(self: &Arc<Self>) -> Arc<dyn Tool> {
         Arc::new(SendMessage(self.clone()))
     }
@@ -582,5 +594,41 @@ mod tests {
         assert_eq!(later.messages, ["展示后到第二条"]);
         assert_eq!(later.review_anchor.as_deref(), Some("later"));
         assert_eq!(turn.take_batch(true).unwrap(), SteeringBatch::default());
+    }
+
+    #[test]
+    fn observing_pending_input_never_consumes_it_or_crosses_identity_and_turn() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "session".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 7).unwrap();
+        assert_eq!(live.pending_anchor(&scope, 7), None);
+        live.steer_anchored(
+            &scope,
+            7,
+            "先看看我".into(),
+            Some("new-input".into()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(live.pending_anchor(&scope, 7).as_deref(), Some("new-input"));
+        assert_eq!(live.pending_anchor(&scope, 8), None);
+        assert_eq!(
+            live.pending_anchor(
+                &ContextScope {
+                    user_id: "other".into(),
+                    ..scope.clone()
+                },
+                7
+            ),
+            None
+        );
+        assert_eq!(live.pending_anchor(&scope, 7).as_deref(), Some("new-input"));
+        let consumed = turn.take_batch(false).unwrap();
+        assert_eq!(consumed.messages, ["先看看我"]);
+        assert_eq!(consumed.review_anchor.as_deref(), Some("new-input"));
+        assert_eq!(live.pending_anchor(&scope, 7), None);
     }
 }

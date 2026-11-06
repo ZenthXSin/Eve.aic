@@ -172,8 +172,9 @@ pub(crate) fn openai_schema() -> ConfigSchema {
 /// 按用途选择模型角色与单次输出上限；随每次模型解析读取，保存后下一次请求生效。
 pub(crate) const MODEL_USES_NAMESPACE: &str = "runtime.model_uses";
 /// 用途名与健康记录、自主预算类别一致。
-pub(crate) const MODEL_USES: [&str; 24] = [
+pub(crate) const MODEL_USES: [&str; 25] = [
     "dialogue",
+    "speech",
     "plan",
     "interest",
     "research",
