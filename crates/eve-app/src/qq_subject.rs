@@ -3386,6 +3386,20 @@ mod tests {
     #[tokio::test]
     async fn missing_contract_plans_without_tools_then_freezes_original_action_contract() {
         let f = Fixture::new().await;
+        let original_goal = "创建固定产物并验证摘要";
+        FocusTool(f.subject.clone())
+            .execute(
+                call(
+                    "manage_subject_focus",
+                    json!({
+                        "action":"discover", "id":"missing-contract",
+                        "title":"创建固定产物", "goal":original_goal,
+                    }),
+                ),
+                authorized("a").with_delegated(true),
+            )
+            .await
+            .unwrap();
         f.config()
             .execute(config_call(), authorized("a"))
             .await
@@ -3394,6 +3408,16 @@ mod tests {
         pump(&f, now);
         let planning = f.tasks.snapshot().unwrap().tasks[0].clone();
         assert!(planning.source.starts_with(PLAN_TASK_SOURCE_PREFIX));
+        let input: PlanningInput = serde_json::from_str(
+            planning
+                .spec
+                .instructions
+                .strip_prefix(PLAN_INPUT_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(input.goal, original_goal);
+        assert!(input.exact_goal && input.require_receipts);
         assert!(matches!(
             planning.execution.as_ref().unwrap().completion_contract,
             Some(eve_task_api::TaskCompletionContract::Text { .. })
@@ -3429,7 +3453,7 @@ mod tests {
                 .instructions,
             planning.spec.instructions
         );
-        let result = json!({"title":"规划后创建固定产物","goal":"创建固定产物并验证摘要",
+        let result = json!({"title":"规划后创建固定产物","goal":original_goal,
             "assessment":{"problem_key":"planned-artifact","expected_gain":"验证有复用价值的结果","verification":"读取完整文件SHA256","reuse_plan":"保留固定工序","benefit":90,"confidence":100,"cost":10,"risk":0,"evidence":[]},
             "completion_contract":file_contract()}).to_string();
         assert!(validate_plan_result(&planning, &result).is_ok());
