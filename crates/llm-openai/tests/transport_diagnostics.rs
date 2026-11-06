@@ -11,6 +11,7 @@ use support::{Reply, Server, final_response};
 
 fn request() -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "fixture-private-input")],
         tools: vec![],
     }

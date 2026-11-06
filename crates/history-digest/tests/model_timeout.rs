@@ -28,6 +28,7 @@ impl LlmModelResolver for Resolver {
 }
 fn request() -> DigestRequest {
     DigestRequest {
+        model_session: None,
         previous_turns: 0,
         previous: vec![],
         turns: vec![DigestTurn {

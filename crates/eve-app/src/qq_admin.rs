@@ -322,8 +322,19 @@ impl ContextAssembler for AccessContext {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut snapshot = self.inner.assemble_scoped(input, scope.clone()).await?;
+            let mut snapshot = self
+                .inner
+                .assemble_with_model_session(input, scope.clone(), model_session)
+                .await?;
             let admin = scope
                 .as_ref()
                 .is_some_and(|s| self.admin.is_operator_identity(s));

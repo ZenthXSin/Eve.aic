@@ -28,6 +28,12 @@ fn serialized(value: &impl serde::Serialize) -> String {
 /// 前缀哈希链：第 0 项是工具定义，第 i 项是工具定义加前 i 条消息。
 fn chain(request: &ModelRequest) -> (Vec<u64>, Vec<u64>) {
     let mut hasher = DefaultHasher::new();
+    // 上游缓存按可信长期会话隔离；相同正文出现在其他用户/用途时不能算本会话命中。
+    request
+        .session
+        .as_ref()
+        .map(|s| s.prompt_cache_key())
+        .hash(&mut hasher);
     let tools = serialized(&request.tools);
     tools.hash(&mut hasher);
     let mut hashes = vec![hasher.finish()];
@@ -118,6 +124,14 @@ impl PrefixProbe {
 }
 
 impl LlmProvider for PrefixProbe {
+    fn request_fingerprint(
+        &self,
+        request: &ModelRequest,
+        mode: eve_llm_api::ResponseMode,
+    ) -> Result<Option<eve_llm_api::ModelRequestFingerprint>, eve_llm_api::LlmError> {
+        self.inner.request_fingerprint(request, mode)
+    }
+
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         self.measure(&request);
         self.inner.complete(request)

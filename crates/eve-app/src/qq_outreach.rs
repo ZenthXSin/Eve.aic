@@ -458,6 +458,15 @@ async fn compose(
     stopped: &mut watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let request = ComposeRequest {
+        model_session: Some(
+            eve_llm_api::ModelSession::owned(
+                "outreach-composer",
+                &invitation.owner,
+                &invitation.id,
+            )
+            .and_then(|s| s.with_turn(&invitation.id))
+            .map_err(|_| OutreachError::InvalidInput)?,
+        ),
         invitation_id: invitation.id.clone(),
         composer_version: services.composer.version().into(),
         facts: invitation.facts.clone(),
@@ -567,6 +576,22 @@ async fn listen(
             .outreach
             .begin_response(&invitation.id, turns, started)?;
         let request = ResponseRequest {
+            model_session: Some(
+                eve_llm_api::ModelSession::owned(
+                    "outreach-response",
+                    &invitation.owner,
+                    &invitation.id,
+                )
+                .and_then(|s| {
+                    s.with_turn(
+                        texts
+                            .last()
+                            .map(|turn| turn.message_id.as_str())
+                            .unwrap_or(&invitation.id),
+                    )
+                })
+                .map_err(|_| OutreachError::InvalidInput)?,
+            ),
             invitation_id: invitation.id.clone(),
             judge_version: services.responder.version().into(),
             invitation: prefix(
@@ -805,6 +830,17 @@ impl QqOutreach for ChannelAdapter {
                 .begin_judgement(&invitation.id, &moment.message_id, started)
                 .map_err(plugin_error)?;
             let request = JudgeRequest {
+                model_session: Some(
+                    eve_llm_api::ModelSession::scoped(
+                        "outreach-timing",
+                        &eve_llm_api::ContextScope {
+                            session_id: moment.session.session_id.clone(),
+                            user_id: moment.session.user_id.clone(),
+                        },
+                    )
+                    .and_then(|s| s.with_turn(&moment.message_id))
+                    .map_err(|_| plugin_error(OutreachError::InvalidInput))?,
+                ),
                 invitation_id: invitation.id.clone(),
                 judge_version: judge.version().into(),
                 invitation: prefix(
@@ -965,8 +1001,19 @@ impl ContextAssembler for OutreachContext {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
+            let mut context = self
+                .wrapped
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             let Some(scope) = scope else {
                 return Ok(context);
             };

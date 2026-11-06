@@ -16,6 +16,7 @@ impl OpenAiProvider {
     pub(crate) async fn request_retried(
         &self,
         body: &serde_json::Value,
+        headers: &reqwest::header::HeaderMap,
         sink: Option<&dyn ModelTextSink>,
         deadline: Instant,
         diagnostics: &mut crate::timing::CallDiagnostics,
@@ -24,7 +25,7 @@ impl OpenAiProvider {
             let mut retry_after = None;
             let identity = diagnostics.next_attempt();
             let result = self
-                .request_once(body, sink, &mut retry_after, identity)
+                .request_once(body, headers, sink, &mut retry_after, identity)
                 .await;
             let Err(error) = &result else { return result };
             if attempt == 3 || !transient(error) {

@@ -73,6 +73,30 @@ pub struct JevRelationJudge {
     slots: Semaphore,
 }
 impl JevRelationJudge {
+    fn model_headers(
+        &self,
+        session: Option<&eve_llm_api::ModelSession>,
+    ) -> Result<reqwest::header::HeaderMap, eve_llm_api::LlmError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, self.authorization.clone());
+        if let Some(session) = session {
+            session.validate()?;
+            for (key, value) in [
+                ("session-id", session.session_id()),
+                ("thread-id", session.thread_id()),
+                ("x-client-request-id", session.client_request_id()),
+            ] {
+                headers.insert(
+                    key,
+                    HeaderValue::from_str(value).map_err(|_| {
+                        eve_llm_api::LlmError::Configuration("Jev 会话请求头无效".into())
+                    })?,
+                );
+            }
+        }
+        Ok(headers)
+    }
+
     pub fn new(config: JevConfig, api_key: &str) -> Result<Self, JevConfigurationError> {
         let base = Url::parse(&config.base_url).map_err(|_| JevConfigurationError)?;
         let loopback = base.host_str().is_some_and(|host| {
@@ -344,6 +368,18 @@ impl RelationJudge for JevRelationJudge {
         Box::pin(async move {
             observe_relation(observer.as_ref(), RelationObservation::Supported);
             let body = request_with_examples(&input, &self.config.model, examples)?;
+            let session = eve_llm_api::ModelSession::scoped(
+                "jev-relation",
+                &eve_llm_api::ContextScope {
+                    session_id: input.message.target.session.session_id.clone(),
+                    user_id: input.message.target.session.user_id.clone(),
+                },
+            )
+            .and_then(|session| session.with_turn(&input.message.message_id))
+            .map_err(|_| RelationError::Protocol)?;
+            let headers = self
+                .model_headers(Some(&session))
+                .map_err(|_| RelationError::Protocol)?;
             let _slot = self
                 .slots
                 .try_acquire()
@@ -355,7 +391,7 @@ impl RelationJudge for JevRelationJudge {
                 let mut response = self
                     .client
                     .post(self.endpoint.clone())
-                    .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+                    .headers(headers)
                     .json(&body)
                     .send()
                     .await

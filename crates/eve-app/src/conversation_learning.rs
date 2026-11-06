@@ -116,11 +116,22 @@ impl ContextAssembler for Context {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
             let learned = eve_training_plugin::TrainingContext(self.training.clone())
-                .assemble_scoped(input.clone(), scope.clone())
+                .assemble_with_model_session(input.clone(), scope.clone(), model_session.clone())
                 .await?;
-            let mut current = self.inner.assemble_scoped(input, scope).await?;
+            let mut current = self
+                .inner
+                .assemble_with_model_session(input, scope, model_session.clone())
+                .await?;
             current.revision.push_str(&format!(":{}", learned.revision));
             current.profile.push('\n');
             current.profile.push_str(&learned.profile);

@@ -476,6 +476,7 @@ dependencies = [
 name = "eve-clarify-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "ring",
  "serde",
  "serde_json",
@@ -825,6 +826,7 @@ dependencies = [
 name = "eve-knowledge-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "ring",
  "serde",
  "serde_json",
@@ -878,6 +880,7 @@ name = "eve-llm-api"
 version = "0.1.0"
 dependencies = [
  "eve-plugin-api",
+ "ring",
  "serde",
  "serde_json",
  "zeroize",
@@ -900,6 +903,7 @@ dependencies = [
 name = "eve-memory-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "eve-session-api",
  "serde",
  "serde_json",
@@ -992,6 +996,7 @@ dependencies = [
 name = "eve-outreach-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "ring",
  "serde",
  "serde_json",
@@ -1017,6 +1022,7 @@ dependencies = [
 name = "eve-people-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "eve-plugin-api",
  "serde",
 ]
@@ -1039,6 +1045,7 @@ dependencies = [
 name = "eve-plan-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "ring",
  "serde",
  "serde_json",
@@ -1307,6 +1314,9 @@ dependencies = [
 [[package]]
 name = "eve-semantic-api"
 version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+]
 
 [[package]]
 name = "eve-semantic-plugin"
@@ -1356,6 +1366,7 @@ dependencies = [
 name = "eve-skill-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "eve-practice-api",
  "ring",
  "serde",

@@ -42,7 +42,13 @@ impl SkillDistiller for ModelSkillDistiller {
             if request.distiller_version != DISTILLER_VERSION {
                 return Err(SkillError::InvalidInput);
             }
-            let text = complete(&*self.resolver, DISTILL_PROMPT, &request).await?;
+            let text = complete(
+                &*self.resolver,
+                DISTILL_PROMPT,
+                &request,
+                request.model_session.clone(),
+            )
+            .await?;
             if text.len() > MAX_PROPOSAL_OUTPUT_BYTES {
                 return Err(invalid_output());
             }
@@ -86,7 +92,21 @@ impl SkillSelector for ModelSkillSelector {
             if request.selector_version != SELECTOR_VERSION || request.candidates.is_empty() {
                 return Err(SkillError::InvalidInput);
             }
-            let text = complete(&*self.resolver, SELECT_PROMPT, &request).await?;
+            let text = complete(
+                &*self.resolver,
+                SELECT_PROMPT,
+                &request,
+                Some(
+                    eve_llm_api::ModelSession::owned(
+                        "skill-selector",
+                        &request.task.owner,
+                        &request.selection_id,
+                    )
+                    .and_then(|s| s.with_turn(&request.selection_id))
+                    .map_err(provider_error)?,
+                ),
+            )
+            .await?;
             if text.len() > MAX_CHOICE_OUTPUT_BYTES {
                 return Err(invalid_output());
             }
@@ -116,9 +136,11 @@ async fn complete(
     resolver: &dyn LlmModelResolver,
     prompt: &str,
     request: &impl serde::Serialize,
+    session: Option<eve_llm_api::ModelSession>,
 ) -> SkillResult<String> {
     let input = serde_json::to_string(request).map_err(|_| SkillError::InvalidInput)?;
     let model_request = ModelRequest {
+        session,
         messages: vec![
             ChatMessage::text(ChatRole::System, prompt),
             ChatMessage::text(ChatRole::User, input),

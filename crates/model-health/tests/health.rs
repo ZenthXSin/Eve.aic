@@ -36,6 +36,7 @@ impl LlmModelResolver for Broken {
 }
 fn request() -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "你好")],
         tools: vec![],
     }

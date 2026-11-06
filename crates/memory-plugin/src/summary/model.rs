@@ -62,6 +62,21 @@ impl ConversationSummarizer for ModelConversationSummarizer {
                 return Err(SummaryFailure::InvalidOutput);
             }
             let request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::scoped(
+                        "memory-summary",
+                        &eve_llm_api::ContextScope {
+                            session_id: format!(
+                                "{}:{}",
+                                batch.scope.channel.len(),
+                                batch.scope.channel
+                            ) + &batch.scope.session_id,
+                            user_id: batch.scope.user_id.clone(),
+                        },
+                    )
+                    .and_then(|s| s.with_turn(&batch.sequence.to_string()))
+                    .map_err(failure)?,
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, PROMPT),
                     ChatMessage::text(ChatRole::User, FORMAT_GUARD),

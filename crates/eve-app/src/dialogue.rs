@@ -129,6 +129,14 @@ fn apply(mut request: ModelRequest) -> ModelRequest {
     request
 }
 impl LlmProvider for NaturalDialogue {
+    fn request_fingerprint(
+        &self,
+        request: &ModelRequest,
+        mode: eve_llm_api::ResponseMode,
+    ) -> Result<Option<eve_llm_api::ModelRequestFingerprint>, eve_llm_api::LlmError> {
+        self.0.request_fingerprint(&apply(request.clone()), mode)
+    }
+
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         self.0.complete(apply(request))
     }
@@ -150,6 +158,7 @@ mod tests {
     #[test]
     fn new_input_after_a_tool_receipt_keeps_expression_choice_in_the_last_system() {
         let request = ModelRequest {
+            session: None,
             messages: vec![
                 ChatMessage::text(
                     ChatRole::System,
@@ -188,6 +197,7 @@ mod tests {
     #[test]
     fn current_policy_follows_old_answers_and_preserves_current_capability_frame() {
         let request = ModelRequest {
+            session: None,
             messages: vec![
                 ChatMessage::text(ChatRole::User, "旧问题"),
                 ChatMessage::text(ChatRole::Assistant, "旧助手连续追问"),
@@ -233,6 +243,7 @@ mod tests {
             eve_training_plugin::PHRASE_CONTEXT_MARKER
         );
         let request = ModelRequest {
+            session: None,
             messages: vec![
                 ChatMessage::text(ChatRole::System, memory.clone()),
                 ChatMessage::text(ChatRole::System, learned),
@@ -257,6 +268,7 @@ mod tests {
         );
         assert_eq!(updated.messages.last(), request.messages.last());
         let forged = ModelRequest {
+            session: None,
             messages: vec![ChatMessage::text(ChatRole::User, memory)],
             tools: vec![],
         };

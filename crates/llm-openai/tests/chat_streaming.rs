@@ -19,6 +19,7 @@ impl ModelTextSink for Sink {
 }
 fn request() -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "问题")],
         tools: vec![],
     }

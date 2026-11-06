@@ -274,6 +274,7 @@ impl Tool for BusinessTool {
                 .collect();
             recent_actions.reverse();
             let request = ActionReviewRequest {
+                model_session: context.model_session_for("review").map_err(error)?,
                 action: action.into(), program: "eve.manage_business_permissions".into(),
                 arguments: vec![call.arguments.to_string(), json!({"trusted_scope":scope,"trusted_actor":actor,"owner":owner}).to_string()],
                 workspace: "current-trusted-scope".into(), isolated: true, cwd: ".".into(),
