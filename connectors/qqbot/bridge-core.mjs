@@ -454,6 +454,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   }
   // Progress consumes the original passive window, but never completes its reply.
   async function progress(frame, item) {
+    const hostActivity = frame.host_activity === true;
     const index = item.progress ?? 0;
     if (item.sending || item.next !== undefined || frame.index !== index || index >= 64 || (frame.proactive !== true && (item.passiveProgress ?? index) >= 3)) {
       warn("invalid_progress"); return;
@@ -461,6 +462,13 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (!validText(frame.text) || Buffer.byteLength(frame.text) > (frame.explicit === true ? 32768 : 1024)) {
       warn("invalid_progress");
       send({ type: "delivery", id: frame.id, progress: true, index, ok: false });
+      return;
+    }
+    if (hostActivity && (frame.explicit === true || frame.proactive === true ||
+        frame.image_path !== undefined || !validMessageId(frame.based_on_message_id) ||
+        frame.based_on_message_id !== frame.id || !frame.text.startsWith("系统进度："))) {
+      warn("invalid_progress");
+      send({type:"delivery",id:frame.id,progress:true,index,ok:false});
       return;
     }
     const proactive = frame.proactive === true;
@@ -475,13 +483,23 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     item.lastProgress = now();
     item.sending = true;
     try {
+      if (hostActivity) {
+        const previous = item.hostActivities ?? (item.hostActivities = new Set());
+        const quota = item.target.scope === "c2c" ? 2 : 1;
+        if (previous.size >= quota || previous.has(frame.text) || item.passiveProgress > 2) {
+          send({type:"delivery",id:frame.id,progress:true,index,ok:false,failure_kind:"progress_rate_limit"});
+          return;
+        }
+        // 宿主提示是独立事实；失败或未知也不在本窗口重放同一文本。
+        previous.add(frame.text);
+      }
       if (!proactive && elapsed >= PASSIVE_REPLY_WINDOW_MS) {
         send({ type: "delivery", id: frame.id, progress: true, index, ok: false,
           failure_kind: "passive_window_elapsed" });
         return;
       }
       const target = proactive ? {scope: item.target.scope, targetId: item.target.targetId} : item.target;
-      const guard=frame.explicit===true ? () => !item.finished && latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) === (frame.based_on_message_id ?? frame.id) : undefined;
+      const guard=frame.explicit===true || hostActivity ? () => !item.finished && latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) === (frame.based_on_message_id ?? frame.id) : undefined;
       const image=frame.image_path;
       if(image!==undefined && (frame.explicit!==true || typeof image!=="string" || !image || image.length>4096 || /[\p{Cc}]/u.test(image))) throw new Error("invalid_image_path");
       const result = image===undefined ? await sendText(target, frame.text, replyMention(item), SEND_TIMEOUT_MS, guard) : await sendImage(target,image,guard);

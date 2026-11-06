@@ -118,6 +118,14 @@ impl LiveDialogue {
     pub(crate) fn next(&self) -> Option<LiveSend> {
         self.outgoing.lock().ok()?.pop_front()
     }
+    /// 宿主活动提示让出同会话已经排队的明确发言，不领取或完成那次发送。
+    pub(crate) fn has_outgoing(&self, session: &eve_session_api::SessionKey) -> bool {
+        self.outgoing.lock().map_or(true, |pending| {
+            pending.iter().any(|send| {
+                send.scope.session_id == session.session_id && send.scope.user_id == session.user_id
+            })
+        })
+    }
     /// 只观察同一轮尚未被运行时消费的新输入，不取走正文或推进审核锚点。
     pub(crate) fn pending_anchor(&self, scope: &ContextScope, turn_id: u64) -> Option<String> {
         let turn = self.turns.lock().ok()?.get(&key(scope))?.upgrade()?;

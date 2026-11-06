@@ -46,7 +46,8 @@ pub use state::{ImageAttachment, Message, valid_message_id};
 pub use trusted_review::QqRestrictionObserver;
 
 /// 慢步骤进度的时间阈值：本轮某一步（等待模型或一批工具）持续超过它仍未结束时，
-/// 通道补发一条说明当前步骤与已进行时长的进度。返回 None 表示关闭；每次检查时读取，可热修改。
+/// 通道补发宿主可确认的活动。实时路径不调用措辞模型、不抄内部 final；
+/// 返回 None 表示关闭；每次检查时读取，可热修改。
 pub trait QqSlowProgress: Send + Sync {
     fn after(&self) -> Option<std::time::Duration>;
     /// 阶段反馈与长任务主动进度；由宿主配置，不由模型授予发送权限。
