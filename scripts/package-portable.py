@@ -20,8 +20,6 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NODE_VERSION = "22.22.0"
 TARGETS = {
-    "x86_64-pc-windows-msvc": ("windows-x64", "win-x64", "zip", "c97fa376d2becdc8863fcd3ca2dd9a83a9f3468ee7ccf7a6d076ec66a645c77a"),
-    "aarch64-pc-windows-msvc": ("windows-arm64", "win-arm64", "zip", "5b44fd410df7b4cd0a1891a05a7b606f8fb7d8786a94997b996a372e82478d7a"),
     "x86_64-unknown-linux-gnu": ("linux-x64", "linux-x64", "tar.xz", "9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37"),
     "aarch64-unknown-linux-gnu": ("linux-arm64", "linux-arm64", "tar.xz", "1bf1eb9ee63ffc4e5d324c0b9b62cf4a289f44332dfef9607cea1a0d9596ba6f"),
 }
@@ -125,8 +123,7 @@ def resource_worker(action, arguments):
 
 def package(target, binary_directory, output_directory):
     label, node_platform, node_extension, pinned_digest = TARGETS[target]
-    windows = label.startswith("windows-")
-    if sys.platform != ("win32" if windows else "linux"):
+    if sys.platform != "linux":
         raise RuntimeError("打包必须使用相符平台的原生运行环境。")
     with stage('source_metadata', platform=label):
         source = checked(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -139,34 +136,17 @@ def package(target, binary_directory, output_directory):
     bundle = output_directory / name
     bundle.mkdir()  # 不覆盖旧发行包。
     print(json.dumps(dict(packaging_stage='copy_runtime_assets', event='started', platform=label)), flush=True)
-    extension = ".exe" if windows else ""
     for binary in BINARIES:
-        shutil.copy2(binary_directory / (binary + extension), bundle)
+        shutil.copy2(binary_directory / binary, bundle)
     shutil.copy2(ROOT / "AGENT.md", bundle)
-    shutil.copy2(ROOT / "packaging/windows/config.example.json", bundle)
+    shutil.copy2(ROOT / "packaging/common/config.example.json", bundle)
     for file in ("Launch.mjs", "Updater.mjs", "update-contract.mjs", "update-archive.mjs"):
         shutil.copy2(ROOT / "packaging/common" / file, bundle)
-    if windows:
-        for file in ("Launch.ps1", "Open-Panel.ps1", "Start-Eve.cmd", "Start-Console.cmd", "Start-Web.cmd", "Open-Panel.cmd", "Update-Eve.cmd", "使用说明.md"):
-            source_file = ROOT / "packaging/windows" / file
-            if source_file.suffix == ".ps1":
-                (bundle / source_file.name).write_text(source_file.read_text(encoding="utf-8"), encoding="utf-8-sig")
-            elif source_file.suffix == ".cmd":
-                (bundle / source_file.name).write_bytes(source_file.read_text().replace("\n", "\r\n").encode("ascii"))
-            else:
-                shutil.copy2(source_file, bundle)
-        if label == "windows-arm64":
-            for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Start-Web", "web"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
-                (bundle / f"{script}.cmd").write_bytes((
-                    '@echo off\r\nchcp 65001 >nul\r\n'
-                    '"%~dp0runtime\\node.exe" "%~dp0Launch.mjs" ' + mode + ' %*\r\npause\r\n').encode("ascii"))
-    else:
-        for file in ("使用说明.md",):
-            shutil.copy2(ROOT / "packaging/posix" / file, bundle)
-        for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Start-Web", "web"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
-            shell = bundle / f"{script}.sh"
-            shell.write_text('#!/bin/sh\nEVE_PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\nexec "$EVE_PACKAGE_DIR/runtime/bin/node" "$EVE_PACKAGE_DIR/Launch.mjs" ' + mode + ' "$@"\n', encoding="utf-8")
-            shell.chmod(0o755)
+    shutil.copy2(ROOT / "packaging/posix/使用说明.md", bundle)
+    for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Start-Web", "web"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
+        shell = bundle / f"{script}.sh"
+        shell.write_text('#!/bin/sh\nEVE_PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\nexec "$EVE_PACKAGE_DIR/runtime/bin/node" "$EVE_PACKAGE_DIR/Launch.mjs" ' + mode + ' "$@"\n', encoding="utf-8")
+        shell.chmod(0o755)
     bridge = copy_qq_bridge(bundle)
     runtime = bundle / "runtime"
     runtime.mkdir()
@@ -183,16 +163,11 @@ def package(target, binary_directory, output_directory):
         with stage('extract_node', timeout_seconds=120):
             worker('extract', node_archive, temp)
         node_root = temp / f"node-v{NODE_VERSION}-{node_platform}"
-        if windows:
-            node = runtime / "node.exe"
-            shutil.copy2(node_root / "node.exe", node)
-            npm = node_root / "node_modules/npm/bin/npm-cli.js"
-        else:
-            (runtime / "bin").mkdir()
-            node = runtime / "bin/node"
-            shutil.copy2(node_root / "bin/node", node)
-            node.chmod(0o755)
-            npm = node_root / "lib/node_modules/npm/bin/npm-cli.js"
+        (runtime / "bin").mkdir()
+        node = runtime / "bin/node"
+        shutil.copy2(node_root / "bin/node", node)
+        node.chmod(0o755)
+        npm = node_root / "lib/node_modules/npm/bin/npm-cli.js"
         shutil.copy2(node_root / "LICENSE", runtime / "NODE-LICENSE.txt")
         with stage('check_node', timeout_seconds=30):
             reported = checked([str(node), "--version"], capture_output=True, text=True).stdout.strip()
@@ -205,16 +180,16 @@ def package(target, binary_directory, output_directory):
         checked([str(node), "--input-type=module", "-e", 'await import("@tencent-connect/qqbot-nodejs");'], cwd=bridge)
     for binary in BINARIES:
         with stage('check_binary', binary=binary, timeout_seconds=30):
-            checked([str(bundle / (binary + extension)), "--help"], stdout=subprocess.DEVNULL)
+            checked([str(bundle / binary), "--help"], stdout=subprocess.DEVNULL)
     with stage('hash_bundle'):
         files = {file.relative_to(bundle).as_posix(): digest(file) for file in sorted(bundle.rglob("*")) if file.is_file()}
     manifest = {"format_version": 1, "source_commit": source, "source_tree": tree, "version": version,
-                "target": target, "platform_label": label, "rust_version": "1.95.0", "static_crt": windows,
+                "target": target, "platform_label": label, "rust_version": "1.95.0", "static_crt": False,
                 "node_version": NODE_VERSION, "node_archive_sha256": pinned_digest,
                 "credentials_included": False, "user_data_included": False, "files_sha256": files,
                 "updater_protocol": 1, "state_schema_generation": 2}
     (bundle / "build-info.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    archive = output_directory / (name + ('.zip' if windows else '.tar.gz'))
+    archive = output_directory / (name + '.tar.gz')
     with stage('archive_bundle', timeout_seconds=180):
         worker('archive', bundle, archive, timeout=180)
     with stage('hash_archive'):

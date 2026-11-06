@@ -17,4 +17,4 @@ Eve 装配适配器为 `eve-app::qq_scripts::ScriptTools`，提供保存、查�
 
 Rust v1使用可信rustc独立隔离编译std-only源文件，不调用Cargo或重编Eve；通过`EVE_SCRIPT_RUSTC`配置实际编译器路径。候选失败保留旧版，产物校验后缓存。无状态插件支持旧调用在途时切换新版；有状态插件需确认快照与CAS迁移。
 
-可选[容器后端](container/README.md)供Windows连接可信Linux容器daemon。当前仅Linux实际执行已验收，Windows专用runner工作流尚需真实环境；未配置隔离器继续拒绝执行，Rust编译当前仅支持Linux bubblewrap。
+可选[容器后端](container/README.md)连接可信 Linux 容器 daemon。支持范围为 Linux，Windows 专用 runner 验收已停止；未配置隔离器继续拒绝执行，Rust 编译当前仅支持 Linux bubblewrap。

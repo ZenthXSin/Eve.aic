@@ -95,9 +95,9 @@ test('稳定版本按数值比较，拒绝预发行、降级、错误平台和�
   assert.throws(() => updatePlan({ ...release, assets: [{ ...release.assets[0], browser_download_url: 'https://example.com/evil' }] }, base));
   assert.throws(() => updatePlan({ ...release, assets: [] }, base));
 });
-test('仅四个Linux和Windows平台可选对应原生资产，历史macOS资产不再选用', () => {
-  assert.deepEqual(Object.keys(TARGETS).sort(), ['linux-arm64', 'linux-x64', 'windows-arm64', 'windows-x64']);
-  for (const [platform_label, target] of [['macos-x64', 'x86_64-apple-darwin'], ['macos-arm64', 'aarch64-apple-darwin']]) {
+test('仅 Linux 双架构可选对应原生资产，历史 Windows 和 macOS 资产不再选用', () => {
+  assert.deepEqual(Object.keys(TARGETS).sort(), ['linux-arm64', 'linux-x64']);
+  for (const [platform_label, target] of [['windows-x64', 'x86_64-pc-windows-msvc'], ['windows-arm64', 'aarch64-pc-windows-msvc'], ['macos-x64', 'x86_64-apple-darwin'], ['macos-arm64', 'aarch64-apple-darwin']]) {
     const current = { ...base, platform_label, target };
     assert.throws(() => currentManifest(current));
     assert.throws(() => updatePlan(releaseOf(Buffer.from('historical archive'), 'v2.0.0', platform_label), current));
@@ -108,14 +108,17 @@ test('仅四个Linux和Windows平台可选对应原生资产，历史macOS资产
   }
   for (const [label, target] of Object.entries(TARGETS)) {
     const release = releaseOf(Buffer.from('archive'), 'v2.0.0', label);
+    release.assets.unshift(...['windows-x64', 'windows-arm64'].flatMap(oldLabel =>
+      releaseOf(Buffer.from('retained historical archive'), 'v2.0.0', oldLabel).assets));
     assert.equal(updatePlan(release, { ...base, platform_label: label, target }).target, target);
   }
 });
 test('ZIP 与 tar 实际解码、中文路径和文件清单一致', () => {
-  for (const label of ['linux-x64', 'windows-x64']) {
-    const { files, manifest } = tree('v1.1.0', label), folder = 'Eve-v1.1.0-' + label;
-    const archive = label.startsWith('windows-') ? archiveZip(files, folder) : archiveTar(files, folder);
-    const plan = updatePlan(releaseOf(archive, 'v1.1.0', label), { ...base, platform_label: label, target: TARGETS[label] });
+  const { files, manifest } = tree(), folder = 'Eve-v1.1.0-linux-x64';
+  for (const [extension, archive] of [['tar.gz', archiveTar(files, folder)], ['zip', archiveZip(files, folder)]]) {
+    // 归档解码器保留两种格式的边界测试；发行选择只提供 Linux tar.gz。
+    const plan = { version: manifest.version, label: manifest.platform_label, target: manifest.target,
+      folder, name: `${folder}.${extension}` };
     const decoded = unpack(archive, plan);
     verifyManifest(manifest, plan, [...decoded.keys()]);
     assert.equal(decoded.get('使用说明.md').bytes.toString(), '合成发行说明');
