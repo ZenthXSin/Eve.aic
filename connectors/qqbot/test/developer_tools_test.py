@@ -333,18 +333,26 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertEqual(journal.read_bytes(), before)
 
     def test_invalid_arguments_and_missing_eve_source_never_claim_self_upgrade(self):
+        outside = self.work / "secrets"
+        outside_bytes = b"outside-workspace-fixture-content"
+        outside.write_bytes(outside_bytes)
         def respond(body):
+            self.assertNotIn(outside_bytes.decode(), json.dumps(body, ensure_ascii=False))
             if not self.results(body):
                 return tool_response([("read_file", {"path": "../secrets"}),
                     ("github_api", {"method": "GET", "repository": "test/repo", "url": "http://other.invalid", "token": "model-cannot-authorize"}),
                     ("prepare_self_upgrade", {})])
             results = self.results(body)
-            self.assertIn("仅限主人", json.dumps(results[0], ensure_ascii=False))
+            self.assertEqual(len(results), 3)
+            self.assertEqual(results[0]["error"]["code"], "InvalidArguments")
+            self.assertIn("路径必须位于源码工作区内", results[0]["error"]["message"])
             self.assertIn("参数", json.dumps(results[1], ensure_ascii=False))
             self.assertIn("宿主没有启用实时升级监督器", json.dumps(results[2], ensure_ascii=False))
             return text_response("升级尚未准备，运行版本未变化")
         self.callback = respond
         self.enabled(self.send(self.message("invalid", "核对升级", expected="升级尚未准备，运行版本未变化")))
+        self.assertEqual(outside.read_bytes(), outside_bytes)
+        self.assertEqual(self.kind("review"), [])
         self.assertFalse((self.work / "state/developer-tools/candidates").exists())
 
     def test_live_upgrade_request_uses_host_turn_and_scope_and_does_not_claim_applied(self):
