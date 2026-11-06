@@ -73,9 +73,13 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
-      - name: 实际 Eve QQBot 进程验收
+      - name: 编译实际 Eve QQ、Web 与记忆进程
         run: |
+          set -x
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
+      - name: 进程验收：Web 与基础对话
+        run: |
+          set -x
           python3 scripts/test-web-chat.py
           python3 scripts/test-web-autonomy.py
           python3 scripts/test-web-goals.py
@@ -89,6 +93,9 @@ jobs:
           python3 connectors/qqbot/test/web_panel_test.py
           python3 connectors/qqbot/test/cognition_test.py
           python3 connectors/qqbot/test/goal_feedback_test.py
+      - name: 进程验收：记忆、学习与能力形成
+        run: |
+          set -x
           python3 connectors/qqbot/test/memory_test.py
           python3 connectors/qqbot/test/memory_capacity_test.py
           python3 connectors/qqbot/test/conversation_digest_test.py
@@ -102,6 +109,9 @@ jobs:
           python3 connectors/qqbot/test/strategy_test.py
           python3 connectors/qqbot/test/skill_test.py
           python3 connectors/qqbot/first-goal-acceptance.py --help
+      - name: 进程验收：工具执行、隔离与桥接
+        run: |
+          set -x
           python3 connectors/qqbot/test/toolforge_test.py
           python3 connectors/qqbot/test/dialogue_tools_test.py
           python3 connectors/qqbot/test/developer_tools_test.py
@@ -115,6 +125,9 @@ jobs:
           python3 connectors/qqbot/test/live_upgrade_test.py
           EVE_TEST_UPGRADE_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/self_upgrade_timeout_test.py
           python3 connectors/qqbot/test/transport_test.py
+      - name: 进程验收：模型请求、缓存与执行进展
+        run: |
+          set -x
           python3 connectors/qqbot/test/people_test.py
           python3 connectors/qqbot/test/phrases_test.py
           python3 connectors/qqbot/test/model_health_test.py
@@ -129,6 +142,9 @@ jobs:
           python3 connectors/qqbot/test/tool_progress_test.py
           python3 connectors/qqbot/test/slow_progress_test.py
           python3 connectors/qqbot/test/stage_feedback_test.py
+      - name: 进程验收：上下文、源码查阅与自主探索
+        run: |
+          set -x
           python3 connectors/qqbot/test/history_window_test.py
           python3 connectors/qqbot/test/layered_context_test.py
           python3 connectors/qqbot/test/history_digest_test.py
@@ -147,6 +163,9 @@ jobs:
           python3 connectors/qqbot/test/trigger_test.py
           python3 connectors/qqbot/test/idle_loop_test.py
           python3 connectors/qqbot/test/continuous_autonomy_test.py
+      - name: 进程验收：后台任务与群聊记忆
+        run: |
+          set -x
           python3 connectors/qqbot/test/background_task_test.py
           python3 connectors/qqbot/test/task_progress_test.py
           python3 connectors/qqbot/test/default_goal_journey_test.py
@@ -164,6 +183,9 @@ jobs:
           python3 connectors/qqbot/test/session_archive_test.py
           python3 connectors/qqbot/test/group_digest_test.py
           python3 connectors/qqbot/test/group_recall_test.py
+      - name: 进程验收：恢复、管理与模型传输
+        run: |
+          set -x
           python3 connectors/qqbot/test/background_recovery_test.py
           python3 connectors/qqbot/test/background_diagnostics_test.py
           python3 connectors/qqbot/test/ask_once_test.py
@@ -177,6 +199,9 @@ jobs:
           python3 connectors/qqbot/test/session_diagnostics_test.py
           python3 connectors/qqbot/test/permission_inspection_test.py
           python3 connectors/qqbot/test/delivery_recovery_test.py
+      - name: 进程验收：持续任务与训练评审
+        run: |
+          set -x
           python3 connectors/qqbot/test/compaction_stream_test.py
           python3 connectors/qqbot/test/adaptive_context_test.py
           python3 connectors/qqbot/test/completion_test.py
