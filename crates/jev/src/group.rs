@@ -142,10 +142,10 @@ impl JevRelationJudge {
             .json(&body)
             .send()
             .await
-            .map_err(|_| error())?;
+            .map_err(transport_error)?;
         if !response.status().is_success() {
             return Err(LlmError::Provider(format!(
-                "Jev 群关系 HTTP 状态 {}",
+                "Jev HTTP 状态 {}",
                 response.status().as_u16()
             )));
         }
@@ -153,16 +153,23 @@ impl JevRelationJudge {
             .content_length()
             .is_some_and(|n| n > MAX_OUTPUT_BYTES as u64)
         {
-            return Err(error());
+            return Err(LlmError::Protocol("Jev 响应超过容量上限".into()));
         }
         let mut bytes = vec![];
-        while let Some(chunk) = response.chunk().await.map_err(|_| error())? {
+        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
             if bytes.len() + chunk.len() > MAX_OUTPUT_BYTES {
-                return Err(error());
+                return Err(LlmError::Protocol("Jev 响应超过容量上限".into()));
             }
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
+    }
+}
+fn transport_error(error: reqwest::Error) -> LlmError {
+    if error.is_timeout() {
+        LlmError::ProviderTimeout
+    } else {
+        LlmError::Provider("Jev HTTP 传输不可用".into())
     }
 }
 impl GroupRelationJudge for JevRelationJudge {

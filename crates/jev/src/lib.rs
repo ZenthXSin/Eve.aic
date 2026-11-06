@@ -1,4 +1,4 @@
-//! TypeSafe/SystemOne 的有界消息判断适配；只实现公开 RelationJudge。
+//! TypeSafe/SystemOne 的有界分类适配；各用途依赖独立公开契约，共用 HTTP 与并发槽。
 use eve_message_api::{
     DiscardRelationObservations, IntentPart, MAX_RELATION_EXAMPLES, MessageIntent, RelationAttempt,
     RelationDecision, RelationError, RelationExample, RelationFuture, RelationInput, RelationJudge,
@@ -13,6 +13,7 @@ use serde::{
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
+mod action;
 mod context_recall;
 mod group;
 mod recall;

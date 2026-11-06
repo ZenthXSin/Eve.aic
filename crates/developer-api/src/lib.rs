@@ -229,6 +229,12 @@ impl ActionReviewVerdict {
         self.allow && self.risk < ReviewRisk::High
     }
 }
+mod action_classification;
+pub use action_classification::{
+    ActionClassification, ActionClassificationFuture, ActionReviewClassifier, ActionReviewMode,
+    ActionReviewObserver, ActionReviewRoute, ActionReviewUncertainty,
+};
+
 pub type ActionReviewFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ActionReviewVerdict, String>> + Send + 'a>,
 >;

@@ -1646,6 +1646,7 @@ name = "eve-action-review"
 version = "0.1.0"
 dependencies = [
  "eve-developer-api",
+ "eve-jev",
  "eve-llm-api",
  "serde",
  "serde_json",
@@ -2170,6 +2171,7 @@ version = "0.1.0"
 dependencies = [
  "eve-chime-api",
  "eve-control-api",
+ "eve-developer-api",
  "eve-llm-api",
  "eve-memory-api",
  "eve-message-api",

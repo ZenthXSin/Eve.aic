@@ -15,7 +15,7 @@ use eve_runtime::LlmRelationJudge;
 use serde_json::json;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -65,7 +65,7 @@ pub(crate) fn relation_plugin(
 
 pub(crate) fn group_judge(settings: Arc<dyn ConfigService>) -> Result<Arc<JevRoleJudge>, AppError> {
     let key = std::env::var(JEV_KEY).map_err(|_| "群话题判断需要宿主 EVE_JEV_API_KEY")?;
-    let judge = Arc::new(JevRoleJudge::new(settings, key));
+    let judge = JevRoleJudge::shared(settings, key)?;
     judge.resolve()?;
     Ok(judge)
 }
@@ -75,7 +75,7 @@ pub(crate) fn context_selector(
     settings: Arc<dyn ConfigService>,
 ) -> Option<Arc<dyn eve_memory_api::ContextRelevanceSelector>> {
     let key = std::env::var(JEV_KEY).ok()?;
-    let judge = Arc::new(JevRoleJudge::new(settings, key));
+    let judge = JevRoleJudge::shared(settings, key).ok()?;
     judge.resolve().ok()?;
     Some(judge)
 }
@@ -134,7 +134,7 @@ fn relation_plugin_with_key_reader(
         .map_err(|_| "消息判断用途配置或宿主凭据无效。")?;
     let fallback = Arc::new(LlmRelationJudge::with_resolver(resolver));
     let primary: Option<Arc<dyn RelationJudge>> = if mode == MessageJudgeMode::Jev {
-        let judge = Arc::new(JevRoleJudge::new(settings, read_key(JEV_KEY)?));
+        let judge = JevRoleJudge::shared(settings, read_key(JEV_KEY)?)?;
         judge.resolve()?;
         Some(judge)
     } else {
@@ -172,7 +172,7 @@ impl eve_chime_api::GroupRelationJudge for JevRoleJudge {
             let judge = self
                 .resolve()
                 .map_err(|_| eve_llm_api::LlmError::Context("Jev 群关系配置不可用".into()))?;
-            judge.classify(input).await
+            eve_chime_api::GroupRelationJudge::classify(judge.as_ref(), input).await
         })
     }
 }
@@ -192,6 +192,42 @@ impl eve_chime_api::GroupRecallSelector for JevRoleJudge {
 }
 
 impl JevRoleJudge {
+    /// 同一宿主配置服务与独立凭据共用 HTTP、热配置和并发槽；弱引用不延长宿主寿命。
+    /// 新凭据不会复用旧客户端，也不会因消息、记忆或审查入口各自装配而放大额度。
+    pub(crate) fn shared(
+        settings: Arc<dyn ConfigService>,
+        api_key: String,
+    ) -> Result<Arc<Self>, JevConfigurationError> {
+        static SHARED: OnceLock<Mutex<Vec<Weak<JevRoleJudge>>>> = OnceLock::new();
+        let mut shared = SHARED
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .map_err(|_| JevConfigurationError)?;
+        shared.retain(|entry| entry.strong_count() > 0);
+        for previous in shared.iter().filter_map(Weak::upgrade) {
+            if Arc::ptr_eq(&settings, &previous.settings)
+                && previous
+                    .credentials
+                    .as_ref()
+                    .ok()
+                    .and_then(|credentials| {
+                        crate::model_credentials::resolve(
+                            credentials.as_ref(),
+                            eve_llm_api::CredentialPurpose::Jev,
+                            None,
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|credential| credential.expose() == api_key)
+            {
+                return Ok(previous);
+            }
+        }
+        let judge = Arc::new(Self::new(settings, api_key));
+        shared.push(Arc::downgrade(&judge));
+        Ok(judge)
+    }
+
     fn new(settings: Arc<dyn ConfigService>, api_key: String) -> Self {
         Self {
             settings,
@@ -241,7 +277,7 @@ impl JevRoleJudge {
         Err(JevConfigurationError)
     }
 
-    fn resolve(&self) -> Result<Arc<JevRelationJudge>, JevConfigurationError> {
+    pub(crate) fn resolve(&self) -> Result<Arc<JevRelationJudge>, JevConfigurationError> {
         let captured = self.capture()?;
         let credentials = self
             .credentials
@@ -276,6 +312,23 @@ impl JevRoleJudge {
             judge: judge.clone(),
         });
         Ok(judge)
+    }
+}
+
+impl eve_developer_api::ActionReviewClassifier for JevRoleJudge {
+    fn classify(
+        &self,
+        mode: eve_developer_api::ActionReviewMode,
+        request: eve_developer_api::ActionReviewRequest,
+    ) -> eve_developer_api::ActionClassificationFuture<'_> {
+        Box::pin(async move {
+            let Ok(judge) = self.resolve() else {
+                return eve_developer_api::ActionClassification::Uncertain(
+                    eve_developer_api::ActionReviewUncertainty::Unavailable,
+                );
+            };
+            eve_developer_api::ActionReviewClassifier::classify(judge.as_ref(), mode, request).await
+        })
     }
 }
 
