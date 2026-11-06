@@ -1,6 +1,6 @@
 # Codex 适配器接线设计
 
-本文记录原 Codex 适配器、主/辅模型共同构造、识图入口和显式切换工具的实现。远端真实 Rust 1.95 已完成 metadata、离线锁核对与原文件校验，准确锁已原样取回，见[锁解析记录](Codex依赖锁解析记录.md)。提交 `d2aa3f9a` 对应的合并检验已通过真实 Rust 1.95 全工作区 all-targets 构建检查、274 项定向测试和七个受影响包的严格 Clippy，QQ/Web 四个适配器进程用例通过；上一头 `c31213a5` 的 Stable 全工作区测试 2491 项成功、0 失败。缩小调试产物后，完整候选仍在就绪阶段超时；QQ 长回归另在延后回复的插入消息场景失败，尚未到达压缩流复验。本次显式隔离热更新夹具的自动能力探测，保留记忆、开发工具和全部交接断言；远端新头及最终默认完整组合仍待验收。当前未切换生产或向真实 Codex 端点请求。基础会话 API 来自 `a2eb9e52c135ae03e36233541242f6fe287a8a91`，其最终验收提交 `c0ede7efed0a3b2ee2676b37c578fc8eb6c6da85` 已正式合并。Rust 定向通过不代表宿主完整运行验收完成。
+本文记录原 Codex 适配器、主/辅模型共同构造、识图入口和显式切换工具的实现。远端真实 Rust 1.95 已完成 metadata、离线锁核对与原文件校验，准确锁已原样取回，见[锁解析记录](Codex依赖锁解析记录.md)。提交 `d2aa3f9a` 对应的合并检验已通过真实 Rust 1.95 全工作区 all-targets 构建检查、274 项定向测试和七个受影响包的严格 Clippy，QQ/Web 四个适配器进程用例通过；Stable Linux 全工作区测试 2491 项成功、0 失败，压缩流六项通过，整个 Linux 作业成功。缩小调试产物后，QQ 完整候选仍在就绪阶段超时；QQ 长回归另在延后回复的插入消息场景失败。本次显式隔离热更新夹具的自动能力探测，并让延后回复夹具在退出前等待通道结束命令，保留记忆、开发工具和全部交接断言；远端新头及最终默认完整组合仍待验收。当前未切换生产或向真实 Codex 端点请求。基础会话 API 来自 `a2eb9e52c135ae03e36233541242f6fe287a8a91`，其最终验收提交 `c0ede7efed0a3b2ee2676b37c578fc8eb6c6da85` 已正式合并。Rust 定向通过不代表宿主完整运行验收完成。
 
 目标是在保留现有 Chat 默认路径的前提下，为主模型和辅助模型提供显式的原 Codex Responses 实现。模型名称、端点、协议和实现选择分开处理；失败不自动切换模型、协议、凭据或实现。
 
@@ -95,13 +95,15 @@ HTTP 重试复用当前 request ID；进程恢复时仅相同指纹可复用检�
 
 `d2aa3f9a` 的 [MSRV 作业](https://github.com/ZenthXSin/Eve.aic/actions/runs/42178999666/job/127763978007) 与 [QQ/Web 作业](https://github.com/ZenthXSin/Eve.aic/actions/runs/42178999730/job/127763977889) 原日志均确认实际检出 `46224a79bcab87ffdbe73eec9df068889bf95b5c`，由基线 `8b6fd3d5955d44b0f015dd33f1f06d8366b12002` 与本 PR 头组成。真实 rustc/cargo 1.95.0 的定向测试再次 274 成功、0 失败、2 忽略；全目标检查与七包 Clippy 成功。Web 两项（34.671 秒）、QQ 两项（1.577 秒）通过，小日志 Artifact `13484532589` 的官方压缩摘要与内部日志摘要已核对。
 
+同轮 [Stable Linux 作业](https://github.com/ZenthXSin/Eve.aic/actions/runs/42178999666/job/127763977849) 原日志确认相同合并检验提交，实际 Stable rustc 为 1.99.1。全工作区测试含 412 条结果行，合计 2491 成功、0 失败、24 忽略；反向特性树包含 `arbitrary_precision/default/raw_value/std`，fmt、全目标检查、工作区 Clippy 与整个 Linux 作业均成功。后续压缩流六项在 20.838 秒内全部通过，原 context_compaction 三项在 7.586 秒内通过。四条成功分支的真实估算为 524040 → 89057；六条均保留 35 条工具回执，摘要只在第三批之后触发，两个负向场景也保留全部回执。QQ 长回归没有到达这些用例，不能据 Linux 独立步骤的通过写成 QQ 全量通过。该 Rust run 的总体失败来自旧 Windows 作业；按用户要求，其共享矩阵由 PR #482 移除。
+
 调试信息关闭后，热更新程序由 922,293,416 缩小至 173,807,768 字节，初始宿主 7.576 秒运行、9.090 秒交接。候选监督器于 11.109 秒发布 starting，20.333 秒仍未就绪，外层进入 `host_supervisor_not_ready` 回退，28.331 秒完成保留状态的回退；原 35 秒内没有提交候选。同版本重启通过。减小调试产物确实缩短了前段，但不能据此称候选启动问题已经解决。
 
 两条手写热更新命令遗漏 `--minimal-profile`，默认组合会在发出 READY 之前同步探测最多三个浏览器，每个上限 5 秒。受控 PATH 只放三个慢合成浏览器，用固定 `52c2e0f3` / Rust 1.89 release 程序和实际测试桥验证：默认组合 11.036 秒仍未就绪、已依次探测三个浏览器；显式最小组合 0.160 秒就绪且没有浏览器探测。这证明夹具的自动能力发现足以与 10 秒就绪期限冲突，但未证明它是该次 CI 失败的唯一原因。
 
 现为同版本重启和候选升级显式传入 `--minimal-profile`，保留 `--memory`、已有开发权限配置、真实宿主与候选包，以及 35/10 秒期限、平台 Sent、全部工具回执、第二进程零重放和状态恢复断言。相同旧 release 程序的两项完整夹具验收通过，用例共 9.153 秒，候选 5.150 秒提交、同版本 2.605 秒重启。旧产物 SHA-256 为 `55dc6a5dde12469a4d5ec3d5cd008d61d10810c4f6925e1a619df274ea375b38`；这只确认隔离夹具兼容性，不计作当前 PR / Rust 1.95 / Codex 实测，也不代表默认完整能力组合的启动慢已修复。最终 Debian 12、Rust 1.95 release 必须使用默认完整组合进行 QQ/Web 与升级预演，不能借用最小组合的通过结论。
 
-该轮 QQ 长回归于 2026-11-06 07:33:15 UTC 自然结束，在 `deferred_reply_test.py::test_new_input_during_backoff_is_applied_before_the_next_request` 报 `QQBot 命令写入失败`，同组其余五项通过。压缩流、后续浏览器领域实践和离线 Cargo 完整恢复尚未执行，不将前置列出的命令当作执行成功。新头仍须完整复验，旧作业未取消。
+该轮 QQ 长回归于 2026-11-06 07:33:15 UTC 自然结束，在 `deferred_reply_test.py::test_new_input_during_backoff_is_applied_before_the_next_request` 报 `QQBot 命令写入失败`，同组其余五项通过。实际检出版本的源码确认通道先保存 Handled，再发送 finish，而该手写场景只等 Handled 就让桥接进程退出。实际 Node 测试桥的受控时序复现：先写 Handled、延后 finish 时，旧脚本退出导致 BrokenPipe；补等 finish 后保持管道直到收尾。修复仅让该场景像公共 send 辅助方法一样等待结束命令，并新增恰好三个 Chat 请求和两个 finish 各一次的断言；保留 503、500 毫秒退避、Merged、补充原话、单条回复及同轮历史断言。相同旧 `52c2e0f3` / Rust 1.89 release 程序的目标用例在 1.191 秒通过；这仍不替代新头 CI。QQ 后续压缩流、浏览器领域实践和离线 Cargo 完整恢复尚未执行，新头须完整复验；旧作业未取消。
 
 上一头 `c31213a5` 对应 [MSRV 作业](https://github.com/ZenthXSin/Eve.aic/actions/runs/42173404493/job/127746231737) 实际检出 `f680458e4c34772afd555dc1af6b89d8063a0302`，基线为 `f3809617852513bceea0a4b58712562d3aad91fe`。真实 rustc/cargo 1.95.0、全目标检查和七包 Clippy 通过，274 项成功、2 个忽略入口；其中 Codex/OpenAI 本轮新增 12 项解析回归均通过。OpenAI 单包反向特性树明确为 `default/raw_value/std`。同头 [Stable Linux 作业](https://github.com/ZenthXSin/Eve.aic/actions/runs/42173404493/job/127746232058) 的全工作区测试原日志含 412 条结果行，合计 2491 成功、0 失败、24 忽略；fmt、全目标检查和工作区 Clippy 成功，反向特性树明确包含 `arbitrary_precision/default/raw_value/std`，原九项数字解析失败已经消除。
 
