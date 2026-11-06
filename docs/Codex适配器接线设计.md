@@ -35,7 +35,7 @@ Codex 配合 `chat`、Chat 完整端点、缺少可信 `ModelSession` 或不支�
 | `reasoning_effort=omit` | 不发送 reasoning；其他值必须可由原 Codex `ReasoningEffort` 表示 |
 | temperature | 永不发送 |
 | 主/辅凭据 | 原 `CredentialBank` 按用途和引用产生租约，再交给适配器构造；不复制凭据到配置或诊断 |
-| `EVE_OPENAI_TRANSIENT_RETRIES` | 显式启用原 Codex 有界 HTTP 重试；整个请求共用总期限；应用完成/协议失败不自动换实现重试 |
+| `EVE_OPENAI_TRANSIENT_RETRIES` | 宿主默认启用原 Codex 有界 HTTP 重试，设为 `false` / `0` 可关闭；直接新建 `CodexProvider` 默认不重试。整个请求共用总期限，应用完成/协议失败不自动换实现重试 |
 | `EVE_OPENAI_STREAM_COMPLETIONS` | OpenAI 分支维持原行为；Codex 原客户端始终 SSE，关闭此项不会让它伪装成非流式 JSON HTTP |
 | 首包/停顿/总期限 | 现有用途限制保留，转换成 Codex 同名时间策略；不重置等待或重试的总截止 |
 | 文本 sink | Codex 原流完整验证后一次交最终正文；暂不提供逐字预览；工具批次不混入 commentary |
@@ -97,17 +97,21 @@ HTTP 重试复用当前 request ID；进程恢复时仅相同指纹可复用检�
 
 另外新增 4 个真实宿主进程用例，尚未执行：QQ 指令切 Codex 后由普通对话实际发送 Responses SSE，模型调用切换工具后当前轮仍走 Codex、下一轮走 Chat，重启后重复入站不重放配置写入；独立 eve-web 经 `/api/chat/send` 在两个方向调用真实工具切换，验证当前轮、下一轮、两个独立 Web 会话和两次重启。两种入口各自检查可信身份与伪造参数拒绝，逐条捕获 HTTP 请求核对工具定义、high、无 temperature、模型名、输出上限、稳定会话/缓存键和独立请求 ID。请求总数必须恰好等于正常模型/工具往返，不容许额外目录探测、模型审查或失败回退。这些夹具使用本地合成模型响应，不代表外部供应商兼容性或真实模型自主能力已验收。
 
-最小动态验收命令（先由 Rust 1.95 完成锁文件解析）：
+CI 已按实际 1.95 版本拆分：最低版本任务运行定向 Rust 回归与受影响包的严格 Clippy，QQBot 通道任务编译两种宿主并运行上述 4 个进程用例，Stable 两个平台继续完整回归。最低版本任务在依赖构建前校验原文件，关闭调试信息和增量编译，限时 45 分钟；各任务的实际结果仍待取得。
+
+最小动态验收命令（先完成候选锁文件解析，再由真实 Rust 1.95 验证）：
 
 ```bash
+python3 scripts/verify-codex-upstream.py
 cargo +1.95.0 check --workspace --all-targets --locked
 cargo +1.95.0 fmt -- --check
+cargo +1.95.0 test -p eve-llm-api --lib --locked
 cargo +1.95.0 test -p eve-llm-codex --test responses --locked
-cargo +1.95.0 test -p eve-app models::tests --locked
-cargo +1.95.0 test -p eve-app qq_model --locked
+cargo +1.95.0 test -p eve-app --lib models::tests --locked
+cargo +1.95.0 test -p eve-app --lib qq_model --locked
 cargo +1.95.0 test -p eve-llm-openai --locked
-cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
-python3 scripts/verify-codex-upstream.py
+cargo +1.95.0 test -p eve-runtime --test llm_host --test session_host --test session_http --test model_resolver --test context_compaction --test openai_provider --test streaming --locked
+cargo +1.95.0 clippy -p eve-llm-api -p eve-llm-openai -p eve-llm-codex -p eve-runtime -p eve-app -p eve-developer-tools -p eve-web-panel-api --all-targets --locked -- -D warnings
 cargo +1.95.0 build -p eve-app --bin eve-qqbot --bin eve-web --locked
 EVE_QQBOT_BINARY=target/debug/eve-qqbot python3 connectors/qqbot/test/model_adapter_test.py
 EVE_WEB_BINARY=target/debug/eve-web python3 scripts/test-web-model-adapter.py

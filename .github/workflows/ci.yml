@@ -550,15 +550,53 @@ jobs:
   msrv:
     name: 最低 Rust 版本 / 1.95.0
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 包含原 Codex 依赖的首次编译及定向回归；真实 QQ/Web 进程复用 qqbot.yml 的 1.95 作业。
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: 安装最低支持版本
-        run: rustup toolchain install 1.95.0 --profile minimal
-      - name: 检查最低版本的所有构建目标
-        run: cargo +1.95.0 check --workspace --all-targets --locked
       - name: 核对保留的 Codex 原文件
         run: python3 scripts/verify-codex-upstream.py
+      - name: 安装最低支持版本
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustc +1.95.0 --version --verbose
+          cargo +1.95.0 --version
+      - name: 检查最低版本的所有构建目标
+        id: msrv-targets
+        run: cargo +1.95.0 check --workspace --all-targets --locked
+      - name: 验证最低版本的公共模型会话契约
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-llm-api --lib --locked
+      - name: 验证最低版本的原 Codex Responses 传输与恢复
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-llm-codex --test responses --locked
+      - name: 验证最低版本的原 OpenAI Chat、Responses 与会话回归
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-llm-openai --locked
+      - name: 验证最低版本的主辅选择、九组合与识图入口
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-app --lib models::tests --locked
+      - name: 验证最低版本的适配器切换身份、事务与推理参数
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: cargo +1.95.0 test -p eve-app --lib qq_model --locked
+      - name: 验证最低版本的会话持久化、请求恢复与工具零重放
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: |
+          cargo +1.95.0 test -p eve-runtime --locked \
+            --test llm_host --test session_host --test session_http \
+            --test model_resolver --test context_compaction \
+            --test openai_provider --test streaming
+      - name: 检查最低版本受影响包的 Clippy 警告
+        if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
+        run: |
+          cargo +1.95.0 clippy --all-targets --locked \
+            -p eve-llm-api -p eve-llm-openai -p eve-llm-codex \
+            -p eve-runtime -p eve-app -p eve-developer-tools -p eve-web-panel-api \
+            -- -D warnings
