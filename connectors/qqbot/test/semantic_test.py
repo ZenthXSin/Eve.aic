@@ -36,6 +36,7 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
     def setUp(self):
         recall_test.RecallAcceptance.setUp(self)
         self.embeddings = []
+        self.embedding_requests = []
         self.embedding_failure = False
         self.embedding_authorizations = []
         self.before_embedding = None
@@ -50,6 +51,9 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 with outer.lock:
                     outer.embeddings.append(body)
+                    outer.embedding_requests.append({"body": body, "headers": {
+                        name: self.headers.get(name)
+                        for name in ("session-id", "thread-id", "x-client-request-id")}})
                     outer.embedding_authorizations.append(self.headers.get("Authorization"))
                 if outer.before_embedding:
                     outer.before_embedding(body)
