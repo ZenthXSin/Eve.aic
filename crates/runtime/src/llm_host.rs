@@ -508,6 +508,8 @@ pub struct LlmHost {
     tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
     delegated: bool,
+    /// 可信宿主指定的自由会话；不从模型文字推断，也不改变工具权限或计数。
+    exploration_session: bool,
     delegated_review: Option<(eve_llm_api::ContextScope, Arc<Vec<String>>)>,
     review_source: Option<Arc<dyn eve_llm_api::ReviewUserMessageSource>>,
     review_anchor: Option<String>,
@@ -576,6 +578,7 @@ impl LlmHost {
             tool_scope_policy: None,
             shared_steps: None,
             delegated: false,
+            exploration_session: false,
             delegated_review: None,
             review_source: None,
             review_anchor: None,
@@ -773,6 +776,12 @@ impl LlmHost {
     }
     pub fn with_background_task_id(mut self, id: String) -> Self {
         self.background_task_id = Some(id);
+        self
+    }
+
+    /// 探索可以自行结束，未完成的念头不触发目标续行或交付报告。
+    pub fn with_exploration_session(mut self) -> Self {
+        self.exploration_session = true;
         self
     }
 
@@ -1653,7 +1662,9 @@ impl LlmHost {
                 let batch = steering
                     .take_batch(
                         matches!(response, ModelResponse::Final { .. })
-                            && (closing || continuation.remaining().is_none()),
+                            && (self.exploration_session
+                                || closing
+                                || continuation.remaining().is_none()),
                     )
                     .map_err(|error| fail(error, diagnostics.clone()))?;
                 let has_extra = !batch.messages.is_empty();
@@ -1677,7 +1688,7 @@ impl LlmHost {
                 }
             }
             if let ModelResponse::Final { text } = response {
-                if !closing && continuation.remaining().is_some() {
+                if !self.exploration_session && !closing && continuation.remaining().is_some() {
                     if continuation_checks == 3 {
                         return Err(fail(LlmError::Protocol("任务仍标记为未完成；自动续行三次后仍未完成或说明阻塞，已停止本轮，不能宣称完成".into()), diagnostics));
                     }
@@ -1690,6 +1701,10 @@ impl LlmHost {
                 }
                 diagnostics.stage = TurnStage::Completed;
                 if let Some(frame) = &mut checkpoint {
+                    // 仍想继续的念头可以保留，结束一段探索不必把它改成目标完成。
+                    if self.exploration_session {
+                        frame.closing = true;
+                    }
                     frame.result = Some(text.clone());
                     frame.provider_requests = diagnostics.provider_requests;
                     self.save_execution_checkpoint(frame, &diagnostics, &continuation)
@@ -1746,6 +1761,9 @@ impl LlmHost {
                     && self.config.max_tool_rounds != 0
                     && diagnostics.tool_batches >= self.config.max_tool_rounds)
             {
+                if self.exploration_session && closing {
+                    return Err(fail(LlmError::RoundLimit, diagnostics));
+                }
                 if closing && !reporting {
                     // 兼容服务可能忽略无工具收尾，继续生成旧工具名。拒绝执行该批，
                     // 用独立只读汇报请求隔离原先要求持续执行的指令；不增加工具额度。
@@ -1965,6 +1983,9 @@ impl LlmHost {
     }
 
     fn step_limit_notice(&self, local_used: usize, expression: bool) -> String {
+        if self.exploration_session {
+            return "这段探索的工具额度已经用尽。可以自然停下，留下感想或疑问；无需成果、成功声明、验收或报告。已发生的经历会保存，未执行的调用不会执行。".into();
+        }
         if expression {
             return if self.expression_available(local_used) {
                 "本轮已停止业务工具执行，尚未执行的批次不会执行。当前只提供预算内的 send_message，由你决定是否需要说明已有结果或具体阻塞；需要开口就调用它，也可以安静结束。普通 assistant 文本只存为内部记录，对方收不到；不得把未完成说成完成或承诺本轮还会继续。".into()

@@ -8,6 +8,8 @@ mod idle;
 pub use idle::*;
 mod self_interest;
 pub use self_interest::*;
+mod exploration;
+pub use exploration::*;
 mod autonomy;
 pub use autonomy::*;
 

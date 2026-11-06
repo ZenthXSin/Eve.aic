@@ -198,6 +198,9 @@ fn evaluate_receipts(
 
 /// 任务结算和重启恢复均调用此函数；旧的手工宿主任务仍须没有已知剩余工作或未知效果。
 pub fn evaluate_task_completion(task: &Task, result: &str) -> TaskCompletionAssessment {
+    if task.is_exploration() {
+        return unknown("exploration_session_is_not_a_goal");
+    }
     if task.cancel_requested {
         return blocked("task_cancel_requested");
     }

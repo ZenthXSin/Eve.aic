@@ -1,5 +1,5 @@
-//! 后台任务契约：Eve 在对话中把一件需要多步完成的事派发到后台，由执行器在步数预算内独立完成，
-//! 结束后经私聊或可信宿主的本地收件箱通知派发它的用户。
+//! 后台执行契约：任务按原要求执行并通知用户；自由探索复用执行队列和实际回执，
+//! 允许没有预设目标的会话自然结束，不产生任务完成、进度或被动通知。
 //!
 //! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时在持久化的安全边界接续，未知工具结果不自动重放；
 //! 发送通知时进程退出记为结果未知，不重发。
@@ -22,7 +22,7 @@ pub use strategy::*;
 
 pub const TASK_PLUGIN_ID: &str = "eve.task";
 pub const TASK_STATE_KEY: &str = "tasks.v1";
-/// 账本至多保存的任务；满了时删除最早了结（已结束且通知已了结）的一条，没有可删的就不再新增。
+/// 账本容量；仅淘汰通知已了结的任务或经历已确认保存的探索，没有可删的就不再新增。
 pub const MAX_TASKS: usize = 128;
 /// 同一用户同时排队或执行中的任务上限。
 pub const MAX_ACTIVE_PER_OWNER: usize = 4;
@@ -107,10 +107,41 @@ pub trait TaskArchiveStore: Send + Sync {
 
 pub const MAX_AUTO_RECOVERIES: u32 = 3;
 
+/// 可信宿主冻结的执行语义；探索会话没有目标成功条件，也不产生任务通知。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskExecutionKind {
+    #[default]
+    Task,
+    Exploration,
+}
+impl TaskExecutionKind {
+    pub fn is_task(&self) -> bool {
+        *self == Self::Task
+    }
+}
+
+/// 探索结束的宿主事实，不代表达到目标，也不要求产生发现或结论。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSessionEndReason {
+    NaturalStop,
+    ToolBudgetExhausted,
+    DeadlineExpired,
+    RecoveryLimitReached,
+}
+
 /// 新任务默认开启安全接续；旧任务没有检查点，保持旧的中断语义。
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskExecution {
+    #[serde(default, skip_serializing_if = "TaskExecutionKind::is_task")]
+    pub kind: TaskExecutionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_end_reason: Option<TaskSessionEndReason>,
+    /// 独立经历成功持久化后由宿主确认；缺省表示尚未确认，不能淘汰会话正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exploration_acknowledged_at_ms: Option<u64>,
     pub checkpoint: Option<eve_llm_api::TurnCheckpoint>,
     /// 最近一次结束的持久时间下界；阻塞接续保留，下一次结束必须严格增加。
     /// 防止同毫秒或时钟回拨复用通知结算批次；旧状态首次接续时从 finished_at_ms 补齐。
@@ -151,7 +182,7 @@ pub struct TaskOwner {
 pub struct TaskSpec {
     /// 简短标题，用于列表与通知。
     pub title: String,
-    /// 交给执行器的完整说明；无论是否携带上下文，均须写清任务边界与交付物。
+    /// 交给执行器的完整说明；任务写明边界与交付物，探索只需宿主提供会话语境。
     pub instructions: String,
     /// 步数预算：至多调用多少次工具。
     pub max_steps: u32,
@@ -199,6 +230,8 @@ pub enum TaskStatus {
     Running,
     /// 执行器给出了最终结果。
     Completed,
+    /// 自由探索会话已结束；不表示达成目标或验证结论。
+    SessionEnded,
     /// 本次执行已停止，等待用户补充信息或解除阻塞；不自动接续。
     Blocked,
     /// 执行失败（模型或工具不可用、超时等），保存原因。
@@ -225,6 +258,10 @@ pub struct TaskUsage {
 /// 执行器回报的结局。
 #[derive(Clone, Eq, PartialEq)]
 pub enum TaskEnd {
+    /// 只供 Exploration；小结可以为空，非空时必须已保存在本会话检查点中。
+    SessionEnded {
+        result: String,
+    },
     Completed {
         result: String,
     },
@@ -296,7 +333,7 @@ impl NoticeStatus {
     }
 }
 
-/// 结束通知：完成、失败与中断的任务各有一条；取消的任务没有。
+/// 结束通知：普通任务按结局通知；取消任务与自由探索会话没有自动通知。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Notice {
@@ -340,18 +377,30 @@ pub struct Task {
     pub execution: Option<TaskExecution>,
 }
 impl Task {
+    pub fn execution_kind(&self) -> TaskExecutionKind {
+        self.execution
+            .as_ref()
+            .map_or(TaskExecutionKind::Task, |execution| execution.kind)
+    }
+    pub fn is_exploration(&self) -> bool {
+        self.execution_kind() == TaskExecutionKind::Exploration
+    }
     pub fn needs_step_approval(&self) -> bool {
-        self.source.starts_with(FAILURE_RECOVERY_SOURCE_PREFIX)
+        !self.is_exploration()
+            && self.source.starts_with(FAILURE_RECOVERY_SOURCE_PREFIX)
             && self
                 .execution
                 .as_ref()
                 .and_then(|e| e.checkpoint.as_ref())
                 .is_some_and(recovery_needs_step_approval)
     }
-    /// 已结束且通知（如有）已了结；容量满时可以腾出。
+    /// 已结束且通知（如有）已了结；探索须等独立经历确认后才可腾出正文。
     pub fn settled_at(&self) -> Option<u64> {
         if !self.status.finished() {
             return None;
+        }
+        if self.is_exploration() {
+            return self.execution.as_ref()?.exploration_acknowledged_at_ms;
         }
         if self
             .execution
@@ -369,9 +418,11 @@ impl Task {
     }
     /// 通知正在等待投递。
     pub fn notice_pending(&self) -> bool {
-        self.notice
-            .as_ref()
-            .is_some_and(|notice| notice.status == NoticeStatus::Pending)
+        !self.is_exploration()
+            && self
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.status == NoticeStatus::Pending)
     }
 }
 
@@ -385,6 +436,8 @@ pub struct TaskSummary {
     pub instructions: String,
     pub created_at_ms: u64,
     pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "TaskExecutionKind::is_task")]
+    pub kind: TaskExecutionKind,
 }
 impl From<&Task> for TaskSummary {
     fn from(task: &Task) -> Self {
@@ -395,6 +448,7 @@ impl From<&Task> for TaskSummary {
             instructions: task.spec.instructions.clone(),
             created_at_ms: task.created_at_ms,
             status: task.status,
+            kind: task.execution_kind(),
         }
     }
 }
@@ -596,6 +650,31 @@ pub trait TaskAdmin: Send + Sync {
         _review_messages: Vec<String>,
         _completion_contract: Option<TaskCompletionContract>,
         _deadline_at_ms: Option<u64>,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
+    /// 创建无目标的内部探索会话；身份、原授权与资源同一次持久化，不接受成功合同。
+    /// mode 永久属于这次来源；重复来源不得在普通任务与探索间转换。
+    /// 替换实现未支持此语义时明确拒绝，不能降级为旧的无合同任务。
+    fn create_exploration(
+        &self,
+        _owner: &TaskOwner,
+        _spec: TaskSpec,
+        _source: &str,
+        _review_messages: Vec<String>,
+        _deadline_at_ms: Option<u64>,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
+    /// 宿主已经将真实经历存到独立持久存储后确认；仅解除容量保留，不修改原结局。
+    /// 替换后端必须显式实现，不能以成功返回而静默丢掉确认。
+    fn acknowledge_exploration(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _finished_at_ms: u64,
         _now_ms: u64,
     ) -> TaskResult<Task> {
         Err(TaskError::InvalidTransition)
@@ -856,6 +935,7 @@ impl fmt::Debug for TaskSnapshot {
 impl fmt::Debug for TaskEnd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::SessionEnded { .. } => "SessionEnded",
             Self::Completed { .. } => "Completed",
             Self::Failed { .. } => "Failed",
             Self::Cancelled => "Cancelled",

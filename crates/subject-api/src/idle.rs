@@ -13,6 +13,17 @@ pub enum IdleChoice {
     Wait,
     Reflect,
     Act,
+    Explore,
+}
+
+/// 好奇的可选线索，不是目标、验收条件或执行授权。
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleExploration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interest_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,6 +63,10 @@ pub struct IdleReflection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interest_updates: Vec<SelfInterest>,
     pub action: Option<IdleAction>,
+    /// Explore 本身已足够；可以省略整个对象，也可以没有线索或既有兴趣。
+    /// 缺省字段不写回旧记录，保持旧回顾的持久指纹不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exploration: Option<IdleExploration>,
     /// 下一次回顾的间隔，三十分钟至一天；不改变原授权截止。
     pub revisit_after_minutes: u32,
 }
@@ -65,6 +80,7 @@ impl IdleReflection {
             || self.judgments.len() > 4
             || self.interest_updates.len() > 2
             || (self.choice == IdleChoice::Act) != self.action.is_some()
+            || (self.choice != IdleChoice::Explore && self.exploration.is_some())
             || serde_json::to_vec(self)
                 .map_err(|_| SubjectError::InvalidInput)?
                 .len()
@@ -109,6 +125,14 @@ impl IdleReflection {
                 || action.assessment.score() <= 0
             {
                 return Err(SubjectError::InvalidInput);
+            }
+        }
+        if let Some(exploration) = &self.exploration {
+            if exploration.cue.as_ref().is_some_and(|cue| cue.len() > 1024) {
+                return Err(SubjectError::InvalidInput);
+            }
+            if let Some(key) = &exploration.interest_key {
+                validate_id(key)?;
             }
         }
         Ok(())
@@ -175,7 +199,12 @@ impl IdleObservation {
                 || evidence.text.len() > 16384
                 || !matches!(
                     evidence.kind.as_str(),
-                    "focus" | "task_result" | "completed_conversation" | "self_reflection"
+                    "focus"
+                        | "task_result"
+                        | "completed_conversation"
+                        | "self_reflection"
+                        | "exploration_experience"
+                        | "exploration_reflection"
                 )
             {
                 return Err(SubjectError::InvalidInput);

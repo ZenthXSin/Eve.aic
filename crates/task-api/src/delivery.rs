@@ -7,6 +7,7 @@ pub struct TaskDeliveryEntry {
     pub id: String,
     pub owner: TaskOwner,
     pub source: String,
+    pub kind: TaskExecutionKind,
     pub created_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub notice: Option<Notice>,
@@ -17,6 +18,7 @@ impl From<&Task> for TaskDeliveryEntry {
             id: task.id.clone(),
             owner: task.owner.clone(),
             source: task.source.clone(),
+            kind: task.execution_kind(),
             created_at_ms: task.created_at_ms,
             finished_at_ms: task.finished_at_ms,
             notice: task.notice.clone(),
@@ -24,12 +26,16 @@ impl From<&Task> for TaskDeliveryEntry {
     }
 }
 impl TaskDeliveryEntry {
+    fn execution_kind(&self) -> TaskExecutionKind {
+        self.kind
+    }
     /// 通知认领不得把候选换成另一身份、来源或创建记录。
     pub fn matches(&self, task: &Task) -> bool {
         self.id == task.id
             && self.owner == task.owner
             && self.source == task.source
             && self.created_at_ms == task.created_at_ms
+            && self.kind == task.execution_kind()
     }
 }
 
@@ -48,6 +54,9 @@ impl TaskDeliverySnapshot {
             validate_owner(&task.owner).map_err(|_| TaskError::CorruptState)?;
             validate_id(&task.source).map_err(|_| TaskError::CorruptState)?;
             if !ids.insert(&task.id) || task.created_at_ms == 0 {
+                return Err(TaskError::CorruptState);
+            }
+            if !task.kind.is_task() && task.notice.is_some() {
                 return Err(TaskError::CorruptState);
             }
             if let Some(notice) = &task.notice {
@@ -72,6 +81,7 @@ pub(super) trait NoticeRecord {
     fn user_id(&self) -> &str;
     fn finished_at_ms(&self) -> Option<u64>;
     fn notice(&self) -> Option<&Notice>;
+    fn kind(&self) -> TaskExecutionKind;
 }
 macro_rules! notice_record {
     ($ty:ty) => {
@@ -88,6 +98,9 @@ macro_rules! notice_record {
             fn notice(&self) -> Option<&Notice> {
                 self.notice.as_ref()
             }
+            fn kind(&self) -> TaskExecutionKind {
+                self.execution_kind()
+            }
         }
     };
 }
@@ -95,12 +108,15 @@ notice_record!(Task);
 notice_record!(TaskDeliveryEntry);
 
 fn pending(task: &impl NoticeRecord) -> bool {
-    task.notice()
-        .is_some_and(|notice| notice.status == NoticeStatus::Pending)
+    task.kind().is_task()
+        && task
+            .notice()
+            .is_some_and(|notice| notice.status == NoticeStatus::Pending)
 }
 fn sending<T: NoticeRecord>(tasks: &[T], user_id: &str) -> bool {
     tasks.iter().any(|task| {
-        task.user_id() == user_id
+        task.kind().is_task()
+            && task.user_id() == user_id
             && task
                 .notice()
                 .is_some_and(|n| n.status == NoticeStatus::Delivering)
@@ -267,6 +283,7 @@ mod tests {
                 user_id: user.into(),
             },
             source: format!("source:{id}"),
+            kind: TaskExecutionKind::Task,
             created_at_ms: 1,
             finished_at_ms: Some(10),
             notice: (variant != 0).then(|| Notice {

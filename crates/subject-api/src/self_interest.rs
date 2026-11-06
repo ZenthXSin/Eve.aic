@@ -46,7 +46,7 @@ impl SelfInterest {
             || self.want_to_try.len() > 384
             || (self.phase.motivates_action() && self.want_to_try.trim().is_empty())
             || self.strength > 100
-            || self.evidence.is_empty()
+            || (self.phase.motivates_action() && self.evidence.is_empty())
             || self.evidence.len() > 4
         {
             return Err(SubjectError::InvalidInput);
@@ -107,7 +107,7 @@ pub fn validate_self_interests(interests: &[SelfInterestRecord]) -> SubjectResul
             || record.updated_at_ms < record.first_recorded_at_ms
             || !keys.insert(&record.current.key)
             || !topics.insert(self_interest_topic_key(&record.current.topic))
-            || record.consumed_evidence.is_empty()
+            || (record.current.phase.motivates_action() && record.consumed_evidence.is_empty())
             || record.consumed_evidence.len() > 32
             || record
                 .current
@@ -142,6 +142,44 @@ pub struct SelfInterestHistoryPage {
 /// commit 必须原子保存整个回顾；同一 task_id 重送相同输入只返回已存状态，
 /// 不改变时间、修订或再回顾期限。来源去重覆盖完整历史，不限于上下文视图。
 pub trait IdleMemoryStore: Send + Sync {
+    /// 保存实际探索经历。session_id 全局唯一；相同内容可重送，不同内容必须拒绝。
+    /// 默认明确不支持，替换后端不能把未持久化的经历伪装为成功。
+    fn record_exploration(&self, _experience: &crate::ExplorationExperience) -> SubjectResult<()> {
+        Err(SubjectError::Unavailable)
+    }
+    fn exploration(
+        &self,
+        _scope: &crate::SubjectScope,
+        _session_id: &str,
+    ) -> SubjectResult<Option<crate::ExplorationExperience>> {
+        Err(SubjectError::Unavailable)
+    }
+    /// None 读取最近经历，next_before 继续向旧记录读取；每页最多 16 条。
+    fn explorations(
+        &self,
+        _scope: &crate::SubjectScope,
+        _before: Option<u64>,
+        _limit: usize,
+    ) -> SubjectResult<crate::ExplorationExperiencePage> {
+        Err(SubjectError::Unavailable)
+    }
+    /// 一次已提交回顾只派发一次会话；与兴趣和任务问题键无关。
+    fn reserve_exploration_source(
+        &self,
+        _scope: &crate::SubjectScope,
+        _reflection_id: &str,
+        _focus_id: &str,
+        _now_ms: u64,
+    ) -> SubjectResult<()> {
+        Err(SubjectError::Unavailable)
+    }
+    fn exploration_source(
+        &self,
+        _scope: &crate::SubjectScope,
+        _reflection_id: &str,
+    ) -> SubjectResult<Option<String>> {
+        Err(SubjectError::Unavailable)
+    }
     fn snapshot(&self, scope: &crate::SubjectScope) -> SubjectResult<crate::IdleMind>;
     /// 填充已展示兴趣对当前冻结证据的消费标记；不能把完整历史放入模型上下文。
     fn prepare_observation(&self, observation: &mut crate::IdleObservation) -> SubjectResult<()>;
