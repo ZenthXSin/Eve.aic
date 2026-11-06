@@ -43,6 +43,9 @@ pub(super) fn quiet_request(text: &str) -> bool {
         "不要汇报",
         "不用汇报",
         "无需汇报",
+        "不用播报",
+        "不要播报",
+        "无需播报",
         "先不用回答",
         "先不回答",
         "先别回复",
@@ -382,6 +385,27 @@ mod tests {
         assert!(quiet_request("这个先不用回答，先核对"));
         assert!(quiet_request("Please stay quiet while checking"));
         assert!(!quiet_request("执行期间告诉我现在在做什么"));
+    }
+
+    #[test]
+    fn broadcast_opt_out_is_quiet_but_broadcast_requests_and_unrelated_negation_are_not() {
+        for request in [
+            "做一次检查，过程中不用播报",
+            "继续检查，过程中不要播报，完成后告诉我结果",
+            "执行这条命令，无需播报进度",
+        ] {
+            assert!(quiet_request(request), "未识别明确的安静请求：{request}");
+        }
+        for request in [
+            "做一次检查，过程中需要播报",
+            "执行时告诉我当前进度",
+            "检查播报功能是否正常",
+            "这个命令不用重跑，继续播报已有结果",
+            "把两项检查结果分别播报",
+            "检查识别播报错误的逻辑",
+        ] {
+            assert!(!quiet_request(request), "不应抑制普通请求：{request}");
+        }
     }
 
     #[test]
