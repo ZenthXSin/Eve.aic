@@ -403,6 +403,16 @@ impl Store {
         db.execute("UPDATE speech SET due=?2,updated=?3 WHERE id=?1 AND event=?4 AND state IN ('pending','waiting','ready')",params![key(event)?,now().saturating_add(after_ms.clamp(1000,86_400_000)),now(),serde_json::to_string(event).map_err(error)?]).map_err(error)?;
         Ok(())
     }
+    fn release_evaluation(&self, event: &QqSpeechEvent) -> PluginResult<()> {
+        let db = self.connection.lock().map_err(error)?;
+        // future 被取消或通道插件停止时仍复用同一账本；只释放本次未完成的决定。
+        // 已退役、已决定或已经开始投递的记录不能被析构器重新入队。
+        db.execute(
+            "UPDATE speech SET state='waiting',decision=NULL,due=?2,updated=?3 WHERE id=?1 AND event=?4 AND state='evaluating'",
+            params![key(event)?, now().saturating_add(RETRY_MS), now(), serde_json::to_string(event).map_err(error)?],
+        ).map_err(error)?;
+        Ok(())
+    }
     fn retire(&self, event: &QqSpeechEvent) -> PluginResult<()> {
         let db = self.connection.lock().map_err(error)?;
         db.execute("UPDATE speech SET state='stale',updated=?2 WHERE id=?1 AND event=?3 AND state IN ('pending','evaluating','waiting','ready')",params![key(event)?,now(),serde_json::to_string(event).map_err(error)?]).map_err(error)?;
@@ -579,6 +589,19 @@ pub(crate) struct Speech {
     pub(crate) host: eve_runtime::LlmHostConfig,
     pub(crate) conversations: eve_qqbot_plugin::QqConversations,
 }
+
+struct EvaluationGuard<'a> {
+    store: &'a Store,
+    event: &'a QqSpeechEvent,
+}
+impl Drop for EvaluationGuard<'_> {
+    fn drop(&mut self) {
+        if self.store.release_evaluation(self.event).is_err() {
+            diagnosed("evaluation_release", context_error("持久化不可用"));
+        }
+    }
+}
+
 impl Speech {
     async fn decide(&self, event: &QqSpeechEvent) -> Result<QqSpeechDecision, LlmError> {
         let scope = ContextScope {
@@ -673,11 +696,19 @@ impl QqSpeech for Speech {
                 user_id: event.session.user_id.clone(),
             };
             // 原话可能已持久化，而对应回执尚未提交；重启后的内存目录不能独自证明最新性。
-            if !self
+            let current = match self
                 .conversations
                 .review_user_message_is_current(&scope, &event.anchor)
-                .map_err(context_error)?
             {
+                Ok(current) => current,
+                Err(error) => {
+                    self.store
+                        .postpone(&event, RETRY_MS)
+                        .map_err(context_error)?;
+                    return Err(diagnosed("current_message", context_error(error)));
+                }
+            };
+            if !current {
                 self.store
                     .postpone(&event, RETRY_MS)
                     .map_err(context_error)?;
@@ -697,6 +728,10 @@ impl QqSpeech for Speech {
             self.store
                 .save(&event, "evaluating", None, now())
                 .map_err(context_error)?;
+            let _evaluation = EvaluationGuard {
+                store: self.store.as_ref(),
+                event: &event,
+            };
             // 完整决定过程（含上下文读取）都受期限约束。任何错误都回到可重试状态，
             // 不让模型结束后的新鲜度读取失败把记录永久留在 evaluating。
             let result =

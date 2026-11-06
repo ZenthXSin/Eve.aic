@@ -455,3 +455,364 @@ fn speech_history_uses_bounded_recent_page_in_chronological_order() {
     assert_eq!(view["turns"][1]["turn_id"], 2);
     assert_eq!(view["turns"][1]["state"], "pending");
 }
+
+#[derive(Clone, Copy)]
+enum ModelAnswer {
+    Pending,
+    Failure,
+    Silence,
+}
+
+struct DecisionProvider {
+    answer: Mutex<ModelAnswer>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl eve_llm_api::LlmProvider for DecisionProvider {
+    fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(request.tools.is_empty());
+            let input: Value =
+                serde_json::from_str(request.messages.last().unwrap().text.as_deref().unwrap())
+                    .unwrap();
+            assert_eq!(input["current_user_message"]["text"], "/help");
+            let answer = *self.answer.lock().unwrap();
+            match answer {
+                ModelAnswer::Pending => std::future::pending().await,
+                ModelAnswer::Failure => Err(LlmError::Provider("本地模型故障夹具".into())),
+                ModelAnswer::Silence => Ok(ModelResponse::Final {
+                    text: r#"{"action":"silence"}"#.into(),
+                }),
+            }
+        })
+    }
+}
+impl DecisionProvider {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+struct DecisionResolver(Arc<DecisionProvider>);
+impl LlmModelResolver for DecisionResolver {
+    fn resolve(&self) -> Result<eve_llm_api::ModelSelection, LlmError> {
+        Ok(eve_llm_api::ModelSelection {
+            provider: self.0.clone(),
+            provider_timeout: std::time::Duration::from_secs(59),
+        })
+    }
+}
+
+fn decision_fixture(
+    directory: &Path,
+    conversations: eve_qqbot_plugin::QqConversations,
+    event: &QqSpeechEvent,
+    answer: ModelAnswer,
+) -> (Speech, Arc<DecisionProvider>) {
+    let provider = Arc::new(DecisionProvider {
+        answer: Mutex::new(answer),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let resolver = Arc::new(DecisionResolver(provider.clone()));
+    (
+        Speech {
+            store: Store::open(&directory.join("decisions.sqlite3")).unwrap(),
+            resolver: resolver.clone(),
+            background_resolver: resolver,
+            context: crate::services::default_context(),
+            sessions: Arc::new(RecentOnly(event.session.clone())),
+            host: eve_runtime::LlmHostConfig::default(),
+            conversations,
+        },
+        provider,
+    )
+}
+
+struct NoConversationExecution;
+impl eve_control_api::ControlRunner for NoConversationExecution {
+    fn run<'a>(
+        &'a self,
+        _: eve_session_api::SessionInput,
+        _: &'a dyn eve_llm_api::TurnEventSink,
+    ) -> eve_control_api::RunFuture<'a> {
+        panic!("原话夹具只经过通道持久化，不执行主模型或工具")
+    }
+}
+
+/// 通过真实入站路径建立原文绑定，不为测试开放修改 QqConversations 私有状态的接口。
+async fn bound_conversations(
+    directory: &Path,
+) -> (eve_qqbot_plugin::QqConversations, QqSpeechEvent) {
+    use eve_plugin_api::{PluginId, ServiceId};
+    use eve_qqbot_plugin::{QqBotConfig, QqBotPlugin, QqBotStatusHandle};
+    let message = eve_qqbot_plugin::Message {
+        id: "input-1".into(),
+        scope: "c2c".into(),
+        target_id: "owner".into(),
+        user_id: "owner".into(),
+        text: "/help".into(),
+        attachments: vec![],
+        quoted: None,
+    };
+    let mut frame = serde_json::to_value(&message).unwrap();
+    frame["type"] = json!("restriction_only");
+    frame["version"] = json!(1);
+    frame["original_text"] = json!(message.text);
+    let script = directory.join("original-ingress.mjs");
+    std::fs::write(
+        &script,
+        [
+            "import readline from 'node:readline';\nconst frames = ",
+            &json!([{"type":"ready","version":1}, frame]).to_string(),
+            ";\nfor (const frame of frames) process.stdout.write(JSON.stringify(frame) + '\\n');\n\
+             const input = readline.createInterface({input:process.stdin});\n\
+             input.on('line', line => {\n\
+               const command = JSON.parse(line);\n\
+               if (command.type === 'finish' || command.type === 'stop')\n\
+                 process.stdout.end(() => process.exit(0));\n\
+             });\n",
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let services = eve_kernel::KernelServices::default();
+    let registry = services.registry.clone();
+    let kernel = eve_kernel::Kernel::with_services(services);
+    kernel
+        .register(Box::new(
+            eve_control_plugin::ControlPlugin::new(Arc::new(NoConversationExecution), vec![])
+                .unwrap(),
+        ))
+        .unwrap();
+    kernel
+        .register(Box::new(
+            eve_config_plugin::ConfigPlugin::new(eve_config_plugin::ConfigBootstrap::new(
+                directory,
+                vec![eve_message_api::message_schema()],
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+    kernel
+        .register(Box::new(
+            eve_message_plugin::RelationPlugin::rules().unwrap(),
+        ))
+        .unwrap();
+    kernel
+        .register(Box::new(
+            eve_message_plugin::MessageRouterPlugin::builtin().unwrap(),
+        ))
+        .unwrap();
+    let plugin = QqBotPlugin::new(QqBotConfig {
+        node_program: "node".into(),
+        bridge_script: script,
+        bridge_args: vec![],
+        app_id: "speech-test".into(),
+        app_secret: "local-fixture".into(),
+        sandbox: true,
+        markdown: false,
+    })
+    .unwrap()
+    .with_receipt_archive(Arc::new(
+        eve_qqbot_receipt_sqlite::SqliteReceiptArchive::open(&directory.join("originals.sqlite3"))
+            .unwrap(),
+    ));
+    let conversations = plugin.conversations();
+    kernel.register(Box::new(plugin)).unwrap();
+    kernel
+        .start(&PluginId::new(eve_qqbot_plugin::QQBOT_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let status = registry
+        .get(&ServiceId::new(eve_qqbot_plugin::QQBOT_STATUS_SERVICE_ID).unwrap())
+        .unwrap()
+        .unwrap()
+        .value
+        .downcast::<QqBotStatusHandle>()
+        .unwrap();
+    let mut changes = status.status.clone();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !changes.borrow_and_update().closed {
+            changes.changed().await.unwrap();
+        }
+    })
+    .await;
+    kernel.stop_all().await.unwrap();
+    closed.expect("原话夹具没有完成持久化并关闭通道");
+    assert!(!status.status.borrow().terminal_error);
+    assert_eq!(status.status.borrow().received, 1);
+    let event = QqSpeechEvent {
+        session: message.session_key("speech-test").unwrap(),
+        anchor: message.id,
+        ..event("after-channel-exit")
+    };
+    assert_eq!(
+        conversations
+            .original_message_at(&event.session, &event.anchor)
+            .unwrap(),
+        "/help"
+    );
+    assert_eq!(
+        conversations
+            .latest_message_id(&event.session)
+            .unwrap()
+            .as_deref(),
+        Some(event.anchor.as_str())
+    );
+    (conversations, event)
+}
+
+fn make_retry_due(store: &Store, event: &QqSpeechEvent) {
+    // 只推进时钟条件；不改变状态或重开账本，证明清理本身恢复了可调度性。
+    assert_eq!(
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE speech SET due=0 WHERE id=?1 AND state='waiting'",
+                [key(event).unwrap()],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.pending().unwrap(), std::slice::from_ref(event));
+}
+
+#[tokio::test]
+async fn original_preflight_error_postpones_without_calling_model_or_spinning() {
+    let directory = tempfile::tempdir().unwrap();
+    let event = event("missing-original");
+    let (speech, provider) = decision_fixture(
+        directory.path(),
+        eve_qqbot_plugin::QqConversations::default(),
+        &event,
+        ModelAnswer::Silence,
+    );
+    let started = now();
+    assert!(speech.consider(event.clone()).await.is_err());
+    let (state, decision, due) = speech.store.state(&event).unwrap();
+    assert_eq!(state, "pending");
+    assert!(decision.is_none());
+    assert!(due >= started + RETRY_MS);
+    assert!(speech.store.pending().unwrap().is_empty());
+    assert!(speech.consider(event).await.unwrap().is_none());
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn provider_failure_returns_to_waiting_and_same_store_can_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let (conversations, event) = bound_conversations(directory.path()).await;
+    let (speech, provider) = decision_fixture(
+        directory.path(),
+        conversations,
+        &event,
+        ModelAnswer::Failure,
+    );
+    let started = now();
+    assert!(matches!(
+        speech.consider(event.clone()).await,
+        Err(LlmError::Provider(_))
+    ));
+    let (state, decision, due) = speech.store.state(&event).unwrap();
+    assert_eq!(state, "waiting");
+    assert!(decision.is_none());
+    assert!(due >= started + RETRY_MS);
+    assert!(speech.consider(event.clone()).await.unwrap().is_none());
+    assert_eq!(provider.calls(), 1);
+    *provider.answer.lock().unwrap() = ModelAnswer::Silence;
+    make_retry_due(&speech.store, &event);
+    assert!(matches!(
+        speech.consider(event.clone()).await.unwrap(),
+        Some(QqSpeechDecision::Silence {})
+    ));
+    assert_eq!(speech.store.state(&event).unwrap().0, "silence");
+    assert_eq!(provider.calls(), 2);
+}
+
+#[tokio::test]
+async fn cancelled_consideration_retries_without_reopening_the_live_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let (conversations, event) = bound_conversations(directory.path()).await;
+    let (speech, provider) = decision_fixture(
+        directory.path(),
+        conversations,
+        &event,
+        ModelAnswer::Pending,
+    );
+    let mut future = speech.consider(event.clone());
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(speech.store.state(&event).unwrap().0, "evaluating");
+    assert_eq!(provider.calls(), 1);
+    let cancelled = now();
+    drop(future);
+    let (state, decision, due) = speech.store.state(&event).unwrap();
+    assert_eq!(state, "waiting", "丢弃 future 后不能留在 evaluating");
+    assert!(decision.is_none());
+    assert!(due >= cancelled + RETRY_MS);
+    assert!(speech.consider(event.clone()).await.unwrap().is_none());
+    assert_eq!(provider.calls(), 1);
+    *provider.answer.lock().unwrap() = ModelAnswer::Silence;
+    make_retry_due(&speech.store, &event);
+    assert!(matches!(
+        speech.consider(event.clone()).await.unwrap(),
+        Some(QqSpeechDecision::Silence {})
+    ));
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(speech.store.state(&event).unwrap().0, "silence");
+}
+
+#[tokio::test]
+async fn cancellation_cleanup_preserves_retired_dispatched_and_replaced_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let (conversations, original) = bound_conversations(directory.path()).await;
+    let (speech, _) = decision_fixture(
+        directory.path(),
+        conversations,
+        &original,
+        ModelAnswer::Pending,
+    );
+    for state in ["stale", "sending", "sent", "replacement"] {
+        let mut event = original.clone();
+        event.id = format!("preserve-{state}");
+        let mut future = speech.consider(event.clone());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(speech.store.state(&event).unwrap().0, "evaluating");
+        match state {
+            "stale" => speech.store.retire(&event).unwrap(),
+            "replacement" => {
+                event.anchor = "replacement-input".into();
+                speech.store.enqueue(&event).unwrap();
+            }
+            _ => {
+                speech
+                    .store
+                    .save(&event, "ready", Some(&speak()), 0)
+                    .unwrap();
+                speech.store.dispatched(&event).unwrap();
+                if state == "sent" {
+                    speech
+                        .store
+                        .delivered(
+                            &event,
+                            QqOutreachResult::Sent {
+                                platform_message_id: Some("confirmed-local-receipt".into()),
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let saved = speech.store.state(&event).unwrap();
+        drop(future);
+        assert_eq!(speech.store.state(&event).unwrap(), saved);
+    }
+}

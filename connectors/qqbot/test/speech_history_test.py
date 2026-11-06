@@ -74,9 +74,11 @@ class SpeechHistoryAcceptance(live.LiveToolAcceptance):
         for path, digest in self.history_files.items():
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
         count = len(self.speech_requests)
-        self.run_live([])
+        self.run_live([{'delay_ms': 2500}])
         self.assertEqual(len(self.speech_requests), count)
         self.assertFalse([e for e in self.events if e.get('type') in ('push', 'progress')])
+        self.assertTrue(any(event['id'] == 'host-reply:help-long' and state == 'sent'
+                            for event, state, _ in self.speech_rows()))
 
 
 if __name__ == '__main__':
