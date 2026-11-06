@@ -44,22 +44,30 @@ jobs:
           node-version: '22.22.0'
       - name: 准备 Linux 脚本与成员项目的真实隔离环境
         if: runner.os == 'Linux'
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          sudo apt-get install -y bubblewrap python3 nodejs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          sudo apt-get install -y --no-install-recommends bubblewrap python3
+          # 固定路径的隔离执行器复用 setup-node 的版本，避免再下载一份系统 Node。
+          ci_node="$(readlink -f -- "$(command -v node)")"
+          test "$("$ci_node" --version)" = v22.22.0
+          if [ "$ci_node" != /usr/bin/node ]; then
+            sudo ln -sfnT -- "$ci_node" /usr/bin/node
+          fi
           # Ubuntu 24.04 的 AppArmor 默认限制非特权用户命名空间；与成员项目验收保持一致。
-          if (Test-Path "/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          fi
           bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           /usr/bin/python3 --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          /usr/bin/node --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          test "$(/usr/bin/node --version)" = v22.22.0
+          node_mounts=(--ro-bind /usr/lib /usr/lib --ro-bind /lib /lib)
+          if [ -d /lib64 ]; then node_mounts+=(--ro-bind /lib64 /lib64); fi
+          bwrap --unshare-all --cap-drop ALL --clearenv "${node_mounts[@]}" \
+            --proc /proc --dev /dev --ro-bind "$ci_node" /runtime/node \
+            /runtime/node --no-addons --jitless --max-old-space-size=64 --max-semi-space-size=4 \
+            -e 'if (process.version !== "v22.22.0") process.exit(1); console.log(process.version)'
       - name: 验证自动发行的版本与恢复语义
         run: python -X utf8 scripts/test-release-portable.py
       - name: 验证 Debian 12 生产证据与失败产物拒绝
