@@ -549,7 +549,10 @@ def validate_receipt_segments(segments, reply, state):
         raise ValueError('invalid_segment_ledger')
     # 与分段契约一致：完整代码围栏必须由同一片段覆盖。
     spans, opened, offset = [], None, 0
-    for line in encoded.splitlines(keepends=True):
+    lines = encoded.split(b'\n')
+    for index, line in enumerate(lines):
+        if index < len(lines) - 1:
+            line += b'\n'
         content = line.rstrip(b'\n\r')
         body = content.lstrip(b' \t')
         indent = len(content) - len(body)
