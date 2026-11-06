@@ -2708,8 +2708,19 @@ mod tests {
             .unwrap();
         let s = scope(&trusted("a", "owner"));
         let subject = f.subject.clone() as Arc<dyn SubjectAdmin>;
-        let (policy, _) = grant_for(&subject, &s).unwrap().unwrap();
-        f.tick(policy.updated_at_ms + AUTONOMY_INTERVAL_MS);
+        // 后续前台配置使用真实时钟；这里实际派发并扣预算，不把账本写到未来。
+        let now = crate::qq_tasks::now_ms();
+        let tasks = f.tasks.clone() as Arc<dyn TaskAdmin>;
+        let focus = plan_next(&subject, &tasks, &s, now).unwrap().unwrap();
+        let dispatched = dispatch_focus(
+            &subject,
+            &tasks,
+            &(Arc::new(Owner) as Arc<dyn AutonomyOwner>),
+            focus,
+            now,
+        )
+        .unwrap();
+        assert!(matches!(dispatched, SubjectDispatch::Completed { .. }));
         assert_eq!(f.tasks.snapshot().unwrap().tasks.len(), 1);
         let mut renamed = config_call();
         renamed.id = "another-call".into();

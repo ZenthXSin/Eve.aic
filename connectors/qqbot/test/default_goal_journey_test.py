@@ -1,4 +1,4 @@
-"""默认 QQ 入口的连续代码修复目标；实际文件、命令、审核、提醒及恢复。
+"""默认 QQ 入口的连续代码修复目标；实际文件、零审批命令、提醒及恢复。
 
 模型与平台为本地协议替身，用于确定性验证宿主。用错误的完成声明触发原合同修复，
 不把模型文字或单独文件写入当作交付；不涉及生产目录或外部平台。
@@ -72,16 +72,10 @@ class DefaultGoalJourneyAcceptance(progress.TaskProgressAcceptance):
     def respond_journey(self, body):
         if self.definitions(body) == {"submit_review"}:
             request = json.loads(body["messages"][-1]["content"])
-            self.assertTrue(request["delegated"])
-            self.assertEqual(request["user_messages"], self.originals)
-            self.assertEqual(request["workspace"], str(self.work.resolve()))
-            self.assertEqual(request["program"], self.command["program"])
-            self.assertEqual(request["arguments"], self.command["args"])
-            self.assertEqual(request["cwd"], "project")
             self.reviews.append(request)
             return default.tool_response("review-" + str(len(self.reviews)), "submit_review", {
-                "risk": "low", "authorization": "high", "outcome": "allow",
-                "rationale": "原用户明确授权在隔离测试项目中运行固定行为检查，完整参数和原话已核对"})
+                "risk": "high", "authorization": "low", "outcome": "deny",
+                "rationale": "普通隔离项目测试应直接执行，不依赖模型批准"})
         if default.WORKER not in body["messages"][0].get("content", ""):
             self.assert_default_tools(body)
             if self.text(body) != self.originals[-1]:
@@ -182,7 +176,7 @@ class DefaultGoalJourneyAcceptance(progress.TaskProgressAcceptance):
         self.assertEqual((self.project / "test_schedule.py").read_text(), self.verifier)
         attempts = [json.loads(line) for line in (self.project / "attempts.jsonl").read_text().splitlines()]
         self.assertEqual(attempts, [{"passed": False, "cases": 3}, {"passed": True, "cases": 3}])
-        self.assertEqual(len(self.reviews), 2)
+        self.assertEqual(self.reviews, [], "普通测试与修复命令无需模型审批")
         self.assertEqual([push["id"] for push in self.pushes()], ["taskprogress-" + task["id"] + "-1",
             f'{task["id"]}:finish-{task["finished_at_ms"]}:attempt-1'])
         journal = self.state / "developer-tools" / "operations.jsonl"
@@ -200,7 +194,7 @@ class DefaultGoalJourneyAcceptance(progress.TaskProgressAcceptance):
         self.run_default(self.checkpoint("no-replay"), checkpoints={"no-replay": no_replay})
         self.assertEqual(journal.read_bytes(), saved_journal)
         self.assertEqual((self.project / "attempts.jsonl").read_bytes(), saved_attempts)
-        self.assertEqual(len(self.reviews), 2)
+        self.assertEqual(self.reviews, [], "重启恢复也不增加普通命令审批")
 
 
 if __name__ == "__main__":

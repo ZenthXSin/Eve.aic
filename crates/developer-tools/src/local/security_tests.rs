@@ -488,7 +488,9 @@ async fn missing_identity_and_failed_execution_journal_still_prevent_writes() {
     assert!(!root.path().join("failed-journal").exists());
 }
 
+#[cfg(unix)]
 struct Authorization(Arc<AtomicBool>);
+#[cfg(unix)]
 impl DeveloperAuthorization for Authorization {
     fn is_operator(&self, _: &ContextScope) -> bool {
         self.0.load(Ordering::SeqCst)
