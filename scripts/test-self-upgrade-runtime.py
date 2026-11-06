@@ -286,6 +286,11 @@ class ReplyAnchorReceiptTests(unittest.TestCase):
         segments['parts'][1]['end'] = cut
         segments['parts'].append(dict(start=cut + 1, end=len(encoded), state='Sent'))
         self.assert_rejected_without_write('invalid_segment_ledger')
+        # Rust 仅按 LF 划分围栏行；裸 CR 仍属于同一行，不能误判新增围栏。
+        self.parent.update(reply='a\r```\nx\n```\nz', segments=dict(planner='fixture', parts=[
+            dict(start=0, end=5, state='Sent'), dict(start=6, end=13, state='Sent')]))
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
 
     def test_v10_archive_binding_does_not_supply_a_missing_hot_sibling(self):
         import sqlite3
