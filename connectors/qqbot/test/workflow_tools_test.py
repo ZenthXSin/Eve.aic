@@ -1,4 +1,4 @@
-"""实际 Eve 进程保存并执行可复用流程，跨重启复用且继续接受命令审核。"""
+"""实际 Eve 进程跨重启复用流程，普通步骤免审，具体系统危险拒绝后停止。"""
 import json
 import sys
 import unittest
@@ -48,19 +48,21 @@ class WorkflowToolsAcceptance(developer.DeveloperAcceptance):
         runs=list((self.work/'state/workflow-tools/runs').glob('*.json'))
         self.assertEqual(len(runs),2)
         self.assertTrue(all(json.loads(p.read_text())['completed'] for p in runs))
+        self.assertEqual(self.kind('review'), [], '普通工作流读写和验证不调用审查模型')
 
     def test_workflow_cannot_bypass_action_review_or_continue_after_denied_step(self):
         folder=self.source/'retained'; folder.mkdir()
+        folder.chmod(0o700)
         reviewed=[]
         def review(request):
             reviewed.append(request)
-            return {'risk':'medium','authorization':'unknown','outcome':'deny','rationale':'用户未授权删除'}
+            return {'risk':'high','authorization':'high','outcome':'allow','rationale':'权限扩大存在直接系统风险'}
         self.review_reply=review
         def respond(body):
             results=self.results(body)
             if not results:
                 return calls(('save','save_workflow_tool',{'name':'受审查流程','description':'命令仍需审查',
-                    'steps':[{'id':'remove','name':'run_command','arguments':{'program':'rm','args':['-r','retained']}},
+                    'steps':[{'id':'permissions','name':'run_command','arguments':{'program':'chmod','args':['777','retained']}},
                              {'id':'after','name':'write_file','arguments':{'path':'must-not-run.txt','content':'bad','expected_sha256':''}}]}))
             if len(results)==1:
                 return calls(('execute','run_workflow_tool',{'workflow_id':results[0]['workflow']['id'],'revision':1}))
@@ -69,8 +71,9 @@ class WorkflowToolsAcceptance(developer.DeveloperAcceptance):
         self.callback=respond
         self.enabled(self.send(self.message('denied','只检查现有目录',expected='审核拒绝，后续未执行')))
         self.assertTrue(folder.exists()); self.assertFalse((self.source/'must-not-run.txt').exists())
+        self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
         self.assertEqual(len(reviewed),1)
-        self.assertIn('只检查现有目录',reviewed[0]['user_messages'][-1])
+        self.assertEqual(reviewed[0]['user_messages'], [])
 
 
 if __name__=='__main__':unittest.main()

@@ -530,9 +530,10 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
         retained = self.source / "retained"
         retained.mkdir()
         (retained / "keep.txt").write_text("keep", encoding="utf8")
+        retained.chmod(0o700)
         originals = ["背景正文 " + str(i) for i in range(5)]
         originals[2] += "\n" + "完整原话不能裁剪。" * 700 + "\n正文末尾标记"
-        action = "请删除 retained 目录"
+        action = "检查 retained 目录权限变更"
         stop = "立即急停当前会话并取消既有任务"
 
         def respond(body):
@@ -541,9 +542,9 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
                 return text_response("背景已收到")
             self.assertEqual(text, action)
             if not self.results(body):
-                return tool_response([("run_command", {"program": "rm", "args": ["-r", "retained"]})])
+                return tool_response([("run_command", {"program": "chmod", "args": ["777", "retained"]})])
             self.assertFalse(self.results(body)[0].get("success", False), self.results(body))
-            return text_response("急停后未执行删除")
+            return text_response("急停后未改变权限")
 
         self.callback = respond
         self.response_gates[("review", 1)] = "review-held"
@@ -553,6 +554,8 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
         pending = self.request(action, request=format(6, "032x"))
         self.assertEqual(self.web("/api/chat/send", pending)[0], 202)
         self.wait_until(lambda: len(self.kind("review")) == 1, "危险命令未进入实际审核请求")
+        pending_review = json.loads(self.kind("review")[0]["body"]["messages"][-1]["content"])
+        self.assertEqual(pending_review["user_messages"], [], "系统危险审查不重复发送用户历史")
         baseline = len(self.kind("chat"))
         stop_request = self.request(stop, request=format(7, "032x"))
         started = time.monotonic()
@@ -572,9 +575,11 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
         self.assertEqual(committed[0]["user_messages"], originals[-4:] + [action, stop])
         self.assertEqual(grant["user_messages"], originals[-4:] + [action, stop])
         self.assertEqual((retained / "keep.txt").read_text(), "keep")
+        self.assertEqual(retained.stat().st_mode & 0o777, 0o700)
         self.gate("review-held").touch()
         self.assertEqual(self.finish_web(pending)["status"], "failed")
         self.assertEqual((retained / "keep.txt").read_text(), "keep")
+        self.assertEqual(retained.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.web("/api/chat/send", stop_request)[1]["status"], "completed")
         self.stop_web(graceful=True)
         self.start_web()
@@ -583,6 +588,7 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
         self.assertEqual(len([e for e in self.business_ledger()["audit"]
                               if e["action"] == "emergency_stop" and e["outcome"] == "committed"]), 1)
         self.assertEqual((retained / "keep.txt").read_text(), "keep")
+        self.assertEqual(retained.stat().st_mode & 0o777, 0o700)
 
 
 if __name__ == "__main__":

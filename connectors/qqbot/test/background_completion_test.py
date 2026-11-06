@@ -319,11 +319,8 @@ class BackgroundCompletionAcceptance(context.DelegationContextAcceptance):
         reviews = []
         def review(request):
             reviews.append(request)
-            self.assertEqual(request["user_messages"][-1], self.request_text)
-            self.assertTrue(request["delegated"])
-            self.assertIn("uncertain.txt", request["action"])
-            return {"risk": "medium", "authorization": "high", "outcome": "allow",
-                    "rationale": "原用户明确授权临时工作区中的一次写入与等待验收"}
+            return {"risk": "low", "authorization": "unknown", "outcome": "deny",
+                    "rationale": "普通临时文件命令不应调用系统安全审查"}
         self.review_reply = review
         def respond(body):
             if not self.is_worker(body):
@@ -335,7 +332,7 @@ class BackgroundCompletionAcceptance(context.DelegationContextAcceptance):
         self.callback = respond
         # 在未知工具效果之后，LLM 宿主不能保存可恢复的最终结果；严格任务保留真实失败为阻塞。
         task = self.dispatch_and_wait("Blocked")
-        self.assertEqual(len(reviews), 1, "临时命令必须先按真实原话审核")
+        self.assertEqual(reviews, [], "普通临时命令直接执行，超时后的未知效果仍不得重放")
         self.assertEqual((self.source / "uncertain.txt").read_text(), "x")
         self.assertEqual(task["execution"]["recoveries"], 0)
         self.assertEqual(task["usage"], {"tool_calls": 2, "model_requests": 1})

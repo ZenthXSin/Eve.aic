@@ -207,7 +207,6 @@ impl WebAutonomy {
             kernel,
             bootstrap,
             admin.clone(),
-            crate::developer::action_reviewer(registry.clone(), health.clone()),
             resources.corpus.as_ref(),
             source.clone(),
             practice_runner,
@@ -359,7 +358,6 @@ impl WebAutonomy {
             .push(Arc::new(crate::qq_subject::ConfigureTool {
                 subject: subject.clone(),
                 owner: admin.clone(),
-                reviewer: crate::developer::action_reviewer(registry.clone(), health),
             }));
         bootstrap
             .tools

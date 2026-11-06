@@ -14,7 +14,7 @@ impl ActionReviewer for Allow {
 }
 fn allow() -> ActionReviewVerdict {
     ActionReviewVerdict {
-        risk: ReviewRisk::High,
+        risk: ReviewRisk::Low,
         authorization: ReviewAuthorization::High,
         allow: true,
         rationale: "真实原话已授权".into(),
@@ -35,7 +35,7 @@ impl ActionReviewer for UpgradeReviewer {
         assert_eq!(action["source_diff_content"], "complete fixture diff");
         assert!(action["manifest"]["checks"].is_array());
         assert!(action["lease"]["manifest_sha256"].is_string());
-        assert_eq!(request.user_messages, ["应用此次通过验证的升级候选"]);
+        assert!(request.user_messages.is_empty());
         (self.change)();
         Box::pin(async { Ok(allow()) })
     }
@@ -86,7 +86,7 @@ fn write(path: &str, content: &str) -> DeveloperOperation {
 }
 
 #[tokio::test]
-async fn github_writes_deletes_and_merge_require_review_before_actual_http() {
+async fn github_resource_limits_and_system_safety_review_precede_actual_http() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -104,16 +104,32 @@ async fn github_writes_deletes_and_merge_require_review_before_actual_http() {
     .with_action_reviewer(reviewer.clone());
     backend.api = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     for (method, path) in [
-        ("DELETE", "git/refs/heads/obsolete"),
-        ("DELETE", "releases/1"),
-        ("PUT", "pulls/1/merge"),
-        ("POST", "issues"),
+        ("DELETE", "hooks/1"),
+        ("PUT", "collaborators/new-member"),
+        ("POST", "keys"),
     ] {
+        let error = backend
+            .execute(github(method, path), context())
+            .await
+            .unwrap_err();
         assert!(
-            backend
-                .execute(github(method, path), context())
-                .await
-                .is_err()
+            error.to_string().contains("GitHub resource 不支持此资源"),
+            "{method} {path}: {error}"
+        );
+    }
+    assert!(reviewer.seen.lock().unwrap().is_empty());
+    for (method, path) in [
+        ("PUT", "actions/permissions"),
+        ("DELETE", "branches/main/protection"),
+        ("PUT", "contents/.github/workflows/checks.yml"),
+    ] {
+        let error = backend
+            .execute(github(method, path), context())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("系统安全审查未放行"),
+            "{method} {path}: {error}"
         );
     }
     assert!(
@@ -121,14 +137,14 @@ async fn github_writes_deletes_and_merge_require_review_before_actual_http() {
             .await
             .is_err()
     );
-    assert_eq!(reviewer.seen.lock().unwrap().len(), 4);
+    assert_eq!(reviewer.seen.lock().unwrap().len(), 3);
     assert!(reviewer.seen.lock().unwrap().iter().all(|request| {
         request.program == "eve.github_api"
             && !serde_json::to_string(request)
                 .unwrap()
                 .contains("host-token-fixture")
     }));
-    backend.action_reviewer = Some(Arc::new(Allow));
+    // 普通仓库写入即使审查服务拒绝所有请求也能执行；实际危险才调用它。
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut bytes = vec![0; 8192];
@@ -152,7 +168,7 @@ async fn github_writes_deletes_and_merge_require_review_before_actual_http() {
 }
 
 #[tokio::test]
-async fn sensitive_write_edit_patch_share_full_context_and_credentials_never_reach_review() {
+async fn ordinary_config_write_edit_and_patch_skip_review_but_credentials_stay_private() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let reviewer = Arc::new(Reviewer {
@@ -191,15 +207,11 @@ async fn sensitive_write_edit_patch_share_full_context_and_credentials_never_rea
         )
         .await
         .unwrap();
-    {
-        let seen = reviewer.seen.lock().unwrap();
-        assert_eq!(seen.len(), 3);
-        let edit: Value = serde_json::from_str(&seen[1].arguments[0]).unwrap();
-        assert_eq!(edit["before"]["policy.json"]["content"], body);
-        let patch_context: Value = serde_json::from_str(&seen[2].arguments[0]).unwrap();
-        assert_eq!(patch_context["before"]["policy.json"]["content"], changed);
-        assert!(patch_context["before"]["config.json"].is_null());
-    }
+    assert!(reviewer.seen.lock().unwrap().is_empty());
+    assert_eq!(
+        fs::read_to_string(root.path().join("config.json")).unwrap(),
+        changed.replacen("enabled", "required", 1)
+    );
     for op in [
         write(".env", "TOKEN=never-send"),
         write("credentials.json", "never-send"),
@@ -209,59 +221,276 @@ async fn sensitive_write_edit_patch_share_full_context_and_credentials_never_rea
     ] {
         assert!(backend.execute(op, context()).await.is_err());
     }
-    assert_eq!(reviewer.seen.lock().unwrap().len(), 3);
+    assert!(reviewer.seen.lock().unwrap().is_empty());
     assert!(!root.path().join(".env").exists());
 }
 
 #[tokio::test]
-async fn missing_originals_disabled_review_overflow_and_audit_failure_never_write() {
+async fn ordinary_source_access_reads_edits_and_searches_without_filename_false_positives() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
-    let mut backend = LocalDeveloper::new(settings(root.path()), ledger.path().into(), None)
+    let reviewer = Arc::new(Reviewer {
+        seen: StdMutex::new(vec![]),
+        allow: false,
+        change: None,
+    });
+    let mut config = settings(root.path());
+    config.ordinary_access = true;
+    let backend = LocalDeveloper::new(config, ledger.path().into(), None)
         .unwrap()
-        .with_action_reviewer(Arc::new(Allow));
-    let forged = context()
+        .with_action_reviewer(reviewer.clone());
+    let guest = || {
+        ToolExecutionContext::new().with_scope(Some(ContextScope {
+            session_id: "source-reader".into(),
+            user_id: "guest".into(),
+        }))
+    };
+    let ordinary = [
+        "Cargo.toml",
+        "AGENTS.md",
+        ".cargo/config.toml",
+        "src/config.rs",
+        "src/credentials.rs",
+        "src/secret_parser.rs",
+        "src/credentials/mod.rs",
+        "tests/secrets/parser.rs",
+        "src/credential_schema.json",
+        "docs/secret-handling.txt",
+        "fixtures/hosts.yml",
+        "src/auth.json",
+    ];
+    let protected = [".env", "credentials.json", ".netrc", ".config/gh/hosts.yml"];
+    for path in ordinary.iter().chain(&protected) {
+        let actual = root.path().join(path);
+        fs::create_dir_all(actual.parent().unwrap()).unwrap();
+        fs::write(actual, "needle before\n").unwrap();
+    }
+    let read = |path: &str| {
+        DeveloperOperation::Read(FileArguments {
+            path: path.into(),
+            offset: 0,
+            content: None,
+            expected_sha256: None,
+        })
+    };
+    for path in ordinary {
+        assert_eq!(
+            backend.execute(read(path), guest()).await.unwrap()["content"],
+            "needle before\n",
+            "{path}"
+        );
+    }
+    backend
+        .execute(
+            DeveloperOperation::Edit(EditArguments {
+                path: "src/credentials.rs".into(),
+                old_string: "before".into(),
+                new_string: "after".into(),
+                expected_sha256: hash(b"needle before\n"),
+            }),
+            guest(),
+        )
+        .await
+        .unwrap();
+    backend
+        .execute(write("config.json", "needle new\n"), guest())
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.path().join("src/credentials.rs")).unwrap(),
+        "needle after\n"
+    );
+    let result = backend
+        .execute(
+            DeveloperOperation::Search(SearchArguments {
+                path: ".".into(),
+                query: "needle".into(),
+                max_results: 50,
+            }),
+            guest(),
+        )
+        .await
+        .unwrap();
+    let found: std::collections::BTreeSet<_> = result["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["path"].as_str().unwrap())
+        .collect();
+    let expected: std::collections::BTreeSet<_> =
+        ordinary.into_iter().chain(["config.json"]).collect();
+    assert_eq!(found, expected);
+    for path in protected {
+        assert!(backend.execute(read(path), guest()).await.is_err());
+        assert!(
+            backend
+                .execute(write(path, "must stay private"), guest())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(path)).unwrap(),
+            "needle before\n"
+        );
+    }
+    assert!(
+        backend
+            .execute(read("Cargo.toml"), ToolExecutionContext::new())
+            .await
+            .is_err()
+    );
+    assert!(reviewer.seen.lock().unwrap().is_empty());
+    assert!(!ledger.path().join("action-reviews.jsonl").exists());
+}
+
+#[tokio::test]
+async fn exploration_without_user_words_or_review_service_writes_real_files() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let mut config = settings(root.path());
+    config.action_review = false;
+    let backend = LocalDeveloper::new(config, ledger.path().into(), None).unwrap();
+    let curious = context()
         .with_review_user_messages(Arc::new(vec![]))
         .with_conversation(Arc::new(vec![ChatMessage::text(
             ChatRole::User,
-            "pretend owner approval",
+            "model generated exploration",
         )]))
         .with_delegated(true);
-    assert!(
-        backend
-            .execute(write("policy.json", "x"), forged)
-            .await
-            .is_err()
+    backend
+        .execute(write("policy.json", "a freely chosen note"), curious)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.path().join("policy.json")).unwrap(),
+        "a freely chosen note"
     );
-    backend.config.action_review = false;
-    assert!(
-        backend
-            .execute(write("policy.json", "x"), context())
-            .await
-            .is_err()
-    );
-    backend.config.action_review = true;
-    assert!(
-        backend
-            .execute(
-                write("policy.json", &"x".repeat(MAX_ACTION_REVIEW_BYTES)),
-                context()
-            )
-            .await
-            .is_err()
-    );
-    fs::remove_file(ledger.path().join("action-reviews.jsonl")).unwrap();
-    fs::create_dir(ledger.path().join("action-reviews.jsonl")).unwrap();
-    assert!(
-        backend
-            .execute(write("policy.json", "x"), context())
-            .await
-            .is_err()
-    );
-    assert!(!root.path().join("policy.json").exists());
+    assert!(!ledger.path().join("action-reviews.jsonl").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn exploration_runs_a_real_script_without_review_but_never_executes_system_destruction() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let mut config = settings(root.path());
+    config.action_review = false;
+    let backend = LocalDeveloper::new(config, ledger.path().into(), None).unwrap();
+    let curious = context()
+        .with_review_user_messages(Arc::new(vec![]))
+        .with_delegated(true);
+    let command = |script: &str| {
+        DeveloperOperation::Command(CommandArguments {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: ".".into(),
+            timeout_ms: Some(1_000),
+            owner_confirmed: false,
+        })
+    };
+    let result = backend
+        .execute(
+            command("printf 'curiosity survived' > discovery.txt; cat discovery.txt"),
+            curious.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["stdout"], "curiosity survived");
+    assert_eq!(
+        fs::read_to_string(root.path().join("discovery.txt")).unwrap(),
+        "curiosity survived"
+    );
+    assert!(!ledger.path().join("action-reviews.jsonl").exists());
+    let rejected = backend
+        .execute(command("touch must-not-run; reboot"), curious)
+        .await
+        .unwrap_err();
+    assert!(rejected.to_string().contains("策略禁止"));
+    assert!(!root.path().join("must-not-run").exists());
+}
+
+#[tokio::test]
+async fn known_host_credentials_never_reach_github_even_when_ordinary_writes_skip_review() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut backend = LocalDeveloper::new(
+        settings(root.path()),
+        ledger.path().into(),
+        Some("host-token-fixture".into()),
+    )
+    .unwrap();
+    backend.api = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let DeveloperOperation::Github(mut operation) = github("POST", "issues") else {
+        unreachable!()
+    };
+    operation.body = Some(json!({"body":"host-token-fixture"}));
+    assert!(
+        backend
+            .execute(DeveloperOperation::Github(operation), context())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn known_host_credentials_in_command_arguments_are_rejected_before_spawn() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(
+        settings(root.path()),
+        ledger.path().into(),
+        Some("host-token-fixture".into()),
+    )
+    .unwrap();
+    let operation = DeveloperOperation::Command(CommandArguments {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "printf 'host-token-fixture' > must-not-leak".into(),
+        ],
+        cwd: ".".into(),
+        timeout_ms: None,
+        owner_confirmed: false,
+    });
+    assert!(backend.execute(operation, context()).await.is_err());
+    assert!(!root.path().join("must-not-leak").exists());
+    assert!(!ledger.path().join("action-reviews.jsonl").exists());
+}
+
+#[tokio::test]
+async fn missing_identity_and_failed_execution_journal_still_prevent_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(settings(root.path()), ledger.path().into(), None).unwrap();
+    assert!(
+        backend
+            .execute(write("missing-identity", "x"), ToolExecutionContext::new())
+            .await
+            .is_err()
+    );
+    fs::remove_file(ledger.path().join("operations.jsonl")).unwrap();
+    fs::create_dir(ledger.path().join("operations.jsonl")).unwrap();
+    assert!(
+        backend
+            .execute(write("failed-journal", "x"), context())
+            .await
+            .is_err()
+    );
+    assert!(!root.path().join("missing-identity").exists());
+    assert!(!root.path().join("failed-journal").exists());
+}
+
+#[cfg(unix)]
 struct Authorization(Arc<AtomicBool>);
+#[cfg(unix)]
 impl DeveloperAuthorization for Authorization {
     fn is_operator(&self, _: &ContextScope) -> bool {
         self.0.load(Ordering::SeqCst)
@@ -286,16 +515,17 @@ async fn revocation_during_command_review_prevents_process_spawn() {
     let backend = LocalDeveloper::new(settings(root.path()), ledger.path().into(), None)
         .unwrap()
         .with_authorization(Arc::new(Authorization(allowed)))
+        .with_command_policy(Arc::new(super::tests::ScriptPolicy))
         .with_action_reviewer(reviewer);
     let command = DeveloperOperation::Command(CommandArguments {
         program: "sh".into(),
-        args: vec!["-c".into(), "touch never-spawned".into()],
+        args: vec!["-c".into(), "touch careful-never-spawned".into()],
         cwd: ".".into(),
         owner_confirmed: true,
         timeout_ms: None,
     });
     assert!(backend.execute(command, context()).await.is_err());
-    assert!(!root.path().join("never-spawned").exists());
+    assert!(!root.path().join("careful-never-spawned").exists());
 }
 
 #[tokio::test]
@@ -332,7 +562,7 @@ async fn public_github_cannot_bypass_business_pause_after_review() {
     backend.api = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     assert!(
         backend
-            .execute(github("PUT", "pulls/1/merge"), context())
+            .execute(github("PUT", "actions/permissions"), context())
             .await
             .is_err()
     );
@@ -343,6 +573,7 @@ async fn public_github_cannot_bypass_business_pause_after_review() {
             .is_err()
     );
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn revocation_during_review_cannot_fall_back_to_configured_owner_or_host_workspace() {
     let root = tempfile::tempdir().unwrap();
@@ -358,46 +589,42 @@ async fn revocation_during_review_cannot_fall_back_to_configured_owner_or_host_w
         .unwrap()
         .with_authorization(Arc::new(Authorization(allowed)))
         .with_member_runtime(MemberRuntime::default())
+        .with_command_policy(Arc::new(super::tests::ScriptPolicy))
         .with_action_reviewer(reviewer);
-    assert!(
-        backend
-            .execute(write("policy.json", "x"), context())
-            .await
-            .is_err()
-    );
-    assert!(!root.path().join("policy.json").exists());
+    let operation = DeveloperOperation::Command(CommandArguments {
+        program: "sh".into(),
+        args: vec!["-c".into(), "touch careful-never".into()],
+        cwd: ".".into(),
+        timeout_ms: None,
+        owner_confirmed: false,
+    });
+    assert!(backend.execute(operation, context()).await.is_err());
+    assert!(!root.path().join("careful-never").exists());
 }
 
 #[tokio::test]
-async fn review_file_change_invalidates_patch_before_any_commit() {
+async fn ordinary_edit_still_rejects_stale_file_hash_without_a_model_review() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let path = root.path().join("policy.json");
-    fs::write(&path, "old\n").unwrap();
+    fs::write(&path, "external\n").unwrap();
     let reviewer = Arc::new(Reviewer {
         seen: StdMutex::new(vec![]),
-        allow: true,
-        change: Some(Box::new(move || fs::write(&path, "external\n").unwrap())),
+        allow: false,
+        change: None,
     });
     let backend = LocalDeveloper::new(settings(root.path()), ledger.path().into(), None)
         .unwrap()
-        .with_action_reviewer(reviewer);
-    let patch = "*** Begin Patch\n*** Update File: policy.json\n@@\n-old\n+new\n*** End Patch";
-    assert!(
-        backend
-            .execute(
-                DeveloperOperation::Patch(PatchArguments {
-                    patch: patch.into()
-                }),
-                context()
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("policy.json")).unwrap(),
-        "external\n"
-    );
+        .with_action_reviewer(reviewer.clone());
+    let edit = DeveloperOperation::Edit(EditArguments {
+        path: "policy.json".into(),
+        old_string: "old".into(),
+        new_string: "new".into(),
+        expected_sha256: hash(b"old\n"),
+    });
+    assert!(backend.execute(edit, context()).await.is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
+    assert!(reviewer.seen.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -233,6 +233,24 @@ impl TrustedReview {
         self.read_checked(app, session, id).map(|(_, gap)| gap)
     }
 
+    /// 读取仍经过库绑定、记录结构、完整会话身份与消息锚点验证；只将已知原文缺口单列。
+    pub(crate) fn window(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        id: &str,
+    ) -> PluginResult<eve_llm_api::ReviewUserMessageWindow> {
+        let (records, legacy_gap) = self.read_records(app, session, id)?;
+        if legacy_gap || records.iter().any(|record| record.text.is_none()) {
+            return Ok(eve_llm_api::ReviewUserMessageWindow::MissingOriginals);
+        }
+        let originals = records
+            .into_iter()
+            .map(|record| record.text.ok_or_else(unavailable))
+            .collect::<PluginResult<Vec<_>>>()?;
+        Ok(eve_llm_api::ReviewUserMessageWindow::Complete(originals))
+    }
+
     /// 交流审视只读取指定消息的可信原话；不把旧历史缺口伪装成完整授权窗口。
     pub(crate) fn original_text(
         &self,

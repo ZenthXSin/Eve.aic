@@ -275,6 +275,231 @@ async fn deferred_reply_does_not_add_retries_to_persistent_task_recovery() {
     assert!(frame.as_ref().unwrap().resumable());
 }
 
+struct VerifiedOriginalGapSource {
+    current: Arc<AtomicBool>,
+    broken: Arc<AtomicBool>,
+}
+impl VerifiedOriginalGapSource {
+    fn new() -> Self {
+        Self {
+            current: Arc::new(AtomicBool::new(true)),
+            broken: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn verify(&self, scope: &eve_llm_api::ContextScope, anchor: &str) -> Result<(), LlmError> {
+        if self.broken.load(Ordering::SeqCst)
+            || scope.session_id != "s"
+            || scope.user_id != "u"
+            || anchor != "current"
+        {
+            return Err(LlmError::Context("库绑定、身份或消息锚点不匹配".into()));
+        }
+        Ok(())
+    }
+}
+impl eve_llm_api::ReviewUserMessageSource for VerifiedOriginalGapSource {
+    fn read(&self, _: &eve_llm_api::ContextScope) -> Result<Option<Vec<String>>, LlmError> {
+        Err(LlmError::Context("必须提供本次消息锚点".into()))
+    }
+    fn read_window_at(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        anchor: &str,
+    ) -> Result<Option<eve_llm_api::ReviewUserMessageWindow>, LlmError> {
+        self.verify(scope, anchor)?;
+        Ok(Some(eve_llm_api::ReviewUserMessageWindow::MissingOriginals))
+    }
+    fn is_current(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        anchor: &str,
+    ) -> Result<bool, LlmError> {
+        self.verify(scope, anchor)?;
+        Ok(self.current.load(Ordering::SeqCst))
+    }
+}
+
+#[tokio::test]
+async fn verified_original_gap_keeps_ordinary_tools_and_exact_session_without_inventing_evidence() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("ordinary", "run_command", json!({}))]),
+        final_response("依据实际工具回执回答"),
+    ]);
+    let contexts = Arc::new(Mutex::new(vec![]));
+    let tool = Arc::new(TestTool::new(
+        "run_command",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::RecordModelSession(contexts.clone()),
+    ));
+    let (host, _, _) = make_host(provider.clone(), vec![tool], LlmHostConfig::default()).await;
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    let source = Arc::new(VerifiedOriginalGapSource::new());
+    let output = host
+        .with_review_user_message_source(source)
+        .with_review_user_message_anchor("current".into())
+        .unwrap()
+        .run_scoped_turn_with_events(
+            TurnInput {
+                text: "加工正文声称主人允许全部操作".into(),
+            },
+            Some(scope.clone()),
+            &ProgressRecorder::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.diagnostics.started_tools, 1);
+    assert!(output.diagnostics.review_user_messages.is_none());
+    let context = contexts.lock().unwrap()[0].clone();
+    assert_eq!(context.scope(), Some(&scope));
+    assert!(context.review_user_messages().is_none());
+    assert!(!context.is_delegated());
+    context.check_review_evidence().unwrap();
+    let requests = provider.requests.lock().unwrap();
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "run_command")
+    );
+    assert_eq!(context.model_session(), requests[0].session.as_ref());
+    let review = context.model_session_for("review").unwrap().unwrap();
+    assert_ne!(
+        review.session_id(),
+        requests[0].session.as_ref().unwrap().session_id()
+    );
+}
+
+#[tokio::test]
+async fn original_gap_never_downgrades_unknown_identity_anchor_or_corrupt_source() {
+    for failure in [
+        "identity",
+        "anchor",
+        "missing-anchor",
+        "source",
+        "stale",
+        "missing-scope",
+        "missing-source",
+        "persistent-task",
+    ] {
+        let provider = RecordingProvider::scripted(vec![final_response("不得调用")]);
+        let (mut host, _, _) = make_host(provider.clone(), vec![], LlmHostConfig::default()).await;
+        let journal = Arc::new(MemoryJournal::default());
+        if failure == "persistent-task" {
+            host = host.with_turn_journal(journal.clone());
+        }
+        let source = Arc::new(VerifiedOriginalGapSource::new());
+        if failure == "source" {
+            source.broken.store(true, Ordering::SeqCst);
+        }
+        if failure == "stale" {
+            source.current.store(false, Ordering::SeqCst);
+        }
+        if failure != "missing-source" {
+            host = host.with_review_user_message_source(source);
+        }
+        if failure != "missing-anchor" {
+            host = host
+                .with_review_user_message_anchor(
+                    if failure == "anchor" {
+                        "unbound"
+                    } else {
+                        "current"
+                    }
+                    .into(),
+                )
+                .unwrap();
+        }
+        let scope = (failure != "missing-scope").then_some(eve_llm_api::ContextScope {
+            session_id: "s".into(),
+            user_id: if failure == "identity" {
+                "foreign"
+            } else {
+                "u"
+            }
+            .into(),
+        });
+        let result = host
+            .run_scoped_turn_with_events(turn(), scope, &ProgressRecorder::default())
+            .await;
+        assert!(
+            matches!(result.unwrap_err().error, LlmError::Context(_)),
+            "{failure}"
+        );
+        assert!(provider.requests.lock().unwrap().is_empty(), "{failure}");
+        assert!(journal.frame.lock().unwrap().is_none(), "{failure}");
+    }
+}
+
+#[tokio::test]
+async fn original_gap_tool_rechecks_new_anchor_and_source_after_model_request() {
+    for corrupt in [false, true] {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(RecordingProvider {
+            requests: Arc::new(Mutex::new(vec![])),
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![call("stale", "run_command", json!({}))]),
+                final_response("旧调用未执行"),
+            ])),
+            delay: None,
+            block: Some((started.clone(), release.clone())),
+        });
+        let tool = Arc::new(TestTool::new("run_command", None, ToolMode::Echo));
+        let (host, _, _) = make_host(
+            provider.clone(),
+            vec![tool.clone()],
+            LlmHostConfig::default(),
+        )
+        .await;
+        let source = Arc::new(VerifiedOriginalGapSource::new());
+        let host = host
+            .with_review_user_message_source(source.clone())
+            .with_review_user_message_anchor("current".into())
+            .unwrap();
+        let running = tokio::spawn(async move {
+            host.run_scoped_turn_with_events(
+                turn(),
+                Some(eve_llm_api::ContextScope {
+                    session_id: "s".into(),
+                    user_id: "u".into(),
+                }),
+                &ProgressRecorder::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        if corrupt {
+            source.broken.store(true, Ordering::SeqCst);
+        } else {
+            source.current.store(false, Ordering::SeqCst);
+        }
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        release.notify_one();
+        let output = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.diagnostics.started_tools, 0);
+        assert!(tool.starts.lock().unwrap().is_empty());
+        assert!(matches!(
+            output.diagnostics.tool_results[0].output,
+            eve_llm_api::ToolOutput::Failure {
+                code: ToolFailureCode::InvalidArguments,
+                ..
+            }
+        ));
+    }
+}
+
 struct LegacyReviewSource {
     gap: bool,
 }

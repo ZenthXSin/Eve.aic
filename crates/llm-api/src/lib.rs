@@ -744,6 +744,15 @@ pub struct ContextScope {
     pub user_id: String,
 }
 
+/// 可信原文窗口与授权证据可用性分开记录，不能把缺口重建成加工正文或空的完整证据。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReviewUserMessageWindow {
+    Complete(Vec<String>),
+    /// 来源已核对持久库绑定、完整身份和指定消息；只有原文缺失或已登记的旧历史缺口。
+    /// 不表示任何新权限。损坏、身份不符、未知锚点或来源不可用必须返回错误。
+    MissingOriginals,
+}
+
 /// 通道验证和持久化后的独立用户原文来源。引用、附件提示、模型上下文不是授权证据。
 /// None 表示此来源不处理该通道；Some(empty) 表示该范围没有可用的真实用户原话。
 pub trait ReviewUserMessageSource: Send + Sync {
@@ -757,6 +766,16 @@ pub trait ReviewUserMessageSource: Send + Sync {
         Err(LlmError::Context(
             "原话来源不支持可信消息锚点；未回退到可变最新消息".into(),
         ))
+    }
+    /// 前台执行独立核对原文窗口；明确缺口不关闭普通工具，身份变更仍须完整原话。
+    /// 默认沿用严格原文读取；只有已验证上述缺口类别的来源才能返回 MissingOriginals。
+    fn read_window_at(
+        &self,
+        scope: &ContextScope,
+        anchor: &str,
+    ) -> Result<Option<ReviewUserMessageWindow>, LlmError> {
+        self.read_at(scope, anchor)
+            .map(|messages| messages.map(ReviewUserMessageWindow::Complete))
     }
     /// 只核对最新可信入站消息是否仍为已消费的锚点，不读取或提前消费新授权正文。
     fn is_current(&self, _scope: &ContextScope, _anchor: &str) -> Result<bool, LlmError> {

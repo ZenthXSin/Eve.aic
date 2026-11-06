@@ -164,7 +164,7 @@ pub(crate) fn install_with_member_runtime_backend_profile(
         policy = policy.merged(extra);
     }
     backend = backend.with_command_policy(Arc::new(policy));
-    // 需确认的命令交给审查者；配置关闭或宿主没有审查者时，仍由模型带 owner_confirmed。
+    // 只把具体系统危险交给审查者；普通命令不要求模型自称用户已确认。
     if let Some(reviewer) = reviewer.filter(|_| config.action_review) {
         backend = backend.with_action_reviewer(reviewer);
     }
@@ -243,9 +243,26 @@ struct Reported(
 );
 impl ActionReviewer for Reported {
     fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
+        self.review_reported(request, false)
+    }
+
+    fn review_system_safety(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
+        self.review_reported(request, true)
+    }
+}
+impl Reported {
+    fn review_reported(
+        &self,
+        request: ActionReviewRequest,
+        system_safety: bool,
+    ) -> ActionReviewFuture<'_> {
         Box::pin(async move {
             let delegated = request.delegated;
-            let result = self.0.review(request).await;
+            let result = if system_safety {
+                self.0.review_system_safety(request).await
+            } else {
+                self.0.review(request).await
+            };
             let outcome = match &result {
                 Ok(_) => ModelOutcome::Succeeded,
                 Err(e) if e.contains("超时") => ModelOutcome::TimedOut,
@@ -259,8 +276,10 @@ impl ActionReviewer for Reported {
             self.1
                 .record(REVIEW_USE, outcome, crate::qq_people::now_ms());
             let line = match &result {
-                Ok(v) => json!({"outcome": if v.permits() { "allowed" } else { "denied" },
-                    "risk": v.risk, "authorization": v.authorization, "delegated": delegated}),
+                Ok(v) => {
+                    json!({"outcome": if (system_safety && v.permits_system_safety()) || (!system_safety && v.permits()) { "allowed" } else { "denied" },
+                    "risk": v.risk, "authorization": v.authorization, "delegated": delegated,"system_safety":system_safety})
+                }
                 Err(_) => json!({"outcome": "failed", "error": outcome, "delegated": delegated}),
             };
             eprintln!("EVE_ACTION_REVIEW {line}");
@@ -268,7 +287,7 @@ impl ActionReviewer for Reported {
         })
     }
 }
-/// QQ 宿主的行动审查者；没有模型凭据时不装配，开发工具退回由模型带 owner_confirmed。
+/// QQ 宿主的行动审查者；没有模型凭据时不装配，普通开发不依赖审查服务。
 pub(crate) fn action_reviewer(
     registry: Arc<dyn ServiceRegistry>,
     health: Arc<eve_model_health::HealthBook>,
