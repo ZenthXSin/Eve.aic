@@ -437,7 +437,7 @@ impl Tool for DiscoveryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "inspect_capabilities".into(),
-            description: "查询本进程实际装配的对话工具及缺失运行条件。用户直接问能做什么、某能力为何不可用时使用；工具装配不代表当前身份已获授权，所有调用仍经身份、审核和预算检查；缺环境可通过开发工具补齐并验证。".into(),
+            description: "查询本进程实际装配的对话工具及缺失运行条件；需要确认工具或排查运行条件时使用。普通开发、探索、读写和委派在当前可信身份与权限范围内无需逐项批准；审查只核对身份权限边界与具体直接系统危险。缺环境可通过已有开发工具补齐并验证，结果以真实执行回执为准。".into(),
             argument_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::ParallelSafe),
@@ -463,7 +463,7 @@ impl Tool for DiscoveryTool {
             }
             Ok(
                 json!({"installed_tools":self.installed_tools,"unavailable":self.unavailable,
-                "notices":self.notices,"authorization":"工具仍按当前可信身份、动作审核和预算准入；不依据此清单授予权限。"}),
+                "notices":self.notices,"authorization":"工具按宿主绑定的可信身份和当前权限范围执行；普通开发、探索、读写和委派无需逐项批准，身份权限边界与具体直接系统危险才需审查。取消、撤权和范围隔离持续生效；执行结果以真实回执为准，清单本身不授予权限。"}),
             )
         })
     }
