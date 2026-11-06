@@ -178,8 +178,16 @@ async fn failed_proactive_becomes_authored_passive_only_for_a_new_anchor_and_set
             .status,
         NoticeStatus::Delivered
     );
+    let before_restart = tasks.snapshot().unwrap();
     kernel.stop_all().await.unwrap();
-    let (kernel, _, channel) = open(directory.path()).await;
+    drop(channel);
+    drop(tasks);
+    drop(kernel);
+    let (kernel, tasks, channel) = open(directory.path()).await;
+    assert!(
+        tasks.snapshot().unwrap() == before_restart,
+        "重启必须保留任务结果、投递状态和全部尝试记录"
+    );
     assert!(
         channel
             .passive_candidates(&session, "after-restart")
@@ -275,8 +283,16 @@ async fn passive_candidates_preserve_expiry_attempt_budget_and_unknown_across_re
             .status,
         NoticeStatus::Unknown
     );
+    let before_restart = tasks.snapshot().unwrap();
     kernel.stop_all().await.unwrap();
-    let (kernel, _, channel) = open(directory.path()).await;
+    drop(channel);
+    drop(tasks);
+    drop(kernel);
+    let (kernel, tasks, channel) = open(directory.path()).await;
+    assert!(
+        tasks.snapshot().unwrap() == before_restart,
+        "重启必须保留过期、次数耗尽和未知投递的完整状态"
+    );
     assert!(
         channel
             .passive_candidates(&session, "after-restart")
