@@ -116,6 +116,7 @@ impl ActionReviewer for ModelActionReviewer {
             let input = serde_json::to_string(&request).map_err(|_| "审查请求无法序列化")?;
             let selection = self.resolver.resolve().map_err(|e| e.to_string())?;
             let request = ModelRequest {
+                session: request.model_session,
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),
@@ -170,6 +171,7 @@ mod tests {
     }
     fn request() -> ActionReviewRequest {
         ActionReviewRequest {
+            model_session: None,
             action: "git reset --hard".into(),
             program: "git".into(),
             arguments: vec!["reset".into(), "--hard".into()],

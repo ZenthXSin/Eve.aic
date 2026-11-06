@@ -80,6 +80,7 @@ impl MemoryRecallContext {
         mut context: ContextSnapshot,
         scope: ContextScope,
         query: BoundedQuery,
+        model_session: Option<eve_llm_api::ModelSession>,
     ) -> Result<ContextSnapshot, LlmError> {
         let scope = MemoryScope {
             channel: self.channel.clone(),
@@ -104,7 +105,7 @@ impl MemoryRecallContext {
             Recall::Hybrid { hybrid, lexical } => {
                 let attempted = match hybrid.reader(scope.clone()) {
                     Ok(reader) => reader
-                        .recall(&request)
+                        .recall_with_model_session(&request, model_session.as_ref())
                         .await
                         .ok()
                         .filter(|response| response.validate_for(&scope, &request).is_ok()),
@@ -181,12 +182,23 @@ impl ContextAssembler for MemoryRecallContext {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
             let query = scope.as_ref().map(|_| bounded_query(&input.text));
-            let context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
+            let context = self
+                .wrapped
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             match (scope, query) {
                 (Some(scope), Some(query)) if !query.text.is_empty() => {
-                    self.append(context, scope, query).await
+                    self.append(context, scope, query, model_session).await
                 }
                 _ => Ok(context),
             }

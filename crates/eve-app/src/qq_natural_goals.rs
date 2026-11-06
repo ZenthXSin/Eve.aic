@@ -89,6 +89,7 @@ impl Review {
             .collect();
         recent_actions.reverse();
         let request = ActionReviewRequest {
+            model_session: context.model_session_for("review").map_err(failed)?,
             action: "根据真实用户请求更改其待办或计划".into(),
             program: format!("eve.{tool}"),
             arguments: vec![serde_json::json!({"operation":evidence,"trusted_scope":scope,"turn_id":context.turn_id(),"call_id":call.id}).to_string()],

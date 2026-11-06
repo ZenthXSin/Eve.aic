@@ -8,6 +8,7 @@ use support::{Reply, Server};
 
 fn request() -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "你好")],
         tools: vec![],
     }
@@ -206,6 +207,7 @@ async fn invalid_input_fails_before_http() {
     assert!(matches!(
         provider
             .complete(ModelRequest {
+                session: None,
                 messages: vec![],
                 tools: vec![]
             })

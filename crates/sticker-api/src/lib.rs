@@ -58,6 +58,14 @@ pub struct StickerReview {
 /// 可替换的审看器：只看这一张图，不调用工具，不读写其他状态。
 pub trait StickerReviewer: Send + Sync {
     fn review(&self, image: ImageInput) -> LlmFuture<'_, StickerReview>;
+    /// 宿主已领取的独立图片作业会话；旧实现仍接收相同图片。
+    fn review_with_session(
+        &self,
+        image: ImageInput,
+        _session: eve_llm_api::ModelSession,
+    ) -> LlmFuture<'_, StickerReview> {
+        self.review(image)
+    }
 }
 
 /// 一张挑好的表情包：本地只读路径，交给渠道上传。

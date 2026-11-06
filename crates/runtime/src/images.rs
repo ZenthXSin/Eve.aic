@@ -68,6 +68,7 @@ mod tests {
         );
         assert_eq!(messages[2].images.len(), MAX_TURN_IMAGES);
         ModelRequest {
+            session: None,
             messages: messages.clone(),
             tools: vec![],
         }

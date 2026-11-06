@@ -548,6 +548,9 @@ impl OutreachSnapshot {
 /// 撰写请求：只含宿主整理的事实；规则与领域无关。
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ComposeRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub invitation_id: String,
     pub composer_version: String,
     pub facts: Vec<Fact>,
@@ -570,6 +573,9 @@ pub struct FeedbackNote {
 /// 以及用户对之前邀请的回应。
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct JudgeRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub invitation_id: String,
     pub judge_version: String,
     pub invitation: String,
@@ -595,6 +601,9 @@ pub struct ResponseTurnText {
 /// 回应识别请求：已送达的邀请正文与之后的几轮对话。
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ResponseRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub invitation_id: String,
     pub judge_version: String,
     pub invitation: String,
@@ -1093,6 +1102,7 @@ mod tests {
     #[test]
     fn verdicts_must_quote_the_user_and_name_the_message() {
         let request = ResponseRequest {
+            model_session: None,
             invitation_id: "invite-1".into(),
             judge_version: "judge:v1".into(),
             invitation: "要不要一起做？".into(),

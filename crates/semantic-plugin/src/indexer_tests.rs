@@ -8,6 +8,7 @@ use std::sync::Mutex;
 struct Inputs {
     profile: EmbeddingProfile,
     calls: Mutex<Vec<Vec<String>>>,
+    sessions: Mutex<Vec<Option<eve_llm_api::ModelSession>>>,
 }
 impl EmbeddingProvider for Inputs {
     fn profile(&self) -> &EmbeddingProfile {
@@ -19,6 +20,14 @@ impl EmbeddingProvider for Inputs {
             self.calls.lock().unwrap().push(inputs.to_vec());
             Ok(vec![vec![1.0, 0.1]; inputs.len()])
         })
+    }
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
+        self.sessions.lock().unwrap().push(session.cloned());
+        self.embed(inputs)
     }
 }
 struct Memory {
@@ -133,6 +142,7 @@ async fn fixture(
             dimensions: 2,
         },
         calls: Mutex::new(vec![]),
+        sessions: Mutex::new(vec![]),
     });
     let indexer = Indexer::new(
         Arc::new(Memory { cold, late_error }),
@@ -162,10 +172,13 @@ async fn hot_plan_keeps_one_batch_but_counts_all_scopes_and_preserves_next_batch
     assert_eq!(embedder.calls.lock().unwrap()[0], first);
     let plan = indexer.plan().unwrap();
     assert_eq!(plan.pending_count, 24);
-    assert_eq!(plan.pending.len(), 16);
+    assert_eq!(plan.pending.len(), 4);
     assert_eq!(plan.pending[0].input, "user-9");
-    assert_eq!(plan.pending[4].input, "user-1");
-    assert_eq!(plan.pending[4].scope, scope_key(&scope("second")));
+    assert!(
+        plan.pending
+            .iter()
+            .all(|item| item.scope == scope_key(&scope("first")))
+    );
     assert_eq!(
         indexer.status().unwrap(),
         IndexStatus {
@@ -173,6 +186,29 @@ async fn hot_plan_keeps_one_batch_but_counts_all_scopes_and_preserves_next_batch
             pending: 24
         }
     );
+    assert_eq!(indexer.step(101).await.unwrap(), 4);
+    let plan = indexer.plan().unwrap();
+    assert_eq!(plan.pending.len(), 16);
+    assert_eq!(plan.pending[0].input, "user-1");
+    assert!(
+        plan.pending
+            .iter()
+            .all(|item| item.scope == scope_key(&scope("second")))
+    );
+    assert_eq!(indexer.step(102).await.unwrap(), 16);
+    {
+        let sessions = embedder.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.iter().all(|session| {
+            session
+                .as_ref()
+                .is_some_and(|session| session.turn_id().is_some())
+        }));
+        assert_ne!(
+            sessions[0].as_ref().unwrap().session_id(),
+            sessions[2].as_ref().unwrap().session_id()
+        );
+    }
     kernel.stop_all().await.unwrap();
 }
 #[tokio::test]
@@ -340,6 +376,7 @@ async fn persisted_snapshot_resolves_archived_preference_sources_without_embeddi
             dimensions: 2,
         },
         calls: Mutex::new(vec![]),
+        sessions: Mutex::new(vec![]),
     });
     let indexer = Indexer::new(Arc::new(SnapshotMemory(snapshots)), index, embedder.clone());
     let status = indexer.status().unwrap();

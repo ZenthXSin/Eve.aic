@@ -54,6 +54,12 @@ pub(crate) fn parse(text: &str) -> Result<ChimeVerdict, LlmError> {
 impl ChimeJudge for ModelChimeJudge {
     fn judge(&self, context: ChimeContext) -> LlmFuture<'_, ChimeVerdict> {
         Box::pin(async move {
+            let session = crate::model_session(
+                "chime-judge",
+                context
+                    .target()
+                    .ok_or_else(|| LlmError::Context("插话判断缺少可信消息范围".into()))?,
+            )?;
             let recent: Vec<_> = context
                 .recent
                 .iter()
@@ -70,6 +76,7 @@ impl ChimeJudge for ModelChimeJudge {
             })
             .to_string();
             let request = ModelRequest {
+                session: Some(session),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, CHIME_FORMAT_GUARD),

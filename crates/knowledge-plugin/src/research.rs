@@ -101,6 +101,11 @@ impl Researcher {
             return Ok(ResearchOutcome::Completed(ExtractionOutput::default()));
         }
         let request = SelectionRequest {
+            model_session: Some(
+                eve_llm_api::ModelSession::owned("source-selector", &run.topic.owner, &run.id)
+                    .and_then(|s| s.with_turn("selection"))
+                    .map_err(|_| KnowledgeError::InvalidInput)?,
+            ),
             run_id: run.id.clone(),
             selector_version: self.selector.version().into(),
             brief: run.topic.brief.clone(),
@@ -180,6 +185,11 @@ impl Researcher {
             return Ok(ResearchOutcome::Failed(ResearchFailure::Fetch));
         }
         let request = ExtractionRequest {
+            model_session: Some(
+                eve_llm_api::ModelSession::owned("knowledge-extractor", &run.topic.owner, &run.id)
+                    .and_then(|s| s.with_turn("extraction"))
+                    .map_err(|_| KnowledgeError::InvalidInput)?,
+            ),
             run_id: run.id.clone(),
             extractor_version: self.extractor.version().into(),
             brief: run.topic.brief.clone(),

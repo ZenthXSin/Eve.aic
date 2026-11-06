@@ -5,6 +5,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 fn request(text: &str) -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, text)],
         tools: vec![],
     }

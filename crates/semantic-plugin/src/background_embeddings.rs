@@ -77,10 +77,19 @@ impl BackgroundEmbeddings {
         Ok(())
     }
 
-    fn lookup(&self, inputs: &[String]) -> EmbedResult<Vec<Vec<f32>>> {
+    fn lookup(
+        &self,
+        inputs: &[String],
+        session: Option<&eve_llm_api::ModelSession>,
+    ) -> EmbedResult<Vec<Vec<f32>>> {
         validate_inputs(inputs)?;
         self.inner.profile().validate()?;
-        let key = key(self.inner.profile(), inputs);
+        if let Some(session) = session {
+            session
+                .validate()
+                .map_err(|_| EmbeddingError::InvalidInput)?;
+        }
+        let key = key(self.inner.profile(), inputs, session);
         let now = Instant::now();
         let mut state = self.state.lock().map_err(|_| EmbeddingError::Provider)?;
         if state.closed {
@@ -130,11 +139,15 @@ impl BackgroundEmbeddings {
         let cache = Arc::downgrade(&self.state);
         let provider = self.inner.clone();
         let inputs = inputs.to_vec();
+        let session = session.cloned();
         let task = runtime.spawn(async move {
-            let result = provider.embed(&inputs).await.and_then(|vectors| {
-                validate_vectors(provider.profile(), inputs.len(), &vectors)?;
-                Ok(vectors)
-            });
+            let result = provider
+                .embed_with_model_session(&inputs, session.as_ref())
+                .await
+                .and_then(|vectors| {
+                    validate_vectors(provider.profile(), inputs.len(), &vectors)?;
+                    Ok(vectors)
+                });
             if let Some(cache) = cache.upgrade()
                 && let Ok(mut state) = cache.lock()
                 && !state.closed
@@ -160,12 +173,26 @@ impl EmbeddingProvider for BackgroundEmbeddings {
         self.inner.profile()
     }
     fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
-        Box::pin(async move { self.lookup(inputs) })
+        self.embed_with_model_session(inputs, None)
+    }
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
+        Box::pin(async move { self.lookup(inputs, session) })
     }
 }
-fn key(profile: &EmbeddingProfile, inputs: &[String]) -> [u8; 32] {
+fn key(
+    profile: &EmbeddingProfile,
+    inputs: &[String],
+    session: Option<&eve_llm_api::ModelSession>,
+) -> [u8; 32] {
     let mut hash = Context::new(&SHA256);
-    hash.update(b"eve.query-embeddings.v1");
+    hash.update(b"eve.query-embeddings.v2");
+    let binding = session.map_or("", eve_llm_api::ModelSession::prompt_cache_key);
+    hash.update(&(binding.len() as u64).to_be_bytes());
+    hash.update(binding.as_bytes());
     hash.update(&profile.dimensions.to_be_bytes());
     for value in std::iter::once(&profile.model).chain(inputs.iter()) {
         hash.update(&(value.len() as u64).to_be_bytes());

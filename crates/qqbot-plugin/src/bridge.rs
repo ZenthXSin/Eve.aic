@@ -1710,6 +1710,10 @@ pub(crate) async fn run(
                                 _ => (vec![], 0),
                             };
                             let facts = crate::QqProgressFacts {
+                                model_session: Some(eve_llm_api::ModelSession::scoped("progress", &eve_llm_api::ContextScope {
+                                    session_id: current.key.session.session_id.clone(),
+                                    user_id: current.key.session.user_id.clone(),
+                                }).and_then(|s| s.with_turn(&current.message.id)).map_err(|_| failure("进展模型会话绑定无效"))?.for_request(previous_messages.len() as u64)),
                                 user_request: current.message.text.clone(),
                                 activity: slow_steps.get(&current.message.id).map(|s| s.label.clone()),
                                 phase: if matches!(event.event.kind, TurnEventKind::ContextCompactionStarted) { "compaction" } else if waiting_seconds.is_some() { "waiting" } else if ordinary_count == 0 && matches!(event.event.kind, TurnEventKind::ToolBatchStarted { .. }) { "start" } else { "milestone" }.into(),

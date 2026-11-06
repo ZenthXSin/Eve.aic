@@ -518,6 +518,7 @@ impl PeopleDirectory for PeopleController {
             write!(&mut fingerprint, "{byte:02x}").map_err(|_| unavailable())?;
         }
         Ok(Some(ProfileRequest {
+            model_session: None,
             participant: participant.into(),
             fingerprint,
             sources,

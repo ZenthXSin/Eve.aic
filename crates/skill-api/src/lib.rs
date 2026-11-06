@@ -446,6 +446,9 @@ impl SkillSnapshot {
 /// 提炼请求：只含已验证的产物、实际证据与已有技能，不含用户原话或学习目标描述。
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct DistillRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub distillation_id: String,
     pub distiller_version: String,
     pub runner: RunnerProfile,

@@ -142,6 +142,9 @@ async fn reviewed_progress_facts_are_compared_inside_the_claim_even_with_the_sam
         let queued = TaskProgressToken::from_task(&task).unwrap();
         tasks.start(&task.id, 20).unwrap();
         let mut checkpoint = eve_llm_api::TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: eve_llm_api::ContextScope {
                 session_id: alice.session_id.clone(),

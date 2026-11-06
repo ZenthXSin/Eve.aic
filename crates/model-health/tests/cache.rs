@@ -23,6 +23,7 @@ fn request(history: &[&str], tool: &str) -> ModelRequest {
             .map(|text| ChatMessage::text(ChatRole::User, *text)),
     );
     ModelRequest {
+        session: None,
         messages,
         tools: vec![ToolDefinition {
             name: tool.into(),
@@ -66,6 +67,32 @@ async fn prefix_probe_measures_reuse_and_locates_breaks() {
     let cache = book.snapshot()[0].1.cache.clone();
     assert_eq!(cache.recent_local[3].0, cache.recent_local[3].1);
     assert!(cache.recent_local_ratio().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn prefix_reuse_is_measured_within_the_explicit_session_only() {
+    use eve_llm_api::{ContextScope, ModelSession};
+    let book = Arc::new(HealthBook::new());
+    let probe = PrefixProbe::new(Arc::new(Echo), "dialogue", book.clone());
+    let scope = ContextScope {
+        session_id: "fixture".into(),
+        user_id: "fixture-user".into(),
+    };
+    let main = ModelSession::scoped("main", &scope).unwrap();
+    let review = main.fork("review", None).unwrap();
+    let mut request = request(&["相同正文"], "echo");
+    for session in [
+        main.clone().with_turn("1").unwrap(),
+        review,
+        main.with_turn("2").unwrap(),
+    ] {
+        request.session = Some(session);
+        probe.complete(request.clone()).await.unwrap();
+    }
+    let cache = book.snapshot()[0].1.cache.clone();
+    assert_eq!(cache.recent_local[0].1, 0);
+    assert_eq!(cache.recent_local[1].1, 0);
+    assert_eq!(cache.recent_local[2].0, cache.recent_local[2].1);
 }
 
 #[test]
