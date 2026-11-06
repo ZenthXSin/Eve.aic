@@ -114,6 +114,9 @@ fn create(tasks: &TaskController, source: &str, max_steps: u32, deadline: Option
 }
 fn frame(result: Option<&str>) -> TurnCheckpoint {
     TurnCheckpoint {
+        model_session: None,
+        pending_model_request: None,
+        pending_request_fingerprint: None,
         version: 1,
         scope: ContextScope {
             session_id: owner().session_id,

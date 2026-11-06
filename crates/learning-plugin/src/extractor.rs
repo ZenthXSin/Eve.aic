@@ -37,6 +37,22 @@ impl ModelPreferenceExtractor {
         Box::pin(async move {
             let input = validated_input(&batch)?;
             let request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::scoped(
+                        "preference-learning",
+                        &eve_llm_api::ContextScope {
+                            session_id: format!(
+                                "{}:{}",
+                                batch.scope.channel.len(),
+                                batch.scope.channel
+                            ) + &batch.scope.session_id,
+                            user_id: batch.scope.user_id.clone(),
+                        },
+                    )
+                    .and_then(|s| s.with_turn(&batch.id))
+                    .map_err(provider_error)?
+                    .for_request(u64::from(batch.attempt)),
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),

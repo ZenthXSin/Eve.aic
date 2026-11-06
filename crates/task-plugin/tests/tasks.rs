@@ -1266,6 +1266,9 @@ async fn corrupt_finished_epoch_bounds_refuse_restart_without_replacing_original
 fn checkpoint(user: &str) -> eve_llm_api::TurnCheckpoint {
     let owner = owner(user);
     eve_llm_api::TurnCheckpoint {
+        pending_model_request: None,
+        pending_request_fingerprint: None,
+        model_session: None,
         version: 1,
         scope: eve_llm_api::ContextScope {
             session_id: owner.session_id,

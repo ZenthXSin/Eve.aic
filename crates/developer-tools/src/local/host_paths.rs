@@ -7,7 +7,7 @@ fn protected_name(path: &Path) -> bool {
         || path.components().any(|part| {
             matches!(part, Component::Normal(name)
             if matches!(name.to_string_lossy().to_ascii_lowercase().as_str(),
-                ".git" | ".eve-developer" | ".netrc" | ".npmrc" | "hosts.yml" | "auth.json"))
+                ".git" | ".eve-developer"))
         })
         || [
             "/proc",
@@ -254,10 +254,6 @@ impl LocalDeveloper {
             return Err(failed("父目录不存在；先创建父目录"));
         }
         Ok(real)
-    }
-
-    pub(super) fn external_path(&self, text: &str) -> bool {
-        Path::new(text).is_absolute() && !Path::new(text).starts_with(&self.root)
     }
 
     pub(super) fn check_model_file(&self, path: &Path) -> Result<(), ToolExecutionError> {

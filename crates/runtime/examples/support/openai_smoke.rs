@@ -13,6 +13,7 @@ use llm_services::{CONTEXT, OWNER, ServicePlugin, TOOL};
 pub async fn run(provider: Arc<dyn LlmProvider>) -> Result<(), Box<dyn std::error::Error>> {
     let response = provider
         .complete(ModelRequest {
+            session: None,
             messages: vec![ChatMessage::text(ChatRole::User, "请用中文简短问候。")],
             tools: vec![],
         })

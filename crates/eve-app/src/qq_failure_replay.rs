@@ -706,6 +706,9 @@ mod tests {
             .unwrap();
         tasks.start(&task.id, now).unwrap();
         let frame = eve_llm_api::TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: scope(),
             messages: vec![

@@ -189,6 +189,7 @@ export function optionsFromEnv(env) {
 }
 export function createBridge(bot, emit, limit = 128, now = () => performance.now(), group = {}, timers = {}) {
   const pending = new Map();
+  const passiveWindows = new Map();
   const latestInput = new Map();
   const routeKey = (scope, target, sender) => JSON.stringify([scope,target,sender]);
   const pushing = new Set();
@@ -256,6 +257,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (closed) return;
     closed = true;
     pending.clear();
+    passiveWindows.clear();
     latestInput.clear();
     bot.stop();
   };
@@ -301,6 +303,9 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     const inputKey=routeKey(msg.kind,target.targetId,msg.senderId);
     latestInput.delete(inputKey);
     latestInput.set(inputKey,msg.messageId);
+    for (const [id, item] of passiveWindows) {
+      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS || routeKey(item.target.scope,item.target.targetId,item.senderId) === inputKey) passiveWindows.delete(id);
+    }
     if (msg.kind === "group") {
       const groupKey=routeKey("group",target.targetId,"*");
       latestInput.delete(groupKey);
@@ -437,6 +442,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if(image!==undefined && (frame.explicit!==true || typeof image!=="string" || !image || image.length>4096 || /[\p{Cc}]/u.test(image))) throw new Error("invalid_image_path");
       const result = image===undefined ? await sendText(target, frame.text, replyMention(item), SEND_TIMEOUT_MS, guard) : await sendImage(target,image,guard);
       const messageId=image===undefined ? result?.id : result?.message?.id;
+      if (frame.explicit === true && image === undefined) item.explicitTextSent = true;
       send({ type: "delivery", id: frame.id, progress: true, index, ok: true, delivery_mode: proactive ? "proactive" : "passive", elapsed_ms: elapsed,
         ...(validMessageId(messageId) ? { message_id: messageId } : {}) });
     } catch (err) {
@@ -525,6 +531,30 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       pushing.delete(frame.id);
     }
   }
+  // 实时对话收尾后仍只使用原消息的被动额度；没有窗口时绝不回退主动消息。
+  async function passivePush(frame) {
+    if (!validMessageId(frame.id)) {warn("invalid_command");return;}
+    const reject = kind => send({type:"delivery",id:frame.id,push:true,ok:false,failure_kind:kind});
+    const item = passiveWindows.get(frame.based_on_message_id);
+    if (!item) {reject("passive_window_missing");return;}
+    if ((frame.foreground === true) !== (item.foreground === true)) {reject("passive_window_missing");return;}
+    if (frame.scope !== "c2c" || item.target.scope !== frame.scope || item.target.targetId !== frame.target_id || item.senderId !== frame.sender_id ||
+        latestInput.get(routeKey(frame.scope,frame.target_id,frame.sender_id)) !== frame.based_on_message_id) {reject("stale_decision");return;}
+    if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS) {passiveWindows.delete(frame.based_on_message_id);reject("passive_window_elapsed");return;}
+    if (item.sending || item.attempts.has(frame.id)) {warn("duplicate_reply");return;}
+    if (item.remaining <= 0) {reject("passive_quota_exhausted");return;}
+    if (!validText(frame.text) || Buffer.byteLength(frame.text) > MAX_PUSH_BYTES) {reject("reply_limit");return;}
+    item.attempts.add(frame.id);
+    item.remaining--; // 失败或未知也占额度，桥接层不重发。
+    item.sending = true;
+    try {
+      const guard = () => !closed && passiveWindows.get(frame.based_on_message_id) === item && now() - item.receivedAt < PASSIVE_REPLY_WINDOW_MS &&
+        latestInput.get(routeKey(frame.scope,frame.target_id,frame.sender_id)) === frame.based_on_message_id;
+      const result = await sendText(item.target,frame.text,undefined,SEND_TIMEOUT_MS,guard);
+      send({type:"delivery",id:frame.id,push:true,ok:true,delivery_mode:"passive",message_id:result.id});
+    } catch (err) {send({type:"delivery",id:frame.id,push:true,ok:false,...diagnostic(err)});}
+    finally {item.sending=false;}
+  }
   return {
     stop,
     warn,
@@ -533,6 +563,10 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if (frame.version !== 1) { warn("protocol_version"); return; }
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
+      if (frame.type === "close_foreground") {
+        if (passiveWindows.get(frame.id)?.foreground === true) passiveWindows.delete(frame.id);
+        return;
+      }
       // 只恢复宿主持久接收的锚点；绝不覆盖本进程已经看见的新消息。
       if (frame.type === "restore_anchor") {
         if (!["c2c","group"].includes(frame.scope) || !validId(frame.target_id) || !validId(frame.sender_id) || !validMessageId(frame.message_id)) {warn("invalid_command");return;}
@@ -540,11 +574,25 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         if (!latestInput.has(key) && latestInput.size < 8192) latestInput.set(key,frame.message_id);
         return;
       }
+      if (frame.type === "passive_push") { await passivePush(frame); return; }
       if (frame.type === "push") { await push(frame); return; }
       if (frame.type === "file") { await pushFile(frame); return; }
       const item = pending.get(frame.id);
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
+        // 已并入长工具轮次的新输入保留自己的原被动额度，不复用父轮或重置接收时刻。
+        const foreground = frame.keep_foreground === true;
+        if ((foreground || (frame.keep_passive === true && item.explicitTextSent === true)) && !item.sending && !item.finished && item.next === undefined && item.target.scope === "c2c") {
+          const remaining = passiveLimit(item.target.scope) - (item.passiveProgress ?? item.progress ?? 0);
+          const remainingMs = Math.floor(PASSIVE_REPLY_WINDOW_MS - Math.max(0, now() - item.receivedAt));
+          if (remaining > 0 && remainingMs > 0 && latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) === frame.id) {
+            for (const [id, saved] of passiveWindows) if (now() - saved.receivedAt >= PASSIVE_REPLY_WINDOW_MS) passiveWindows.delete(id);
+            if (passiveWindows.size < limit) {
+              passiveWindows.set(frame.id,{...item,remaining,attempts:new Set(),foreground});
+              send({type:foreground ? "foreground_window" : "passive_window",id:frame.id,remaining_ms:remainingMs,remaining});
+            }
+          }
+        }
         if (!item.sending) pending.delete(frame.id);
         else item.finished = true;
         return;

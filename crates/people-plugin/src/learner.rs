@@ -42,6 +42,15 @@ impl ImpressionLearner for ModelImpressionLearner {
                 .collect();
             let input = serde_json::json!({"messages": batch.messages, "known": known}).to_string();
             let request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::anchored(
+                        "impression-learning",
+                        None,
+                        &batch.participant,
+                    )
+                    .and_then(|s| s.with_turn(&batch.id))
+                    .map_err(|e| failure(&e.to_string()))?,
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),

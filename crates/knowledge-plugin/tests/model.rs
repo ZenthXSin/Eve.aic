@@ -53,6 +53,7 @@ fn text(value: impl Into<String>) -> Result<ModelResponse, LlmError> {
 
 fn selection(brief: &str) -> SelectionRequest {
     SelectionRequest {
+        model_session: None,
         run_id: "research-1".into(),
         selector_version: SELECTOR_VERSION.into(),
         brief: brief.into(),
@@ -73,6 +74,7 @@ const PAGE: &str = "Each mod needs a mod.hjson file in its root. Requires versio
 
 fn extraction(brief: &str) -> ExtractionRequest {
     ExtractionRequest {
+        model_session: None,
         run_id: "research-1".into(),
         extractor_version: EXTRACTOR_VERSION.into(),
         brief: brief.into(),

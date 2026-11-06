@@ -58,6 +58,7 @@ impl HistoryDigester for ModelHistoryDigester {
                         let response = selection
                             .provider
                             .complete_json(ModelRequest {
+                                session: request.model_session.as_ref().map(|session| session.for_request(request.covered_turns() as u64 * 2 + attempt)),
                                 messages: vec![
                                     ChatMessage::text(ChatRole::System, PROMPT),
                                     ChatMessage::text(ChatRole::User, input.clone()),

@@ -108,23 +108,8 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
         reviews=[]
         def review(request):
             reviews.append(request)
-            plan=json.loads(request['arguments'][0])
-            expected_checks=[{'program':str(wrapper),'arguments':arguments,'cwd':'.'} for arguments in [
-                ['fmt','--all','--','--check'],
-                ['clippy','--release','--workspace','--all-targets','--locked','--','-D','warnings'],
-                ['test','--release','--workspace','--locked'],
-                ['build','-p','eve-app','--bins','--release','--locked']]]
-            allowed=(request['user_messages'][-1]=='准备新版本' and not request['delegated']
-                and request['program']=='eve.prepare_self_upgrade'
-                and plan['source']['head']==revision
-                and plan['source_diff']['base_revision']==revision
-                and plan['source_diff']['target_revision']==revision
-                and plan['source_diff_content']=='' and plan['active_sha256']=='a'*64
-                and plan['publish_only'] is True and plan['activate'] is False
-                and plan['checks']==expected_checks
-                and plan['after_rust_tests']=={'program':'python3','arguments':['-B','scripts/verify-self-upgrade.py'],'cwd':'.'})
-            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
-                'outcome':'allow' if allowed else 'deny','rationale':'核对准备原话、完整空差异及四项真实Cargo和Python验收执行计划'}
+            return {'risk':'low','authorization':'unknown','outcome':'deny',
+                'rationale':'准备和验证候选无需模型批准；实际切换才核对系统影响'}
         self.review_reply=review
         def respond(body):
             results=self.results(body)
@@ -139,6 +124,9 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
                 self.assertEqual(len(result['checks']),4)
                 self.assertTrue(all(c['success'] for c in result['checks']))
                 self.assertFalse(result['applied'])
+                self.assertEqual(result['source']['head'], revision)
+                self.assertEqual(result['source_diff']['base_revision'], revision)
+                self.assertEqual(result['source_diff']['target_revision'], revision)
             except AssertionError as error:
                 # 失败结果照常触发严格回复校验；不把测试断言变成 HTTP 500 引起模型重试。
                 verification_failures.append(str(error))
@@ -165,7 +153,7 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
         self.assertGreater(time.monotonic()-start,43,'必须跨过旧的单命令 43 秒总期限')
         stop_heartbeat()
         self.assertEqual(heartbeat_errors,[])
-        self.assertEqual(len(reviews),1,'准备候选必须独立审核一次')
+        self.assertEqual(reviews, [], '准备候选执行真实验证，无需模型审查')
         self.assertFalse((queue/'request.json').exists(),'准备不能申请上线')
         print(json.dumps({'upgrade_prepared':True,'elapsed_seconds':round(time.monotonic()-start,3),
             'command_timeout_ms':13_000,'toolchain':toolchain or 'host-default',

@@ -47,6 +47,7 @@ impl PlanProposer for ModelPlanProposer {
             let response = tokio::time::timeout(
                 selection.provider_timeout.min(MAX_PROVIDER_TIMEOUT),
                 selection.provider.complete(ModelRequest {
+                    session: request.model_session.clone(),
                     messages: vec![
                         ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                         ChatMessage::text(ChatRole::User, input),

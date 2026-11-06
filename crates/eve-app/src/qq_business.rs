@@ -22,6 +22,92 @@ pub(crate) use tool::BusinessTool;
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 
+/// 仅用于普通待办与计划的宿主身份记录，不代表模型审查或业务扩权。
+pub(crate) const HOST_AUTHORIZED: &str = "host_authorized";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostOperation {
+    pub version: u32,
+    pub tool: String,
+    pub operation: serde_json::Value,
+    pub trusted_scope: ContextScope,
+    pub turn_id: u64,
+    pub call_id: String,
+    pub delegated: bool,
+}
+
+impl HostOperation {
+    fn decode(
+        target: Option<&str>,
+        action: &str,
+        scope: &ContextScope,
+        actor: &str,
+        turn_id: Option<u64>,
+    ) -> Result<Self, String> {
+        let record: Self = serde_json::from_str(target.ok_or("宿主动作记录缺失")?)
+            .map_err(|_| "宿主动作记录损坏")?;
+        let operation = record.operation["arguments"]["action"].as_str();
+        if record.version != 1
+            || record.tool != action
+            || !matches!(
+                (action, operation),
+                ("manage_goal", Some("create" | "feedback"))
+                    | ("manage_plan", Some("propose" | "confirm" | "withdraw"))
+            )
+            || &record.trusted_scope != scope
+            || actor != scope.user_id
+            || Some(record.turn_id) != turn_id
+            || record.turn_id == 0
+            || record.call_id.trim().is_empty()
+            || record.call_id.len() > 1024
+            || record.call_id.chars().any(char::is_control)
+            || (record.delegated && action == "manage_goal" && operation == Some("feedback"))
+        {
+            return Err("宿主动作的身份、范围、轮次或工具不一致".into());
+        }
+        if action == "manage_plan" && operation == Some("confirm") {
+            let arguments = &record.operation["arguments"];
+            let plan = &record.operation["plan"];
+            let goal = &record.operation["goal"];
+            let id = plan["id"].as_str().ok_or("宿主计划记录缺少计划编号")?;
+            if eve_plan_api::validate_id(id).is_err()
+                || arguments["plan_id"] != plan["id"]
+                || arguments["expected_revision"]
+                    .as_u64()
+                    .is_none_or(|r| r == 0)
+                || arguments["expected_revision"] != plan["revision"]
+                || arguments["goal_id"].as_str().is_none()
+                || arguments["goal_id"] != goal["id"]
+                || plan["binding"]["goal_id"] != goal["id"]
+                || goal["revision"].as_u64().is_none_or(|r| r == 0)
+                || plan["binding"]["goal_revision"] != goal["revision"]
+                || goal["visibility"] != serde_json::json!({"User":scope.user_id})
+            {
+                return Err("宿主计划记录的编号或版本不一致".into());
+            }
+        }
+        Ok(record)
+    }
+}
+
+fn valid_audit_evidence(event: &Audit) -> bool {
+    if event.outcome == HOST_AUTHORIZED {
+        event.user_messages.is_empty()
+            && event.verdict.is_none()
+            && HostOperation::decode(
+                event.target.as_deref(),
+                &event.action,
+                &event.scope,
+                &event.actor,
+                event.turn_id,
+            )
+            .is_ok()
+    } else {
+        valid_messages(&event.user_messages)
+    }
+}
+
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(path)?.sync_all()?;
@@ -154,7 +240,7 @@ impl Ledger {
                     && event.at_ms > 0
                     && !event.actor.is_empty()
                     && !event.action.is_empty()
-                    && valid_messages(&event.user_messages)
+                    && valid_audit_evidence(event)
                     && !event.outcome.is_empty()
             })
             && self
@@ -285,13 +371,38 @@ impl Store {
             return Ok(index.scopes.get(plan_id).cloned());
         }
         let mut scopes = BTreeMap::new();
-        for record in state.audit.iter().rev().filter(|record| {
-            record.action == "manage_plan"
-                && record.outcome == "review_allowed"
-                && record.verdict.as_ref().is_some_and(|v| {
-                    v.permits() && v.authorization == eve_developer_api::ReviewAuthorization::High
+        for record in state
+            .audit
+            .iter()
+            .rev()
+            .filter(|record| record.action == "manage_plan")
+        {
+            if record.outcome == HOST_AUTHORIZED {
+                let operation = HostOperation::decode(
+                    record.target.as_deref(),
+                    &record.action,
+                    &record.scope,
+                    &record.actor,
+                    record.turn_id,
+                )?;
+                if operation.operation["arguments"]["action"] == "confirm" {
+                    let id = operation.operation["plan"]["id"]
+                        .as_str()
+                        .ok_or("宿主计划记录缺少计划编号")?;
+                    scopes
+                        .entry(id.to_owned())
+                        .or_insert_with(|| record.scope.clone());
+                }
+                continue;
+            }
+            // 旧版本的独立审核记录仍可恢复，但拒绝或弱授权记录不能绑定计划。
+            if record.outcome != "review_allowed"
+                || record.verdict.as_ref().is_none_or(|v| {
+                    !v.permits() || v.authorization != eve_developer_api::ReviewAuthorization::High
                 })
-        }) {
+            {
+                continue;
+            }
             let target = record.target.as_deref().ok_or("计划审核记录缺少完整动作")?;
             let request: serde_json::Value =
                 serde_json::from_str(target).map_err(|_| "计划审核动作损坏")?;
@@ -385,8 +496,19 @@ impl Store {
     pub(crate) fn mutate(&self, mutation: Mutation) -> Result<bool, String> {
         let mut current = self.lock()?;
         if current.revision != mutation.expected_revision {
-            return Err("审核期间授权状态已变化；本次没有写入，请依据新原话重新核对".into());
+            return Err("操作期间授权状态已变化；本次没有写入，请核对当前权限".into());
         }
+        let mutation = Audit {
+            scope: mutation.scope,
+            actor: mutation.actor,
+            action: mutation.action,
+            target: mutation.target,
+            at_ms: mutation.at_ms,
+            turn_id: mutation.turn_id,
+            user_messages: mutation.user_messages,
+            verdict: mutation.verdict,
+            outcome: mutation.outcome,
+        };
         if mutation.outcome == "committed"
             && matches!(mutation.action.as_str(), "revoke" | "emergency_stop")
             && mutation.turn_id.is_none()
@@ -401,11 +523,9 @@ impl Store {
         {
             return Ok(false);
         }
-        if !valid_scope(&mutation.scope)
-            || !valid_messages(&mutation.user_messages)
-            || mutation.at_ms == 0
+        if !valid_scope(&mutation.scope) || !valid_audit_evidence(&mutation) || mutation.at_ms == 0
         {
-            return Err("业务授权缺少可信范围或完整用户原话".into());
+            return Err("动作记录缺少可信身份绑定，或业务授权缺少完整用户原话".into());
         }
         let evidence_digest = evidence(&mutation.scope, mutation.turn_id, &mutation.user_messages);
         if mutation.outcome == "committed"
@@ -491,17 +611,7 @@ impl Store {
                 _ => return Err("业务授权动作无效".into()),
             }
         }
-        next.audit.push(Audit {
-            scope: mutation.scope,
-            actor: mutation.actor,
-            action: mutation.action,
-            target: mutation.target,
-            at_ms: mutation.at_ms,
-            turn_id: mutation.turn_id,
-            user_messages: mutation.user_messages,
-            verdict: mutation.verdict,
-            outcome: mutation.outcome,
-        });
+        next.audit.push(mutation);
         if !next.valid() {
             if matches!(
                 mutation_action(&next),
@@ -585,6 +695,120 @@ mod tests {
             outcome: "committed".into(),
             expected_revision: store.revision().unwrap(),
         }
+    }
+
+    fn host_plan(store: &Store, id: &str, turn: u64) -> Mutation {
+        let scope = scope("a");
+        let target = HostOperation {
+            version: 1,
+            tool: "manage_plan".into(),
+            operation: serde_json::json!({
+                "arguments":{"action":"confirm","plan_id":id,"goal_id":"goal","expected_revision":2},
+                "plan":{"id":id,"revision":2,"binding":{"goal_id":"goal","goal_revision":3}},
+                "goal":{"id":"goal","revision":3,"visibility":{"User":"owner"}},
+            }),
+            trusted_scope: scope.clone(),
+            turn_id: turn,
+            call_id: format!("confirm-{id}"),
+            delegated: true,
+        };
+        Mutation {
+            scope,
+            actor: "owner".into(),
+            action: "manage_plan".into(),
+            target: Some(serde_json::to_string(&target).unwrap()),
+            at_ms: 100 + turn,
+            turn_id: Some(turn),
+            user_messages: vec![],
+            verdict: None,
+            outcome: HOST_AUTHORIZED.into(),
+            expected_revision: store.revision().unwrap(),
+        }
+    }
+
+    #[test]
+    fn host_plan_scope_survives_restart_beside_legacy_review_without_new_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut old = mutation(&store, "manage_plan", 1);
+        old.outcome = "review_allowed".into();
+        old.verdict = Some(ActionReviewVerdict {
+            risk: eve_developer_api::ReviewRisk::Medium,
+            authorization: eve_developer_api::ReviewAuthorization::High,
+            allow: true,
+            rationale: "旧版本持久审核".into(),
+        });
+        let operation = serde_json::json!({
+            "operation":{"arguments":{"action":"confirm"},"plan":{"id":"legacy-plan"}},
+            "trusted_scope":old.scope,"turn_id":old.turn_id,"call_id":"legacy-confirm"
+        });
+        old.target = Some(serde_json::json!({
+            "program":"eve.manage_plan","arguments":[operation.to_string()],"user_messages":old.user_messages
+        }).to_string());
+        store.mutate(old).unwrap();
+        assert_eq!(
+            store.reviewed_plan_scope("legacy-plan").unwrap(),
+            Some(scope("a"))
+        );
+        assert_eq!(store.reviewed_plan_scope("current-plan").unwrap(), None);
+        store.mutate(host_plan(&store, "current-plan", 2)).unwrap();
+        assert_eq!(
+            store.reviewed_plan_scope("current-plan").unwrap(),
+            Some(scope("a")),
+            "旧索引随新记录失效"
+        );
+        let bytes = std::fs::read(directory.path().join("business-permissions.json")).unwrap();
+        let restarted = Store::open(directory.path()).unwrap();
+        for id in ["legacy-plan", "current-plan"] {
+            assert_eq!(restarted.reviewed_plan_scope(id).unwrap(), Some(scope("a")));
+        }
+        assert!(restarted.grant(&scope("a")).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(directory.path().join("business-permissions.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn host_outcome_cannot_authorize_business_or_bind_foreign_and_corrupt_plan_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let valid = host_plan(&store, "current-plan", 2);
+        let saved_target = valid.target.clone().unwrap();
+        for change in 0..7 {
+            let mut invalid = host_plan(&store, "current-plan", 2);
+            match change {
+                0 => invalid.action = "unlock".into(),
+                1 => invalid.scope = scope("foreign"),
+                2 => invalid.actor = "someone-else".into(),
+                3 => invalid.turn_id = Some(3),
+                4 => invalid.user_messages = vec!["加工说明不是用户原话".into()],
+                5 => invalid.target = None,
+                _ => {
+                    let mut target: serde_json::Value =
+                        serde_json::from_str(&saved_target).unwrap();
+                    target["operation"]["arguments"]["expected_revision"] = 9.into();
+                    invalid.target = Some(target.to_string());
+                }
+            }
+            assert!(store.mutate(invalid).is_err());
+            assert_eq!(store.revision().unwrap(), 0);
+        }
+        let mut missing_originals = mutation(&store, "unlock", 1);
+        missing_originals.user_messages.clear();
+        assert!(store.mutate(missing_originals).is_err());
+        assert!(store.grant(&scope("a")).unwrap().is_none());
+        store.mutate(valid).unwrap();
+        let path = directory.path().join("business-permissions.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut target: serde_json::Value = serde_json::from_str(&saved_target).unwrap();
+        target["trusted_scope"]["session_id"] = "foreign".into();
+        document["audit"][0]["target"] = target.to_string().into();
+        let corrupted = serde_json::to_vec(&document).unwrap();
+        std::fs::write(&path, &corrupted).unwrap();
+        assert!(Store::open(directory.path()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), corrupted);
     }
 
     #[test]

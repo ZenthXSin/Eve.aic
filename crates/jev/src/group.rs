@@ -128,11 +128,17 @@ fn parse(
     Ok(decision)
 }
 impl JevRelationJudge {
-    pub(crate) async fn group_request(&self, body: Value) -> Result<Vec<u8>, LlmError> {
+    pub(crate) async fn group_request(
+        &self,
+        body: Value,
+        session: Option<&eve_llm_api::ModelSession>,
+    ) -> Result<Vec<u8>, LlmError> {
+        // SystemOne 正文继续使用既有 schema；独立会话只走显式 HTTP 请求头。
+        let headers = self.model_headers(session)?;
         let mut response = self
             .client
             .post(self.endpoint.clone())
-            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .headers(headers)
             .json(&body)
             .send()
             .await
@@ -165,6 +171,12 @@ impl GroupRelationJudge for JevRelationJudge {
             if !input.valid() {
                 return Err(error());
             }
+            let session = eve_llm_api::ModelSession::anchored(
+                "jev-group-relation",
+                None,
+                &input.message.conversation,
+            )?
+            .with_turn(&input.message.id)?;
             let _slot = self.slots.try_acquire().map_err(|_| error())?;
             let mut input = input;
             while !input.examples.is_empty()
@@ -194,12 +206,14 @@ impl GroupRelationJudge for JevRelationJudge {
                     }
                 }
                 let mut decisions = vec![];
-                for partition in &partitions {
+                for (ordinal, partition) in partitions.iter().enumerate() {
                     let body = request(&input, partition, &self.config.model);
                     if serde_json::to_vec(&body).map_err(|_| error())?.len() > MAX_INPUT_BYTES {
                         return Err(error());
                     }
-                    let bytes = self.group_request(body).await?;
+                    let bytes = self
+                        .group_request(body, Some(&session.for_request(ordinal as u64)))
+                        .await?;
                     decisions.push(parse(&bytes, &input, partition)?);
                 }
                 // 任一分片识别到明确相关性即可；不同明确话题冲突时不猜。
@@ -261,8 +275,18 @@ mod tests {
     }
     #[tokio::test]
     async fn group_http_keeps_full_exchange_and_returns_locally_bound_topic() {
-        let (url, seen, task) =
-            crate::tests::server(200, serde_json::to_vec(&output()).unwrap(), "").await;
+        let session = eve_llm_api::ModelSession::anchored("jev-group-relation", None, "g")
+            .unwrap()
+            .with_turn("new")
+            .unwrap()
+            .for_request(0);
+        let (url, seen, task) = crate::tests::server_with_session(
+            200,
+            serde_json::to_vec(&output()).unwrap(),
+            "",
+            Some(session),
+        )
+        .await;
         let result = crate::tests::judge(url).classify(input()).await.unwrap();
         assert_eq!(result.topic.as_deref(), Some("old"));
         assert!(result.needs_reply);
@@ -273,6 +297,7 @@ mod tests {
         );
         assert_eq!(sent["state"]["exchanges"][0]["eve_reply"], "可以用传送带");
         assert!(sent.get("tools").is_none());
+        assert!(sent.get("prompt_cache_key").is_none());
         task.await.unwrap();
     }
     #[test]

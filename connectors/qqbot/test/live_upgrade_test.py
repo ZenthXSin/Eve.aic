@@ -43,9 +43,9 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         reviews=[]
         def review(request):
             reviews.append(request)
-            allowed='重启一次' in request['user_messages'] and 'restart_self' in request['action']
-            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
-                    'outcome':'allow' if allowed else 'deny','rationale':'核对当前用户重启授权'}
+            allowed=request['user_messages']==[] and request['program']=='eve.restart_self'
+            return {'risk':'medium','authorization':'unknown',
+                    'outcome':'allow' if allowed else 'deny','rationale':'受监督器保护的短暂重启不造成状态丢失或持续不可用'}
         self.review_reply=review
         def respond(body):
             results=self.results(body)
@@ -133,10 +133,10 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         def review(request):
             reviews.append(request)
             operation=json.loads(request['arguments'][0])
-            allowed=('应用合成候选' in request['user_messages'] and request['program']=='eve.apply_self_upgrade'
+            allowed=(request['user_messages']==[] and request['program']=='eve.apply_self_upgrade'
                      and operation.get('source_diff_content')==patch.decode())
-            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
-                    'outcome':'allow' if allowed else 'deny','rationale':'核对应用原话与完整冻结源码差异'}
+            return {'risk':'medium','authorization':'unknown',
+                    'outcome':'allow' if allowed else 'deny','rationale':'依据完整冻结源码差异核对实际系统影响，不要求逐步授权'}
         self.review_reply=review
         def respond(body):
             results=self.results(body)

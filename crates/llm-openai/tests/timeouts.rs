@@ -42,6 +42,7 @@ fn provider(server: &Server, first: u64, idle: u64, total: u64) -> OpenAiProvide
 }
 fn request() -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "测试")],
         tools: vec![],
     }

@@ -24,6 +24,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         self.ledger_path = self.work / "state/business-permissions.json"
         self.target = self.source / "keep"
         self.target.mkdir()
+        self.target.chmod(0o700)
         (self.target / "evidence.txt").write_text("急停后必须保留", encoding="utf8")
         self.reviews = []
         self.command_results = []
@@ -65,6 +66,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
     def assert_retained(self):
         self.assertEqual((self.target / "evidence.txt").read_text(encoding="utf8"),
                          "急停后必须保留")
+        self.assertEqual(self.target.stat().st_mode & 0o777, 0o700)
 
     def assert_no_expression(self, *message_ids):
         events = [json.loads(line) for path in self.work.glob('events-*.jsonl')
@@ -80,10 +82,10 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
     def review_allow(self, request):
         self.reviews.append(request)
         return {"risk": "medium", "authorization": "high", "outcome": "allow",
-                "rationale": "用户明确允许删除临时工作区 keep，返回此次旧审核结论"}
+                "rationale": "临时工作区权限变更的旧安全结论，返回时仍须核对最新取消状态"}
 
     def test_owner_group_stop_commits_while_review_waits_and_restart_keeps_it(self):
-        command_text = "明确允许执行 rm -r keep，只删除工作区内 keep 目录"
+        command_text = "检查 chmod 777 keep 权限变更，只涉及临时工作区 keep 目录"
         command_raw = "<@!1904159860> " + command_text
         stop_text = "立即急停当前会话并取消既有任务"
         stop_raw = "<@!1904159860> " + stop_text
@@ -95,7 +97,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             results = self.results(body)
             if current == command_text:
                 if not results:
-                    return tool_response([("run_command", {"program": "rm", "args": ["-r", "keep"]})])
+                    return tool_response([("run_command", {"program": "chmod", "args": ["777", "keep"]})])
                 self.assertFalse(results[-1].get("success", False), results[-1])
                 self.assertRegex(json.dumps(results[-1], ensure_ascii=False), "业务权限已暂停|review_evidence_changed")
                 self.command_results.append(results[-1])
@@ -115,7 +117,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             self.assertFalse(self.gate("old-review-release").exists())
             self.assertEqual(self.reviews, [], "审核响应仍被门阻挡")
             request = json.loads(self.kind("review")[0]["body"]["messages"][-1]["content"])
-            self.assertEqual(request["user_messages"], [command_raw])
+            self.assertEqual(request["user_messages"], [], "系统危险审查不重复发送原话")
             self.assertFalse(request["delegated"])
             self.assertIn("keep", request["action"])
             self.assertIsNone(self.grant())
@@ -245,7 +247,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         self.assert_retained()
 
     def test_live_group_stop_steers_existing_turn_before_old_review_returns(self):
-        command = "明确允许执行 rm -r keep，只删除工作区内 keep 目录"
+        command = "检查 chmod 777 keep 权限变更，只涉及临时工作区 keep 目录"
         stop = "立即急停当前会话并取消既有任务"
         originals = ["<@!1904159860> " + text for text in [command, stop]]
         self.review_reply = self.review_allow
@@ -256,7 +258,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             current = self.text(body)
             if self.chat_rounds == 1:
                 self.assertEqual(current, command)
-                return tool_response([("run_command", {"program": "rm", "args": ["-r", "keep"]})])
+                return tool_response([("run_command", {"program": "chmod", "args": ["777", "keep"]})])
             if current == stop:
                 # 工具结束后新正文进入同一轮；旧工具回执位于新正文之前。
                 results = [json.loads(message["content"]) for message in body["messages"]
@@ -286,7 +288,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             self.assertEqual(self.reviews, [])
             self.assertEqual(self.chat_rounds, 1, "急停未另起模型轮次")
             request = json.loads(self.kind("review")[0]["body"]["messages"][-1]["content"])
-            self.assertEqual(request["user_messages"], originals[:1])
+            self.assertEqual(request["user_messages"], [])
             self.assertEqual(self.grant()["user_messages"], originals)
             receipt = self.receipt("live-stop")
             self.assertEqual(receipt["state"], "Merged")

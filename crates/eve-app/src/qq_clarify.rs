@@ -406,6 +406,11 @@ async fn compose(
     stopped: &mut watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     let input = ComposeRequest {
+        model_session: Some(
+            eve_llm_api::ModelSession::owned("clarify-composer", &request.owner, &request.id)
+                .and_then(|s| s.with_turn(&request.id))
+                .map_err(|_| ClarifyError::InvalidInput)?,
+        ),
         request_id: request.id.clone(),
         composer_version: request.composer_version.clone(),
         stall: request.stall.kind,
@@ -547,6 +552,17 @@ impl QqOutreach for ChannelAdapter {
                 .begin_judgement(&request.id, &moment.message_id, now)
                 .map_err(plugin_error)?;
             let input = JudgeRequest {
+                model_session: Some(
+                    eve_llm_api::ModelSession::scoped(
+                        "clarify-timing",
+                        &eve_llm_api::ContextScope {
+                            session_id: moment.session.session_id.clone(),
+                            user_id: moment.session.user_id.clone(),
+                        },
+                    )
+                    .and_then(|s| s.with_turn(&moment.message_id))
+                    .map_err(|_| plugin_error(ClarifyError::InvalidInput))?,
+                ),
                 invitation_id: request.id.clone(),
                 judge_version: judge.version().into(),
                 invitation: prefix(
@@ -706,6 +722,41 @@ impl QqOutreach for Combined {
         {
             Some((_, source)) => source.ordinary_candidate(candidate),
             None => Ok(false),
+        }
+    }
+    fn passive_candidates(
+        &self,
+        session: &SessionKey,
+        anchor: &str,
+    ) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let mut candidates = Vec::new();
+        for (prefix, source) in &self.0 {
+            match source.passive_candidates(session, anchor) {
+                Ok(rows)
+                    if rows.iter().all(|c| {
+                        c.id.starts_with(prefix) && c.session.as_ref() == Some(session)
+                    }) =>
+                {
+                    candidates.extend(rows)
+                }
+                _ => eprintln!("Eve 被动事实来源暂不可用：{prefix}"),
+            }
+        }
+        Ok(candidates)
+    }
+    fn claim_passive_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        match self
+            .0
+            .iter()
+            .find(|(prefix, _)| candidate.id.starts_with(prefix))
+        {
+            Some((_, source)) => source.claim_passive_candidate(candidate, text, anchor),
+            None => Ok(None),
         }
     }
     fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {

@@ -156,15 +156,12 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.wait_for(saved, "终态与真实经历尚未完整保存到主体历史", 20)
 
     def review_free(self, request):
-        if self.baseline_reviews is not None:
-            # 若普通探索仍依赖行动审查，明确拒绝；不能用恒定 allow 掩盖残留门槛。
-            return {"risk": "low", "authorization": "high", "outcome": "deny",
-                    "rationale": "本夹具拒绝给普通自由探索追加行动审批"}
-        return {"risk": "medium", "authorization": "high", "outcome": "allow",
-                "rationale": "合成主人授权临时范围内的自由探索及固定资源"}
+        # 配置及普通探索均无需模型审批；恒定拒绝才能暴露残留的审批依赖。
+        return {"risk": "low", "authorization": "high", "outcome": "deny",
+                "rationale": "本夹具拒绝给普通自由探索追加行动审批"}
 
     def assert_grant_identity(self, before, after):
-        for key in ("generation", "evidence_digest", "review_messages", "expires_at_ms",
+        for key in ("generation", "configured_turn_id", "evidence_digest", "review_messages", "expires_at_ms",
                     "max_goals", "steps_per_goal"):
             self.assertEqual(after.get(key), before.get(key), "不得重授探索资源：" + key)
         self.assertLessEqual(after["issued"], before["max_goals"])
@@ -200,6 +197,7 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.run_idle(self.send(message))
         self.baseline_grant = self.grant()
         self.baseline_reviews = len(self.kind("review"))
+        self.assertEqual(self.baseline_reviews, 0, "自主预算配置不应调用模型审查")
         self.assertEqual(self.baseline_grant["issued"], 0)
 
     def observation(self, body):
@@ -332,6 +330,19 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.assertEqual(execution.get("progress_notices", []), [])
         self.assertIsNone(execution.get("completion_contract"))
 
+    def assert_session_binding(self, task):
+        session = task["execution"]["checkpoint"]["model_session"]
+        self.assertEqual(session["version"], 1)
+        for key in ("session_id", "scope_id", "turn_id"):
+            self.assertRegex(session[key], r"^[0-9a-f]{64}$")
+        worker_keys = {body.get("prompt_cache_key") for body in self.worker_bodies}
+        self.assertEqual(len(worker_keys), 1, "工具往返和恢复必须沿用同一探索缓存键")
+        [worker_key] = worker_keys
+        self.assertRegex(worker_key, r"^[0-9a-f]{64}$")
+        other_keys = {request["body"].get("prompt_cache_key") for request in self.requests
+                      if request["kind"] == "chat" and not self.is_worker(request["body"])}
+        self.assertNotIn(worker_key, other_keys, "探索不能复用前台或空闲回顾会话")
+
     def wait_end(self, status=NORMAL_STATUS, tools=None, requests=None):
         self.wait_for(lambda: len(self.explorations()) == 1
                       and self.explorations()[0]["status"] == status,
@@ -339,6 +350,7 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.wait_reconciled()
         task = self.explorations()[0]
         self.assert_quiet(task)
+        self.assert_session_binding(task)
         self.assertIsNotNone(task.get("finished_at_ms"))
         if tools is not None:
             self.assertEqual(task["usage"]["tool_calls"], tools)
@@ -559,6 +571,9 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.assertTrue(self.worker_returned.wait(5))
         before = copy.deepcopy(self.explorations()[0])
         self.assertEqual(before["status"], "Running")
+        saved_checkpoint = before["execution"]["checkpoint"]
+        self.assertGreater(saved_checkpoint["pending_model_request"], 0)
+        self.assertRegex(saved_checkpoint["pending_request_fingerprint"], r"^[0-9a-f]{64}$")
         self.run_idle(self.checkpoint("resumed"), checkpoints={
             "resumed": lambda: self.wait_end(tools=1, requests=3)})
         after = self.explorations()[0]
@@ -566,6 +581,10 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
             self.assertEqual(after[field], before[field])
         for field in ("kind", "deadline_at_ms", "authorization_deadline_at_ms", "review_messages"):
             self.assertEqual(after["execution"].get(field), before["execution"].get(field))
+        restored_checkpoint = after["execution"]["checkpoint"]
+        self.assertEqual(restored_checkpoint["model_session"], saved_checkpoint["model_session"])
+        self.assertIsNone(restored_checkpoint.get("pending_model_request"))
+        self.assertIsNone(restored_checkpoint.get("pending_request_fingerprint"))
         self.assertEqual(after["execution"]["recoveries"], 1)
         self.assertEqual(len(self.worker_calls), 1)
         self.assert_no_replay()

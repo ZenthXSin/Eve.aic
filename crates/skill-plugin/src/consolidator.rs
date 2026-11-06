@@ -154,6 +154,15 @@ impl Consolidator {
                         None
                     };
                     let request = DistillRequest {
+                        model_session: Some(
+                            eve_llm_api::ModelSession::owned(
+                                "skill-distiller",
+                                &entry.owner,
+                                &entry.id,
+                            )
+                            .and_then(|s| s.with_turn(&entry.id))
+                            .map_err(|_| SkillError::InvalidInput)?,
+                        ),
                         distillation_id: entry.id.clone(),
                         distiller_version: self.distiller.version().into(),
                         runner: entry.runner.clone(),

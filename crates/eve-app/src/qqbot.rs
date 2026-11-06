@@ -2088,7 +2088,6 @@ async fn run_qqbot_composed(
                 commands: natural_goals.clone(),
                 review: crate::qq_natural_goals::Review {
                     admin: qq_admin.clone(),
-                    reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
                 },
             }));
         }
@@ -2098,7 +2097,6 @@ async fn run_qqbot_composed(
                 commands: natural_plans.clone(),
                 review: crate::qq_natural_goals::Review {
                     admin: qq_admin.clone(),
-                    reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
                 },
             }));
         }
@@ -2207,7 +2205,7 @@ async fn run_qqbot_composed(
             )?);
         }
         bootstrap.tools.push(Arc::new(crate::qq_subject::FocusTool(subject.clone())));
-        bootstrap.tools.push(Arc::new(crate::qq_subject::ConfigureTool { subject: subject.clone(), owner: qq_admin.clone(), reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()) }));
+        bootstrap.tools.push(Arc::new(crate::qq_subject::ConfigureTool { subject: subject.clone(), owner: qq_admin.clone() }));
         bootstrap.tools.push(Arc::new(crate::qq_files::FileDeliveryStatusTool(outbox.clone())));
         let script_python = std::env::var_os("EVE_SCRIPT_PYTHON")
             .map(PathBuf::from)
@@ -2545,7 +2543,7 @@ async fn run_qqbot_composed(
         if let Some(store)=speech_store {
             let sessions=registry.get(&ServiceId::new(SESSION_SERVICE_ID)?)?.ok_or("发言决定缺少会话服务")?.value.downcast::<SessionServiceHandle>().map_err(|_|"会话服务类型错误")?;
             plugin=plugin.with_speech(Arc::new(crate::qq_speech::Speech{
-                store,resolver:observed_capped("dialogue",Some(59))?,background_resolver:budget_gate.wrap(observed_capped("dialogue",Some(59))?,"outreach")?,context:speech_context.ok_or("发言决定缺少上下文")?,sessions:sessions.0.clone(),host:speech_config,conversations:conversations.clone(),
+                store,resolver:observed_capped("speech",Some(59))?,background_resolver:budget_gate.wrap(observed_capped("speech",Some(59))?,"outreach")?,context:speech_context.ok_or("发言决定缺少上下文")?,sessions:sessions.0.clone(),host:speech_config,conversations:conversations.clone(),
             }));
         } else {
             plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed_capped("progress", Some(7))?)));

@@ -141,6 +141,23 @@ pub trait QqOutreach: Send + Sync {
     fn candidates(&self) -> PluginResult<Vec<QqOutreachCandidate>> {
         Ok(vec![])
     }
+    /// 已完成真实私聊回复的剩余被动窗口；可结算过期事实，不认领、不恢复历史窗口。
+    fn passive_candidates(
+        &self,
+        _session: &SessionKey,
+        _anchor: &str,
+    ) -> PluginResult<Vec<QqOutreachCandidate>> {
+        Ok(vec![])
+    }
+    /// 与主动认领分离；来源必须核对同一会话、事实版本及被动消息锚点。
+    fn claim_passive_candidate(
+        &self,
+        _candidate: &QqOutreachCandidate,
+        _text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        Ok(None)
+    }
     /// 候选的普通私聊资格只能由来源核对持久事实与可信身份，不能由 JSON 标记授予。
     fn ordinary_candidate(&self, _candidate: &QqOutreachCandidate) -> PluginResult<bool> {
         Ok(false)

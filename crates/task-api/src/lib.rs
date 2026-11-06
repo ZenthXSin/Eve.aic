@@ -216,6 +216,7 @@ pub fn validate_delegated_context(context: &DelegatedContext) -> TaskResult<()> 
         return Err(TaskError::InvalidInput);
     }
     eve_llm_api::ModelRequest {
+        session: None,
         messages,
         tools: vec![],
     }

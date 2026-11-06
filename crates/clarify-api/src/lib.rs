@@ -333,6 +333,9 @@ impl ClarifySnapshot {
 /// 撰写请求：只含宿主整理的事实；规则与领域无关。
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ComposeRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub request_id: String,
     pub composer_version: String,
     pub stall: StallKind,

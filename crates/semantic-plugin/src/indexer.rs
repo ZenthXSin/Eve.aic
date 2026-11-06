@@ -35,6 +35,7 @@ pub struct Indexer {
 
 struct Pending {
     scope: String,
+    source_revision: u64,
     item: String,
     content_sha256: String,
     input: String,
@@ -94,7 +95,12 @@ impl Indexer {
                 .reader(scope.clone())
                 .map_err(|_| IndexStepError::Memory)?;
             let key = scope_key(&scope);
-            let available = MAX_EMBED_BATCH.saturating_sub(pending.len());
+            // 一个远端请求只绑定一个可信范围，不混入其他人的索引条目。
+            let available = if pending.is_empty() {
+                MAX_EMBED_BATCH
+            } else {
+                0
+            };
             let choose_block = block.is_none();
             let scanned = scan_layout(
                 reader.as_ref(),
@@ -126,6 +132,7 @@ impl Indexer {
                                     if plan.pending.len() < available {
                                         plan.pending.push(Pending {
                                             scope: key.clone(),
+                                            source_revision: item.evidence_revision,
                                             item: item.key,
                                             content_sha256: hash,
                                             input,
@@ -144,6 +151,7 @@ impl Indexer {
                                     let input = embed_input(&item)?;
                                     Some(Pending {
                                         scope: key.clone(),
+                                        source_revision: item.evidence_revision,
                                         content_sha256: content_hash(&input),
                                         item: item.key,
                                         input,
@@ -222,10 +230,36 @@ impl Indexer {
         batch: Vec<Pending>,
         now_ms: u64,
     ) -> Result<Vec<IndexEntry>, IndexStepError> {
+        let first = batch
+            .first()
+            .ok_or(IndexStepError::Embedding(EmbeddingError::InvalidInput))?;
+        if batch.iter().any(|item| item.scope != first.scope) {
+            return Err(IndexStepError::Embedding(EmbeddingError::InvalidInput));
+        }
+        let mut session =
+            eve_llm_api::ModelSession::anchored("embedding-index", None, &first.scope)
+                .map_err(|_| IndexStepError::Embedding(EmbeddingError::InvalidInput))?;
+        // 来源引用与持久修订定义该批作业，正文指纹只用于索引有效性，不充当会话身份。
+        for item in &batch {
+            session = session
+                .fork(
+                    "source",
+                    Some(&format!(
+                        "{}:{}:{}",
+                        item.item.len(),
+                        item.item,
+                        item.source_revision
+                    )),
+                )
+                .map_err(|_| IndexStepError::Embedding(EmbeddingError::InvalidInput))?;
+        }
+        let session = session
+            .with_turn("index-batch")
+            .map_err(|_| IndexStepError::Embedding(EmbeddingError::InvalidInput))?;
         let inputs: Vec<String> = batch.iter().map(|item| item.input.clone()).collect();
         let vectors = self
             .embedder
-            .embed(&inputs)
+            .embed_with_model_session(&inputs, Some(&session))
             .await
             .map_err(IndexStepError::Embedding)?;
         eve_semantic_api::validate_vectors(self.embedder.profile(), inputs.len(), &vectors)

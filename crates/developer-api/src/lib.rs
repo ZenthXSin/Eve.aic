@@ -9,6 +9,8 @@ use std::{
 
 mod upgrade;
 pub use upgrade::*;
+mod credentials;
+pub use credentials::credential_path;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,7 +59,7 @@ pub struct DeveloperConfig {
     /// 追加的命令策略规则文件（JSON）；内置规则始终生效。
     #[serde(default)]
     pub command_policy: Option<PathBuf>,
-    /// 敏感命令和业务动作交给宿主装配的行动审查者判断；关闭或未装配时拒绝需审核的动作，owner_confirmed不能代替审核。
+    /// 具有具体系统危险的动作交给宿主装配的审查者；普通开发和探索不依赖此服务。
     #[serde(default = "enabled")]
     pub action_review: bool,
     #[serde(default = "cargo")]
@@ -80,7 +82,7 @@ fn enabled() -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum CommandDecision {
     Allow,
-    /// 需要主人或管理员在对话里明确同意后再执行。
+    /// 命中具体系统危险，需要检查实际影响；不表示需要用户逐步批准。
     Prompt,
     Forbidden,
 }
@@ -121,9 +123,19 @@ impl CommandEvaluation {
 /// 可替换的命令策略：只根据程序与参数判断，不执行任何东西。
 pub trait CommandPolicy: Send + Sync {
     fn evaluate(&self, program: &str, args: &[String]) -> CommandEvaluation;
+
+    /// 宿主绑定的真实 cwd 用于识别相对路径指向的系统目标；不接受模型自称的安全范围。
+    fn evaluate_at(
+        &self,
+        program: &str,
+        args: &[String],
+        _cwd: &std::path::Path,
+    ) -> CommandEvaluation {
+        self.evaluate(program, args)
+    }
 }
 
-/// 行动审查的风险等级，参考 openai/codex Guardian 的风险分类（Apache-2.0）。
+/// 行动对系统的实际影响等级；具体含义由身份或系统安全入口约定。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewRisk {
@@ -136,7 +148,7 @@ pub enum ReviewRisk {
     /// 明显外泄凭据，或大范围不可逆破坏。
     Critical,
 }
-/// 用户对这一步的授权程度；只依据用户本人的原话判断。
+/// 兼容的身份/访问边界授权程度；系统安全入口不使用此字段作准入条件。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewAuthorization {
@@ -152,6 +164,9 @@ pub enum ReviewAuthorization {
 /// 交给审查者的一次行动。只有 `user_messages` 是可信的用户原话；其余都是待核对的数据。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActionReviewRequest {
+    /// 宿主绑定的独立审查会话；不进入送审正文或模型参数。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     /// 有界行动摘要；不得据此替代下面完整的程序、参数或业务操作。
     pub action: String,
     /// 命令的真实程序；业务动作使用 eve.xxx 名称，并在 arguments[0] 提供完整 JSON 操作。
@@ -207,6 +222,12 @@ impl ActionReviewVerdict {
             && self.authorization >= ReviewAuthorization::Medium
             && (self.risk < ReviewRisk::High || self.authorization == ReviewAuthorization::High)
     }
+
+    /// 系统安全入口只判断直接危害，不把缺少目标、用户原话或逐步授权当作拒绝理由。
+    /// 身份由调用方通过可信宿主核验；高/严重风险不能靠用户同意消除。
+    pub fn permits_system_safety(&self) -> bool {
+        self.allow && self.risk < ReviewRisk::High
+    }
 }
 pub type ActionReviewFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ActionReviewVerdict, String>> + Send + 'a>,
@@ -214,6 +235,12 @@ pub type ActionReviewFuture<'a> = std::pin::Pin<
 /// 可替换的行动审查者。失败、超时或输出不合格时返回错误，宿主一律不执行。
 pub trait ActionReviewer: Send + Sync {
     fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_>;
+
+    /// 仅评估动作是否直接危害系统安全。默认转发兼容已有替换实现；
+    /// 实现者不得在此入口要求任务目标、业务价值或具体用户逐步授权。
+    fn review_system_safety(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
+        self.review(request)
+    }
 }
 
 /// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
@@ -360,7 +387,7 @@ pub struct CommandArguments {
     pub cwd: String,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// 命令策略要求确认的命令：主人或管理员已在对话里明确同意时才可置为 true。
+    /// 旧协议兼容字段；模型自称确认不参与宿主身份或系统安全判断。
     #[serde(default)]
     pub owner_confirmed: bool,
 }

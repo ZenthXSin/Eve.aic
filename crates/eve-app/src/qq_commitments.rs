@@ -368,8 +368,19 @@ impl ContextAssembler for CommitmentContext {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
+            let mut context = self
+                .wrapped
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             let Some(scope) = scope.filter(|s| s.user_id != crate::qq_group::USER) else {
                 return Ok(context);
             };

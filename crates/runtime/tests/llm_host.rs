@@ -1,9 +1,9 @@
 use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::{
     ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture, LlmProvider,
-    ModelRequest, ModelResponse, Tool, ToolBinding, ToolCall, ToolConcurrency, ToolDefinition,
-    ToolExecutionContext, ToolExecutionError, ToolFailureCode, ToolFuture, ToolService,
-    ToolValidationError, TurnInput,
+    ModelRequest, ModelResponse, ModelSession, Tool, ToolBinding, ToolCall, ToolConcurrency,
+    ToolDefinition, ToolExecutionContext, ToolExecutionError, ToolFailureCode, ToolFuture,
+    ToolService, ToolValidationError, TurnInput,
 };
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginId, PluginManifest,
@@ -57,16 +57,64 @@ async fn deferred_reply_keeps_tool_receipts_and_retries_only_the_failed_model_re
         },
     )
     .await;
+    let session = ModelSession::anchored("local", None, "persisted-local-fixture")
+        .unwrap()
+        .with_turn("persisted-turn-7")
+        .unwrap();
+    let host = host.with_model_session(session.clone());
     let output = host.run_turn(turn()).await.unwrap();
     assert_eq!(output.text, "核对完整回执后回复");
     assert_eq!(output.diagnostics.provider_requests, 4);
     assert_eq!(output.diagnostics.started_tools, 1);
     assert_eq!(tool.starts.lock().unwrap().len(), 1);
     let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests[0].session, Some(session.for_request(1)));
+    assert_eq!(requests[1].session, Some(session.for_request(2)));
     assert_eq!(requests[1], requests[2]);
     assert_eq!(requests[2], requests[3]);
     assert!(requests[1].tools.is_empty(), "重试不能重置工具额度");
     assert_eq!(output.diagnostics.tool_results.len(), 1);
+}
+
+#[tokio::test]
+async fn task_model_binding_reaches_tools_and_independent_review_sessions() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("child-call", "record", json!({}))]),
+        final_response("完成"),
+    ]);
+    let contexts = Arc::new(Mutex::new(vec![]));
+    let tool = Arc::new(TestTool::new(
+        "record",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::RecordModelSession(contexts.clone()),
+    ));
+    let (host, assembler, _) =
+        make_host(provider.clone(), vec![tool], LlmHostConfig::default()).await;
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    let session = ModelSession::anchored("task", Some(&scope), "task-27")
+        .unwrap()
+        .with_turn("task-27")
+        .unwrap();
+    host.with_model_session(session.clone())
+        .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        *assembler.model_sessions.lock().unwrap(),
+        vec![Some(session.clone())]
+    );
+    let context = contexts.lock().unwrap()[0].clone();
+    assert_eq!(context.model_session(), Some(&session.for_request(1)));
+    let review = context.model_session_for("review").unwrap().unwrap();
+    review.validate_scope(Some(&scope)).unwrap();
+    assert_ne!(review.session_id(), session.session_id());
+    assert_ne!(review.prompt_cache_key(), session.prompt_cache_key());
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests[0].session, Some(session.for_request(1)));
+    assert_eq!(requests[1].session, Some(session.for_request(2)));
 }
 
 #[tokio::test]
@@ -225,6 +273,231 @@ async fn deferred_reply_does_not_add_retries_to_persistent_task_recovery() {
     let frame = journal.frame.lock().unwrap();
     assert_eq!(frame.as_ref().unwrap().provider_requests, 1);
     assert!(frame.as_ref().unwrap().resumable());
+}
+
+struct VerifiedOriginalGapSource {
+    current: Arc<AtomicBool>,
+    broken: Arc<AtomicBool>,
+}
+impl VerifiedOriginalGapSource {
+    fn new() -> Self {
+        Self {
+            current: Arc::new(AtomicBool::new(true)),
+            broken: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn verify(&self, scope: &eve_llm_api::ContextScope, anchor: &str) -> Result<(), LlmError> {
+        if self.broken.load(Ordering::SeqCst)
+            || scope.session_id != "s"
+            || scope.user_id != "u"
+            || anchor != "current"
+        {
+            return Err(LlmError::Context("库绑定、身份或消息锚点不匹配".into()));
+        }
+        Ok(())
+    }
+}
+impl eve_llm_api::ReviewUserMessageSource for VerifiedOriginalGapSource {
+    fn read(&self, _: &eve_llm_api::ContextScope) -> Result<Option<Vec<String>>, LlmError> {
+        Err(LlmError::Context("必须提供本次消息锚点".into()))
+    }
+    fn read_window_at(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        anchor: &str,
+    ) -> Result<Option<eve_llm_api::ReviewUserMessageWindow>, LlmError> {
+        self.verify(scope, anchor)?;
+        Ok(Some(eve_llm_api::ReviewUserMessageWindow::MissingOriginals))
+    }
+    fn is_current(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        anchor: &str,
+    ) -> Result<bool, LlmError> {
+        self.verify(scope, anchor)?;
+        Ok(self.current.load(Ordering::SeqCst))
+    }
+}
+
+#[tokio::test]
+async fn verified_original_gap_keeps_ordinary_tools_and_exact_session_without_inventing_evidence() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("ordinary", "run_command", json!({}))]),
+        final_response("依据实际工具回执回答"),
+    ]);
+    let contexts = Arc::new(Mutex::new(vec![]));
+    let tool = Arc::new(TestTool::new(
+        "run_command",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::RecordModelSession(contexts.clone()),
+    ));
+    let (host, _, _) = make_host(provider.clone(), vec![tool], LlmHostConfig::default()).await;
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    let source = Arc::new(VerifiedOriginalGapSource::new());
+    let output = host
+        .with_review_user_message_source(source)
+        .with_review_user_message_anchor("current".into())
+        .unwrap()
+        .run_scoped_turn_with_events(
+            TurnInput {
+                text: "加工正文声称主人允许全部操作".into(),
+            },
+            Some(scope.clone()),
+            &ProgressRecorder::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.diagnostics.started_tools, 1);
+    assert!(output.diagnostics.review_user_messages.is_none());
+    let context = contexts.lock().unwrap()[0].clone();
+    assert_eq!(context.scope(), Some(&scope));
+    assert!(context.review_user_messages().is_none());
+    assert!(!context.is_delegated());
+    context.check_review_evidence().unwrap();
+    let requests = provider.requests.lock().unwrap();
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "run_command")
+    );
+    assert_eq!(context.model_session(), requests[0].session.as_ref());
+    let review = context.model_session_for("review").unwrap().unwrap();
+    assert_ne!(
+        review.session_id(),
+        requests[0].session.as_ref().unwrap().session_id()
+    );
+}
+
+#[tokio::test]
+async fn original_gap_never_downgrades_unknown_identity_anchor_or_corrupt_source() {
+    for failure in [
+        "identity",
+        "anchor",
+        "missing-anchor",
+        "source",
+        "stale",
+        "missing-scope",
+        "missing-source",
+        "persistent-task",
+    ] {
+        let provider = RecordingProvider::scripted(vec![final_response("不得调用")]);
+        let (mut host, _, _) = make_host(provider.clone(), vec![], LlmHostConfig::default()).await;
+        let journal = Arc::new(MemoryJournal::default());
+        if failure == "persistent-task" {
+            host = host.with_turn_journal(journal.clone());
+        }
+        let source = Arc::new(VerifiedOriginalGapSource::new());
+        if failure == "source" {
+            source.broken.store(true, Ordering::SeqCst);
+        }
+        if failure == "stale" {
+            source.current.store(false, Ordering::SeqCst);
+        }
+        if failure != "missing-source" {
+            host = host.with_review_user_message_source(source);
+        }
+        if failure != "missing-anchor" {
+            host = host
+                .with_review_user_message_anchor(
+                    if failure == "anchor" {
+                        "unbound"
+                    } else {
+                        "current"
+                    }
+                    .into(),
+                )
+                .unwrap();
+        }
+        let scope = (failure != "missing-scope").then_some(eve_llm_api::ContextScope {
+            session_id: "s".into(),
+            user_id: if failure == "identity" {
+                "foreign"
+            } else {
+                "u"
+            }
+            .into(),
+        });
+        let result = host
+            .run_scoped_turn_with_events(turn(), scope, &ProgressRecorder::default())
+            .await;
+        assert!(
+            matches!(result.unwrap_err().error, LlmError::Context(_)),
+            "{failure}"
+        );
+        assert!(provider.requests.lock().unwrap().is_empty(), "{failure}");
+        assert!(journal.frame.lock().unwrap().is_none(), "{failure}");
+    }
+}
+
+#[tokio::test]
+async fn original_gap_tool_rechecks_new_anchor_and_source_after_model_request() {
+    for corrupt in [false, true] {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(RecordingProvider {
+            requests: Arc::new(Mutex::new(vec![])),
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![call("stale", "run_command", json!({}))]),
+                final_response("旧调用未执行"),
+            ])),
+            delay: None,
+            block: Some((started.clone(), release.clone())),
+        });
+        let tool = Arc::new(TestTool::new("run_command", None, ToolMode::Echo));
+        let (host, _, _) = make_host(
+            provider.clone(),
+            vec![tool.clone()],
+            LlmHostConfig::default(),
+        )
+        .await;
+        let source = Arc::new(VerifiedOriginalGapSource::new());
+        let host = host
+            .with_review_user_message_source(source.clone())
+            .with_review_user_message_anchor("current".into())
+            .unwrap();
+        let running = tokio::spawn(async move {
+            host.run_scoped_turn_with_events(
+                turn(),
+                Some(eve_llm_api::ContextScope {
+                    session_id: "s".into(),
+                    user_id: "u".into(),
+                }),
+                &ProgressRecorder::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        if corrupt {
+            source.broken.store(true, Ordering::SeqCst);
+        } else {
+            source.current.store(false, Ordering::SeqCst);
+        }
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        release.notify_one();
+        let output = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.diagnostics.started_tools, 0);
+        assert!(tool.starts.lock().unwrap().is_empty());
+        assert!(matches!(
+            output.diagnostics.tool_results[0].output,
+            eve_llm_api::ToolOutput::Failure {
+                code: ToolFailureCode::InvalidArguments,
+                ..
+            }
+        ));
+    }
 }
 
 struct LegacyReviewSource {
@@ -407,6 +680,194 @@ impl eve_llm_api::TurnJournal for MemoryJournal {
         }
         *self.frame.lock().unwrap() = Some(frame.clone());
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn restored_checkpoint_reuses_the_failed_model_request_without_replaying_tools() {
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    let session = ModelSession::anchored("task", Some(&scope), "task-recovery")
+        .unwrap()
+        .with_turn("task-recovery")
+        .unwrap();
+    let first_provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("once", "echo", json!({"receipt": "保留"}))]),
+        Err(LlmError::ProviderTimeout),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let config = LlmHostConfig {
+        max_tool_calls: 1,
+        max_tool_rounds: 0,
+        final_answer_on_round_limit: true,
+        ..Default::default()
+    };
+    let (host, _, _) = make_host(first_provider.clone(), vec![tool.clone()], config.clone()).await;
+    let journal = Arc::new(MemoryJournal::default());
+    let host = host
+        .with_turn_journal(journal.clone())
+        .with_model_session(session.clone());
+    assert_eq!(
+        host.run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+            .await
+            .unwrap_err()
+            .error,
+        LlmError::ProviderTimeout,
+    );
+    let bytes = serde_json::to_vec(journal.frame.lock().unwrap().as_ref().unwrap()).unwrap();
+    let frame: eve_llm_api::TurnCheckpoint = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(frame.model_session, Some(session.clone()));
+    assert_eq!(frame.pending_model_request, Some(2));
+    assert!(frame.pending_request_fingerprint.is_some());
+    assert_eq!(frame.provider_requests, 2);
+    frame.validate(1).unwrap();
+    drop(host);
+    drop(journal);
+
+    let restored = Arc::new(MemoryJournal::default());
+    *restored.frame.lock().unwrap() = Some(frame);
+    let recovered_provider = RecordingProvider::scripted(vec![final_response("恢复完成")]);
+    let (host, _, _) = make_host(recovered_provider.clone(), vec![tool.clone()], config).await;
+    let output = host
+        .with_turn_journal(restored.clone())
+        .with_model_session(session)
+        .run_scoped_turn_with_events(turn(), Some(scope), &ProgressRecorder::default())
+        .await
+        .unwrap();
+    assert_eq!(output.text, "恢复完成");
+    assert_eq!(*tool.starts.lock().unwrap(), ["once"]);
+    assert_eq!(
+        first_provider.requests.lock().unwrap()[1],
+        recovered_provider.requests.lock().unwrap()[0],
+    );
+    let frame = restored.frame.lock().unwrap();
+    assert!(frame.as_ref().unwrap().pending_model_request.is_none());
+    assert!(
+        frame
+            .as_ref()
+            .unwrap()
+            .pending_request_fingerprint
+            .is_none()
+    );
+    assert_eq!(frame.as_ref().unwrap().result.as_deref(), Some("恢复完成"));
+}
+
+#[tokio::test]
+async fn restored_changed_prompt_or_missing_fingerprint_uses_a_new_request_id() {
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    let session = ModelSession::anchored("task", Some(&scope), "task-context-change")
+        .unwrap()
+        .with_turn("persisted-run")
+        .unwrap();
+    let provider = RecordingProvider::scripted(vec![Err(LlmError::ProviderTimeout)]);
+    let (host, _, _) = make_host(provider.clone(), vec![], LlmHostConfig::default()).await;
+    let journal = Arc::new(MemoryJournal::default());
+    host.with_model_session(session.clone())
+        .with_turn_journal(journal.clone())
+        .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+        .await
+        .unwrap_err();
+    let saved = journal.frame.lock().unwrap().clone().unwrap();
+    let original = provider.requests.lock().unwrap()[0].clone();
+    for change_prompt in [true, false] {
+        let mut frame = saved.clone();
+        if !change_prompt {
+            frame.pending_request_fingerprint = None;
+        }
+        let restored = Arc::new(MemoryJournal::default());
+        *restored.frame.lock().unwrap() = Some(frame);
+        let mut config = LlmHostConfig::default();
+        if change_prompt {
+            config.system_prompt_snapshot = Some(
+                eve_llm_api::SystemPromptSnapshot::new(
+                    "恢复后新的宿主系统说明".into(),
+                    eve_llm_api::SystemPromptOrigin::Inline,
+                    "changed-fixture".into(),
+                )
+                .unwrap(),
+            );
+        }
+        let provider = RecordingProvider::scripted(vec![final_response("完成")]);
+        let (host, _, _) = make_host(provider.clone(), vec![], config).await;
+        host.with_model_session(session.clone())
+            .with_turn_journal(restored)
+            .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+            .await
+            .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests[0].session, Some(session.for_request(2)));
+        if change_prompt {
+            assert_ne!(requests[0].messages, original.messages);
+        } else {
+            assert_eq!(requests[0].messages, original.messages);
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_binding_mismatch_preserves_the_saved_record_and_never_calls_the_model() {
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    let session = ModelSession::anchored("task", Some(&scope), "task-original")
+        .unwrap()
+        .with_turn("task-original")
+        .unwrap();
+    let first_provider = RecordingProvider::scripted(vec![Err(LlmError::ProviderTimeout)]);
+    let (host, _, _) = make_host(first_provider, vec![], LlmHostConfig::default()).await;
+    let journal = Arc::new(MemoryJournal::default());
+    host.with_model_session(session.clone())
+        .with_turn_journal(journal.clone())
+        .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+        .await
+        .unwrap_err();
+    let original = journal.frame.lock().unwrap().clone().unwrap();
+    let other_scope = eve_llm_api::ContextScope {
+        user_id: "another-user".into(),
+        ..scope.clone()
+    };
+    for candidate in [
+        ModelSession::anchored("task", Some(&scope), "other-task")
+            .unwrap()
+            .with_turn("other-task")
+            .unwrap(),
+        ModelSession::anchored("review", Some(&scope), "task-original")
+            .unwrap()
+            .with_turn("task-original")
+            .unwrap(),
+        ModelSession::anchored("task", Some(&other_scope), "task-original")
+            .unwrap()
+            .with_turn("task-original")
+            .unwrap(),
+        session.with_turn("different-turn").unwrap(),
+    ] {
+        let provider = RecordingProvider::scripted(vec![final_response("不得请求")]);
+        let (host, assembler, _) =
+            make_host(provider.clone(), vec![], LlmHostConfig::default()).await;
+        let failure = host
+            .with_model_session(candidate)
+            .with_turn_journal(journal.clone())
+            .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            LlmError::Context(_) | LlmError::Configuration(_)
+        ));
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(assembler.snapshots.load(Ordering::SeqCst), 0);
+        assert!(assembler.model_sessions.lock().unwrap().is_empty());
+        assert_eq!(journal.frame.lock().unwrap().as_ref().unwrap(), &original);
     }
 }
 
@@ -707,9 +1168,20 @@ fn service_id(name: &str) -> ServiceId {
 struct CountingContext {
     snapshots: AtomicUsize,
     history: Mutex<Vec<eve_llm_api::ChatMessage>>,
+    model_sessions: Mutex<Vec<Option<ModelSession>>>,
 }
 
 impl ContextAssembler for CountingContext {
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<eve_llm_api::ContextScope>,
+        session: Option<ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
+        self.model_sessions.lock().unwrap().push(session);
+        self.assemble_scoped(input, scope)
+    }
+
     fn assemble(&self, _input: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
         self.snapshots.fetch_add(1, Ordering::SeqCst);
         let history = self.history.lock().unwrap().clone();
@@ -739,6 +1211,7 @@ enum ToolMode {
     WaitForDrop(Arc<AtomicBool>),
     RecordScope(Arc<Mutex<Vec<Option<eve_llm_api::ContextScope>>>>),
     RecordReview(Arc<Mutex<Vec<Vec<String>>>>),
+    RecordModelSession(Arc<Mutex<Vec<ToolExecutionContext>>>),
 }
 
 struct NeverFuture {
@@ -849,6 +1322,10 @@ impl Tool for TestTool {
                     .push(context.scope().cloned());
                 Ok(json!({"id": call.id}))
             }),
+            ToolMode::RecordModelSession(seen) => Box::pin(async move {
+                seen.lock().unwrap().push(context);
+                Ok(json!({"id": call.id}))
+            }),
             ToolMode::Echo | ToolMode::Error => Box::pin(async move {
                 starts.lock().expect("starts lock").push(call.id.clone());
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -905,6 +1382,22 @@ impl RecordingProvider {
 }
 
 impl LlmProvider for RecordingProvider {
+    fn request_fingerprint(
+        &self,
+        request: &ModelRequest,
+        mode: eve_llm_api::ResponseMode,
+    ) -> Result<Option<eve_llm_api::ModelRequestFingerprint>, LlmError> {
+        eve_llm_api::ModelRequestFingerprint::from_json(
+            "test-recording-provider-v1",
+            &(
+                &request.messages,
+                &request.tools,
+                mode == eve_llm_api::ResponseMode::Stream,
+            ),
+        )
+        .map(Some)
+    }
+
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         self.requests.lock().expect("request lock").push(request);
         let delay = self.delay;
@@ -1023,7 +1516,10 @@ async fn make_host_with_registry(
         }))
         .expect("register service plugin");
 
-    config.system_prompt = "你是测试助手".into();
+    config.system_prompt = config
+        .system_prompt_snapshot
+        .as_ref()
+        .map_or_else(|| "你是测试助手".into(), |snapshot| snapshot.text().into());
     config.output_format = "纯文本".into();
     let bindings = tools
         .iter()
@@ -2535,6 +3031,58 @@ impl eve_llm_api::TurnSteeringSource for ReviewSteeringSource {
         Ok(self.0.clone())
     }
 }
+
+#[tokio::test]
+async fn a_new_message_during_deferred_reply_gets_a_new_request_id_in_the_same_session() {
+    let provider = RecordingProvider::scripted(vec![
+        Err(LlmError::ProviderTimeout),
+        final_response("已采用当前补充"),
+    ]);
+    let (host, _, _, kernel) = make_host_with_registry(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            deferred_reply: Some(deferred_policy(1)),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    kernel
+        .register(Box::new(eve_session_plugin::SessionPlugin::new().unwrap()))
+        .unwrap();
+    kernel
+        .start(&PluginId::new(eve_session_api::SESSION_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let host = host.with_steering(Arc::new(ReviewSteeringSource(Arc::new(ReviewSteering {
+        reads: AtomicUsize::new(0),
+        correction: "补充：查看新版本的源码".into(),
+    }))));
+    eve_runtime::SessionLlmHost::new(host, eve_runtime::SessionBinding::builtin())
+        .run_turn_with_events(
+            eve_session_api::SessionInput {
+                key: eve_session_api::SessionKey::new("s", "u").unwrap(),
+                text: "查看源码".into(),
+            },
+            &ProgressRecorder::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first = requests[0].session.as_ref().unwrap();
+        let next = requests[1].session.as_ref().unwrap();
+        assert_eq!(first.session_id(), next.session_id());
+        assert_eq!(first.prompt_cache_key(), next.prompt_cache_key());
+        assert_eq!(first.turn_id(), next.turn_id());
+        assert_ne!(first.client_request_id(), next.client_request_id());
+        assert_ne!(requests[0].messages, requests[1].messages);
+    }
+    kernel.stop_all().await.unwrap();
+}
+
 #[tokio::test]
 async fn review_original_messages_refresh_when_a_user_steers_an_active_turn() {
     let provider = RecordingProvider::scripted(vec![

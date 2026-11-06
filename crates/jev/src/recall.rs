@@ -88,6 +88,12 @@ impl GroupRecallSelector for JevRelationJudge {
             if !input.valid() {
                 return Err(error());
             }
+            let session = eve_llm_api::ModelSession::anchored(
+                "jev-group-recall",
+                None,
+                &input.current.conversation,
+            )?
+            .with_turn(&input.current.id)?;
             let _slot = tokio::time::timeout(SLOT_WAIT, self.slots.acquire())
                 .await
                 .map_err(|_| error())?
@@ -117,7 +123,7 @@ impl GroupRecallSelector for JevRelationJudge {
             }
             let body = recall_request(&input, &exchanges, &self.config.model);
             tokio::time::timeout(self.config.timeout, async {
-                let bytes = self.group_request(body).await?;
+                let bytes = self.group_request(body, Some(&session)).await?;
                 parse_recall(&bytes, &input)
             })
             .await

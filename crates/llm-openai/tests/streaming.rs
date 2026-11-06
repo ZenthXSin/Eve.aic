@@ -21,6 +21,7 @@ impl ModelTextSink for Sink {
 }
 fn request() -> ModelRequest {
     ModelRequest {
+        session: None,
         messages: vec![ChatMessage::text(ChatRole::User, "流式中文")],
         tools: vec![],
     }

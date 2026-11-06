@@ -285,6 +285,23 @@ impl QqConversations {
         self.review
             .read(&identity.app_id, &identity.session, message_id)
     }
+    /// 与严格原文读取共用完整身份及库校验，区分已知正文缺口和不可用/损坏来源。
+    pub fn review_window_at(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        message_id: &str,
+    ) -> PluginResult<eve_llm_api::ReviewUserMessageWindow> {
+        if !crate::state::valid_message_id(message_id) {
+            return Err(PluginError::State("QQ 原文窗口锚点无效".into()));
+        }
+        let session = SessionKey::new(&scope.session_id, &scope.user_id)
+            .map_err(|_| PluginError::State("QQ 原文窗口身份无效".into()))?;
+        let identity = self
+            .identity(&session)?
+            .ok_or_else(|| PluginError::State("QQ 原文窗口缺少平台身份".into()))?;
+        self.review
+            .window(&identity.app_id, &identity.session, message_id)
+    }
     /// 交流审视使用指定锚点的完整入站原话，包含失败或尚未完成轮次。
     /// 只供理解当前交流；不能替代完整审核窗口，不提供新权限。
     pub fn original_message_at(

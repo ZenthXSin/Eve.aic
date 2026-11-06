@@ -46,6 +46,8 @@ use tokio::{
 };
 
 mod action_capabilities;
+#[cfg(test)]
+mod passive_tests;
 
 pub(crate) const DISPATCH_TOOL: &str = "dispatch_background_task";
 pub(crate) const LIST_TOOL: &str = "list_background_tasks";
@@ -205,6 +207,7 @@ pub(crate) struct WorkerRun {
 
 struct WorkerRequest {
     exploration: bool,
+    model_session: Option<eve_llm_api::ModelSession>,
     idle_review: bool,
     idle_input: Option<String>,
     instructions: String,
@@ -478,6 +481,7 @@ impl Worker {
     async fn run_request(&self, request: WorkerRequest) -> WorkerRun {
         let WorkerRequest {
             exploration,
+            model_session,
             idle_review,
             idle_input,
             instructions,
@@ -584,6 +588,41 @@ impl Worker {
             }
         };
         let host = host.with_shared_steps(steps_pool.clone()).delegated();
+        let host = if let Some(session) = model_session {
+            host.with_model_session(session)
+        } else if let Some(id) = &background_task_id {
+            let role = if exploration {
+                "exploration"
+            } else if idle_review {
+                "idle-review"
+            } else if subject_plan.is_some() {
+                "subject-plan"
+            } else {
+                "task"
+            };
+            match eve_llm_api::ModelSession::anchored(role, scope.as_ref(), id)
+                .and_then(|session| session.with_turn(id))
+            {
+                Ok(session) => host.with_model_session(session),
+                Err(_) => {
+                    return WorkerRun {
+                        end: TaskEnd::Failed {
+                            reason: "后台任务缺少有效模型会话绑定；未请求模型".into(),
+                        },
+                        usage: TaskUsage::default(),
+                        retryable: false,
+                    };
+                }
+            }
+        } else {
+            return WorkerRun {
+                end: TaskEnd::Failed {
+                    reason: "独立执行缺少模型会话绑定；未请求模型".into(),
+                },
+                usage: TaskUsage::default(),
+                retryable: false,
+            };
+        };
         let host = match background_task_id {
             Some(id) => host.with_background_task_id(id),
             None => host,
@@ -1186,6 +1225,7 @@ fn instructions_with_context(
     let messages: Vec<eve_llm_api::ChatMessage> = serde_json::from_str(&context.messages_json)
         .map_err(|_| failed("委派上下文格式无效；未执行"))?;
     eve_llm_api::ModelRequest {
+        session: None,
         messages,
         tools: vec![],
     }
@@ -1574,6 +1614,22 @@ impl Tool for SubagentTool {
             }
             let running = worker.run_request(WorkerRequest {
                 exploration: false,
+                // call ID 来自当前执行器绑定，不采用工具参数中的 agent_id 当会话标识。
+                // 父轮次和 call ID 合起来是该独立子代理的稳定锚点。
+                model_session: Some({
+                    let parent = context
+                        .model_session()
+                        .ok_or_else(|| failed("子代理缺少可信父模型会话"))?;
+                    let turn = parent
+                        .turn_id()
+                        .ok_or_else(|| failed("子代理缺少可信父轮次"))?;
+                    let call_id = context
+                        .call_id()
+                        .ok_or_else(|| failed("子代理缺少宿主工具调用编号"))?;
+                    parent
+                        .fork("subagent", Some(&format!("{turn}:{call_id}")))
+                        .map_err(failed)?
+                }),
                 idle_review: false,
                 idle_input: None,
                 instructions,
@@ -1687,8 +1743,19 @@ impl ContextAssembler for TaskContext {
         input: TurnInput,
         scope: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
+            let mut context = self
+                .wrapped
+                .assemble_with_model_session(input, scope.clone(), model_session.clone())
+                .await?;
             let Some(scope) = scope else {
                 return Ok(context);
             };
@@ -1768,8 +1835,8 @@ fn notice_text(task: &Task) -> String {
     bounded(&text, QQ_OUTREACH_MAX_BYTES)
 }
 
-/// 通道的投递点：结束的任务先主动私聊通知一次，发不出去时随用户下一条私聊的回复附带。
-/// 通知是用户派发的任务的结局，不经时机判断；投递前先保存尝试。
+/// 任务结果的投递来源。实时对话由 Eve 自己决定表达内容，并精确认领主动或被动尝试；
+/// 旧兼容通道仍可使用固定通知正文。两种路径都在实际发送前保存尝试。
 pub(crate) struct ChannelAdapter {
     pub(crate) tasks: Arc<dyn TaskAdmin>,
 }
@@ -1784,50 +1851,14 @@ fn verify_delivery_claim(
     Ok(())
 }
 
-impl QqOutreach for ChannelAdapter {
-    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
-        let now = now_ms();
-        let mut snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
-        snapshot.validate().map_err(plugin_error)?;
-        snapshot
-            .tasks
-            .retain(|t| t.owner.session_id.starts_with("qq:"));
-        let overdue: Vec<_> = snapshot.overdue(now).map(|t| t.id.clone()).collect();
-        for id in &overdue {
-            self.tasks.expire(id, now).map_err(plugin_error)?;
-        }
-        let mut output = Vec::new();
-        // 逐个移除已取出的只读目录候选，沉默的首条不阻塞其他候选。
-        while let Some(entry) = snapshot.due_proactive().cloned() {
-            snapshot.tasks.retain(|t| t.id != entry.id);
-            if overdue.contains(&entry.id) {
-                continue;
-            }
-            let Some(task) = self
-                .tasks
-                .get_owned(&entry.owner, &entry.id)
-                .map_err(plugin_error)?
-            else {
-                continue;
-            };
-            if !entry.matches(&task) {
-                return Err(plugin_error(TaskError::CorruptState));
-            }
-            output.push(crate::qq_speech::candidate(task.id.clone(),Some(SessionKey{session_id:task.owner.session_id.clone(),user_id:task.owner.user_id.clone()}),task.owner.user_id.clone(),json!({
-                "kind":"background_task_result","id":task.id,"owner":task.owner,"source":task.source,"created_at_ms":task.created_at_ms,"finished_at_ms":task.finished_at_ms,
-                "attempt_count":task.notice.as_ref().map_or(0,|n|n.attempts.len()),"title":task.spec.title,"status":task.status,"result":task.result,"failure":task.failure,
-                "remaining":task.execution.as_ref().and_then(|e|e.checkpoint.as_ref()).and_then(|c|c.remaining.as_ref()),"needs_step_approval":task.needs_step_approval()
-            }))?);
-        }
-        Ok(output)
-    }
-    fn claim_candidate(
+impl ChannelAdapter {
+    fn claim_task_candidate(
         &self,
         candidate: &eve_qqbot_plugin::QqOutreachCandidate,
         text: &str,
-        _anchor: &str,
+        channel: DeliveryChannel,
     ) -> PluginResult<Option<QqOutreachPush>> {
-        if !self.candidates()?.contains(candidate) {
+        if text.trim() != text || text.is_empty() || text.len() > QQ_OUTREACH_MAX_BYTES {
             return Ok(None);
         }
         let Some(session) = &candidate.session else {
@@ -1843,12 +1874,19 @@ impl QqOutreach for ChannelAdapter {
         let count = candidate.facts["attempt_count"]
             .as_u64()
             .ok_or_else(|| plugin_error(TaskError::InvalidInput))? as usize;
+        let now = now_ms();
+        if now.saturating_sub(finish) > eve_task_api::DELIVERY_WINDOW_MS {
+            self.tasks
+                .expire(&candidate.id, now)
+                .map_err(plugin_error)?;
+            return Ok(None);
+        }
         let claimed = match self.tasks.claim_notice_expected(
             &owner,
             &candidate.id,
             finish,
             count,
-            DeliveryChannel::Proactive,
+            channel,
             now_ms(),
         ) {
             Ok(t) => t,
@@ -1863,6 +1901,143 @@ impl QqOutreach for ChannelAdapter {
                 text: text.into(),
             },
         }))
+    }
+}
+
+fn task_candidate(
+    task: &Task,
+    anchor: Option<&str>,
+) -> PluginResult<eve_qqbot_plugin::QqOutreachCandidate> {
+    let mut facts = json!({
+        "kind":"background_task_result","id":task.id,"owner":task.owner,"source":task.source,"created_at_ms":task.created_at_ms,"finished_at_ms":task.finished_at_ms,
+        "attempt_count":task.notice.as_ref().map_or(0,|n|n.attempts.len()),"title":task.spec.title,"status":task.status,"result":task.result,"failure":task.failure,
+        "remaining":task.execution.as_ref().and_then(|e|e.checkpoint.as_ref()).and_then(|c|c.remaining.as_ref()),"needs_step_approval":task.needs_step_approval()
+    });
+    if let Some(anchor) = anchor {
+        facts["passive_anchor"] = json!(anchor);
+    }
+    crate::qq_speech::candidate(
+        task.id.clone(),
+        Some(SessionKey {
+            session_id: task.owner.session_id.clone(),
+            user_id: task.owner.user_id.clone(),
+        }),
+        task.owner.user_id.clone(),
+        facts,
+    )
+}
+
+impl QqOutreach for ChannelAdapter {
+    fn passive_candidates(
+        &self,
+        session: &SessionKey,
+        anchor: &str,
+    ) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        if !session.session_id.starts_with("qq:") || !eve_qqbot_plugin::valid_message_id(anchor) {
+            return Ok(vec![]);
+        }
+        let now = now_ms();
+        let mut snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        snapshot.validate().map_err(plugin_error)?;
+        snapshot.tasks.retain(|task| {
+            task.owner.session_id == session.session_id && task.owner.user_id == session.user_id
+        });
+        let overdue: Vec<_> = snapshot.overdue(now).map(|t| t.id.clone()).collect();
+        for id in &overdue {
+            self.tasks.expire(id, now).map_err(plugin_error)?;
+        }
+        snapshot.tasks.retain(|t| !overdue.contains(&t.id));
+        let mut output = Vec::new();
+        while let Some(entry) = snapshot.due_passive(&session.user_id, anchor).cloned() {
+            snapshot.tasks.retain(|t| t.id != entry.id);
+            if entry.owner.session_id != session.session_id {
+                continue;
+            }
+            let Some(task) = self
+                .tasks
+                .get_owned(&entry.owner, &entry.id)
+                .map_err(plugin_error)?
+            else {
+                continue;
+            };
+            verify_delivery_claim(&entry, &task)?;
+            output.push(task_candidate(&task, Some(anchor))?);
+        }
+        Ok(output)
+    }
+    fn claim_passive_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        let Some(session) = &candidate.session else {
+            return Ok(None);
+        };
+        if !self
+            .passive_candidates(session, anchor)?
+            .contains(candidate)
+        {
+            return Ok(None);
+        }
+        self.claim_task_candidate(
+            candidate,
+            text,
+            DeliveryChannel::Passive {
+                message_id: anchor.into(),
+            },
+        )
+    }
+
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let now = now_ms();
+        let mut snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        snapshot.validate().map_err(plugin_error)?;
+        snapshot
+            .tasks
+            .retain(|t| t.owner.session_id.starts_with("qq:"));
+        let overdue: Vec<_> = snapshot.overdue(now).map(|t| t.id.clone()).collect();
+        for id in &overdue {
+            self.tasks.expire(id, now).map_err(plugin_error)?;
+        }
+        let mut output = Vec::new();
+        // 逐个移除已取出的只读目录候选，沉默的首条不阻塞其他候选。
+        while let Some(entry) = snapshot.due_proactive().cloned() {
+            snapshot.tasks.retain(|t| t.id != entry.id);
+            if overdue.contains(&entry.id)
+                || entry.notice.as_ref().is_some_and(|notice| {
+                    notice
+                        .attempts
+                        .iter()
+                        .any(|attempt| matches!(attempt.channel, DeliveryChannel::Passive { .. }))
+                })
+            {
+                continue;
+            }
+            let Some(task) = self
+                .tasks
+                .get_owned(&entry.owner, &entry.id)
+                .map_err(plugin_error)?
+            else {
+                continue;
+            };
+            if !entry.matches(&task) {
+                return Err(plugin_error(TaskError::CorruptState));
+            }
+            output.push(task_candidate(&task, None)?);
+        }
+        Ok(output)
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        self.claim_task_candidate(candidate, text, DeliveryChannel::Proactive)
     }
 
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
@@ -2194,6 +2369,7 @@ async fn run(
                             worker
                                 .run_request(WorkerRequest {
                                     exploration,
+                                    model_session: None,
                                     idle_review,
                                     idle_input,
                                     instructions: text,
@@ -2330,6 +2506,9 @@ mod tests {
 
     fn exploration_checkpoint() -> eve_llm_api::TurnCheckpoint {
         eve_llm_api::TurnCheckpoint {
+            model_session: None,
+            pending_model_request: None,
+            pending_request_fingerprint: None,
             version: 2,
             scope: ContextScope {
                 session_id: "s".into(),
@@ -2663,6 +2842,9 @@ mod tests {
         let mut task = task(TaskStatus::Failed);
         task.result = None;
         let checkpoint = eve_llm_api::TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 2,
             scope: ContextScope {
                 session_id: task.owner.session_id.clone(),

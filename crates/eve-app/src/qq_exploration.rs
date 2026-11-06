@@ -320,6 +320,9 @@ mod tests {
             arguments: json!({"path":"../outside.txt"}),
         };
         TurnCheckpoint {
+            model_session: None,
+            pending_model_request: None,
+            pending_request_fingerprint: None,
             version: 2,
             scope: ContextScope {
                 session_id: scope().conversation_id,

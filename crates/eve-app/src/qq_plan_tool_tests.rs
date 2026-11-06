@@ -143,15 +143,13 @@ fn context(call: &ToolCall) -> ToolExecutionContext {
 }
 
 #[tokio::test]
-async fn confirmation_reviews_complete_plan_and_actual_revision_before_activation() {
+async fn confirmation_records_full_plan_and_actual_scope_without_model_review() {
     let s = setup().await;
     let dir = tempfile::tempdir().unwrap();
-    let reviewer = fixture::reviewer();
     let tool = tool(
         s.commands,
         Review {
             admin: fixture::admin(dir.path()),
-            reviewer: Some(reviewer.clone()),
         },
     );
     let call = change("confirm", &s.plan);
@@ -162,8 +160,16 @@ async fn confirmation_reviews_complete_plan_and_actual_revision_before_activatio
         s.cognition.snapshot().unwrap().state.goals[&s.goal.id],
         s.goal
     );
-    let request = reviewer.requests.lock().unwrap()[0].clone();
-    let reviewed: Value = serde_json::from_str(&request.arguments[0]).unwrap();
+    let disk = fixture::ledger(dir.path());
+    let event = &disk["audit"][0];
+    assert_eq!(event["outcome"], crate::qq_business::HOST_AUTHORIZED);
+    assert!(event["verdict"].is_null());
+    assert_eq!(event["user_messages"], json!([]));
+    let reviewed: Value = serde_json::from_str(event["target"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        reviewed["trusted_scope"],
+        serde_json::to_value(context(&call).scope().unwrap()).unwrap()
+    );
     assert_eq!(
         reviewed["operation"]["plan"],
         serde_json::to_value(&s.plan).unwrap()
@@ -179,7 +185,13 @@ async fn confirmation_reviews_complete_plan_and_actual_revision_before_activatio
     let before = s.plans.snapshot().unwrap();
     assert!(tool.execute(call.clone(), context(&call)).await.is_err());
     assert_eq!(s.plans.snapshot().unwrap(), before);
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        fixture::ledger(dir.path())["audit"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let plan = &before.plans[0];
     let withdraw = change("withdraw", plan);
     let result = tool
@@ -191,14 +203,13 @@ async fn confirmation_reviews_complete_plan_and_actual_revision_before_activatio
 }
 
 #[tokio::test]
-async fn goal_changed_during_plan_review_cannot_activate_old_steps() {
+async fn changed_goal_cannot_activate_steps_bound_to_old_goal() {
     use eve_cognition_api::GoalFeedbackService;
     let s = setup().await;
     let dir = tempfile::tempdir().unwrap();
-    let mut reviewer = fixture::reviewer();
-    let cognition = s.cognition.clone();
-    let goal = s.goal.clone();
-    Arc::get_mut(&mut reviewer).unwrap().during = Some(Box::new(move || {
+    {
+        let cognition = s.cognition.clone();
+        let goal = s.goal.clone();
         let service = UserGoalFeedback::new(
             Arc::new(cognition.clone()),
             "eve".into(),
@@ -216,12 +227,11 @@ async fn goal_changed_during_plan_review_cannot_activate_old_steps() {
                 at_ms: 3,
             })
             .unwrap();
-    }));
+    }
     let tool = tool(
         s.commands,
         Review {
             admin: fixture::admin(dir.path()),
-            reviewer: Some(reviewer),
         },
     );
     let call = change("confirm", &s.plan);
@@ -238,12 +248,10 @@ async fn goal_changed_during_plan_review_cannot_activate_old_steps() {
 async fn closed_goal_wrong_owner_and_changed_plan_are_rejected() {
     let s = setup().await;
     let dir = tempfile::tempdir().unwrap();
-    let reviewer = fixture::reviewer();
     let tool = tool(
         s.commands.clone(),
         Review {
             admin: fixture::admin(dir.path()),
-            reviewer: Some(reviewer.clone()),
         },
     );
     let call = change("confirm", &s.plan);
@@ -257,22 +265,16 @@ async fn closed_goal_wrong_owner_and_changed_plan_are_rejected() {
         .replace(snapshot.revision, snapshot.state)
         .unwrap();
     assert!(tool.execute(call.clone(), context(&call)).await.is_err());
-    assert!(reviewer.requests.lock().unwrap().is_empty());
+    assert!(!dir.path().join("business-permissions.json").exists());
     assert_eq!(s.plans.snapshot().unwrap().plans[0], s.plan);
     s.kernel.stop_all().await.unwrap();
 
     let s = setup().await;
-    let mut reviewer = fixture::reviewer();
-    let plans = s.plans.clone();
-    let plan = s.plan.clone();
-    Arc::get_mut(&mut reviewer).unwrap().during = Some(Box::new(move || {
-        plans.withdraw(&plan.id, plan.revision, 3).unwrap();
-    }));
+    s.plans.withdraw(&s.plan.id, s.plan.revision, 3).unwrap();
     let tool = super::tests::tool(
         s.commands,
         Review {
             admin: fixture::admin(dir.path()),
-            reviewer: Some(reviewer),
         },
     );
     let call = change("confirm", &s.plan);
@@ -303,7 +305,6 @@ async fn restart_rechecks_revocation_before_step_and_research_admission() {
         s.commands,
         Review {
             admin: admin.clone(),
-            reviewer: Some(fixture::reviewer()),
         },
     );
     let call = change("confirm", &s.plan);
