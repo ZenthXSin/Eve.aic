@@ -1,18 +1,18 @@
 //! 真实 Rust/Node 通道与长运行子进程；只替换模型和外部平台，不向生产 QQ 发消息。
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
-use eve_control_api::{CommitState, ControlRunner, RunFuture, RunReport};
+use eve_control_api::{CommitState, ControlRunner, RunFailure, RunFuture, RunReport};
 use eve_control_plugin::ControlPlugin;
 use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::{
-    ChatMessage, ChatRole, ContextScope, LlmFuture, ToolCall, TurnEvent, TurnEventKind,
+    ChatMessage, ChatRole, ContextScope, LlmError, LlmFuture, ToolCall, TurnEvent, TurnEventKind,
     TurnEventSink, TurnSteeringSource,
 };
 use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
-use eve_plugin_api::{PluginId, PluginResult, ServiceId};
+use eve_plugin_api::{PluginError, PluginId, PluginResult, ServiceId};
 use eve_qqbot_plugin::*;
 use eve_session_api::{
-    SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionInput, SessionKey, SessionService,
-    SessionServiceHandle,
+    SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionFailure, SessionFailureCode, SessionInput,
+    SessionKey, SessionService, SessionServiceHandle,
 };
 use eve_session_plugin::SessionPlugin;
 use serde_json::{Value, json};
@@ -74,6 +74,9 @@ struct Observed {
     runs: AtomicUsize,
     tool_running: AtomicBool,
     completed: AtomicBool,
+    cancelled: AtomicBool,
+    decision_dropped: AtomicBool,
+    retired_before_drop: AtomicBool,
     consumed: Mutex<Vec<String>>,
 }
 struct Runner {
@@ -148,10 +151,37 @@ impl ControlRunner for Runner {
             .await
             .unwrap();
             std::fs::write(self.directory.join("tools-ready"), b"ready").unwrap();
-            let status = tokio::time::timeout(Duration::from_secs(15), child.wait())
-                .await
-                .unwrap()
-                .unwrap();
+            let status = tokio::select! {
+                _ = sink.closed() => None,
+                status = tokio::time::timeout(Duration::from_secs(15), child.wait()) => {
+                    Some(status.unwrap().unwrap())
+                }
+            };
+            let Some(status) = status else {
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+                self.observed.tool_running.store(false, Ordering::SeqCst);
+                self.sessions
+                    .fail(
+                        &started.lease,
+                        SessionFailure {
+                            evidence: None,
+                            code: SessionFailureCode::Cancelled,
+                            started_tools: Some(2),
+                        },
+                    )
+                    .unwrap();
+                self.observed.cancelled.store(true, Ordering::SeqCst);
+                return RunReport {
+                    turn_id: Some(turn_id),
+                    commit: CommitState::Failed,
+                    text: None,
+                    transcript: None,
+                    started_tools: Some(2),
+                    tool_results: vec![],
+                    failure: Some(RunFailure::Execution(LlmError::Cancelled)),
+                };
+            };
             assert!(status.success());
             self.observed.tool_running.store(false, Ordering::SeqCst);
             sink.emit(TurnEvent {
@@ -206,10 +236,24 @@ struct Speech {
     archive: Arc<Archive>,
     observed: Arc<Observed>,
     hold: bool,
+    retire_fails: bool,
     events: Mutex<BTreeMap<String, QqSpeechEvent>>,
     decisions: AtomicUsize,
     deliveries: Mutex<Vec<QqOutreachResult>>,
     retired: AtomicUsize,
+}
+struct DecisionWait<'a>(&'a Speech);
+impl Drop for DecisionWait<'_> {
+    fn drop(&mut self) {
+        self.0
+            .observed
+            .retired_before_drop
+            .store(self.0.retired.load(Ordering::SeqCst) > 0, Ordering::SeqCst);
+        self.0
+            .observed
+            .decision_dropped
+            .store(true, Ordering::SeqCst);
+    }
 }
 impl QqSpeech for Speech {
     fn enqueue(&self, event: QqSpeechEvent) -> PluginResult<()> {
@@ -223,8 +267,11 @@ impl QqSpeech for Speech {
         Ok(())
     }
     fn retire(&self, event: &QqSpeechEvent) -> PluginResult<()> {
-        self.events.lock().unwrap().remove(&event.id);
         self.retired.fetch_add(1, Ordering::SeqCst);
+        if self.retire_fails {
+            return Err(PluginError::State("夹具撤销失败".into()));
+        }
+        self.events.lock().unwrap().remove(&event.id);
         Ok(())
     }
     fn silenced(&self, _: &QqSpeechEvent) -> PluginResult<bool> {
@@ -245,6 +292,7 @@ impl QqSpeech for Speech {
             assert!(self.observed.consumed.lock().unwrap().is_empty());
             self.decisions.fetch_add(1, Ordering::SeqCst);
             if self.hold {
+                let _wait = DecisionWait(self);
                 std::future::pending::<()>().await;
             }
             Ok(Some(QqSpeechDecision::Speak {
@@ -271,7 +319,20 @@ impl QqSpeech for Speech {
     }
 }
 
-async fn scenario(hold: bool) {
+enum Scenario {
+    Speak,
+    ToolCompletesDuringDecision,
+    StopDuringDecision,
+    StopWithRetireFailure,
+}
+
+async fn scenario(mode: Scenario) {
+    let hold = !matches!(mode, Scenario::Speak);
+    let stopping = matches!(
+        mode,
+        Scenario::StopDuringDecision | Scenario::StopWithRetireFailure
+    );
+    let retire_fails = matches!(mode, Scenario::StopWithRetireFailure);
     let directory = tempfile::tempdir().unwrap();
     let services = KernelServices::default();
     let registry = services.registry.clone();
@@ -299,6 +360,7 @@ async fn scenario(hold: bool) {
         archive: archive.clone(),
         observed: observed.clone(),
         hold,
+        retire_fails,
         events: Mutex::default(),
         decisions: AtomicUsize::new(0),
         deliveries: Mutex::default(),
@@ -375,6 +437,45 @@ async fn scenario(hold: bool) {
     })
     .await;
     let still_running = observed.tool_running.load(Ordering::SeqCst);
+    if stopping {
+        status.request_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(3), kernel.stop_all())
+            .await
+            .expect("停止必须回收长工具和未完成的交流决定");
+        reviewed.expect("停止前没有进入交流决定");
+        assert_eq!(stopped.is_err(), retire_fails);
+        assert_eq!(status.status.borrow().terminal_error, retire_fails);
+        assert!(still_running);
+        assert!(observed.cancelled.load(Ordering::SeqCst));
+        assert!(!observed.tool_running.load(Ordering::SeqCst));
+        assert!(!observed.completed.load(Ordering::SeqCst));
+        assert!(observed.consumed.lock().unwrap().is_empty());
+        assert!(observed.decision_dropped.load(Ordering::SeqCst));
+        assert!(
+            observed.retired_before_drop.load(Ordering::SeqCst),
+            "丢弃前台决定前必须先尝试撤销事实"
+        );
+        assert_eq!(speech.decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(speech.retired.load(Ordering::SeqCst), 1);
+        assert!(speech.deliveries.lock().unwrap().is_empty());
+        assert_eq!(
+            speech.events.lock().unwrap().len(),
+            usize::from(retire_fails)
+        );
+        let rows: Vec<Value> = std::fs::read_to_string(directory.path().join("bridge.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let closed = rows
+            .iter()
+            .position(|row| row["type"] == "close_foreground")
+            .unwrap();
+        let stopped = rows.iter().position(|row| row["type"] == "stop").unwrap();
+        assert!(closed < stopped, "先撤销窗口再停止 Node");
+        assert!(!rows.iter().any(|row| row["type"] == "platform"));
+        return;
+    }
     std::fs::write(directory.path().join("release-tool"), b"release").unwrap();
     let completed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -413,6 +514,8 @@ async fn scenario(hold: bool) {
         assert!(sent.is_empty());
         assert!(speech.deliveries.lock().unwrap().is_empty());
         assert!(speech.retired.load(Ordering::SeqCst) > 0);
+        assert!(observed.decision_dropped.load(Ordering::SeqCst));
+        assert!(observed.retired_before_drop.load(Ordering::SeqCst));
     } else {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["target"]["msgId"], "later-input");
@@ -431,10 +534,20 @@ async fn scenario(hold: bool) {
 
 #[tokio::test]
 async fn new_input_can_be_answered_while_the_original_tool_runs_and_is_consumed_once() {
-    scenario(false).await;
+    scenario(Scenario::Speak).await;
 }
 
 #[tokio::test]
 async fn tool_completion_and_consumed_input_retire_an_inflight_speech_decision() {
-    scenario(true).await;
+    scenario(Scenario::ToolCompletesDuringDecision).await;
+}
+
+#[tokio::test]
+async fn stopping_retires_foreground_before_dropping_decision_and_reaps_long_tool() {
+    scenario(Scenario::StopDuringDecision).await;
+}
+
+#[tokio::test]
+async fn retirement_failure_still_closes_window_drops_decision_and_reaps_long_tool() {
+    scenario(Scenario::StopWithRetireFailure).await;
 }

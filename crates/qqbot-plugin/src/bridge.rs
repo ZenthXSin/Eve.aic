@@ -3131,6 +3131,49 @@ pub(crate) async fn run(
     // 先等路由收尾，再查询目标会话最新代，随后取消并等待全部本地执行器。
     closed.send_replace(true);
     let mut cleanup_error = None;
+    // 前台资格随通道停止失效；先撤销事实，再丢弃审视 future，避免取消守卫复活旧决定。
+    let mut retiring_foreground: BTreeMap<_, _> = foreground_inputs
+        .values()
+        .map(|input| (input.event.id.clone(), input.event.clone()))
+        .collect();
+    // 主循环可能在移除输入后的持久化步骤失败，槽中的事实仍必须清理。
+    for event in considering_foreground
+        .as_ref()
+        .map(|pending| &pending.event)
+        .into_iter()
+        .chain(ready_foreground.as_ref().map(|ready| &ready.event))
+    {
+        retiring_foreground.insert(event.id.clone(), event.clone());
+    }
+    if let Some(speaker) = &speech {
+        for event in retiring_foreground.values() {
+            if speaker.retire(event).is_err() {
+                warn(&ctx, "foreground_speech_retire_failed");
+                cleanup_error = Some(failure("QQBot 前台交流事实撤销失败；保留原记录"));
+            }
+        }
+    }
+    drop(considering_foreground);
+    drop(ready_foreground);
+    // 后台事实仍可跨插件重启等待；由服务的取消守卫恢复，不将事实或未知投递标为失效。
+    drop(considering_speech);
+    drop(ready_speech);
+    foreground_windows.clear();
+    for event in retiring_foreground.values() {
+        if write(
+            &mut stdin,
+            json!({"type":"close_foreground","version":1,"id":event.anchor}),
+        )
+        .await
+        .is_err()
+        {
+            warn(&ctx, "foreground_window_close_failed");
+            cleanup_error = Some(failure("QQBot 前台被动窗口关闭失败"));
+            // 管道已不可用，后续 stop/kill 会销毁全部窗口；仍须完成控制器收尾。
+            break;
+        }
+    }
+    foreground_inputs.clear();
     for route in routing {
         if route.wait.await.is_err() {
             cleanup_error = Some(failure("QQBot 消息控制收尾失败"));
