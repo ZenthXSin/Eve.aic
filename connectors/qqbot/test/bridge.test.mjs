@@ -1331,3 +1331,199 @@ test("前台窗口新输入和重启失效，未知投递不重试或变成主�
   assert.equal(restarted.frames.at(-1).failure_kind,"passive_window_missing");
   assert.equal(restarted.sent.length,0);
 });
+
+const liveReplyFrame = (index = 0, anchor = "live-child", text = "已经看过你的补充") => ({
+  version:1,type:"progress",id:"in-1",index,text,explicit:true,based_on_message_id:anchor,
+});
+const keepLiveReply = (id = "live-child", parent = "in-1") => ({
+  version:1,type:"finish",id,keep_live_reply:true,parent_id:parent,
+});
+function groupInput(f, id, user = "user-1", target = "group-1") {
+  f.handlers.get("message")({}, {kind:"group",messageId:id,senderId:user,content:"补充输入",
+    rawEventType:"GROUP_AT_MESSAGE_CREATE",groupOpenid:target,
+    replyTarget:{scope:"group",targetId:target,msgId:id}});
+}
+
+test("群长轮旧窗口失效后，合入的新输入提供自己的原窗口和三次进展额度",async()=>{
+  let now=0;const f=fixture({now:()=>now});f.message("group");
+  await f.bridge.command(activityFrame(0));
+  now=PASSIVE_REPLY_WINDOW_MS;
+  await f.bridge.command(liveReplyFrame(1,"in-1","尚未发出的结果"));
+  await f.bridge.command(liveReplyFrame(2,"in-1","另一条未发出的结果"));
+  assert.equal(f.sent.length,1);
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_elapsed");
+  now+=1000;groupInput(f,"live-child");
+  now+=6000;await f.bridge.command(keepLiveReply());
+  for (let index=3;index<6;index++) await f.bridge.command(liveReplyFrame(index,"live-child","尚未发出的结果"));
+  assert.deepEqual(f.sent.map(x=>x.target.msgId),["in-1","live-child","live-child","live-child"]);
+  assert.ok(f.sent.every(x=>x.target.scope==="group" && x.target.targetId==="group-1" && x.text.startsWith("<@user-1> ")));
+  assert.equal(f.frames.at(-1).elapsed_ms,6000);
+  assert.equal(f.frames.at(-1).id,"in-1");
+  assert.equal(f.frames.at(-1).index,5);
+  await f.bridge.command(liveReplyFrame(6));
+  assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+  assert.equal(f.sent.length,4);
+  groupInput(f,"next-child");await f.bridge.command(keepLiveReply("next-child"));
+  await f.bridge.command(liveReplyFrame(7,"next-child"));
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.equal(f.sent.at(-1).target.msgId,"next-child");
+});
+
+test("群合入窗口保留接收年龄，重复输入及 finish 不刷新时间或恢复额度",async()=>{
+  let now=0;const f=fixture({now:()=>now});f.message("group");
+  now=PASSIVE_REPLY_WINDOW_MS;groupInput(f,"live-child");
+  now+=5000;await f.bridge.command(keepLiveReply());
+  now+=PASSIVE_REPLY_WINDOW_MS-5000;
+  await f.bridge.command(liveReplyFrame());
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_elapsed");
+  assert.equal(f.frames.at(-1).elapsed_ms,PASSIVE_REPLY_WINDOW_MS);
+  now+=1000;groupInput(f,"live-child");
+  await f.bridge.command(keepLiveReply());
+  await f.bridge.command(liveReplyFrame(1));
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_elapsed");
+  assert.equal(f.frames.at(-1).elapsed_ms,PASSIVE_REPLY_WINDOW_MS+1000);
+  assert.equal(f.frames.filter(x=>x.type==="message" && x.id==="live-child").length,1);
+  assert.deepEqual(f.sent,[]);
+});
+
+test("合入前已发送的群进展计入新窗口额度，重复 finish 不退款",async()=>{
+  const f=fixture();f.message("group");groupInput(f,"live-child");
+  await f.bridge.command({...liveReplyFrame(0),id:"live-child"});
+  await f.bridge.command(keepLiveReply());
+  await f.bridge.command(liveReplyFrame(0));
+  await f.bridge.command(keepLiveReply());
+  await f.bridge.command(liveReplyFrame(1));
+  await f.bridge.command(liveReplyFrame(2));
+  assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+  assert.equal(f.sent.length,3);
+  assert.ok(f.sent.every(x=>x.target.msgId==="live-child"));
+});
+
+test("群合入窗口不借其他群或用户的路由，也不接受私聊和未绑定输入",async()=>{
+  for (const mode of ["other-user","other-group","private","unbound","proactive"]) {
+    const f=fixture();f.message("group");
+    if (mode==="private") f.message("c2c","live-child");
+    else groupInput(f,"live-child",mode==="other-user"?"other-user":"user-1",mode==="other-group"?"group-2":"group-1");
+    if (mode!=="unbound") await f.bridge.command(keepLiveReply());
+    await f.bridge.command({...liveReplyFrame(),...(mode==="proactive"?{proactive:true}:{})});
+    assert.equal(f.frames.at(-1).ok,false,mode);
+    assert.equal(f.frames.at(-1).failure_kind,mode==="proactive"?"stale_decision":"passive_window_missing",mode);
+    assert.deepEqual(f.sent,[],mode);
+  }
+});
+
+test("群合入发送在 SDK 前重核父输入、最新输入、窗口对象和真实年龄",async()=>{
+  for (const mode of ["parent-finish","child-finish","new-input","expired","stop"]) {
+    let now=0;const f=fixture({now:()=>now});f.message("group");groupInput(f,"live-child");
+    await f.bridge.command(keepLiveReply());
+    const sending=f.bridge.command(liveReplyFrame());
+    if (mode==="parent-finish") await f.bridge.command({version:1,type:"finish",id:"in-1"});
+    if (mode==="child-finish") await f.bridge.command({version:1,type:"finish",id:"live-child"});
+    if (mode==="new-input") groupInput(f,"later-child");
+    if (mode==="expired") now=PASSIVE_REPLY_WINDOW_MS;
+    if (mode==="stop") f.bridge.stop();
+    await sending;
+    assert.deepEqual(f.sent,[],mode);
+    if (mode!=="stop") assert.equal(f.frames.at(-1).failure_kind,"stale_decision",mode);
+  }
+});
+
+test("其他群或用户的新消息不撤销当前用户的群合入窗口",async()=>{
+  const f=fixture();f.message("group");groupInput(f,"live-child");
+  await f.bridge.command(keepLiveReply());
+  groupInput(f,"other-user-input","other-user");
+  groupInput(f,"other-group-input","user-1","group-2");
+  await f.bridge.command({...liveReplyFrame(),target_id:"group-2",sender_id:"other-user",mention_user_id:"other-user"});
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.deepEqual(f.sent[0],{target:{scope:"group",targetId:"group-1",msgId:"live-child"},text:"<@user-1> 已经看过你的补充"});
+});
+
+test("同用户同群的另一父轮也不能借用已绑定的合入窗口",async()=>{
+  const f=fixture();f.message("group");groupInput(f,"other-parent");groupInput(f,"live-child");
+  await f.bridge.command(keepLiveReply());
+  await f.bridge.command(keepLiveReply("live-child","other-parent"));
+  await f.bridge.command({...liveReplyFrame(),id:"other-parent"});
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  assert.deepEqual(f.sent,[]);
+  await f.bridge.command(liveReplyFrame());
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.equal(f.sent[0].target.msgId,"live-child");
+});
+
+test("父原进展仍在途时可保留新群窗口，旧回执与新窗口发送各自结算",async()=>{
+  const held=deferred();let now=0;
+  const f=fixture({now:()=>now,hold(_target,text){if(text.endsWith("旧进展"))return held.promise;}});f.message("group");
+  const old=f.bridge.command(liveReplyFrame(0,"in-1","旧进展"));
+  await new Promise(setImmediate);assert.equal(f.sent.length,1);
+  now=PASSIVE_REPLY_WINDOW_MS;groupInput(f,"live-child");
+  await f.bridge.command(keepLiveReply());
+  held.resolve();await old;
+  assert.equal(f.frames.at(-1).ok,true);
+  await f.bridge.command(liveReplyFrame(1));
+  assert.deepEqual(f.sent.map(x=>x.target.msgId),["in-1","live-child"]);
+  assert.equal(f.frames.at(-1).ok,true);
+});
+
+test("父取消后已进入 SDK 的群发送仍只记录一次真实晚到结果",async()=>{
+  const held=deferred();const f=fixture({hold:held.promise});f.message("group");groupInput(f,"live-child");
+  await f.bridge.command(keepLiveReply());
+  const sending=f.bridge.command(liveReplyFrame());await new Promise(setImmediate);
+  assert.equal(f.sent.length,1);
+  await f.bridge.command({version:1,type:"finish",id:"in-1"});
+  held.resolve();await sending;
+  const receipts=f.frames.filter(x=>x.type==="delivery" && x.progress);
+  assert.equal(receipts.length,1);assert.equal(receipts[0].ok,true);assert.equal(receipts[0].message_id,"out-1");
+  await f.bridge.command(liveReplyFrame());
+  await f.bridge.command(keepLiveReply());
+  await f.bridge.command(liveReplyFrame(1));
+  assert.equal(f.sent.length,1);
+});
+
+test("群合入发送未知或明确失败均消耗真实额度，同一父序号不会重放",async()=>{
+  for (const error of [{httpStatus:400,bizCode:40034090},Object.assign(new Error("timeout"),{name:"TimeoutError"})]) {
+    const f=fixture({fail:true,error});f.message("group");groupInput(f,"live-child");await f.bridge.command(keepLiveReply());
+    for (let index=0;index<3;index++) {
+      await f.bridge.command(liveReplyFrame(index));
+      assert.equal(f.frames.at(-1).ok,false);
+      await f.bridge.command(liveReplyFrame(index));
+    }
+    await f.bridge.command(liveReplyFrame(3));
+    assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+    assert.equal(f.sent.length,3);
+    groupInput(f,"next-child");await f.bridge.command(keepLiveReply("next-child"));
+    await f.bridge.command(liveReplyFrame(2,"next-child"));
+    assert.equal(f.sent.length,3);
+  }
+});
+
+test("群窗口被更新输入撤销后，恢复锚点与重复入站不能使旧窗口复活",async()=>{
+  const f=fixture();f.message("group");groupInput(f,"live-child");await f.bridge.command(keepLiveReply());
+  groupInput(f,"next-child");await f.bridge.command(keepLiveReply("next-child"));
+  await f.bridge.command({version:1,type:"restore_anchor",scope:"group",target_id:"group-1",sender_id:"user-1",message_id:"live-child"});
+  groupInput(f,"live-child");await f.bridge.command(keepLiveReply());
+  await f.bridge.command(liveReplyFrame());
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  await f.bridge.command(liveReplyFrame(1,"next-child"));
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.equal(f.sent[0].target.msgId,"next-child");
+});
+
+test("新群窗口序号不占父原窗口额度，恢复锚点也不能凭空产生窗口",async()=>{
+  const f=fixture();f.message("group");groupInput(f,"live-child");await f.bridge.command(keepLiveReply());
+  for (let index=0;index<3;index++) await f.bridge.command(liveReplyFrame(index));
+  for (let index=0;index<5;index++) await f.bridge.command({version:1,type:"segment",id:"in-1",index,count:5,text:`父结果 ${index}`});
+  assert.deepEqual(f.sent.map(x=>x.target.msgId),["live-child","live-child","live-child",...Array(5).fill("in-1")]);
+  const restarted=fixture();restarted.message("group");
+  await restarted.bridge.command({version:1,type:"restore_anchor",scope:"group",target_id:"group-1",sender_id:"user-1",message_id:"live-child"});
+  await restarted.bridge.command(liveReplyFrame());
+  assert.equal(restarted.frames.at(-1).failure_kind,"passive_window_missing");
+  assert.deepEqual(restarted.sent,[]);
+});
+
+test("同一 JSONL 块先保留群新窗口再发送，使用新路由且父 finish 清理",async()=>{
+  let now=0;const f=fixture({now:()=>now});f.message("group");now=PASSIVE_REPLY_WINDOW_MS;groupInput(f,"live-child");
+  await consume(Readable.from([line(keepLiveReply())+line(liveReplyFrame())+line({type:"finish",id:"in-1"})]),f.bridge);
+  assert.equal(f.sent.length,1);
+  assert.equal(f.sent[0].target.msgId,"live-child");
+  assert.equal(f.frames.filter(x=>x.type==="delivery" && x.progress).length,1);
+});

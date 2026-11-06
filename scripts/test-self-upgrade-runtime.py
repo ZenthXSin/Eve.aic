@@ -101,6 +101,218 @@ class DigestTests(unittest.TestCase):
                          ['eve','--interest-learning','--practice-mindustry-server','s.jar','--research-corpus','corpus'])
         self.assertEqual(runtime.without_removed_flags(['eve','--training']),['eve','--training'])
 
+class ReplyAnchorReceiptTests(unittest.TestCase):
+    """用真实状态文件和冷库校验多回复窗口，不构建或启动 Eve。"""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='eve-reply-anchor-runtime-')
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / 'state.json'
+        message = dict(id='original', scope='group', target_id='group-1', user_id='user-1', text='升级')
+        self.parent = dict(app_id='app', message=message, state='Handled', reply=None,
+                           control_turn_id=1, progress=[])
+        self.first = dict(app_id='app', message={**message, 'id': 'followup-1', 'text': '继续'},
+                          state='Merged', reply=None, merged_into='original')
+        self.second = dict(app_id='app', message={**message, 'id': 'followup-2', 'text': '还有'},
+                           state='Merged', reply=None, merged_into='original')
+        self.ledger = dict(version=10, entries=[self.parent, self.first, self.second])
+        identity = json.dumps(['app', 'group', 'group-1', 'user-1'], separators=(',', ':')).encode()
+        self.session = 'qq:' + hashlib.sha256(identity).hexdigest()
+        self.request = dict(session_id=self.session, requested_by=self.session, turn_id=1)
+        self.sessions = dict(format_version=1, sessions={self.session: dict(
+            key=dict(session_id=self.session, user_id=self.session), turns=[dict(
+                id=1, input='升级', status=dict(state='Completed', messages=[
+                    dict(role='User', text='升级'), dict(role='Assistant', text='内部结束')]))])})
+
+    def part(self, index, anchor=None, state='Sent', **extra):
+        part = dict(text='明确发言 ' + str(index), state=state, decision_id='call-' + str(index))
+        if state == 'Sent':
+            part['platform_message_id'] = 'platform-' + str(index)
+        if anchor is not None:
+            part['reply_anchor'] = anchor
+        return {**part, **extra}
+
+    def save(self):
+        runtime.atomic(self.path, dict(version=1, entries={
+            'eve.session': {'sessions.v1': list(json.dumps(self.sessions).encode())},
+            'eve.channel.qqbot': {'receipts.v1': list(json.dumps(self.ledger).encode())}}))
+
+    def assert_rejected_without_write(self, code):
+        self.save()
+        before = self.path.read_bytes()
+        for reader in (runtime.delivery_documents, runtime.inherited_receipts, runtime.runtime_idle_gate):
+            with self.subTest(reader=reader.__name__):
+                with self.assertRaisesRegex(ValueError, code):
+                    reader(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_distinct_anchors_have_separate_budgets_and_keep_real_delivery_gate(self):
+        self.parent['progress'] = [self.part(i, anchor) for anchor, i in (
+            (None, 1), (None, 2), (None, 3), ('followup-1', 4), ('followup-1', 5),
+            ('followup-1', 6), ('followup-2', 7), ('followup-2', 8), ('followup-2', 9))]
+        self.parent['progress'][0]['reply_anchor'] = None
+        self.save()
+        before = self.path.read_bytes()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+        self.assertTrue(runtime.runtime_idle_gate(self.path))
+        self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_failed_unknown_and_sending_still_consume_their_actual_window(self):
+        for anchor in (None, 'followup-1'):
+            with self.subTest(anchor=anchor):
+                self.parent['progress'] = [self.part(i, anchor, state) for i, state in
+                                           enumerate(('Sent', 'Sending', 'Failed', 'Unknown'))]
+                self.assert_rejected_without_write('invalid_passive_progress_budget')
+
+    def test_missing_and_null_anchors_share_original_window(self):
+        self.parent['progress'] = [self.part(i) for i in range(4)]
+        self.parent['progress'][1]['reply_anchor'] = None
+        self.assert_rejected_without_write('invalid_passive_progress_budget')
+
+    def test_sending_blocks_current_gate_and_unknown_is_preserved_without_replay(self):
+        self.parent['progress'] = [self.part(1, 'followup-1', 'Sending')]
+        self.save()
+        self.assertFalse(runtime.delivery_gate(self.path, self.request))
+        self.assertFalse(runtime.runtime_idle_gate(self.path))
+        inherited = runtime.inherited_receipts(self.path)
+        self.assertEqual(len(inherited), 1)
+        self.assertTrue(runtime.runtime_idle_gate(self.path, inherited))
+        self.assertFalse(runtime.delivery_gate(self.path, self.request, inherited))
+        self.parent['progress'][0]['state'] = 'Unknown'
+        self.save()
+        before = self.path.read_bytes()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request, inherited))
+        self.assertTrue(runtime.runtime_idle_gate(self.path, inherited))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_proactive_uses_total_budget_but_cannot_claim_passive_anchor(self):
+        self.parent['progress'] = [self.part(i, proactive=True) for i in range(64)]
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.parent['progress'].append(self.part(64, proactive=True))
+        self.assert_rejected_without_write('invalid_progress_ledger')
+        self.parent['progress'] = [self.part(1, 'followup-1', proactive=True)]
+        self.assert_rejected_without_write('invalid_reply_anchor')
+
+    def test_anchor_ids_and_authorship_cannot_be_fabricated(self):
+        for anchor in ('', ' ', ' latest', 'latest\n', 'x\x7f', 'x\x85', 'x' * 254, '界' * 85,
+                       'original', 1, False, [], {}):
+            with self.subTest(anchor=anchor):
+                self.parent['progress'] = [self.part(1, anchor)]
+                self.assert_rejected_without_write('invalid_reply_anchor')
+        self.parent['progress'] = [dict(text='系统进展', state='Sent', reply_anchor='followup-1')]
+        self.assert_rejected_without_write('invalid_reply_anchor')
+        self.parent['progress'] = [self.part(1, 'followup-1', state='Sent', platform_message_id=None)]
+        self.assert_rejected_without_write('invalid_expression_receipt')
+
+    def test_anchor_must_belong_to_same_app_user_scope_target_and_merge_parent(self):
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        original = copy.deepcopy(self.ledger)
+        mutations = (
+            lambda: self.first.update(app_id='other-app'),
+            lambda: self.first['message'].update(user_id='other-user'),
+            lambda: self.first['message'].update(scope='c2c', target_id='user-1'),
+            lambda: self.first['message'].update(target_id='other-group'),
+            lambda: self.first.update(merged_into='missing'),
+            lambda: self.first.update(merged_into='followup-2'),
+            lambda: self.first.update(state='Handled', merged_into=None),
+            lambda: self.ledger['entries'].remove(self.first),
+            lambda: self.ledger['entries'].append(copy.deepcopy(self.first)),
+        )
+        for mutate in mutations:
+            self.ledger = copy.deepcopy(original)
+            self.parent, self.first, self.second = self.ledger['entries']
+            mutate()
+            self.assert_rejected_without_write('invalid_merged_receipt|invalid_reply_anchor_relation')
+        self.ledger = copy.deepcopy(original)
+        self.parent, self.first, self.second = self.ledger['entries']
+        for receipt in self.ledger['entries']:
+            receipt['message'].update(scope='c2c', target_id='user-1')
+        self.assert_rejected_without_write('invalid_reply_anchor')
+
+    def test_same_identity_receipt_in_another_merge_group_is_not_a_window(self):
+        other = copy.deepcopy(self.parent)
+        other.update(message={**other['message'], 'id': 'other-parent'}, progress=[])
+        self.first['merged_into'] = 'other-parent'
+        self.ledger['entries'].append(other)
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.assert_rejected_without_write('invalid_reply_anchor_relation')
+
+    def test_v9_accepts_null_but_cannot_hide_an_actual_anchor(self):
+        self.ledger['version'] = 9
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.assert_rejected_without_write('invalid_reply_anchor_version')
+        self.parent['progress'][0]['reply_anchor'] = None
+        self.save()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+        self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
+
+    def test_sticky_v10_survives_without_hot_anchors(self):
+        self.ledger['entries'] = [self.parent]
+        self.save()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+        self.ledger['entries'] = []
+        self.save()
+        self.assertTrue(runtime.runtime_idle_gate(self.path))
+        self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
+
+    def test_original_window_counts_segments_and_sticker_but_not_other_window(self):
+        self.parent.update(state='Sent', control_turn_id=None, reply='一\n\n二',
+            segments=dict(planner='fixture', parts=[dict(start=0, end=3, state='Sent'),
+                                                   dict(start=5, end=8, state='Sent')]),
+            sticker=dict(path='/fixture/image.png', state='Sent'))
+        self.parent['progress'] = [self.part(1), self.part(2),
+                                  *[self.part(i, 'followup-1') for i in range(3, 6)]]
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.parent['progress'].append(self.part(6))
+        self.assert_rejected_without_write('invalid_passive_progress_budget')
+        self.parent['progress'].pop()
+        self.parent['segments']['parts'][1]['start'] = 4
+        self.assert_rejected_without_write('invalid_segment_ledger')
+
+    def test_v10_segments_preserve_a_complete_code_block(self):
+        reply = '前言\n\n```py\nx\n```'
+        encoded = reply.encode()
+        start = len('前言\n\n'.encode())
+        segments = dict(planner='fixture', parts=[dict(start=0, end=6, state='Sent'),
+                                                 dict(start=start, end=len(encoded), state='Sent')])
+        self.parent.update(state='Sent', control_turn_id=None, reply=reply, segments=segments)
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        cut = start + len('```py'.encode())
+        segments['parts'][1]['end'] = cut
+        segments['parts'].append(dict(start=cut + 1, end=len(encoded), state='Sent'))
+        self.assert_rejected_without_write('invalid_segment_ledger')
+
+    def test_v10_archive_binding_does_not_supply_a_missing_hot_sibling(self):
+        import sqlite3
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.ledger['archive'] = dict(identity='a' * 32, records=1)
+        self.save()
+        with self.assertRaisesRegex(ValueError, 'receipt_archive_missing'):
+            runtime.inherited_receipts(self.path)
+        database = self.path.parent / 'qq-receipts.sqlite3'
+        with sqlite3.connect(database) as db:
+            db.executescript('CREATE TABLE metadata(version INTEGER,identity TEXT); '
+                             'CREATE TABLE receipts(seq INTEGER PRIMARY KEY,app TEXT,message_id TEXT,payload BLOB);')
+            db.execute('INSERT INTO metadata VALUES (1,?)', ('b' * 32,))
+            db.execute('INSERT INTO receipts VALUES (1,?,?,?)',
+                       ('app', 'followup-1', json.dumps(self.first).encode()))
+        with self.assertRaisesRegex(ValueError, 'receipt_archive_mismatch'):
+            runtime.delivery_documents(self.path)
+        with sqlite3.connect(database) as db:
+            db.execute('UPDATE metadata SET identity=?', ('a' * 32,))
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.ledger['entries'].remove(self.first)
+        self.assert_rejected_without_write('invalid_reply_anchor_relation')
+        self.ledger['entries'].append(self.first)
+        self.ledger['archive']['records'] = 2
+        self.assert_rejected_without_write('receipt_archive_mismatch')
+
+
 class ExplorationIdleGateTests(unittest.TestCase):
     """直接读取合成热账本/冷档案并调用真实空闲门，不构建或启动 Eve。"""
     def setUp(self):
