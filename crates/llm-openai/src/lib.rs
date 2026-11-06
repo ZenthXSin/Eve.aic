@@ -460,7 +460,12 @@ impl OpenAiProvider {
         } else {
             sending.await
         }
-        .map_err(transport_error)?;
+        .map_err(|error| {
+            if let Some(timing) = &timing {
+                timing.transport_failed(timing::TransportPhase::BeforeHeaders, &error);
+            }
+            transport_error(error)
+        })?;
         let status = response.status();
         if let Some(timing) = &timing {
             timing.record("headers", Some(status.as_u16()));
@@ -523,6 +528,9 @@ impl OpenAiProvider {
                     response.chunk().await
                 };
                 let Some(chunk) = next.map_err(|error| {
+                    if let Some(timing) = &timing {
+                        timing.transport_failed(timing::TransportPhase::StreamBody, &error);
+                    }
                     if error.is_timeout() {
                         timeouts::expired(
                             "total",
@@ -607,7 +615,12 @@ impl OpenAiProvider {
             return Err(LlmError::Protocol("模型流在正常终态前结束".into()));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if let Some(timing) = &timing {
+                timing.transport_failed(timing::TransportPhase::ResponseBody, &error);
+            }
+            transport_error(error)
+        })? {
             if chunk.len() > self.config.max_response_bytes - bytes.len() {
                 return Err(failed(ProviderFailureKind::ResponseTooLarge));
             }
