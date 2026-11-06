@@ -76,7 +76,7 @@ fn request(session: ModelSession, input: &str) -> ModelRequest {
 #[tokio::test]
 async fn frozen_input_reuses_one_auxiliary_request_and_records_real_usage() {
     let mut server = Server::start(vec![Reply::json(json!({
-        "choices":[{"message":{"role":"assistant","content":"{\"selected_ids\":[\"e-1\"]}"},"finish_reason":"stop"}],
+        "choices":[{"index":0,"message":{"role":"assistant","content":"{\"selected_ids\":[\"e-1\"]}"},"finish_reason":"stop"}],
         "usage":{"prompt_tokens":2048,"completion_tokens":16,"prompt_tokens_details":{"cached_tokens":1024}}
     }))]).await;
     let health = Arc::new(eve_model_health::HealthBook::new());

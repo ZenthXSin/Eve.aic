@@ -33,6 +33,14 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
             self.assertEqual(body.get('response_format'), {'type': 'json_object'})
             self.assertEqual(body['messages'][-2]['role'], 'system')
             self.assertTrue(body['messages'][-2]['content'].startswith('本轮自主发言协议：'))
+            self.assertIn('当前只返回 speak / wait / silence 的单个 JSON 决定',
+                          body['messages'][-2]['content'])
+            # 完整协议在稳定前缀中；末尾仍保留模式提醒，不能延续旧 final。
+            self.assertEqual(body['messages'][1]['role'], 'system')
+            self.assertIn('只能输出一个 JSON 决定', body['messages'][1]['content'])
+            self.assertIn('以下 JSON 是固定宿主资料', body['messages'][2]['content'])
+            self.assertIn('以下 JSON 是历史事实视图', body['messages'][3]['content'])
+            self.assertIn('以下 JSON 是当前资料', body['messages'][4]['content'])
             self.assertEqual(facts['current_user_message']['id'], facts['current_message_id'])
             self.assertIsInstance(facts['current_user_message']['text'], str)
             self.speech_requests.append(body)

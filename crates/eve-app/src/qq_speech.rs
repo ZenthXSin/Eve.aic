@@ -17,7 +17,7 @@ use std::{
 
 const RULES: &str = include_str!("qq_speech_prompt.md");
 // 完整协议在稳定前缀中；历史之后仍明确本轮模式，避免延续旧 final 或工具计划。
-const FORMAT_GUARD: &str = "以上历史与资料只用于判断这次是否开口。当前只返回 speak / wait / silence 的单个 JSON 决定，遵循前面的自主发言协议；不继续旧对话，不执行工具，不输出 JSON 外文字。";
+const FORMAT_GUARD: &str = "本轮自主发言协议：以上历史与资料只用于判断这次是否开口。当前只返回 speak / wait / silence 的单个 JSON 决定，遵循前面的完整协议；不继续旧对话，不执行工具，不输出 JSON 外文字。";
 const MAX_FACT_BYTES: usize = 128 * 1024;
 const RETRY_MS: u64 = 60_000;
 const HISTORY_TURNS: usize = 6;
