@@ -34,4 +34,3 @@ for await (const line of input) {
   await bridge.command(frame);
   if (frame.type === "stop") break;
 }
-
