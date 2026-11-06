@@ -11,3 +11,5 @@
 原 `claim`、`record_delivery`、`claim_progress` 保留兼容；新自主发言链路必须使用精确版本接口，不能在新接口不可用时回退到仅按 ID 认领。替换实现未覆盖新契约时默认返回 `Unavailable`。本地收件箱仍使用独立的 `record_local_delivery` 和 `record_local_progress`，不会伪造平台回执。
 
 事实摘要采用带版本前缀的确定性 SHA-256 编码。升级摘要规则使旧候选失效并重新审视，不需要改写任务执行账本。
+
+冷任务在容量压力下可以保留为历史，运行工作集与历史容量、格式 5 和失败恢复约定见[任务工作集与历史归档](./WORKING_SET.md)。

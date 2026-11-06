@@ -1,5 +1,6 @@
 //! 后台任务账本。
 mod archive;
+mod capacity;
 mod cold;
 mod completion;
 pub use completion::{evaluate_completion_contract, evaluate_task_completion};

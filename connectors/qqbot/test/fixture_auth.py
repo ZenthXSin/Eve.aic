@@ -112,18 +112,24 @@ def expand_learning_archive(documents, directory):
 def expand_task_archive(documents, directory):
     """仅验收侧恢复完整任务；真实读取并核对冷文件，不把目录占位内容冒充正文。"""
     index = documents.get('eve.task', {}).get('tasks.v1')
-    if not index or index.get('format_version') != 4:
+    if not index or index.get('format_version') not in (4, 5):
         return documents
+    assert set(index) == {'format_version', 'tasks'} and len(index['tasks']) <= 128
     tasks, identities = [], set()
+    total, working, working_count, reserved = 0, 0, 0, 0
     for entry in index['tasks']:
+        assert set(entry) == ({'directory', 'record', 'archived'} if index['format_version'] == 5 else {'directory', 'record'})
+        if index['format_version'] == 5:
+            assert type(entry['archived']) is bool
         ref = entry['record']
+        assert set(ref) == {'hash', 'bytes'} and type(ref['bytes']) is int and 0 < ref['bytes'] <= 16 * 1024**2
         digest = ref['hash']
         assert len(digest) == 64 and all(c in '0123456789abcdef' for c in digest)
         path = Path(directory) / (digest + '.json')
         assert not path.is_symlink()
         with path.open('rb') as source:
-            payload = source.read(4 * 1024**2 + 1)
-        assert len(payload) <= 4 * 1024**2 and len(payload) == ref['bytes']
+            payload = source.read(16 * 1024**2 + 1)
+        assert len(payload) <= 16 * 1024**2 and len(payload) == ref['bytes']
         assert hashlib.sha256(payload).hexdigest() == digest
         task = json.loads(payload)
         metadata = json.loads(payload)
@@ -135,8 +141,38 @@ def expand_task_archive(documents, directory):
         assert metadata == entry['directory']
         assert task['id'] not in identities
         identities.add(task['id'])
+        total += ref['bytes']
+        archived = entry.get('archived', False)
+        if not archived:
+            working += ref['bytes']
+            working_count += 1
+        if index['format_version'] == 5:
+            execution = task.get('execution')
+            execution = {} if execution is None else execution
+            assert isinstance(execution, dict)
+            progress = execution.get('progress_notices', [])
+            assert isinstance(progress, list)
+            if progress:
+                assert isinstance(progress[-1], dict) and isinstance(progress[-1].get('attempt'), dict)
+            pending_progress = bool(progress) and progress[-1]['attempt'].get('result') is None
+            pending = task['status'] in ('Queued', 'Running')
+            exploration = execution.get('kind') == 'exploration'
+            acknowledged = execution.get('exploration_acknowledged_at_ms')
+            if archived:
+                assert task['status'] in ('Completed', 'SessionEnded', 'Blocked', 'Failed', 'Cancelled', 'Interrupted')
+                assert type(task.get('finished_at_ms')) is int and task['finished_at_ms'] > 0
+                if exploration:
+                    assert type(acknowledged) is int and acknowledged >= task['finished_at_ms']
+                else:
+                    assert not pending_progress
+                    assert task.get('notice') is None or task['notice'].get('status') in ('Delivered', 'Expired', 'Unknown')
+            opened = pending or task.get('notice') is not None or pending_progress or (exploration and acknowledged is None)
+            reserved += 160 * opened + 32768 * pending
         tasks.append(task)
-    documents['eve.task']['tasks.v1'] = {'format_version':4, 'tasks':tasks}
+    assert total <= (64 if index['format_version'] == 5 else 16) * 1024**2
+    if index['format_version'] == 5:
+        assert working + len(b'{"format_version":2,"tasks":[]}') + max(0, working_count - 1) + reserved <= 16 * 1024**2
+    documents['eve.task']['tasks.v1'] = {'format_version':index['format_version'], 'tasks':tasks}
     return documents
 
 

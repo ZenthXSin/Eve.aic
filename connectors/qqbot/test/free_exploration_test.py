@@ -700,8 +700,10 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         delta = 31 * 60 * 1000
         task["created_at_ms"] -= delta
         task["started_at_ms"] -= delta
-        if ledger["format_version"] == 4:
+        if ledger["format_version"] in (4, 5):
             entry = next(entry for entry in ledger["tasks"] if entry["directory"]["id"] == task_id)
+            if ledger["format_version"] == 5:
+                self.assertIs(entry["archived"], False, "运行任务不能占用历史归档位")
             payload = json.dumps(task, ensure_ascii=False, separators=(",", ":")).encode()
             digest = hashlib.sha256(payload).hexdigest()
             archive = self.state_path.parent / "task-archive" / (digest + ".json")

@@ -553,26 +553,84 @@ def validate_ended_exploration(task, version):
     if task['result'] != retained or execution['session_end_reason'] != reason:
         raise ValueError('invalid_exploration_session_end')
 
+def task_archive_settled(task):
+    """与 Rust settled_at 一致，只用于冷索引资格；归档不改变正文或投递状态。"""
+    if task.get('status') not in ('Completed', 'SessionEnded', 'Blocked', 'Failed', 'Cancelled', 'Interrupted'):
+        return False
+    execution = task.get('execution')
+    if execution is None:
+        execution = {}
+    finished = task.get('finished_at_ms')
+    if type(finished) is not int or finished <= 0:
+        return False
+    if not isinstance(execution, dict):
+        return False
+    if execution.get('kind') == 'exploration':
+        acknowledged = execution.get('exploration_acknowledged_at_ms')
+        return type(acknowledged) is int and acknowledged >= finished
+    progress = execution.get('progress_notices', [])
+    if not isinstance(progress, list) or (progress and (
+            not isinstance(progress[-1], dict) or not isinstance(progress[-1].get('attempt'), dict)
+            or progress[-1]['attempt'].get('result') is None)):
+        return False
+    notice = task.get('notice')
+    return notice is None or (isinstance(notice, dict)
+                             and notice.get('status') in ('Delivered', 'Expired', 'Unknown'))
+
+def task_archive_capacity(ledger):
+    """先核整份索引的工作集与历史上限；不得用 archived 隐藏正在执行的正文。"""
+    total, working, count, reserved = 0, 0, 0, 0
+    version = ledger['format_version']
+    for entry in ledger['tasks']:
+        fields = {'directory', 'record'} | ({'archived'} if version == 5 else set())
+        if (not isinstance(entry, dict) or set(entry) != fields
+                or (version == 5 and type(entry['archived']) is not bool)):
+            raise ValueError('invalid_task_archive_index')
+        record, task = entry['record'], entry['directory']
+        if (not isinstance(record, dict) or set(record) != {'hash', 'bytes'}
+                or not sha(record['hash']) or type(record['bytes']) is not int
+                or not 0 < record['bytes'] <= 16 * 1024 * 1024 or not isinstance(task, dict)):
+            raise ValueError('invalid_task_archive_reference')
+        archived = entry.get('archived', False)
+        if archived and not task_archive_settled(task):
+            raise ValueError('invalid_task_archive_settlement')
+        total += record['bytes']
+        if not archived:
+            working += record['bytes']
+            count += 1
+        if version == 5:
+            execution = task.get('execution')
+            if execution is None:
+                execution = {}
+            if not isinstance(execution, dict):
+                raise ValueError('invalid_task_archive_execution')
+            progress = execution.get('progress_notices', [])
+            if (not isinstance(progress, list) or (progress and (
+                    not isinstance(progress[-1], dict) or not isinstance(progress[-1].get('attempt'), dict)))):
+                raise ValueError('invalid_task_archive_execution')
+            pending = task.get('status') in ('Queued', 'Running')
+            opened = (pending or task.get('notice') is not None
+                      or (execution.get('kind') == 'exploration' and not task_archive_settled(task))
+                      or (bool(progress) and progress[-1]['attempt'].get('result') is None))
+            reserved += 160 * opened + 32768 * pending
+    if total > (64 if version == 5 else 16) * 1024 * 1024:
+        raise ValueError('task_archive_size_limit')
+    if version == 5 and working + len(b'{"format_version":2,"tasks":[]}') + max(0, count - 1) + reserved > 16 * 1024 * 1024:
+        raise ValueError('task_working_set_size_limit')
+
 def task_documents(state_path, ledger):
     """核对任务目录与不可变冷正文；空闲门不能把目录当完整任务。"""
     if (not isinstance(ledger, dict) or set(ledger) != {'format_version', 'tasks'}
-            or type(ledger['format_version']) is not int or ledger['format_version'] not in (1, 2, 3, 4)
+            or type(ledger['format_version']) is not int or ledger['format_version'] not in (1, 2, 3, 4, 5)
             or not isinstance(ledger['tasks'], list) or len(ledger['tasks']) > 128):
         raise ValueError('unknown_task_ledger_version')
     version = ledger['format_version']
-    seen, total = set(), 0
+    seen = set()
+    if version in (4, 5):
+        task_archive_capacity(ledger)
     for entry in ledger['tasks']:
-        if version == 4:
-            if not isinstance(entry, dict) or set(entry) != {'directory', 'record'}:
-                raise ValueError('invalid_task_archive_index')
+        if version in (4, 5):
             record, directory = entry['record'], entry['directory']
-            if (not isinstance(record, dict) or set(record) != {'hash', 'bytes'}
-                    or not sha(record['hash']) or type(record['bytes']) is not int
-                    or not 0 < record['bytes'] <= 16 * 1024 * 1024):
-                raise ValueError('invalid_task_archive_reference')
-            total += record['bytes']
-            if total > 16 * 1024 * 1024:
-                raise ValueError('task_archive_size_limit')
             path = state_path.parent / 'task-archive' / (record['hash'] + '.json')
             if path.is_symlink() or not path.is_file() or path.stat().st_size != record['bytes']:
                 raise ValueError('invalid_task_archive_file')

@@ -10,6 +10,9 @@ use std::sync::{
 
 type Mutation = Box<dyn Fn(&mut Value)>;
 
+#[path = "tasks/working_set.rs"]
+mod working_set;
+
 struct Store {
     inner: FileStateStore,
     fail: AtomicBool,
@@ -2850,9 +2853,16 @@ struct Archive {
     writes: std::sync::atomic::AtomicUsize,
     fail: AtomicBool,
     fail_after: AtomicBool,
+    fail_compact: AtomicBool,
 }
 impl TaskArchiveStore for Archive {
+    fn check_capacity(&self, plan: &TaskArchivePlan<'_>) -> TaskResult<()> {
+        self.file.check_capacity(plan)
+    }
     fn compact(&self, retained: &[String]) -> TaskResult<()> {
+        if self.fail_compact.load(Ordering::SeqCst) {
+            return Err(TaskError::Storage);
+        }
         self.file.compact(retained)
     }
     fn get(&self, hash: &str) -> TaskResult<Vec<u8>> {
@@ -2880,6 +2890,7 @@ impl World {
             writes: Default::default(),
             fail: AtomicBool::new(false),
             fail_after: AtomicBool::new(false),
+            fail_compact: AtomicBool::new(false),
         })
     }
     async fn cold(&self, archive: Arc<Archive>) -> PluginResult<(Kernel, TaskController)> {
