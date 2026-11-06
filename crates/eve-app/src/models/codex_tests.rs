@@ -256,180 +256,190 @@ async fn codex_chat_and_bad_endpoint_transactions_preserve_revision_and_prior_se
 }
 
 #[tokio::test]
-async fn primary_and_auxiliary_mixed_adapters_keep_purpose_credentials_limits_and_failures() {
-    for primary_codex in [true, false] {
-        let root = tempfile::tempdir().unwrap();
-        let mut rejected = Reply::json(json!({"error":"synthetic authentication failure"}));
-        rejected.status = 401;
-        let mut primary = Server::start(vec![if primary_codex {
+async fn all_primary_auxiliary_adapter_protocol_pairs_keep_credentials_limits_and_failures() {
+    let selections = [
+        ("openai", "chat"),
+        ("openai", "responses"),
+        ("codex", "responses"),
+    ];
+    let reply = |adapter, protocol| {
+        if adapter == "codex" {
             codex_final()
         } else {
-            final_reply("chat")
-        }])
-        .await;
-        let mut auxiliary = Server::start(vec![
-            if primary_codex {
-                final_reply("chat")
-            } else {
-                codex_final()
-            },
-            rejected,
-        ])
-        .await;
-        let h = Harness::start_with_validator(
-            root.path(),
-            &primary.url,
-            if primary_codex { "responses" } else { "chat" },
-            true,
-        )
-        .await;
-        h.update(
-            &[
-                (
-                    MODELS_NAMESPACE,
-                    "primary_provider",
-                    json!(if primary_codex { "codex" } else { "openai" }),
-                ),
-                (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
-                (
-                    MODELS_NAMESPACE,
-                    "auxiliary_small_provider",
-                    json!(if primary_codex { "openai" } else { "codex" }),
-                ),
-                (
-                    MODELS_NAMESPACE,
-                    "auxiliary_small_model",
-                    json!("auxiliary-model"),
-                ),
-                (MODELS_NAMESPACE, "auxiliary_small_timeout_ms", json!(2000)),
-                (
-                    MODELS_NAMESPACE,
-                    "auxiliary_small_max_output_tokens",
-                    json!(19),
-                ),
-                (
-                    MODELS_NAMESPACE,
-                    "auxiliary_small_credential_ref",
-                    json!(crate::model_credentials::AUXILIARY),
-                ),
-                (
-                    config::OPENAI_NAMESPACE,
-                    "auxiliary_base_url",
-                    json!(base(&auxiliary)),
-                ),
-                (
-                    config::OPENAI_NAMESPACE,
-                    "auxiliary_protocol",
-                    json!(if primary_codex { "chat" } else { "responses" }),
-                ),
-                (config::OPENAI_NAMESPACE, "reasoning_effort", json!("high")),
-                (
-                    config::MODEL_USES_NAMESPACE,
-                    "summary_role",
-                    json!("auxiliary_small"),
-                ),
-                (
-                    config::MODEL_USES_NAMESPACE,
-                    "summary_max_output_tokens",
-                    json!(7),
-                ),
-            ],
-            ApplyMode::Immediate,
-        );
-        let bank = Arc::new(eve_model_credentials::CredentialBank::default());
-        bank.bind(
-            CredentialPurpose::Primary,
-            crate::model_credentials::PRIMARY,
-            Some("primary-key".into()),
-        )
-        .unwrap();
-        bank.bind(
-            CredentialPurpose::Auxiliary,
-            crate::model_credentials::AUXILIARY,
-            Some("auxiliary-key".into()),
-        )
-        .unwrap();
-        let main = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
-            .resolve()
-            .unwrap();
-        let auxiliary_resolver =
-            CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
-                .with_use("summary")
-                .with_timeout_cap(Duration::from_millis(900));
-        let small = auxiliary_resolver.resolve().unwrap();
-        assert_eq!(
-            small.provider_timeout,
-            Duration::from_millis(if primary_codex { 900 } else { 1900 })
-        );
-        main.provider.complete(request("dialogue")).await.unwrap();
-        let captured = primary.next().await;
-        assert_eq!(
-            header(&captured, "authorization"),
-            Some("Bearer primary-key")
-        );
-        assert_eq!(
-            captured.body[if primary_codex {
-                "max_output_tokens"
-            } else {
-                "max_tokens"
-            }],
-            32
-        );
-        small.provider.complete(request("summary")).await.unwrap();
-        let captured = auxiliary.next().await;
-        assert_eq!(
-            header(&captured, "authorization"),
-            Some("Bearer auxiliary-key")
-        );
-        assert_eq!(
-            captured.body[if primary_codex {
-                "max_tokens"
-            } else {
-                "max_output_tokens"
-            }],
-            7
-        );
-        assert_eq!(captured.body["model"], "auxiliary-model");
-        assert!(captured.body.get("temperature").is_none());
-        if !primary_codex {
-            assert_eq!(captured.body["reasoning"]["effort"], "high");
+            final_reply(protocol)
         }
-        assert!(small.provider.complete(request("summary")).await.is_err());
-        auxiliary.next().await;
-        assert!(
-            primary.requests.try_recv().is_err(),
-            "辅助失败不能切回主实现"
-        );
-        assert!(auxiliary.requests.try_recv().is_err(), "401 不能重试");
-        h.update(
-            &[(
-                config::MODEL_USES_NAMESPACE,
-                "summary_max_output_tokens",
-                json!(0),
-            )],
-            ApplyMode::Immediate,
-        );
-        assert_eq!(
-            summary(h.settings.as_ref(), Some("summary"))
-                .unwrap()
-                .max_output_tokens,
-            Some(19)
-        );
-        let wrong_bank = Arc::new(eve_model_credentials::CredentialBank::default());
-        wrong_bank
-            .bind(
+    };
+    for (primary_adapter, primary_protocol) in selections {
+        for (auxiliary_adapter, auxiliary_protocol) in selections {
+            let root = tempfile::tempdir().unwrap();
+            let mut rejected = Reply::json(json!({"error":"synthetic authentication failure"}));
+            rejected.status = 401;
+            let mut primary = Server::start(vec![reply(primary_adapter, primary_protocol)]).await;
+            let mut auxiliary =
+                Server::start(vec![reply(auxiliary_adapter, auxiliary_protocol), rejected]).await;
+            let h =
+                Harness::start_with_validator(root.path(), &primary.url, primary_protocol, true)
+                    .await;
+            h.update(
+                &[
+                    (MODELS_NAMESPACE, "primary_provider", json!(primary_adapter)),
+                    (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
+                    (
+                        MODELS_NAMESPACE,
+                        "auxiliary_small_provider",
+                        json!(auxiliary_adapter),
+                    ),
+                    (
+                        MODELS_NAMESPACE,
+                        "auxiliary_small_model",
+                        json!("auxiliary-model"),
+                    ),
+                    (MODELS_NAMESPACE, "auxiliary_small_timeout_ms", json!(2000)),
+                    (
+                        MODELS_NAMESPACE,
+                        "auxiliary_small_max_output_tokens",
+                        json!(19),
+                    ),
+                    (
+                        MODELS_NAMESPACE,
+                        "auxiliary_small_credential_ref",
+                        json!(crate::model_credentials::AUXILIARY),
+                    ),
+                    (
+                        config::OPENAI_NAMESPACE,
+                        "auxiliary_base_url",
+                        json!(base(&auxiliary)),
+                    ),
+                    (
+                        config::OPENAI_NAMESPACE,
+                        "auxiliary_protocol",
+                        json!(auxiliary_protocol),
+                    ),
+                    (config::OPENAI_NAMESPACE, "reasoning_effort", json!("high")),
+                    (
+                        config::MODEL_USES_NAMESPACE,
+                        "summary_role",
+                        json!("auxiliary_small"),
+                    ),
+                    (
+                        config::MODEL_USES_NAMESPACE,
+                        "summary_max_output_tokens",
+                        json!(7),
+                    ),
+                ],
+                ApplyMode::Immediate,
+            );
+            let bank = Arc::new(eve_model_credentials::CredentialBank::default());
+            bank.bind(
                 CredentialPurpose::Primary,
                 crate::model_credentials::PRIMARY,
-                Some("wrong-purpose".into()),
+                Some("primary-key".into()),
             )
             .unwrap();
-        assert!(
-            CoreModelResolver::from_credentials(h.settings.clone(), Ok(wrong_bank))
-                .with_use("summary")
+            bank.bind(
+                CredentialPurpose::Auxiliary,
+                crate::model_credentials::AUXILIARY,
+                Some("auxiliary-key".into()),
+            )
+            .unwrap();
+            let main = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
                 .resolve()
-                .is_err()
-        );
-        h.stop().await;
+                .unwrap();
+            let auxiliary_resolver =
+                CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
+                    .with_use("summary")
+                    .with_timeout_cap(Duration::from_millis(900));
+            let small = auxiliary_resolver.resolve().unwrap();
+            assert_eq!(
+                small.provider_timeout,
+                Duration::from_millis(if auxiliary_adapter == "codex" {
+                    1900
+                } else {
+                    900
+                })
+            );
+            main.provider.complete(request("dialogue")).await.unwrap();
+            let captured = primary.next().await;
+            assert_eq!(
+                header(&captured, "authorization"),
+                Some("Bearer primary-key")
+            );
+            assert_eq!(
+                captured.body[if primary_protocol == "chat" {
+                    "max_tokens"
+                } else {
+                    "max_output_tokens"
+                }],
+                32
+            );
+            small.provider.complete(request("summary")).await.unwrap();
+            let captured = auxiliary.next().await;
+            assert_eq!(
+                header(&captured, "authorization"),
+                Some("Bearer auxiliary-key")
+            );
+            assert_eq!(
+                captured.body[if auxiliary_protocol == "chat" {
+                    "max_tokens"
+                } else {
+                    "max_output_tokens"
+                }],
+                7
+            );
+            assert_eq!(captured.body["model"], "auxiliary-model");
+            assert!(captured.body.get("temperature").is_none());
+            if auxiliary_protocol == "responses" {
+                assert_eq!(captured.body["reasoning"]["effort"], "high");
+            } else {
+                assert_eq!(captured.body["reasoning_effort"], "high");
+            }
+            assert_eq!(
+                summary(h.settings.as_ref(), None).unwrap().adapter,
+                primary_adapter
+            );
+            assert_eq!(
+                summary(h.settings.as_ref(), Some("summary"))
+                    .unwrap()
+                    .adapter,
+                auxiliary_adapter
+            );
+            assert!(small.provider.complete(request("summary")).await.is_err());
+            auxiliary.next().await;
+            assert!(
+                primary.requests.try_recv().is_err(),
+                "辅助失败不能切回主实现"
+            );
+            assert!(auxiliary.requests.try_recv().is_err(), "401 不能重试");
+            h.update(
+                &[(
+                    config::MODEL_USES_NAMESPACE,
+                    "summary_max_output_tokens",
+                    json!(0),
+                )],
+                ApplyMode::Immediate,
+            );
+            assert_eq!(
+                summary(h.settings.as_ref(), Some("summary"))
+                    .unwrap()
+                    .max_output_tokens,
+                Some(19)
+            );
+            let wrong_bank = Arc::new(eve_model_credentials::CredentialBank::default());
+            wrong_bank
+                .bind(
+                    CredentialPurpose::Primary,
+                    crate::model_credentials::PRIMARY,
+                    Some("wrong-purpose".into()),
+                )
+                .unwrap();
+            assert!(
+                CoreModelResolver::from_credentials(h.settings.clone(), Ok(wrong_bank))
+                    .with_use("summary")
+                    .resolve()
+                    .is_err()
+            );
+            h.stop().await;
+        }
     }
 }
 
