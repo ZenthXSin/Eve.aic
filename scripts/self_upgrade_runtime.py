@@ -437,6 +437,122 @@ def platform_id(value):
     return (isinstance(value, str) and 0 < len(value.encode()) <= 253 and value.strip() == value
             and not any(ord(c) < 32 or ord(c) == 127 for c in value))
 
+def validate_ended_exploration(task, version):
+    """只读核对探索终态；没有小结或经历确认不代表仍在执行。"""
+    execution, usage = task.get('execution'), task.get('usage')
+    checkpoint = execution.get('checkpoint') if isinstance(execution, dict) else None
+    owner, spec = task.get('owner'), task.get('spec')
+    def unsigned(value, maximum=2**64 - 1):
+        return type(value) is int and 0 <= value <= maximum
+    if (version == 1 or not isinstance(execution, dict) or execution.get('kind') != 'exploration'
+            or execution.get('session_end_reason') not in ('natural_stop', 'tool_budget_exhausted',
+                                                         'deadline_expired', 'recovery_limit_reached')
+            or execution.get('completion_contract') is not None or execution.get('progress_notices', []) != []
+            or execution.get('resume_at_ms') is not None or not unsigned(execution.get('recoveries'), 3)
+            or task.get('cancel_requested') is not False or task.get('notice') is not None
+            or task.get('failure') is not None or not isinstance(task.get('result'), str)
+            or len(task['result'].encode()) > 16384
+            or not isinstance(owner, dict) or set(owner) != {'session_id', 'user_id'}
+            or any(not isinstance(value, str) or not value for value in owner.values())
+            or not isinstance(spec, dict) or not unsigned(spec.get('max_steps'), 5000) or spec['max_steps'] == 0
+            or not isinstance(usage, dict) or set(usage) != {'tool_calls', 'model_requests'}
+            or any(not unsigned(value, 2**32 - 1) for value in usage.values())
+            or not isinstance(checkpoint, dict) or type(checkpoint.get('version')) is not int
+            or checkpoint['version'] not in (1, 2) or checkpoint.get('scope') != owner
+            or checkpoint.get('pending_calls') != []):
+        raise ValueError('invalid_exploration_session_end')
+    times = [task.get(key) for key in ('created_at_ms', 'started_at_ms', 'finished_at_ms')]
+    if any(not unsigned(at) or at == 0 for at in times) or times != sorted(times):
+        raise ValueError('invalid_exploration_session_end')
+    created, started, finished = times
+    last_finished, acknowledged = (execution.get(key) for key in
+                                   ('last_finished_at_ms', 'exploration_acknowledged_at_ms'))
+    deadline, authorization = execution.get('deadline_at_ms'), execution.get('authorization_deadline_at_ms')
+    if (last_finished is not None and (not unsigned(last_finished) or last_finished != finished)
+            or acknowledged is not None and (not unsigned(acknowledged) or acknowledged < finished)
+            or deadline is not None and (not unsigned(deadline) or deadline <= started)
+            or authorization is not None and (not unsigned(authorization) or authorization <= created)
+            or deadline is not None and authorization is not None and deadline > authorization):
+        raise ValueError('invalid_exploration_session_end')
+    used, requests = checkpoint.get('used_tool_calls'), checkpoint.get('provider_requests')
+    delegated, delegated_requests = (checkpoint.get(key, 0) for key in
+                                     ('delegated_tool_calls', 'delegated_model_requests'))
+    if (not unsigned(used, spec['max_steps']) or not unsigned(delegated, spec['max_steps'])
+            or not unsigned(requests, spec['max_steps'] + 16)
+            or not unsigned(delegated_requests, spec['max_steps'] * 2 + 16)
+            or checkpoint['version'] == 1 and (delegated or delegated_requests)
+            or used + delegated > spec['max_steps']
+            or usage != {'tool_calls': used + delegated, 'model_requests': requests + delegated_requests}):
+        raise ValueError('invalid_exploration_session_end')
+    messages = checkpoint.get('messages')
+    if not isinstance(messages, list) or not messages:
+        raise ValueError('invalid_exploration_checkpoint')
+    calls, results, batches, pending = set(), set(), 0, set()
+    for message in messages:
+        if (not isinstance(message, dict) or message.get('role') not in ('System', 'User', 'Assistant', 'Tool')
+                or not isinstance(message.get('tool_calls'), list) or not isinstance(message.get('tool_results'), list)
+                or bool(pending) != (message['role'] == 'Tool')):
+            raise ValueError('invalid_exploration_checkpoint')
+        role, text = message['role'], message.get('text')
+        if (role in ('System', 'User') and (not isinstance(text, str) or not text.strip())
+                or role == 'Assistant' and (text is not None if message['tool_calls'] else
+                                           not isinstance(text, str) or not text.strip())
+                or role == 'Tool' and (text is not None or not message['tool_results'])
+                or type(message.get('internal_only', False)) is not bool
+                or message.get('internal_only', False) and (role != 'Assistant' or message['tool_calls'])):
+            raise ValueError('invalid_exploration_checkpoint')
+        batches += bool(message['tool_calls'])
+        for call in message['tool_calls']:
+            if (role != 'Assistant' or not isinstance(call, dict)
+                    or not isinstance(call.get('id'), str) or not call['id'].strip() or call['id'] in calls
+                    or not isinstance(call.get('name'), str) or not call['name'].strip()
+                    or not isinstance(call.get('arguments'), dict)):
+                raise ValueError('invalid_exploration_checkpoint')
+            calls.add(call['id'])
+            pending.add(call['id'])
+        for result in message['tool_results']:
+            if (role != 'Tool' or not isinstance(result, dict)
+                    or not isinstance(result.get('call_id'), str) or result['call_id'] not in pending
+                    or result['call_id'] in results or not isinstance(result.get('output'), dict)):
+                raise ValueError('invalid_exploration_checkpoint')
+            output = result['output']
+            if set(output) != {'Success'}:
+                failure = output.get('Failure')
+                if (set(output) != {'Failure'} or not isinstance(failure, dict)
+                        or set(failure) != {'code', 'message'} or not isinstance(failure['message'], str)
+                        or failure['code'] not in ('UnknownTool', 'Unavailable', 'OwnerMismatch', 'Inactive',
+                                                  'PermissionDenied', 'InvalidArguments')):
+                    # TimedOut / Cancelled / ExecutionFailed 在 Rust 中属于未知效果，不能是 SessionEnded。
+                    raise ValueError('invalid_exploration_checkpoint')
+            results.add(result['call_id'])
+            pending.remove(result['call_id'])
+        if role == 'Tool' and pending:
+            raise ValueError('invalid_exploration_checkpoint')
+    if (pending or calls != results or len(calls) != used or type(checkpoint.get('tool_batches')) is not int
+            or checkpoint['tool_batches'] != batches or requests < batches):
+        raise ValueError('invalid_exploration_checkpoint')
+    saved = checkpoint.get('result')
+    remaining, request = checkpoint.get('remaining'), checkpoint.get('pending_model_request')
+    if (saved is not None and (not isinstance(saved, str) or not saved.strip() or requests == 0)
+            or not unsigned(checkpoint.get('continuation_checks'), 3) or type(checkpoint.get('closing')) is not bool
+            or remaining is not None and (not isinstance(remaining, str) or not remaining.strip()
+                                          or len(remaining.encode()) > 2048 or saved is not None and not checkpoint['closing'])
+            or request is not None and (not unsigned(request, requests) or request == 0 or saved is not None)
+            or checkpoint.get('pending_request_fingerprint') is not None and request is None):
+        raise ValueError('invalid_exploration_session_end')
+    retained = saved if saved is not None else ''
+    if len(retained.encode()) > 16384:
+        retained = retained.strip()
+        if len(retained.encode()) > 16384:
+            mark = '…（已截断）'
+            retained = retained.encode()[:16384 - len(mark.encode())].decode('utf8', errors='ignore').rstrip() + mark
+    reason = ('tool_budget_exhausted' if used + delegated >= spec['max_steps'] else
+              'natural_stop' if saved is not None else
+              'deadline_expired' if any(at is not None and at <= finished for at in (deadline, authorization)) else
+              'recovery_limit_reached' if execution['recoveries'] >= 3 else 'natural_stop')
+    if task['result'] != retained or execution['session_end_reason'] != reason:
+        raise ValueError('invalid_exploration_session_end')
+
 def task_documents(state_path, ledger):
     """核对任务目录与不可变冷正文；空闲门不能把目录当完整任务。"""
     if (not isinstance(ledger, dict) or set(ledger) != {'format_version', 'tasks'}
@@ -481,10 +597,12 @@ def task_documents(state_path, ledger):
             task = entry
         if (not isinstance(task, dict) or not isinstance(task.get('id'), str) or not task['id']
                 or task['id'] in seen or not isinstance(task.get('status'), str)
-                or task['status'] not in ('Queued', 'Running', 'Completed', 'Blocked', 'Failed', 'Cancelled', 'Interrupted')
+                or task['status'] not in ('Queued', 'Running', 'Completed', 'SessionEnded', 'Blocked', 'Failed', 'Cancelled', 'Interrupted')
                 or version < 3 and task['status'] == 'Blocked'):
             raise ValueError('invalid_task_ledger_record')
         seen.add(task['id'])
+        if task['status'] == 'SessionEnded':
+            validate_ended_exploration(task, version)
         notice = task.get('notice')
         if notice is not None and (not isinstance(notice, dict)
                 or notice.get('status') not in ('Pending', 'Delivering', 'Delivered', 'Expired', 'Unknown')):
@@ -492,7 +610,7 @@ def task_documents(state_path, ledger):
         yield task
 
 def runtime_idle_gate(state_path, inherited=frozenset()):
-    """宿主自动更新只在当前运行的对话、任务、唤醒和文件投递全部空闲时切换。"""
+    """对话、任务、唤醒和投递空闲后切换；合法 SessionEnded 不要求完成通知或经历确认。"""
     sessions, receipts, settled = delivery_documents(state_path, inherited)
     if not settled or any(t['status']['state'] == 'Pending'
             for session in sessions['sessions'].values() for t in session_turns(state_path, session, sessions['format_version'])):
