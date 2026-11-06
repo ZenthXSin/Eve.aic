@@ -527,6 +527,8 @@ async fn explicit_cancel_clears_host_withdrawal_reason_and_tools_cannot_forge_it
             .superseded_by_input
             .is_none()
     );
+    // 工具持有主体和 SQLite 句柄；重启前与原宿主一起释放。
+    drop(tool);
     f.kernel.stop_all().await.unwrap();
     drop(f);
     let f = open(root.path()).await;
