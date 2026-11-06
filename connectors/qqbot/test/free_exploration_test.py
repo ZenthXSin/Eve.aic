@@ -144,6 +144,16 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         return next((item for item in self.experience_rows()
                      if item["session_id"] == task["id"]), None)
 
+    def interest_history_snapshot(self):
+        self.assertTrue((self.state_path.parent / "self-interests.sqlite3").is_file())
+        # 比较实际记录及选择索引列；不能只靠可省略空列表的上下文视图判断未增长。
+        orders = {
+            "interests": "scope,key", "interest_history": "scope,key,revision",
+            "consumed": "scope,key,evidence_id", "reflections": "scope,revision",
+            "exploration_experiences": "seq", "exploration_sources": "scope,reflection_id"}
+        return {table: self.history_query(f"SELECT * FROM {table} ORDER BY {order}")
+                for table, order in orders.items()}
+
     def wait_reconciled(self):
         def saved():
             ids = {row[0] for row in self.history_query("SELECT task FROM reconciled_tasks")}
@@ -516,6 +526,10 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         task = self.start_and_end(tools=0, requests=1)
         before = copy.deepcopy(self.mind())
         experience = copy.deepcopy(self.experience(task))
+        history = self.interest_history_snapshot()
+        self.assertEqual(before.get("self_interests", []), [])
+        self.assertEqual(len(history["exploration_experiences"]), 1)
+        self.assertEqual(len(history["reflections"]), 1)
         def invent(observation, result):
             if self.reflections > 1:
                 result["interest_updates"] = [{
@@ -528,16 +542,24 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
             self.wait_for(lambda: any(t["source"].startswith("subject-idle:")
                 and t["status"] == "Failed" for t in self.tasks()), "伪造经历来源没有拒绝", 20)
         self.run_idle(self.checkpoint("forged"), checkpoints={"forged": rejected})
+        self.assertEqual(self.reflections, 2)
         self.assertEqual(self.mind()["revision"], before["revision"])
-        self.assertEqual(self.mind()["self_interests"], before["self_interests"])
+        self.assertEqual(self.mind().get("self_interests", []), before.get("self_interests", []))
+        self.assertEqual(self.interest_history_snapshot(), history)
         self.assertEqual(self.experience(task), experience)
         self.assertEqual(len(self.explorations()), 1)
+        self.assertEqual(len(self.kind("review")), self.baseline_reviews)
 
     def test_zero_tool_reflection_cannot_masquerade_as_external_evidence(self):
         self.mode = "rest"
         self.allow_idle_failure_notice = True
         task = self.start_and_end(tools=0, requests=1)
         before = copy.deepcopy(self.mind())
+        experience = copy.deepcopy(self.experience(task))
+        history = self.interest_history_snapshot()
+        self.assertEqual(before.get("self_interests", []), [])
+        self.assertEqual(len(history["exploration_experiences"]), 1)
+        self.assertEqual(len(history["reflections"]), 1)
         def invent(observation, result):
             if self.reflections > 1:
                 self.assertEqual(next(item for item in observation["evidence"]
@@ -551,8 +573,13 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.run_idle(self.checkpoint("imagined"), checkpoints={"imagined": lambda: self.wait_for(
             lambda: any(t["source"].startswith("subject-idle:") and t["status"] == "Failed"
                         for t in self.tasks()), "零工具感想被当成外部新证据", 20)})
+        self.assertEqual(self.reflections, 2)
         self.assertEqual(self.mind()["revision"], before["revision"])
-        self.assertEqual(self.mind()["self_interests"], before["self_interests"])
+        self.assertEqual(self.mind().get("self_interests", []), before.get("self_interests", []))
+        self.assertEqual(self.interest_history_snapshot(), history)
+        self.assertEqual(self.experience(task), experience)
+        self.assertEqual(len(self.explorations()), 1)
+        self.assertEqual(len(self.kind("review")), self.baseline_reviews)
 
     def test_saved_receipt_resumes_same_session_without_replaying_tool(self):
         self.mode = "resume"
