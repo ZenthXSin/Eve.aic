@@ -790,7 +790,7 @@ def command_resources(command):
             paths.add(path)
         if flag == '--bridge-script':
             paths.update(p for p in [path.parent / name for name in
-                         ['bridge-core.mjs', 'package.json', 'package-lock.json']] if p.exists())
+                         ['bridge-core.mjs', 'ingress-diagnostics.mjs', 'package.json', 'package-lock.json']] if p.exists())
     return paths
 
 def snapshot_command(command, candidate_request=None):

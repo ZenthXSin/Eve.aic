@@ -97,7 +97,7 @@ class AdminAcceptance(ExecutionAcceptance):
         sessions = documents["eve.session"]["sessions.v1"]
         requests = len(self.requests)
         self.run_eve([
-            {"send": self.message("gap", "执行命令")},
+            {"send": self.message("gap", "执行命令") | {"expected_type": "finish"}},
             {"wait_command": {"id": "gap", "type": "finish"}},
             *self.send(self.message("binding-restart", "/admin", expected="当前平台身份：管理员。")),
         ], developer=True)
