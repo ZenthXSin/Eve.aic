@@ -55,7 +55,7 @@ class ReceiptCapacityAcceptance(segment.SegmentAcceptance):
         self.assertTrue(self.ledger()["entries"][:len(entries)] == entries)
 
     def complete_original_window(self):
-        # 旧账本没有 original_text；保留缺口，用新收到的六条完整原话恢复准入。
+        # 旧账本没有 original_text；新收到的原话只补充窗口，不改写历史缺口。
         return [step for i in range(6) for step in (
             {"send": self.message(f"original-{i}", "/admin", segments=None,
                                   expected="当前平台身份：管理员。")},
@@ -131,11 +131,24 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
             locals()[_name] = None
     del _name
 
-    def test_legacy_conversation_recovers_tools_through_ordinary_chat_across_restart(self):
+    def test_legacy_conversation_keeps_tools_with_original_gap_across_restart(self):
         entries, _ = ReceiptCapacityAcceptance.seed(self, 340, 32768)
         originals = [f"迁移后的普通聊天 {i}，继续聊今天的计划。" for i in range(5)]
         lookup = "现在帮我核对 old-1 的原始回执。"
         tool_results = []
+        code_results = []
+        reviews = []
+        provider = self.provider_response
+
+        def deny_review(body, kind, fallback):
+            if self.definitions(body) == {"submit_review"}:
+                reviews.append(body)
+                return dialogue.tool_response([("submit_review", {
+                    "risk": "high", "authorization": "low", "outcome": "deny",
+                    "rationale": "可信原文缺口不应阻挡普通工具或归档查询"})])
+            return provider(body, kind, fallback)
+
+        self.provider_response = deny_review
 
         def assert_history_preserved():
             with sqlite3.connect(self.work / "state/qq-receipts.sqlite3") as db:
@@ -150,8 +163,25 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
             results = self.results(body)
             if current in originals:
                 names = self.definitions(body)
-                self.assertLessEqual({"read_raw_message", "read_source", "inspect_capabilities"}, names)
-                self.assertFalse({"run_command", "write_file", "run_tool_code", "manage_business_permissions"} & names)
+                self.assertLessEqual({"read_raw_message", "read_source", "inspect_capabilities",
+                                      "run_tool_code", "manage_business_permissions"}, names)
+                self.assertFalse({"run_command", "write_file"} & names,
+                                 "原文缺口不扩大当前宿主未装配的开发能力")
+                if current in (originals[0], originals[2]):
+                    if not results:
+                        return dialogue.tool_response([("run_tool_code", {
+                            "tools": ["read_raw_message"],
+                            "arguments": {"message_id": "old-1"},
+                            "code": "text(await tools.read_raw_message(args));"})])
+                    self.assertEqual(len(results), 1)
+                    self.assertTrue(results[0]["success"], results[0])
+                    [raw] = results[0]["result"]["output"]
+                    self.assertTrue(raw["found"] and raw["archived"], raw)
+                    self.assertIn("旧输入", raw["data"])
+                    self.assertEqual([(item["target"], item["status"])
+                                      for item in results[0]["evidence"]],
+                                     [("read_raw_message", "succeeded")])
+                    code_results.append(results[0])
                 return dialogue.text_response("好，接着聊今天的计划。")
             self.assertEqual(current, lookup)
             self.assertIn("read_raw_message", self.definitions(body))
@@ -169,17 +199,21 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
             f"natural-{i}", originals[i], expected="好，接着聊今天的计划。"))]
         summary = self.run_eve(script, **options)
         self.assertEqual(summary["completed"], 2)
-        self.assertEqual(self.chat_rounds, 2)
+        self.assertEqual(self.chat_rounds, 3)
+        self.assertEqual(len(code_results), 1)
+        self.assertEqual(reviews, [])
         assert_history_preserved()
 
-        # 重启保留迁移缺口；继续普通聊天即可补足，不要求发送命令或重说旧消息。
+        # 重启保留迁移缺口；首条普通消息仍可编排工具，不必补满六条原话。
         script = [step for i in range(2, 5) for step in self.send(self.message(
             f"natural-{i}", originals[i], expected="好，接着聊今天的计划。"))]
         script += self.send(self.message("natural-sixth", lookup, expected="原始回执仍在，已经核对。"))
         summary = self.run_eve(script, **options)
         self.assertEqual(summary["completed"], 4)
         self.assertEqual(len(tool_results), 1)
-        self.assertEqual(self.chat_rounds, 7)
+        self.assertEqual(len(code_results), 2)
+        self.assertEqual(self.chat_rounds, 9)
+        self.assertEqual(reviews, [])
         assert_history_preserved()
         with sqlite3.connect(self.work / "state/qq-receipts.sqlite3") as db:
             saved = [row[0] for row in db.execute("SELECT text FROM qq_originals ORDER BY seq")]
@@ -188,6 +222,20 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
         self.run_eve(self.send(self.message(
             "natural-after-restart", lookup, expected="原始回执仍在，已经核对。")), **options)
         self.assertEqual(len(tool_results), 2)
+        self.assertEqual(self.chat_rounds, 11)
+        self.assertEqual(reviews, [])
+        assert_history_preserved()
+
+        sessions = self.documents()["eve.session"]["sessions.v1"]
+        requests = len(self.requests)
+        self.run_eve([
+            {"send": self.message("natural-0", originals[0]) | {"expected_type": "finish"}},
+            {"wait_command": {"id": "natural-0", "type": "finish"}},
+        ], **options)
+        self.assertEqual(len(self.requests), requests, "重送已完成输入不能重放模型或工具")
+        self.assertEqual(self.documents()["eve.session"]["sessions.v1"], sessions)
+        self.assertEqual(len(code_results), 2)
+        self.assertEqual(reviews, [])
         assert_history_preserved()
 
     def test_model_pulls_archived_receipt_pages_without_crossing_session_or_replaying(self):
