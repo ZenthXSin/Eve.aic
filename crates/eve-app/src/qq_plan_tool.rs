@@ -56,7 +56,7 @@ impl Tool for ManageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "manage_plan".into(),
-            description: "自然聊天查看、建议、确认或撤销当前用户待办的多步计划。inspect取得实际计划编号、当前版本和全部步骤；propose只请求建议，不执行步骤。confirm/withdraw必须使用刚读取的plan_id与expected_revision，不能用旧建议替代当前目标；confirm的完整步骤和用户原话独立送审，确认后由原后台按依赖验证执行。计划各步满足不等于用户现实目标完成。已有业务授权和停止规则继续适用，无需用户输入内部命令。".into(),
+            description: "自然聊天查看、建议、确认或撤销当前用户待办的多步计划。inspect取得实际计划编号、当前版本和全部步骤；propose只请求建议，不执行步骤。用户说暂不执行或只查看时选择inspect，不调用confirm；要求撤回或停止该计划时用withdraw，用户纠正后不得沿用旧confirm。confirm/withdraw必须使用刚读取的plan_id与expected_revision，不能用旧建议替代当前目标；宿主保存完整计划及可信会话绑定，确认后由原后台按依赖验证执行，无需逐步用户授权审查。计划各步满足不等于用户现实目标完成。已有业务授权和停止规则继续适用，无需用户输入内部命令。".into(),
             argument_schema: json!({"type":"object","properties":{"action":{"enum":["inspect","propose","confirm","withdraw"]},"goal_id":{"type":"string"},"plan_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":1}},"required":["action","goal_id"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "natural-plans".into() }),
@@ -123,13 +123,13 @@ impl Tool for ManageTool {
                 return Err(failed("计划尚未待确认或已经过时，未开始执行"));
             }
             self.review.approve("manage_plan", &call, &context,
-                json!({"arguments":call.arguments,"goal":goal,"plan":plan,"capabilities":enabled.capabilities})).await?;
+                json!({"arguments":call.arguments,"goal":goal,"plan":plan,"capabilities":enabled.capabilities}))?;
             let current = enabled
                 .goal(&session.user_id, &goal.id)
                 .map_err(failed)?
-                .ok_or_else(|| failed("审核期间待办已不可用"))?;
+                .ok_or_else(|| failed("提交前待办已不可用"))?;
             if current != goal {
-                return Err(failed("审核期间待办发生变化，未执行旧计划操作"));
+                return Err(failed("提交前待办发生变化，未执行旧计划操作"));
             }
             let at_ms = now_ms().map_err(failed)?;
             if a.action == "propose" {
@@ -158,7 +158,7 @@ impl Tool for ManageTool {
                 .into_iter()
                 .find(|p| p.id == plan.id);
             if current_plan.as_ref() != Some(&plan) {
-                return Err(failed("审核期间计划发生变化，原状态保留"));
+                return Err(failed("提交前计划发生变化，原状态保留"));
             }
             let updated = if a.action == "confirm" {
                 enabled

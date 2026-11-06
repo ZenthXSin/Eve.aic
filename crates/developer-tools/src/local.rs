@@ -31,23 +31,15 @@ const MAX_SEARCH_LINE: usize = 240;
 /// 搜索跳过的目录名：版本库、工具账本与构建产物，不属于源码阅读范围。
 const SKIPPED_NAMES: [&str; 3] = [".git", ".eve-developer", "target"];
 fn sensitive_path(path: &str) -> bool {
-    Path::new(path).components().any(|c| match c {
-        Component::Normal(s) => {
-            let s = s.to_string_lossy().to_ascii_lowercase();
-            s.starts_with('.')
-                || matches!(
-                    s.as_str(),
-                    "agent.md" | "agents.md" | "cargo.toml" | "cargo.lock"
-                )
-                || s.contains("secret")
-                || s.contains("credential")
-                || s.contains("config")
-                || s.ends_with(".pem")
-                || s.ends_with(".key")
-        }
-        Component::CurDir => false,
-        _ => true,
-    })
+    review::credential_path(path)
+        || Path::new(path).components().any(|c| match c {
+            Component::Normal(s) => matches!(
+                s.to_string_lossy().to_ascii_lowercase().as_str(),
+                ".git" | ".eve-developer"
+            ),
+            Component::CurDir => false,
+            _ => true,
+        })
 }
 fn stopped(context: &ToolExecutionContext) -> bool {
     context.is_cancel_requested()
@@ -107,9 +99,7 @@ pub struct LocalDeveloper {
     action_reviewer: Option<std::sync::Arc<dyn ActionReviewer>>,
     session_workspaces: bool,
 }
-/// 交给审查者的用户原话条数与行动轨迹条数；用户原话正文不裁剪，
-/// 工具轨迹与命令摘要仍保持有界。
-const REVIEW_USER_MESSAGES: usize = 6;
+/// 系统安全审查只提供完整动作和有界轨迹；本人原话另存宿主账本，不重复送审。
 const REVIEW_RECENT_ACTIONS: usize = 8;
 const REVIEW_COMMAND_CHARS: usize = 2000;
 const REVIEW_ACTION_CHARS: usize = 300;
@@ -119,7 +109,7 @@ fn clip(text: &str, limit: usize) -> String {
         None => text.to_string(),
     }
 }
-/// 只读取宿主独立保存的原话；后台委托可继承这些证据，模型任务说明不作为授权。
+/// 系统危险来自真实操作；自主或委派不需要本人先逐步命令，身份由宿主实时核对。
 fn review_request(
     a: &CommandArguments,
     reason: String,
@@ -127,19 +117,6 @@ fn review_request(
 ) -> Result<ActionReviewRequest, ToolExecutionError> {
     let delegated = context.is_delegated();
     let messages = context.conversation().unwrap_or_default();
-    let user_messages = if let Some(originals) = context.review_user_messages() {
-        originals
-            .iter()
-            .rev()
-            .take(REVIEW_USER_MESSAGES)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect()
-    } else {
-        vec![]
-    };
     let mut recent_actions: Vec<String> = messages
         .iter()
         .rev()
@@ -167,7 +144,7 @@ fn review_request(
         policy_reason: reason,
         claimed_confirmation: a.owner_confirmed,
         delegated,
-        user_messages,
+        user_messages: vec![],
         recent_actions,
     };
     Ok(request)
@@ -235,7 +212,9 @@ impl LocalDeveloper {
             authorization: None,
             member_runtime: None,
             isolated: false,
-            command_policy: None,
+            command_policy: Some(std::sync::Arc::new(
+                eve_command_policy::PrefixRulePolicy::builtin(),
+            )),
             action_reviewer: None,
             session_workspaces: false,
         })
@@ -255,7 +234,7 @@ impl LocalDeveloper {
         self.command_policy = Some(policy);
         self
     }
-    /// 策略要求确认的命令交给审查者按用户原话判断；不配置时拒绝执行，owner_confirmed不能代替审核。
+    /// 只把命中具体系统危险的动作交给审查者；普通操作无需用户逐步批准。
     pub fn with_action_reviewer(mut self, reviewer: std::sync::Arc<dyn ActionReviewer>) -> Self {
         self.action_reviewer = Some(reviewer);
         self
@@ -437,10 +416,10 @@ impl LocalDeveloper {
             .map_err(|_| failed("行动审核审计不可写，命令未执行"))?;
         let value = match result {
             Ok(v) => {
-                json!({"format_version":1,"operation_id":operation_id,"request_sha256":fingerprint,"status":"reviewed","risk":v.risk,"authorization":v.authorization,"allowed":v.permits()})
+                json!({"format_version":1,"operation_id":operation_id,"request_sha256":fingerprint,"status":"reviewed","risk":v.risk,"authorization":v.authorization,"allowed":v.permits_system_safety(),"review_scope":"direct_system_harm"})
             }
             Err(_) => {
-                json!({"format_version":1,"operation_id":operation_id,"request_sha256":fingerprint,"status":"failed","allowed":false})
+                json!({"format_version":1,"operation_id":operation_id,"request_sha256":fingerprint,"status":"failed","allowed":false,"review_scope":"direct_system_harm"})
             }
         };
         writeln!(file, "{value}")
@@ -983,6 +962,8 @@ impl LocalDeveloper {
         command
             .current_dir(&cwd)
             .env_clear()
+            // 普通命令与自升级检查共用此启动器，避免 Cargo 自动按整机 CPU 数并行压垮宿主。
+            .env("CARGO_BUILD_JOBS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1003,6 +984,7 @@ impl LocalDeveloper {
             "RUSTUP_HOME",
             "CARGO_HOME",
             "CARGO_TARGET_DIR",
+            "CARGO_BUILD_JOBS",
             "CARGO_INCREMENTAL",
             "CARGO_PROFILE_DEV_DEBUG",
             "CARGO_PROFILE_TEST_DEBUG",
@@ -1237,7 +1219,7 @@ impl LocalDeveloper {
         }
         let before = self.source_fingerprint(context).await?;
         if reviewed_source != Some(&before) {
-            return Err(failed("审核后源码已变化或缺少准备审核，未启动构建"));
+            return Err(failed("冻结后源码已变化或缺少准备快照，未启动构建"));
         }
         let mut checks = vec![];
         for args in source::cargo_checks() {

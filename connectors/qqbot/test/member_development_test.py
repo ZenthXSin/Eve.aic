@@ -54,14 +54,8 @@ class MemberDevelopmentAcceptance(developer.DeveloperAcceptance):
         reviews = []
         def review(request):
             reviews.append(request)
-            self.assertTrue(request['isolated'], '审核必须看到真正的成员隔离范围')
-            self.assertIn('.eve-members', request['workspace'])
-            self.assertEqual(request['program'], 'sh')
-            self.assertEqual(request['arguments'], ['-c', command], '审核完整原命令而非摘要')
-            self.assertEqual(request['user_messages'][-1], '写入并构建')
-            self.assertFalse(request['delegated'])
-            return {'risk':'low', 'authorization':'high', 'outcome':'allow',
-                    'rationale':'用户要求写入并构建；命令仅核对隔离项目和凭据未继承，并复制自己的构建产物'}
+            return {'risk':'low', 'authorization':'unknown', 'outcome':'deny',
+                    'rationale':'普通项目构建与隔离验证不应需要模型审查'}
         self.review_reply = review
         def respond(body):
             results = self.results(body)
@@ -93,19 +87,19 @@ class MemberDevelopmentAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(marker.read_text(),'HOST_CONTENT_MUST_NOT_ESCAPE')
         owned = self.source/'.eve-members'
         self.assertEqual(len(list(owned.glob('*/project.txt'))),1)
-        self.assertEqual(len(reviews), 1, '动态 shell 命令仍先审核，普通成员的构建能力保持可用')
+        self.assertEqual(reviews, [], '普通 shell 构建直接在成员隔离中执行')
 
-    def test_member_dangerous_command_is_reviewed_against_original_words_before_execution(self):
+    def test_member_permission_risk_is_reviewed_without_user_history_before_execution(self):
         reviews = []
         def review(request):
             reviews.append(request)
             self.assertTrue(request['isolated'])
-            self.assertEqual(request['program'], 'rm')
-            self.assertEqual(request['arguments'], ['-r', 'keep.txt'])
-            self.assertEqual(request['user_messages'][-1], '建立测试文件并检查，不允许删除')
-            self.assertTrue(request['claimed_confirmation'], '模型自称确认不能扩大真实授权')
-            return {'risk':'medium', 'authorization':'unknown', 'outcome':'deny',
-                    'rationale':'用户明确禁止删除，owner_confirmed不能代替原话授权'}
+            self.assertEqual(request['program'], 'chmod')
+            self.assertEqual(request['arguments'], ['777', 'keep.txt'])
+            self.assertEqual(request['user_messages'], [])
+            self.assertTrue(request['claimed_confirmation'], '模型自称确认不能消除系统危险')
+            return {'risk':'high', 'authorization':'high', 'outcome':'allow',
+                    'rationale':'权限扩大存在高风险，用户或模型声称同意都不消除危险'}
         self.review_reply = review
         def respond(body):
             results = self.results(body)
@@ -113,18 +107,19 @@ class MemberDevelopmentAcceptance(developer.DeveloperAcceptance):
                 return self.tools([('write_file', {'path':'keep.txt', 'content':'MEMBER_FILE_PRESERVED', 'expected_sha256':''})])
             if len(results) == 1:
                 self.assertTrue(results[0]['success'])
-                return self.tools([('run_command', {'program':'rm', 'args':['-r','keep.txt'], 'owner_confirmed':True})])
+                return self.tools([('run_command', {'program':'chmod', 'args':['777','keep.txt'], 'owner_confirmed':True})])
             if len(results) == 2:
-                self.assertIn('行动审核未放行', json.dumps(results[-1], ensure_ascii=False))
+                self.assertIn('系统安全审查未放行', json.dumps(results[-1], ensure_ascii=False))
                 return self.tools([('read_file', {'path':'keep.txt'})])
             self.assertEqual(results[-1]['content'], 'MEMBER_FILE_PRESERVED')
-            return text_response('成员文件可读写，未授权删除未执行')
+            return text_response('成员文件可读写，危险权限变更未执行')
         self.callback = respond
-        self.run_member(self.send(self.member('denied-delete', '建立测试文件并检查，不允许删除', expected='成员文件可读写，未授权删除未执行')))
+        self.run_member(self.send(self.member('denied-permissions', '建立测试文件并检查权限边界', expected='成员文件可读写，危险权限变更未执行')))
         self.assertEqual(len(reviews), 1)
         preserved = list((self.source/'.eve-members').glob('*/keep.txt'))
         self.assertEqual(len(preserved), 1)
         self.assertEqual(preserved[0].read_text(), 'MEMBER_FILE_PRESERVED')
+        self.assertEqual(preserved[0].stat().st_mode & 0o777, 0o600)
 
     def test_member_cannot_promote_work_to_deployment_or_escape_exports_by_symlink(self):
         (self.work/'state/qq-outbox/files').mkdir(parents=True)

@@ -2088,7 +2088,6 @@ async fn run_qqbot_composed(
                 commands: natural_goals.clone(),
                 review: crate::qq_natural_goals::Review {
                     admin: qq_admin.clone(),
-                    reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
                 },
             }));
         }
@@ -2098,7 +2097,6 @@ async fn run_qqbot_composed(
                 commands: natural_plans.clone(),
                 review: crate::qq_natural_goals::Review {
                     admin: qq_admin.clone(),
-                    reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
                 },
             }));
         }
@@ -2207,7 +2205,7 @@ async fn run_qqbot_composed(
             )?);
         }
         bootstrap.tools.push(Arc::new(crate::qq_subject::FocusTool(subject.clone())));
-        bootstrap.tools.push(Arc::new(crate::qq_subject::ConfigureTool { subject: subject.clone(), owner: qq_admin.clone(), reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()) }));
+        bootstrap.tools.push(Arc::new(crate::qq_subject::ConfigureTool { subject: subject.clone(), owner: qq_admin.clone() }));
         bootstrap.tools.push(Arc::new(crate::qq_files::FileDeliveryStatusTool(outbox.clone())));
         let script_python = std::env::var_os("EVE_SCRIPT_PYTHON")
             .map(PathBuf::from)

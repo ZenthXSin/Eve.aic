@@ -1,54 +1,52 @@
-//! 开发操作共用审核入口；完整动作和原话不可用时拒绝，审核不能扩大宿主权限。
+//! 开发动作只在命中具体系统危险时审查；普通操作不以目标或逐步用户授权为门槛。
 use super::*;
 
-pub(super) fn credential_path(path: &str) -> bool {
-    Path::new(path).components().any(|part| match part {
-        Component::Normal(name) => {
-            let name = name.to_string_lossy().to_ascii_lowercase();
-            name == ".env"
-                || name.starts_with(".env.")
-                || matches!(
-                    name.as_str(),
-                    "private"
-                        | ".ssh"
-                        | ".aws"
-                        | ".gnupg"
-                        | "business-permissions.json"
-                        | "business-permissions.initialized"
-                        | "business-permissions.failed"
-                        | "admin-bindings.json"
-                )
-                || name.contains("secret")
-                || name.contains("credential")
-                || name.ends_with(".pem")
-                || name.ends_with(".key")
-                || name.ends_with(".p12")
-        }
-        _ => false,
-    })
+pub(super) use eve_developer_api::credential_path;
+
+/// 路径已由宿主绑定；只审查操作系统、服务状态与启动配置，普通工程配置不额外送审。
+fn sensitive_write(path: &str) -> bool {
+    let path = Path::new(path);
+    path.is_absolute()
+        && [
+            "/etc",
+            "/boot",
+            "/bin",
+            "/sbin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/lib",
+            "/lib",
+            "/lib64",
+            "/dev",
+            "/proc",
+            "/sys",
+            "/var/lib",
+        ]
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
-fn sensitive_write(path: &str) -> bool {
-    Path::new(path).components().any(|part| match part {
-        Component::Normal(name) => {
-            let name = name.to_string_lossy().to_ascii_lowercase();
-            matches!(
-                name.as_str(),
-                "agent.md"
-                    | "agents.md"
-                    | "rule.md"
-                    | "user.md"
-                    | "cargo.toml"
-                    | "cargo.lock"
-                    | ".cargo"
-                    | ".github"
-            ) || name.contains("config")
-                || name.contains("policy")
-                || name.contains("authorization")
-                || name.contains("admin-bindings")
-        }
-        _ => false,
-    })
+fn github_system_change(arguments: &GithubArguments) -> bool {
+    if arguments.method == "GET" {
+        return false;
+    }
+    let resource = arguments.resource.as_str();
+    [
+        "hooks",
+        "collaborators",
+        "teams",
+        "keys",
+        "actions/permissions",
+        "branches",
+    ]
+    .iter()
+    .any(|prefix| {
+        resource == *prefix
+            || resource
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }) || resource.starts_with("contents/.github/workflows/")
+        || resource.starts_with("contents/.env")
 }
 
 /// 审核期间文件发生变化时不得使用新正文执行曾审核的旧动作。
@@ -144,26 +142,36 @@ impl LocalDeveloper {
         Ok(())
     }
 
-    /// GitHub 写入、宿主安全配置变更与需确认命令都经过同一独立审核。
+    /// 仅具体系统危险触发模型审查；身份、路径、回执与候选完整性仍由宿主核对。
     pub(super) async fn review_operation(
         &self,
         operation_id: u64,
         operation: &DeveloperOperation,
         context: &ToolExecutionContext,
     ) -> Result<ReviewedFiles, ToolExecutionError> {
-        context.check_review_evidence()?;
         let mut paths = Vec::new();
         let mut artifacts = Vec::new();
         let mut baseline = None;
-        let mut reviewed_source = None;
+        let system_path = |path: &str| {
+            let actual = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                self.root.join(path)
+            };
+            sensitive_write(&actual.to_string_lossy())
+        };
         let action = match operation {
             DeveloperOperation::Command(command) => {
                 if !self.config.commands {
                     return Err(failed("命令执行未启用"));
                 }
+                self.reject_evidence_credentials(
+                    &serde_json::to_string(command).map_err(|_| failed("命令无法编码"))?,
+                )?;
                 let reason = match &self.command_policy {
                     Some(policy) => {
-                        let evaluation = policy.evaluate(&command.program, &command.args);
+                        let cwd = self.model_path(&command.cwd, false)?;
+                        let evaluation = policy.evaluate_at(&command.program, &command.args, &cwd);
                         match evaluation.decision {
                             Some(CommandDecision::Forbidden) => {
                                 return Err(failed(format!(
@@ -173,20 +181,22 @@ impl LocalDeveloper {
                             }
                             Some(CommandDecision::Prompt) => evaluation.reason(),
                             Some(CommandDecision::Allow) => return Ok(ReviewedFiles(vec![], vec![], None, None)),
-                            None => "命令策略未确认安全范围，必须审核完整命令".into(),
+                            None => return Ok(ReviewedFiles(vec![], vec![], None, None)),
                         }
                     }
-                    None => "命令策略未装配，必须审核完整命令".into(),
+                    None => return Err(failed("命令策略未装配，未执行")),
                 };
                 Some((command.clone(), reason))
             }
             DeveloperOperation::Github(arguments) => {
                 let arguments = self.github_arguments(arguments.clone())?;
-                if arguments.method == "GET" {
+                let encoded = serde_json::to_string(&arguments).map_err(|_| failed("GitHub 动作无法编码"))?;
+                self.reject_evidence_credentials(&encoded)?;
+                if !github_system_change(&arguments) {
                     return Ok(ReviewedFiles(vec![], vec![], None, None));
                 }
                 Some((business_action("github_api", serde_json::to_value(arguments).map_err(|_| failed("GitHub 动作无法编码"))?),
-                    "向 GitHub 写入或删除共享数据；须核对仓库、资源、完整请求正文及原话授权，合并/改写引用/删除发行均属实际副作用".into()))
+                    "变更仓库访问控制、webhook、运行权限或自动执行配置，核对是否泄露凭据或扩大外部控制面".into()))
             }
             DeveloperOperation::PrepareUpgrade => {
                 if !self.config.self_upgrade || !self.config.commands {
@@ -194,16 +204,8 @@ impl LocalDeveloper {
                 }
                 let source = self.source_fingerprint(context).await?;
                 let (_, supervisor) = self.supervisor()?;
-                let checks = source::cargo_checks().into_iter().map(|args| json!({"program":self.config.cargo_program,
-                    "arguments":self.config.cargo_arguments.iter().cloned().chain(args.into_iter().map(str::to_owned)).collect::<Vec<_>>(),"cwd":"."})).collect::<Vec<_>>();
-                let action = business_action("prepare_self_upgrade", json!({"source":source.fingerprint,"source_diff":source.descriptor,
-                    "source_diff_content":source.diff,"active_sha256":supervisor.active_sha256,"checks":checks,
-                    "after_rust_tests":{"program":if cfg!(windows) {"python"} else {"python3"},"arguments":["-B","scripts/verify-self-upgrade.py"],"cwd":"."},
-                    "after_build":{"program":if cfg!(windows) {"python"} else {"python3"},"arguments":["-B","scripts/verify-self-upgrade.py","--binary","<cargo metadata target_directory>/release/eve-qqbot"],"cwd":".","isolated":true,"production_switched":false},
-                    "publish_only":true,"activate":false}));
-                baseline = Some((supervisor.active_sha256, supervisor.active_source_revision));
-                reviewed_source = Some(source);
-                Some((action, "构建与测试会在宿主执行候选的 build.rs、测试和监督验收脚本，属于实际代码执行；须按真实原话审核完整源码差异和执行计划。准备只冻结候选，不授权激活；认证、审核、审计、回退和熔断不得被代码关闭".into()))
+                // 准备只构建、验证并冻结候选，没有线上切换；源码快照不依赖模型批准。
+                return Ok(ReviewedFiles(vec![], vec![], Some((supervisor.active_sha256, supervisor.active_source_revision)), Some(source)));
             }
             DeveloperOperation::ApplyUpgrade(arguments) => {
                 if !self.config.self_upgrade || !self.config.commands || !valid_candidate_sha(&arguments.candidate_sha256) {
@@ -235,23 +237,23 @@ impl LocalDeveloper {
                 artifacts.push((lease_path, hash(&lease_bytes)));
                 baseline = Some((supervisor.active_sha256.clone(), supervisor.active_source_revision.clone()));
                 Some((business_action("apply_self_upgrade", json!({"candidate_sha256":arguments.candidate_sha256,"active_sha256":supervisor.active_sha256,"active_source_revision":supervisor.active_source_revision,"source_diff_content":source_diff,"manifest":manifest,"lease":lease,"scope":context.scope(),"turn_id":context.turn_id(),"retain_state":true})),
-                    "将已验证候选切换为运行中的 Eve，会短暂中断服务。候选验证不等于用户授权；须按原话审核完整候选、验证记录、运行版本和准备租约；业务权限不能跳过审核、回退及熔断".into()))
+                    "将已验证候选切换为运行中的 Eve；仅核对完整差异是否引入凭据外泄、身份绕过、关键状态破坏或持续服务不可用。监督器验证、租约和回退用于判断实际影响，不要求用户逐步批准".into()))
             }
-            DeveloperOperation::RestartSelf => Some((business_action("restart_self",json!({"scope":context.scope(),"turn_id":context.turn_id(),"target":"current-running-binary","retain_state":true})),"重启当前 Eve 服务会短暂中断服务；必须当前真实用户明确要求并经宿主监督器等待回执和空闲后执行，不能伪称已重启".into())),
-            DeveloperOperation::Write(a) if !self.isolated && (sensitive_write(&a.path) || self.external_path(&a.path)) => {
+            DeveloperOperation::RestartSelf => Some((business_action("restart_self",json!({"scope":context.scope(),"turn_id":context.turn_id(),"target":"current-running-binary","retain_state":true})),"重启运行中的 Eve；核对是否会丢失关键状态或中断未结操作。监督器等待回执和空闲后执行的正常短暂重启不属于直接系统危害，不要求逐步用户授权".into())),
+            DeveloperOperation::Write(a) if !self.isolated && system_path(&a.path) => {
                 paths.push(a.path.clone());
                 Some((
                     business_action(
                         "write_file",
                         serde_json::to_value(a).map_err(|_| failed("写入动作无法编码"))?,
                     ),
-                    "修改工程外宿主文件或身份、安全策略、工程配置；按实际路径和原话核对范围"
+                    "写入关键系统路径；核对内容是否破坏系统、泄露凭据或扩大控制面"
                         .into(),
                 ))
             }
-            DeveloperOperation::Edit(a) if !self.isolated && (sensitive_write(&a.path) || self.external_path(&a.path)) => {
+            DeveloperOperation::Edit(a) if !self.isolated && system_path(&a.path) => {
                 paths.push(a.path.clone());
-                Some((business_action("edit_file", serde_json::to_value(a).map_err(|_| failed("编辑动作无法编码"))?), "修改工程外宿主文件或身份、安全策略、工程配置；核对实际路径、完整原文件与替换内容".into()))
+                Some((business_action("edit_file", serde_json::to_value(a).map_err(|_| failed("编辑动作无法编码"))?), "编辑关键系统路径；依据原文件与替换内容判断直接系统影响".into()))
             }
             DeveloperOperation::Patch(a) => {
                 let touched = eve_apply_patch::paths(&a.patch)
@@ -259,11 +261,11 @@ impl LocalDeveloper {
                 if touched.iter().any(|p| credential_path(p)) {
                     return Err(failed("凭据文件不交给模型工具；请通过宿主受信凭据配置处理"));
                 }
-                if self.isolated || !touched.iter().any(|p| sensitive_write(p) || self.external_path(p)) {
+                if self.isolated || !touched.iter().any(|p| system_path(p)) {
                     return Ok(ReviewedFiles(vec![], vec![], None, None));
                 }
                 paths = touched;
-                Some((business_action("apply_patch", serde_json::to_value(a).map_err(|_| failed("补丁动作无法编码"))?), "修改工程外宿主文件或身份、安全策略、工程配置；核对所有实际目标、完整补丁及原文件".into()))
+                Some((business_action("apply_patch", serde_json::to_value(a).map_err(|_| failed("补丁动作无法编码"))?), "补丁触及关键系统路径；依据完整目标、补丁和原文件判断直接系统影响".into()))
             }
             _ => None,
         };
@@ -292,28 +294,20 @@ impl LocalDeveloper {
         let fingerprint = hash(encoded.as_bytes());
         let result = async {
             request.validate_capacity()?;
-            if request.user_messages.is_empty() {
-                return Err(
-                    "缺少宿主保存的真实用户原话，owner_confirmed不能代替独立审核或以委托说明授权"
-                        .into(),
-                );
-            }
             self.reject_evidence_credentials(&encoded).map_err(|_| {
                 "审核上下文含宿主凭据，未向审核模型发送；请通过受信凭据配置处理".to_owned()
             })?;
             if !self.config.action_review {
-                return Err(
-                    "独立审核已关闭，需审核的动作不执行；owner_confirmed不能代替审核".into(),
-                );
+                return Err("系统安全审查已关闭，命中具体危险的动作未执行".into());
             }
             let reviewer = self
                 .action_reviewer
                 .as_ref()
-                .ok_or("独立审核器未配置，owner_confirmed不能代替审核")?;
+                .ok_or("系统安全审查器未配置，具体危险尚未核对")?;
             context.check_review_evidence().map_err(|_| {
                 "review_evidence_changed：用户原话证据已更新或不可核验，旧动作未执行".to_owned()
             })?;
-            let verdict = reviewer.review(request).await?;
+            let verdict = reviewer.review_system_safety(request).await?;
             context.check_review_evidence().map_err(|_| {
                 "review_evidence_changed：审核期间用户原话证据已更新或不可核验，旧动作未执行"
                     .to_owned()
@@ -330,14 +324,14 @@ impl LocalDeveloper {
                 failed(reason)
             }
         })?;
-        if !verdict.permits() {
+        if !verdict.permits_system_safety() {
             return Err(failed(format!(
-                "行动审核未放行，命令未执行/业务动作未执行：风险 {:?}，授权 {:?}。{}",
-                verdict.risk, verdict.authorization, verdict.rationale
+                "系统安全审查未放行，命令未执行/业务动作未执行：风险 {:?}。{}",
+                verdict.risk, verdict.rationale
             )));
         }
         self.authorize_selected_backend(operation, context)?;
-        let files = ReviewedFiles(observed, artifacts, baseline, reviewed_source);
+        let files = ReviewedFiles(observed, artifacts, baseline, None);
         files.recheck(self)?;
         Ok(files)
     }
@@ -350,5 +344,80 @@ pub(super) fn business_action(name: &str, arguments: Value) -> CommandArguments 
         cwd: ".".into(),
         timeout_ms: None,
         owner_confirmed: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_names_are_not_treated_as_credential_files() {
+        for path in [
+            "src/credentials.rs",
+            "src/secret_parser.rs",
+            "src/credentials/mod.rs",
+            "tests/secrets/parser.rs",
+            "src/credentials",
+            "tests/secrets",
+            "src/credential_schema.json",
+            "docs/secret-handling.txt",
+            "docs/secret-handling.md",
+            "policy.json",
+            "Cargo.toml",
+            ".cargo/config.toml",
+            ".github/workflows/build.yml",
+            "fixtures/hosts.yml",
+            "src/auth.json",
+        ] {
+            assert!(!credential_path(path), "{path}");
+            assert!(!sensitive_write(path), "{path}");
+        }
+        for path in [
+            ".env",
+            ".env.local",
+            ".ssh/id_ed25519",
+            "credentials.json",
+            "private/key.pem",
+            "admin-bindings.json",
+            ".netrc",
+            ".npmrc",
+            ".pgpass",
+            ".docker/config.json",
+            ".kube/config",
+            ".config/gh/hosts.yml",
+            ".composer/auth.json",
+            ".config/composer/auth.json",
+            "/run/secrets/service-token",
+        ] {
+            assert!(credential_path(path), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_file_targets_use_the_bound_system_root_before_review() {
+        let project = tempfile::tempdir().unwrap();
+        let ledger = tempfile::tempdir().unwrap();
+        let config: DeveloperConfig = serde_json::from_value(json!({
+            "workspace":project.path(),"operators":["owner"],"commands":true
+        }))
+        .unwrap();
+        let mut backend = LocalDeveloper::new(config, ledger.path().into(), None).unwrap();
+        backend.root = PathBuf::from("/etc");
+        let operation = DeveloperOperation::Write(FileArguments {
+            path: "hosts".into(),
+            offset: 0,
+            content: Some("no execution in this test".into()),
+            expected_sha256: Some(String::new()),
+        });
+        // 只调用准入阶段，未配置审核器；不写任何真实系统文件。
+        assert!(
+            backend
+                .review_operation(1, &operation, &ToolExecutionContext::new())
+                .await
+                .is_err()
+        );
+        assert!(ledger.path().join("action-reviews.jsonl").is_file());
     }
 }

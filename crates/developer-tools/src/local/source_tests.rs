@@ -561,7 +561,7 @@ fn stored_binary_and_submodule_diffs_are_rejected_even_with_matching_hashes() {
 }
 
 #[test]
-fn candidate_capacity_counts_full_six_user_messages_and_manifest_without_cropping() {
+fn candidate_capacity_keeps_complete_action_without_repeating_user_history() {
     let fixture = Fixture::new(None);
     let diff = "a".repeat(96 * 1024);
     let mut candidate = manifest(diff.as_bytes());
@@ -576,14 +576,14 @@ fn candidate_capacity_counts_full_six_user_messages_and_manifest_without_croppin
             .validate_candidate_review_capacity(&candidate, &diff, &ctx)
             .is_ok()
     );
-    candidate["checks"] = json!([{"success":true,"stdout":"v".repeat(128 * 1024)}]);
+    candidate["checks"] = json!([{"success":true,"stdout":"v".repeat(176 * 1024)}]);
     let unchanged = candidate.clone();
     let error = fixture
         .backend
         .validate_candidate_review_capacity(&candidate, &diff, &ctx)
         .err()
         .unwrap();
-    assert!(error.to_string().contains("超过审核容量"));
+    assert!(error.to_string().contains("超过系统安全审查容量"));
     assert_eq!(candidate, unchanged);
     assert_eq!(ctx.review_user_messages().unwrap(), messages.as_slice());
     candidate.as_object_mut().unwrap().remove("checks");
@@ -595,7 +595,7 @@ fn candidate_capacity_counts_full_six_user_messages_and_manifest_without_croppin
         fixture
             .backend
             .validate_candidate_review_capacity(&candidate, "", &ctx)
-            .is_err()
+            .is_ok()
     );
     assert_eq!(
         ctx.review_user_messages().unwrap(),
@@ -626,7 +626,7 @@ fn prepare_fixture() -> (Fixture, PathBuf) {
     let wrapper = fixture.ledger.path().join("malicious-cargo");
     fs::write(
         &wrapper,
-        "#!/bin/sh\nprintf executed > cargo-was-executed\nexit 19\n",
+        "#!/bin/sh\nprintf '%s' \"$CARGO_BUILD_JOBS\" > cargo-was-executed\nexit 19\n",
     )
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
@@ -636,130 +636,59 @@ fn prepare_fixture() -> (Fixture, PathBuf) {
 }
 
 #[cfg(unix)]
-struct PrepareReviewer {
-    allow: bool,
-    mutate_source: Option<PathBuf>,
-    seen: std::sync::Mutex<Vec<ActionReviewRequest>>,
-}
-
-#[cfg(unix)]
-impl ActionReviewer for PrepareReviewer {
-    fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
-        Box::pin(async move {
-            self.seen.lock().unwrap().push(request);
-            if let Some(root) = &self.mutate_source {
-                fs::write(
-                    root.join("main.txt"),
-                    "changed while approval was pending\n",
-                )
-                .unwrap();
-                git(root, &["add", "main.txt"]);
-                git(root, &["commit", "-qm", "change after review snapshot"]);
-            }
-            Ok(ActionReviewVerdict {
-                risk: ReviewRisk::High,
-                authorization: ReviewAuthorization::High,
-                allow: self.allow,
-                rationale: "依据当前宿主绑定原话审核准备动作".into(),
-            })
-        })
-    }
-}
-
-#[cfg(unix)]
 #[tokio::test]
-async fn prepare_does_not_run_configured_cargo_without_reviewer_approval_and_original_messages() {
-    for scenario in ["missing_reviewer", "denied", "missing_originals"] {
+async fn prepare_runs_real_checks_without_a_review_service_or_user_step_approval() {
+    for with_originals in [false, true] {
         let (mut fixture, marker) = prepare_fixture();
-        let reviewer = Arc::new(PrepareReviewer {
-            allow: scenario == "missing_originals",
-            mutate_source: None,
-            seen: std::sync::Mutex::new(vec![]),
-        });
-        if scenario != "missing_reviewer" {
-            fixture.backend.action_reviewer = Some(reviewer.clone());
-        }
-        let ctx = if scenario == "missing_originals" {
-            context().with_review_user_messages(Arc::new(vec![]))
+        fixture.backend.config.action_review = false;
+        let ctx = if with_originals {
+            context()
         } else {
             context()
+                .with_review_user_messages(Arc::new(vec![]))
+                .with_delegated(true)
         };
-        let error = fixture
+        let result = fixture
             .backend
             .execute(DeveloperOperation::PrepareUpgrade, ctx)
             .await
-            .err()
             .unwrap();
-        assert!(error.to_string().contains("审核"), "{scenario}: {error}");
-        assert!(
-            !marker.exists(),
-            "{scenario} executed configured cargo before approval"
-        );
-        assert_eq!(
-            reviewer.seen.lock().unwrap().len(),
-            usize::from(scenario == "denied")
-        );
+        assert_eq!(result["prepared"], false);
+        assert_eq!(result["checks"][0]["exit_code"], 19);
+        let expected_jobs = std::env::var("CARGO_BUILD_JOBS").unwrap_or_else(|_| "1".into());
+        assert_eq!(fs::read_to_string(marker).unwrap(), expected_jobs);
+        assert!(!fixture.ledger.path().join("action-reviews.jsonl").exists());
         fixture.no_candidate_or_queue();
     }
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn prepare_reviews_complete_source_and_actual_build_plan_then_rejects_changed_source() {
-    let (mut fixture, marker) = prepare_fixture();
-    let expected_source = fixture
+async fn prepare_freezes_source_and_rejects_a_changed_snapshot_before_build() {
+    let (fixture, marker) = prepare_fixture();
+    let frozen = fixture
         .backend
-        .source_fingerprint(&context())
+        .review_operation(42, &DeveloperOperation::PrepareUpgrade, &context())
         .await
+        .unwrap()
+        .into_source()
         .unwrap();
-    let reviewer = Arc::new(PrepareReviewer {
-        allow: true,
-        mutate_source: Some(fixture.root.path().into()),
-        seen: std::sync::Mutex::new(vec![]),
-    });
-    fixture.backend.action_reviewer = Some(reviewer.clone());
+    fs::write(
+        fixture.root.path().join("main.txt"),
+        "changed after snapshot\n",
+    )
+    .unwrap();
+    git(fixture.root.path(), &["add", "main.txt"]);
+    git(
+        fixture.root.path(),
+        &["commit", "-qm", "change after snapshot"],
+    );
     let error = fixture
         .backend
-        .execute(DeveloperOperation::PrepareUpgrade, context())
+        .upgrade(&context(), Some(&frozen))
         .await
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains("审核后源码已变化"));
-    assert!(
-        !marker.exists(),
-        "source changed after review but configured cargo still ran"
-    );
-    let seen = reviewer.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].program, "eve.prepare_self_upgrade");
-    assert_eq!(seen[0].user_messages, vec!["完成验证后升级到新提交"]);
-    let action: Value = serde_json::from_str(&seen[0].arguments[0]).unwrap();
-    assert_eq!(action["source_diff_content"], expected_source.diff);
-    assert_eq!(action["source_diff"], expected_source.descriptor);
-    assert_eq!(action["source"], expected_source.fingerprint);
-    assert!(
-        action["source_diff_content"]
-            .as_str()
-            .unwrap()
-            .contains("crates/eve-app/Cargo.toml")
-    );
-    assert_eq!(action["publish_only"], true);
-    assert_eq!(action["activate"], false);
-    let checks = action["checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 4);
-    for (index, command) in checks.iter().enumerate() {
-        assert_eq!(command["program"], fixture.backend.config.cargo_program);
-        assert_eq!(command["arguments"][0], "--offline");
-        assert_eq!(
-            command["arguments"][1],
-            ["fmt", "clippy", "test", "build"][index]
-        );
-        assert_eq!(command["cwd"], ".");
-    }
-    assert_eq!(action["after_rust_tests"]["program"], "python3");
-    assert_eq!(
-        action["after_rust_tests"]["arguments"],
-        json!(["-B", "scripts/verify-self-upgrade.py"])
-    );
+        .unwrap_err();
+    assert!(error.to_string().contains("冻结后源码已变化"));
+    assert!(!marker.exists());
     fixture.no_candidate_or_queue();
 }

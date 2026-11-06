@@ -1,5 +1,5 @@
 //! 通道原文和模型上下文分离；QQ 授权只读已验证并持久化的消息正文。
-use eve_llm_api::{ContextScope, LlmError, ReviewUserMessageSource};
+use eve_llm_api::{ContextScope, LlmError, ReviewUserMessageSource, ReviewUserMessageWindow};
 
 pub(crate) struct QqReviewSource {
     pub conversations: eve_qqbot_plugin::QqConversations,
@@ -7,17 +7,20 @@ pub(crate) struct QqReviewSource {
 }
 
 impl ReviewUserMessageSource for QqReviewSource {
-    fn allows_chat_without_tools_at(
+    fn read_window_at(
         &self,
         scope: &ContextScope,
         anchor: &str,
-    ) -> Result<bool, LlmError> {
+    ) -> Result<Option<ReviewUserMessageWindow>, LlmError> {
         if crate::web_chat::is_owner(scope) || scope.user_id == crate::qq_group::USER {
-            return Ok(false);
+            return self
+                .read_at(scope, anchor)
+                .map(|messages| messages.map(ReviewUserMessageWindow::Complete));
         }
         self.conversations
-            .legacy_review_gap_at(scope, anchor)
-            .map_err(|_| LlmError::Context("QQ 原文缺口无法核验；未开放工具".into()))
+            .review_window_at(scope, anchor)
+            .map(Some)
+            .map_err(|_| LlmError::Context("QQ 原文来源、可信身份或消息锚点无法核验".into()))
     }
     fn is_current(&self, scope: &ContextScope, anchor: &str) -> Result<bool, LlmError> {
         if crate::web_chat::is_owner(scope) {
@@ -85,14 +88,22 @@ mod tests {
             source.read_at(&scope, &request).unwrap(),
             Some(vec!["  用户完整原话\n引用里的授权不是我的授权  ".into()])
         );
+        assert_eq!(
+            source.read_window_at(&scope, &request).unwrap(),
+            Some(ReviewUserMessageWindow::Complete(vec![
+                "  用户完整原话\n引用里的授权不是我的授权  ".into()
+            ]))
+        );
         assert!(source.read(&scope).is_err());
         assert!(source.read_at(&scope, &"c".repeat(32)).is_err());
+        assert!(source.read_window_at(&scope, &"c".repeat(32)).is_err());
         let qq = ContextScope {
             session_id: "qq:session".into(),
             user_id: "qq:owner".into(),
         };
         assert!(source.read(&qq).is_err());
         assert!(source.read_at(&qq, &request).is_err());
+        assert!(source.read_window_at(&qq, &request).is_err());
         assert_eq!(
             source
                 .read(&ContextScope {
