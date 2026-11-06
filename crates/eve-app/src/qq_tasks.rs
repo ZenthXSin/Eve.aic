@@ -671,12 +671,12 @@ impl Worker {
                     retryable: false,
                 };
             };
-            host.with_model_resolver(Arc::new(crate::idle_small::Resolver {
-                inner: self.resolver.clone(),
-                settings: self.settings.clone(),
+            host.with_model_resolver(Arc::new(crate::idle_small::Resolver::new(
+                self.resolver.clone(),
+                self.settings.clone(),
                 input,
-                steps: steps_pool.clone(),
-            }))
+                steps_pool.clone(),
+            )))
         } else {
             host
         };
