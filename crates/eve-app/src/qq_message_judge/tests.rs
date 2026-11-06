@@ -642,6 +642,17 @@ async fn inconsistent_revisions_cannot_reuse_previous_jev_client() {
         judge.judge(input("把解释改成中文。")).await,
         Err(RelationError::Unavailable)
     );
+    assert_eq!(
+        eve_developer_api::ActionReviewClassifier::classify(
+            &judge,
+            eve_developer_api::ActionReviewMode::SystemSafety,
+            action_request(),
+        )
+        .await,
+        eve_developer_api::ActionClassification::Uncertain(
+            eve_developer_api::ActionReviewUncertainty::Unavailable,
+        ),
+    );
     assert!(jev.requests.try_recv().is_err());
     settings.changing.store(false, Ordering::SeqCst);
     assert_eq!(
@@ -652,6 +663,318 @@ async fn inconsistent_revisions_cannot_reuse_previous_jev_client() {
         &jev.next().await,
         "/v1/systemone",
         "jev-a",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    h.stop().await;
+}
+
+fn action_request() -> eve_developer_api::ActionReviewRequest {
+    eve_developer_api::ActionReviewRequest {
+        model_session: None,
+        action: "具体系统影响".into(),
+        program: "eve.restart_self".into(),
+        arguments: vec!["{\"target\":\"current-running-binary\",\"retain_state\":true}".into()],
+        workspace: "/workspace".into(),
+        isolated: false,
+        cwd: ".".into(),
+        policy_reason: "核对具体系统危害".into(),
+        claimed_confirmation: false,
+        delegated: true,
+        user_messages: vec![],
+        recent_actions: vec![],
+    }
+}
+
+fn action_reply() -> Reply {
+    Reply::json(json!({"answers":{
+        "direct_system_harm":{"type":"choice","choice":"bounded","confidence":0.99,
+            "probabilities":{"none":0.0,"bounded":1.0,"high":0.0,"critical":0.0,"uncertain":0.0}},
+        "grounded":{"type":"noul","noul":0.99}
+    }}))
+}
+
+#[tokio::test]
+async fn relation_and_action_share_http_slots_and_new_credentials_do_not_reuse_old_client() {
+    use eve_developer_api::{
+        ActionClassification, ActionReviewClassifier, ActionReviewMode, ActionReviewUncertainty,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut slow = jev_reply(0.99);
+    slow.header_delay = Duration::from_secs(60);
+    let mut jev = Server::start(vec![slow, action_reply(), action_reply()]).await;
+    let h = Harness::start(root.path(), &jev.url, &jev.url).await;
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "jev_max_concurrent_requests", json!(1)),
+            (MODELS_NAMESPACE, "jev_timeout_ms", json!(60000)),
+        ],
+        ApplyMode::Immediate,
+    );
+    let judge = JevRoleJudge::shared(h.settings.clone(), JEV_SECRET.into()).unwrap();
+    let action_judge = JevRoleJudge::shared(h.settings.clone(), JEV_SECRET.into()).unwrap();
+    assert!(Arc::ptr_eq(&judge, &action_judge));
+    let in_flight = {
+        let judge = judge.clone();
+        tokio::spawn(async move { judge.judge(input("把解释改成中文。")).await })
+    };
+    jev.next().await;
+    assert_eq!(
+        action_judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Uncertain(ActionReviewUncertainty::Busy)
+    );
+    assert!(jev.requests.try_recv().is_err());
+    let replacement_key = "synthetic-replaced-jev-action-secret";
+    let replacement = JevRoleJudge::shared(h.settings.clone(), replacement_key.into()).unwrap();
+    assert!(!Arc::ptr_eq(&judge, &replacement));
+    assert!(!Arc::ptr_eq(
+        &judge.resolve().unwrap(),
+        &replacement.resolve().unwrap()
+    ));
+    assert_eq!(
+        replacement
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Uncertain(ActionReviewUncertainty::Busy)
+    );
+    assert!(jev.requests.try_recv().is_err());
+    in_flight.abort();
+    assert!(in_flight.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        action_judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Decided { .. }
+    ));
+    assert_request(
+        &jev.next().await,
+        "/v1/systemone",
+        "jev-a",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    assert!(matches!(
+        replacement
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Decided { .. }
+    ));
+    assert_request(
+        &jev.next().await,
+        "/v1/systemone",
+        "jev-a",
+        replacement_key,
+        JEV_SECRET,
+    );
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn jev_hot_configuration_keeps_in_flight_admission_across_unrelated_and_provider_updates() {
+    use eve_developer_api::{
+        ActionClassification, ActionReviewClassifier, ActionReviewMode, ActionReviewUncertainty,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut slow = jev_reply(0.99);
+    slow.header_delay = Duration::from_secs(60);
+    let mut old = Server::start(vec![slow]).await;
+    let mut next = Server::start(vec![action_reply()]).await;
+    let h = Harness::start(root.path(), &old.url, &old.url).await;
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "jev_max_concurrent_requests", json!(1)),
+            (MODELS_NAMESPACE, "jev_timeout_ms", json!(60000)),
+        ],
+        ApplyMode::Immediate,
+    );
+    let judge = JevRoleJudge::shared(h.settings.clone(), JEV_SECRET.into()).unwrap();
+    let in_flight = {
+        let judge = judge.clone();
+        tokio::spawn(async move { judge.judge(input("把解释改成中文。")).await })
+    };
+    assert_request(
+        &old.next().await,
+        "/v1/systemone",
+        "jev-a",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    h.update(
+        &[(
+            MODELS_NAMESPACE,
+            "primary_model",
+            json!("primary-unrelated"),
+        )],
+        ApplyMode::Immediate,
+    );
+    assert_eq!(
+        judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Uncertain(ActionReviewUncertainty::Busy)
+    );
+    assert!(!in_flight.is_finished());
+    assert!(old.requests.try_recv().is_err());
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "jev_model", json!("jev-b")),
+            (MODELS_NAMESPACE, "jev_timeout_ms", json!(59000)),
+            (
+                PROVIDER_NAMESPACE,
+                "base_url",
+                json!(next.url.trim_end_matches("/v1/responses")),
+            ),
+        ],
+        ApplyMode::NewRequests,
+    );
+    assert_eq!(
+        judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Uncertain(ActionReviewUncertainty::Busy)
+    );
+    assert!(!in_flight.is_finished());
+    assert!(old.requests.try_recv().is_err());
+    assert!(next.requests.try_recv().is_err());
+    let status = crate::model_concurrency::status(&h.settings, ModelRole::Jev)
+        .unwrap()
+        .unwrap();
+    assert_eq!((status.limit, status.active, status.waiting), (1, 1, 0));
+    in_flight.abort();
+    assert!(in_flight.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Decided { .. }
+    ));
+    assert_request(
+        &next.next().await,
+        "/v1/systemone",
+        "jev-b",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn jev_invalid_hot_candidate_keeps_limit_and_lowering_blocks_old_and_new_clients() {
+    use eve_developer_api::{
+        ActionClassification, ActionReviewClassifier, ActionReviewMode, ActionReviewUncertainty,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let slow = || {
+        let mut reply = jev_reply(0.99);
+        reply.header_delay = Duration::from_secs(60);
+        reply
+    };
+    let mut server = Server::start(vec![slow(), slow(), action_reply(), action_reply()]).await;
+    let h = Harness::start(root.path(), &server.url, &server.url).await;
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "jev_max_concurrent_requests", json!(2)),
+            (MODELS_NAMESPACE, "jev_timeout_ms", json!(60000)),
+        ],
+        ApplyMode::Immediate,
+    );
+    let judge = JevRoleJudge::shared(h.settings.clone(), JEV_SECRET.into()).unwrap();
+    let original = judge.resolve().unwrap();
+    let first = {
+        let judge = judge.clone();
+        tokio::spawn(async move { judge.judge(input("把解释改成中文。")).await })
+    };
+    server.next().await;
+    let second = {
+        let judge = judge.clone();
+        tokio::spawn(async move { judge.judge(input("再补一条解释。")).await })
+    };
+    server.next().await;
+    let before = crate::model_concurrency::status(&h.settings, ModelRole::Jev)
+        .unwrap()
+        .unwrap();
+    assert_eq!((before.limit, before.active), (2, 2));
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "jev_max_concurrent_requests", json!(32)),
+            (PROVIDER_NAMESPACE, "base_url", json!("invalid://synthetic")),
+        ],
+        ApplyMode::Immediate,
+    );
+    assert_eq!(
+        judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Uncertain(ActionReviewUncertainty::Unavailable)
+    );
+    assert_eq!(
+        crate::model_concurrency::status(&h.settings, ModelRole::Jev)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "jev_max_concurrent_requests", json!(1)),
+            (MODELS_NAMESPACE, "jev_model", json!("jev-b")),
+            (
+                PROVIDER_NAMESPACE,
+                "base_url",
+                json!(server.url.trim_end_matches("/v1/responses")),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    assert_eq!(
+        judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Uncertain(ActionReviewUncertainty::Busy)
+    );
+    assert!(!first.is_finished() && !second.is_finished());
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        ActionReviewClassifier::classify(
+            original.as_ref(),
+            ActionReviewMode::SystemSafety,
+            action_request(),
+        )
+        .await,
+        ActionClassification::Uncertain(ActionReviewUncertainty::Busy)
+    );
+    assert!(!second.is_finished());
+    assert!(server.requests.try_recv().is_err());
+    second.abort();
+    assert!(second.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        ActionReviewClassifier::classify(
+            original.as_ref(),
+            ActionReviewMode::SystemSafety,
+            action_request(),
+        )
+        .await,
+        ActionClassification::Decided { .. }
+    ));
+    assert_request(
+        &server.next().await,
+        "/v1/systemone",
+        "jev-a",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    assert!(matches!(
+        judge
+            .classify(ActionReviewMode::SystemSafety, action_request())
+            .await,
+        ActionClassification::Decided { .. }
+    ));
+    assert_request(
+        &server.next().await,
+        "/v1/systemone",
+        "jev-b",
         JEV_SECRET,
         PRIMARY_SECRET,
     );

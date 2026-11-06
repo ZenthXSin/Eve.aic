@@ -103,9 +103,10 @@ async fn one_tool_free_request_carries_only_the_batch_and_generic_rules() {
             "system prompt must stay domain-agnostic: {domain}"
         );
     }
-    assert_eq!(
-        request.messages[1].text.as_deref().unwrap(),
-        serde_json::to_string(&input).unwrap()
+    assert!(
+        serde_json::from_str::<ObservationBatch>(request.messages[1].text.as_deref().unwrap())
+            .unwrap()
+            == input
     );
     // 留出的其他领域使用同一观察器与契约。
     let held_out = "我最近迷上了水彩画，但调色总是很脏。";
@@ -124,6 +125,34 @@ async fn one_tool_free_request_carries_only_the_batch_and_generic_rules() {
     assert_eq!(
         mock.requests.lock().unwrap()[0].messages[0].text,
         request.messages[0].text
+    );
+}
+
+#[tokio::test]
+async fn changing_batch_metadata_keeps_the_evidence_prefix_and_scoped_session() {
+    let (observer, mock) = setup(text(r#"{"updates":[]}"#));
+    let first = batch(&[INTEREST]);
+    let mut next = first.clone();
+    next.id = "interest-next-batch".into();
+    next.started_at_ms += 100;
+    observer.observe(first.clone()).await.unwrap();
+    observer.observe(next.clone()).await.unwrap();
+    let requests = mock.requests.lock().unwrap();
+    let previous_text = requests[0].messages[1].text.as_deref().unwrap();
+    let next_text = requests[1].messages[1].text.as_deref().unwrap();
+    let stable_end = previous_text.rfind(",\"id\":").unwrap();
+    assert_eq!(&previous_text[..stable_end], &next_text[..stable_end]);
+    assert!(serde_json::from_str::<ObservationBatch>(previous_text).unwrap() == first);
+    assert!(serde_json::from_str::<ObservationBatch>(next_text).unwrap() == next);
+    let previous_session = requests[0].session.as_ref().unwrap();
+    let next_session = requests[1].session.as_ref().unwrap();
+    assert_eq!(
+        previous_session.prompt_cache_key(),
+        next_session.prompt_cache_key()
+    );
+    assert_ne!(
+        previous_session.client_request_id(),
+        next_session.client_request_id()
     );
 }
 

@@ -3,6 +3,7 @@ use eve_chime_api::{ChimeContext, ChimeJudge, ChimeVerdict};
 use eve_llm_api::{
     ChatMessage, ChatRole, LlmError, LlmFuture, LlmModelResolver, ModelRequest, ModelResponse,
 };
+use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -51,6 +52,32 @@ pub(crate) fn parse(text: &str) -> Result<ChimeVerdict, LlmError> {
     Ok(verdict)
 }
 
+#[derive(Serialize)]
+struct PromptContext<'a> {
+    persona: &'a str,
+    recent: Vec<serde_json::Value>,
+    minutes_since_my_last_reply: Option<u64>,
+    my_replies_last_hour: usize,
+}
+
+fn prompt_context(context: &ChimeContext) -> Result<String, LlmError> {
+    // 时间和发言计数放在原话之后，不让变化节奏打断相同群聊窗口。
+    serde_json::to_string(&PromptContext {
+        persona: &context.persona,
+        recent: context
+            .recent
+            .iter()
+            .map(|m| {
+                json!({"speaker": m.speaker_name.as_deref().unwrap_or("群友"),
+                   "me": m.from_me, "text": m.text})
+            })
+            .collect(),
+        minutes_since_my_last_reply: context.since_my_last_reply_ms.map(|ms| ms / 60_000),
+        my_replies_last_hour: context.my_replies_last_hour,
+    })
+    .map_err(|_| LlmError::Context("插话判断材料编码失败".into()))
+}
+
 impl ChimeJudge for ModelChimeJudge {
     fn judge(&self, context: ChimeContext) -> LlmFuture<'_, ChimeVerdict> {
         Box::pin(async move {
@@ -60,21 +87,7 @@ impl ChimeJudge for ModelChimeJudge {
                     .target()
                     .ok_or_else(|| LlmError::Context("插话判断缺少可信消息范围".into()))?,
             )?;
-            let recent: Vec<_> = context
-                .recent
-                .iter()
-                .map(|m| {
-                    json!({"speaker": m.speaker_name.as_deref().unwrap_or("群友"),
-                           "me": m.from_me, "text": m.text})
-                })
-                .collect();
-            let input = json!({
-                "persona": context.persona,
-                "recent": recent,
-                "minutes_since_my_last_reply": context.since_my_last_reply_ms.map(|ms| ms / 60_000),
-                "my_replies_last_hour": context.my_replies_last_hour,
-            })
-            .to_string();
+            let input = prompt_context(&context)?;
             let request = ModelRequest {
                 session: Some(session),
                 messages: vec![
@@ -97,6 +110,39 @@ impl ChimeJudge for ModelChimeJudge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_reply_timing_preserves_persona_and_original_message_prefix() {
+        let mut context = ChimeContext {
+            persona: "Eve".into(),
+            recent: vec![eve_chime_api::GroupMessage {
+                id: "message-1".into(),
+                conversation: "group".into(),
+                speaker: "person".into(),
+                speaker_name: None,
+                text: "今天读完这本书了\n原话".into(),
+                mentions_me: false,
+                replies_to_me: false,
+                from_me: false,
+                at_ms: 100,
+            }],
+            since_my_last_reply_ms: None,
+            my_replies_last_hour: 0,
+        };
+        let first = prompt_context(&context).unwrap();
+        context.since_my_last_reply_ms = Some(120_000);
+        context.my_replies_last_hour = 1;
+        let next = prompt_context(&context).unwrap();
+        let prefix = first.find(",\"minutes_since_my_last_reply\":").unwrap();
+        assert_eq!(&first[..prefix], &next[..prefix]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&next).unwrap(),
+            json!({
+                "persona":"Eve", "recent":[{"speaker":"群友","me":false,"text":"今天读完这本书了\n原话"}],
+                "minutes_since_my_last_reply":2, "my_replies_last_hour":1,
+            })
+        );
+    }
 
     #[test]
     fn verdicts_must_be_strict_json_with_bounded_fields() {

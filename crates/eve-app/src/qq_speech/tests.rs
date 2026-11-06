@@ -20,6 +20,69 @@ fn speak() -> QqSpeechDecision {
     }
 }
 
+#[test]
+fn new_facts_preserve_rules_pinned_and_history_before_dynamic_speech_context() {
+    let context = ContextSnapshot {
+        pinned: vec!["固定身份与宿主工具事实".into()],
+        profile: "原有交流画像".into(),
+        memories: vec!["原有记忆".into()],
+        ..Default::default()
+    };
+    let history = json!({"turns":[{"internal_final":"旧轮次收尾不是本次输出"}]});
+    let deliveries = vec![json!({"delivery_status":"unknown","event_id":"earlier"})];
+    let first_event = event("first");
+    let first = decision_messages(
+        "同一个 Eve".into(),
+        context.clone(),
+        history.clone(),
+        deliveries.clone(),
+        &first_event,
+        "用户当前完整原话\n第二行".into(),
+        100,
+    );
+    let next_context = ContextSnapshot {
+        profile: "更新后的交流画像".into(),
+        memories: vec!["新的记忆".into()],
+        ..context
+    };
+    let next = decision_messages(
+        "同一个 Eve".into(),
+        next_context,
+        history.clone(),
+        vec![],
+        &event("next"),
+        "另一句原话".into(),
+        200,
+    );
+    assert_eq!(&first[..4], &next[..4]);
+    assert_eq!(first[1].text.as_deref(), Some(RULES));
+    assert_ne!(first[4], next[4]);
+    let data = |message: &ChatMessage| -> Value {
+        serde_json::from_str(message.text.as_deref().unwrap().split_once('：').unwrap().1).unwrap()
+    };
+    assert_eq!(
+        data(&first[2]),
+        json!({"pinned":["固定身份与宿主工具事实"]})
+    );
+    assert_eq!(data(&first[3]), history);
+    assert_eq!(
+        data(&first[4]),
+        json!({
+            "profile":"原有交流画像", "memories":["原有记忆"], "recent_deliveries":deliveries
+        })
+    );
+    assert_eq!(first[5].text.as_deref(), Some(FORMAT_GUARD));
+    let input: Value = serde_json::from_str(first[6].text.as_deref().unwrap()).unwrap();
+    assert_eq!(input["host_event"], first_event.facts);
+    assert_eq!(input["now_ms"], 100);
+    assert_eq!(
+        input["current_user_message"],
+        json!({
+            "id":first_event.anchor, "text":"用户当前完整原话\n第二行"
+        })
+    );
+}
+
 fn ready(store: &Store, event: &QqSpeechEvent) {
     store.enqueue(event).unwrap();
     store.save(event, "ready", Some(&speak()), 0).unwrap();

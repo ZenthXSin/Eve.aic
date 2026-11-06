@@ -53,7 +53,8 @@ impl ContextRelevanceSelector for JevRelationJudge {
             let _slot = self
                 .slots
                 .try_acquire()
-                .map_err(|_| MemoryError::Unavailable)?;
+                .map_err(|_| MemoryError::Unavailable)?
+                .ok_or(MemoryError::Unavailable)?;
             let body = request(&input, &self.config.model);
             if serde_json::to_vec(&body)
                 .map_err(|_| MemoryError::InvalidInput)?

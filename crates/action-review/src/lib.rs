@@ -1,5 +1,6 @@
 //! 行动审查只处理具体系统危险；身份变更保留独立的可信原话入口。
-//! 每次最多一次模型请求，由 submit_review 提交结论，不执行待审动作。
+//! 可先用独立分类器判断，无法确定时至多一次 LLM submit_review，不执行待审动作。
+mod fallback;
 use eve_developer_api::{
     ActionReviewFuture, ActionReviewRequest, ActionReviewVerdict, ActionReviewer,
     ReviewAuthorization, ReviewRisk,
@@ -7,6 +8,7 @@ use eve_developer_api::{
 use eve_llm_api::{
     ChatMessage, ChatRole, LlmModelResolver, ModelRequest, ModelResponse, ToolDefinition,
 };
+pub use fallback::{FallbackActionReviewer, ReviewChainLimits};
 use serde::Deserialize;
 use std::sync::Arc;
 

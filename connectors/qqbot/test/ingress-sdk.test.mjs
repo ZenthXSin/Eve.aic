@@ -65,10 +65,13 @@ test("SDK 缺失或非字符串正文保留具体类型，不从附件或 raw �
 });
 
 test("空白、不支持的附件和仅引用内容仍按归一化空正文拒绝", async t => {
-  for (const [event, patch, attachments, elements] of [
+  for (const [event, patch, attachments, elements, rejections] of [
     ["C2C_MESSAGE_CREATE", {content: " \t\uFEFF "}, null, null],
-    ["C2C_MESSAGE_CREATE", {content: "", attachments: [{content_type: "audio/ogg", url: "https://media.example.invalid/voice.ogg"}]}, 1, null],
-    ["C2C_MESSAGE_CREATE", {content: "", message_type: 103, msg_elements: [{msg_idx: "quote-1", content: "PRIVATE_QUOTE", attachments: [image]}]}, null, 1],
+    ["C2C_MESSAGE_CREATE", {content: "", attachments: [{content_type: "audio/ogg", url: "https://media.example.invalid/voice.ogg"}]}, 1, null, {unsupported_type: 1}],
+    ["GROUP_MESSAGE_CREATE", {content: "", attachments: [{content_type: "video/PRIVATE_TYPE"}]}, 1, null, {unsupported_type: 1}],
+    ["C2C_MESSAGE_CREATE", {content: "", attachments: [{content_type: "image/png", url: "http://PRIVATE_HOST/PRIVATE_IMAGE"}]}, 1, null, {invalid_url: 1}],
+    ["C2C_MESSAGE_CREATE", {content: "", attachments: [null]}, 1, null, {invalid_shape: 1}],
+    ["C2C_MESSAGE_CREATE", {content: "", message_type: 103, msg_elements: [{msg_idx: "quote-1", content: "PRIVATE_QUOTE", attachments: [image]}]}, null, 1, {quoted: 1}],
   ]) {
     const frames = await fixture(t).receive(event, patch);
     assert.equal(frames.length, 1);
@@ -80,6 +83,7 @@ test("空白、不支持的附件和仅引用内容仍按归一化空正文拒�
     assert.equal(detail.last.attachments_count, attachments);
     assert.equal(detail.last.elements_count, elements);
     assert.equal(detail.last.accepted_attachment_count, 0);
+    assert.deepEqual(detail.last.attachment_rejections, rejections);
     assert.equal(JSON.stringify(detail).includes("PRIVATE"), false);
   }
 });

@@ -1,5 +1,6 @@
 //! 本地前缀复用探针：与同一用途最近的请求比较，估算本次请求从开头起有多少内容
-//! 与已发出的请求完全相同（提供方前缀缓存能复用的上限）。只保存哈希，不保存正文。
+//! 与已发出的请求完全相同。以整条消息保守估算，不计变化消息内部仍相同的前缀，
+//! 不是提供方实际命中或计费 token。只保存哈希，不保存正文。
 use eve_llm_api::{
     LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ModelUsageObserver,
     PrefixReuse,
@@ -25,8 +26,8 @@ fn serialized(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
-/// 前缀哈希链：第 0 项是工具定义，第 i 项是工具定义加前 i 条消息。
-fn chain(request: &ModelRequest) -> (Vec<u64>, Vec<u64>) {
+/// 前缀哈希链：第 0 项是会话与工具定义，第 i 项再加前 i 条消息。
+fn chain(request: &ModelRequest) -> (u64, Vec<u64>, Vec<u64>) {
     let mut hasher = DefaultHasher::new();
     // 上游缓存按可信长期会话隔离；相同正文出现在其他用户/用途时不能算本会话命中。
     request
@@ -34,6 +35,7 @@ fn chain(request: &ModelRequest) -> (Vec<u64>, Vec<u64>) {
         .as_ref()
         .map(|s| s.prompt_cache_key())
         .hash(&mut hasher);
+    let session = hasher.finish();
     let tools = serialized(&request.tools);
     tools.hash(&mut hasher);
     let mut hashes = vec![hasher.finish()];
@@ -48,18 +50,18 @@ fn chain(request: &ModelRequest) -> (Vec<u64>, Vec<u64>) {
         hashes.push(hasher.finish());
         tokens.push(estimate_tokens(&text) + message.images.len() as u64 * 1000);
     }
-    (hashes, tokens)
+    (session, hashes, tokens)
 }
 
 #[derive(Default)]
 struct Seen {
-    order: VecDeque<Vec<u64>>,
+    order: VecDeque<(u64, Vec<u64>)>,
     counts: HashMap<u64, u32>,
 }
 
 impl Seen {
     fn measure(&mut self, request: &ModelRequest) -> PrefixReuse {
-        let (hashes, tokens) = chain(request);
+        let (session, hashes, tokens) = chain(request);
         let known = hashes
             .iter()
             .take_while(|hash| self.counts.contains_key(hash))
@@ -71,14 +73,16 @@ impl Seen {
             reused_tokens: reused,
             messages: request.messages.len(),
             first_changed_message: (known < hashes.len()).then(|| known.saturating_sub(1)),
-            tools_changed: known == 0 && !self.order.is_empty(),
+            // 新会话的冷启动不代表工具变化；只与同一会话的已知请求比较。
+            tools_changed: known == 0
+                && self.order.iter().any(|(previous, _)| *previous == session),
         };
         for hash in &hashes {
             *self.counts.entry(*hash).or_default() += 1;
         }
-        self.order.push_back(hashes);
+        self.order.push_back((session, hashes));
         if self.order.len() > PREFIX_MEMORY
-            && let Some(old) = self.order.pop_front()
+            && let Some((_, old)) = self.order.pop_front()
         {
             for hash in old {
                 if let Some(count) = self.counts.get_mut(&hash) {
