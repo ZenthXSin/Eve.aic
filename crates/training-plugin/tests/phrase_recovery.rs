@@ -104,6 +104,17 @@ fn drafts() -> Vec<PhraseDraft> {
     }]
 }
 
+fn text_with_bytes(bytes: usize) -> String {
+    let mut text = "原".repeat(bytes / 3);
+    match bytes % 3 {
+        1 => text.push('x'),
+        2 => text.push('é'),
+        _ => {}
+    }
+    assert!(text.chars().count() <= 512);
+    text
+}
+
 /// 合法 v1 文档恰好填满 2 MiB：每范围最多 24 条，每条至多 512 字符。
 /// 用 JSON 实际长度填充，不依赖新实现的阶段预留常量。
 fn full_legacy_document() -> Vec<u8> {
@@ -133,16 +144,6 @@ fn full_legacy_document() -> Vec<u8> {
         + pending.len()
         - 1;
     let maximum = 2 * 1_048_576;
-    let text_with_bytes = |bytes: usize| {
-        let mut text = "原".repeat(bytes / 3);
-        match bytes % 3 {
-            1 => text.push('x'),
-            2 => text.push('é'),
-            _ => {}
-        }
-        assert!(text.chars().count() <= 512);
-        text
-    };
     for index in 0..(256 - 2) * 24 {
         let mut entry = serde_json::json!({
             "scope": scope(&format!("filler-{}", index / 24)),
@@ -168,6 +169,78 @@ fn full_legacy_document() -> Vec<u8> {
         return bytes;
     }
     panic!("应先达到字节上限");
+}
+
+fn full_v2_document(phase: serde_json::Value) -> serde_json::Value {
+    let mut document: serde_json::Value = serde_json::from_slice(&full_legacy_document()).unwrap();
+    document["version"] = 2.into();
+    document["next"] = 3.into();
+    let messages: Vec<_> = document["pending"]
+        .as_array_mut()
+        .unwrap()
+        .drain(..PHRASE_BATCH)
+        .map(|pending| pending["text"].clone())
+        .collect();
+    document["inflight"] = serde_json::json!([{
+        "batch": {
+            "id": "b2", "scope": scope("one"), "messages": messages,
+            "attempt": 1, "learner_version": PHRASE_LEARNER_VERSION
+        },
+        "phase": phase
+    }]);
+    let maximum = 2 * 1_048_576;
+    let remaining = maximum - serde_json::to_vec(&document).unwrap().len();
+    let padding = document["pending"][0]["text"].as_str().unwrap().len();
+    document["pending"][0]["text"] = text_with_bytes(padding + remaining).into();
+    assert_eq!(serde_json::to_vec(&document).unwrap().len(), maximum);
+    document
+}
+
+#[tokio::test]
+async fn v2_restore_checks_phase_capacity_without_rejecting_the_valid_boundary() {
+    for phase in [
+        serde_json::json!({"state": "running"}),
+        serde_json::json!({"state": "unknown"}),
+        serde_json::json!({"state": "retry_wait", "failure": "timeout", "ready_at_ms": 0}),
+    ] {
+        let mut document = full_v2_document(phase.clone());
+        let bytes = serde_json::to_vec(&document).unwrap();
+        let state = Arc::new(FaultState::default());
+        let id = PluginId::new(TRAINING_PLUGIN_ID).unwrap();
+        state.storage.set(&id, KEY.into(), bytes.clone()).unwrap();
+        let kernel = Kernel::with_services(KernelServices {
+            state: state.clone(),
+            ..Default::default()
+        });
+        kernel
+            .register(Box::new(
+                TrainingPlugin::new(true).unwrap().with_phrase_learning(),
+            ))
+            .unwrap();
+        assert!(
+            kernel.start(&id).await.is_err(),
+            "v2 原始字节合规仍须保留阶段容量"
+        );
+        assert_eq!(state.raw(), bytes, "拒绝恢复不改写原始文档");
+        kernel.stop_all().await.unwrap();
+
+        // 各阶段合计 128 字节的既定格式边界，不因恢复校验而拒绝可写状态。
+        let reserve = 128 - serde_json::to_vec(&phase).unwrap().len();
+        let padding = document["pending"][0]["text"].as_str().unwrap().len();
+        document["pending"][0]["text"] = text_with_bytes(padding - reserve).into();
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert_eq!(bytes.len() + reserve, 2 * 1_048_576);
+        state.storage.set(&id, KEY.into(), bytes.clone()).unwrap();
+        let (kernel, training) = open(state.clone()).await;
+        assert_eq!(state.raw(), bytes, "边界状态只读恢复");
+        if phase["state"] == "retry_wait" {
+            let batch = training.take_phrase_batch(0).unwrap().unwrap();
+            assert_eq!(batch.id, "b2");
+            assert_eq!(batch.attempt, 2);
+            assert_eq!(batch.scope, scope("one"));
+        }
+        kernel.stop_all().await.unwrap();
+    }
 }
 
 fn capacity_drafts() -> Vec<PhraseDraft> {

@@ -182,6 +182,11 @@ impl Phrases {
         {
             return Err(corrupt());
         }
+        // v2 写入已为每个阶段预留容量，恢复时必须校验同一不变量。
+        // 满容量 v1 增加 inflight 字段后可能暂时放不下；仍允许只读恢复旧数据。
+        if version.version == 2 {
+            value.bytes().map_err(|_| corrupt())?;
+        }
         // 重开后的 Running 可能已收到结果或提交失败，不猜成 HTTP 暂态。
         for entry in &mut value.inflight {
             if matches!(entry.phase, Phase::Running {}) {
