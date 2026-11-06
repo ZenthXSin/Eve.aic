@@ -1,5 +1,7 @@
 # Jev / SystemOne 消息判断
 
+行动审查使用独立公开分类契约，覆盖身份/访问边界和直接系统安全两条入口；需要语义判断时先 Jev，无法确定再一次 LLM 后备，见 [Jev 行动审查](./Jev行动审查.md)。本文的消息模式、澄清与消息期限不用于行动审查。
+
 `eve-jev` 是实现公开 `RelationJudge` 的独立 HTTP 适配器，协议依据 TypeSafe 官方 Python SDK 固定版本 [`f078f1e`](https://github.com/typesafe-ai/typesafe-sdk-python/tree/f078f1e208a0d885154dc758344ae4fce77ac168)：`POST /v1/systemone`，Bearer 凭据，输入 `state/model/questions`。适配器只判断消息，不执行工具或控制动作。
 
 QQ 宿主通过显式开关装配，保持实验功能默认关闭。终端入口仍未接入自然消息判断；本地替身验收只证明接线和恢复边界。OpenRouter 支持相同 TypeSafe 协议，可复用此适配器；真实调用和公开样本评估仍不代表线上任务完成率或置信度已校准。
@@ -30,6 +32,8 @@ Jev 模式需要宿主环境中的 `EVE_JEV_API_KEY`，不会读取主模型密�
 | `runtime.models.jev_max_output_tokens` | `EVE_MODELS_JEV_MAX_OUTPUT_TOKENS` | 保持 0；当前 Jev 协议适配不支持此选项 |
 
 启动只预检并构造客户端，不发送健康探测请求。缺凭据、角色关闭或配置错误会拒绝启动；运行中的 Jev 配置变坏则返回不可用并进入主模型回退。每次判断捕获同一修订的角色与 Provider 配置，最多重读四次；在途请求固定选择，新请求使用新配置，宿主只缓存最近一个客户端选择。凭据在宿主启动时读取，变更凭据需重启。
+
+Jev 准入按宿主配置服务身份共享，客户端热更新不会重置在途数量。新候选完整验证后才更新限额；降低上限保留旧请求，后续请求等空位或按原用途回退，旧修订不能重新放宽新限额。主/辅模型与 Jev 分别计数，群原话挑选的等待仍以三秒为限。具体装配和恢复语义见 [Jev 行动审查](Jev行动审查.md)。
 
 ## 通过 OpenRouter 使用原生 Jev
 

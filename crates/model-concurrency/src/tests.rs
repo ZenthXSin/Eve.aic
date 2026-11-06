@@ -326,8 +326,64 @@ async fn invalid_limits_conflicting_revision_and_ticket_overflow_fail_without_qu
     assert!(gate.observe(3, 1).is_err());
     assert!(gate.observe(0, 2).is_err());
     gate.state.lock().unwrap().next = u64::MAX;
+    assert!(gate.try_acquire().is_err());
     assert!(gate.acquire().await.is_err());
     let state = gate.state.lock().unwrap();
     assert_eq!((state.limit, state.revision), (2, 1));
     assert!(state.active.is_empty() && state.queued.is_empty());
+}
+
+#[tokio::test]
+async fn immediate_admission_cannot_jump_a_queued_request_and_cancellation_releases_its_position() {
+    use std::{future::Future, task::Poll};
+    let gate = ConcurrencyGate::new(1, 1).unwrap();
+    let held = gate.try_acquire().unwrap().unwrap();
+    assert!(gate.try_acquire().unwrap().is_none());
+    let mut waiting = Box::pin(gate.acquire());
+    std::future::poll_fn(|cx| {
+        assert!(waiting.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(held);
+    assert_eq!(gate.status().unwrap().active, 0);
+    assert!(gate.try_acquire().unwrap().is_none(), "等待者保留先到顺序");
+    let entered = waiting.await.unwrap();
+    assert_eq!(gate.status().unwrap().waiting, 0);
+    let mut cancelled = Box::pin(gate.acquire());
+    std::future::poll_fn(|cx| {
+        assert!(cancelled.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(cancelled);
+    assert_eq!(gate.status().unwrap().waiting, 0);
+    drop(entered);
+    let next = gate.try_acquire().unwrap().unwrap();
+    assert_eq!(gate.status().unwrap().active, 1);
+    drop(next);
+    assert_eq!(gate.status().unwrap().active, 0);
+}
+
+#[test]
+fn immediate_admission_keeps_active_count_when_limit_changes_and_stale_revision_cannot_reopen() {
+    let gate = ConcurrencyGate::new(2, 1).unwrap();
+    let first = gate.try_acquire().unwrap().unwrap();
+    let second = gate.try_acquire().unwrap().unwrap();
+    gate.observe(1, 2).unwrap();
+    assert_eq!(gate.status().unwrap().active, 2);
+    assert!(gate.try_acquire().unwrap().is_none());
+    drop(first);
+    gate.observe(32, 1).unwrap();
+    assert_eq!(gate.status().unwrap().limit, 1);
+    assert!(gate.try_acquire().unwrap().is_none());
+    drop(second);
+    let third = gate.try_acquire().unwrap().unwrap();
+    assert!(gate.try_acquire().unwrap().is_none());
+    gate.observe(2, 3).unwrap();
+    let fourth = gate.try_acquire().unwrap().unwrap();
+    assert_eq!(gate.status().unwrap().active, 2);
+    drop(third);
+    drop(fourth);
+    assert_eq!(gate.status().unwrap().active, 0);
 }

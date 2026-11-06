@@ -101,6 +101,7 @@ pub struct OpenAiProvider {
     client: Client,
     timing_diagnostics: bool,
     transient_retries: bool,
+    recover_tool_arguments: bool,
     streamed_completions: bool,
     stream_timeouts: Option<StreamTimeoutPolicy>,
     usage: Option<(std::sync::Arc<dyn eve_llm_api::ModelUsageObserver>, String)>,
@@ -213,6 +214,7 @@ impl OpenAiProvider {
             client,
             timing_diagnostics: false,
             transient_retries: false,
+            recover_tool_arguments: false,
             streamed_completions: false,
             stream_timeouts: None,
             usage: None,
@@ -245,6 +247,13 @@ impl OpenAiProvider {
     /// 默认关闭，由聊天组合层显式启用，后台学习保持原有一次性执行语义。
     pub fn with_transient_retries(mut self) -> Self {
         self.transient_retries = true;
+        self
+    }
+
+    /// 主对话可额外允许重取一次无效 JSON 工具参数；仍受 transient_retries、
+    /// 原总尝试次数和期限约束。默认关闭，后台用途不自动增加模型调用。
+    pub fn with_tool_argument_recovery(mut self) -> Self {
+        self.recover_tool_arguments = true;
         self
     }
 

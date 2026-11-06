@@ -1,18 +1,7 @@
 //! 组合层只读取宿主配置与凭据引用。
 use crate::{AppError, CoreBootstrap};
-use eve_developer_api::{ActionReviewFuture, ActionReviewRequest, ActionReviewer, DeveloperConfig};
-use eve_llm_api::{
-    LlmError, LlmModelResolver, ModelHealthObserver, ModelOutcome, ModelSelection, ProviderFailure,
-    ProviderFailureKind,
-};
-use eve_plugin_api::ServiceRegistry;
-use serde_json::json;
-use std::{
-    collections::BTreeSet,
-    path::Path,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use eve_developer_api::{ActionReviewer, DeveloperConfig};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
 /// 行动审查的模型用途，单独记健康与输出上限。
 pub(crate) const REVIEW_USE: &str = "review";
@@ -214,95 +203,5 @@ pub(crate) fn member_runtime(
     }
 }
 
-/// 首次审查时才从已启动的配置服务取模型；之后沿用同一解析器，热配置照常生效。
-struct RegistryResolver {
-    registry: Arc<dyn ServiceRegistry>,
-    key: String,
-    resolver: OnceLock<crate::models::CoreModelResolver>,
-}
-impl LlmModelResolver for RegistryResolver {
-    fn resolve(&self) -> Result<ModelSelection, LlmError> {
-        if self.resolver.get().is_none() {
-            let settings = crate::qq_tasks::config_service(self.registry.as_ref())
-                .map_err(|e| LlmError::Configuration(e.to_string()))?;
-            let _ = self.resolver.set(
-                crate::models::CoreModelResolver::new(settings, self.key.clone())
-                    .with_use(REVIEW_USE),
-            );
-        }
-        self.resolver
-            .get()
-            .ok_or_else(|| LlmError::Configuration("审查模型不可用".into()))?
-            .resolve()
-    }
-}
-/// 每次审查的结局写入标准错误的 `EVE_ACTION_REVIEW` 行，不含命令与原话。
-struct Reported(
-    eve_action_review::ModelActionReviewer,
-    Arc<eve_model_health::HealthBook>,
-);
-impl ActionReviewer for Reported {
-    fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
-        self.review_reported(request, false)
-    }
-
-    fn review_system_safety(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
-        self.review_reported(request, true)
-    }
-}
-impl Reported {
-    fn review_reported(
-        &self,
-        request: ActionReviewRequest,
-        system_safety: bool,
-    ) -> ActionReviewFuture<'_> {
-        Box::pin(async move {
-            let delegated = request.delegated;
-            let result = if system_safety {
-                self.0.review_system_safety(request).await
-            } else {
-                self.0.review(request).await
-            };
-            let outcome = match &result {
-                Ok(_) => ModelOutcome::Succeeded,
-                Err(e) if e.contains("超时") => ModelOutcome::TimedOut,
-                Err(e) if e.starts_with("审查输出") || e.starts_with("审查理由") => {
-                    ModelOutcome::InvalidResponse
-                }
-                Err(_) => ModelOutcome::Failed {
-                    failure: ProviderFailure::new(ProviderFailureKind::Other),
-                },
-            };
-            self.1
-                .record(REVIEW_USE, outcome, crate::qq_people::now_ms());
-            let line = match &result {
-                Ok(v) => {
-                    json!({"outcome": if (system_safety && v.permits_system_safety()) || (!system_safety && v.permits()) { "allowed" } else { "denied" },
-                    "risk": v.risk, "authorization": v.authorization, "delegated": delegated,"system_safety":system_safety})
-                }
-                Err(_) => json!({"outcome": "failed", "error": outcome, "delegated": delegated}),
-            };
-            eprintln!("EVE_ACTION_REVIEW {line}");
-            result
-        })
-    }
-}
-/// QQ 宿主的行动审查者；没有模型凭据时不装配，普通开发不依赖审查服务。
-pub(crate) fn action_reviewer(
-    registry: Arc<dyn ServiceRegistry>,
-    health: Arc<eve_model_health::HealthBook>,
-) -> Option<Arc<dyn ActionReviewer>> {
-    let key = std::env::var("EVE_OPENAI_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())?;
-    health.register(REVIEW_USE);
-    let resolver = RegistryResolver {
-        registry,
-        key,
-        resolver: OnceLock::new(),
-    };
-    Some(Arc::new(Reported(
-        eve_action_review::ModelActionReviewer::new(Arc::new(resolver)),
-        health,
-    )))
-}
+mod action_review;
+pub(crate) use action_review::action_reviewer;
