@@ -251,6 +251,15 @@ impl HistoryContextPlanner for Planner {
         input: &'a TurnInput,
         history: &'a [ChatMessage],
     ) -> LlmFuture<'a, Option<HistoryContextPlan>> {
+        self.plan_with_model_session(scope, input, history, None)
+    }
+    fn plan_with_model_session<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        input: &'a TurnInput,
+        history: &'a [ChatMessage],
+        model_session: Option<&'a ModelSession>,
+    ) -> LlmFuture<'a, Option<HistoryContextPlan>> {
         Box::pin(async move {
             let Some(scope) = scope.filter(|s| s.user_id != crate::qq_group::USER) else {
                 return Ok(None);
@@ -326,11 +335,27 @@ impl HistoryContextPlanner for Planner {
                 }
                 if !candidates.is_empty() {
                     let request = ContextSelectionInput {
+                        model_session: Some(match model_session {
+                            Some(session) => {
+                                session.validate_scope(Some(scope))?;
+                                session.fork("context-selector", None)?
+                            }
+                            None => ModelSession::scoped("context-selector", scope)?,
+                        }),
                         query: excerpt(&input.text, eve_memory_api::MAX_CONTEXT_QUERY_BYTES),
                         candidates,
                     };
                     // 原记录任何修正均使建议缓存失效，包括候选摘录之外的工具结果。
-                    let key = hash(&(scope, &request, &work, history))?;
+                    let key = hash(&(
+                        scope,
+                        request
+                            .model_session
+                            .as_ref()
+                            .map(ModelSession::prompt_cache_key),
+                        &request,
+                        &work,
+                        history,
+                    ))?;
                     let chosen = self.choose(key, request, fallback).await;
                     for id in chosen {
                         if let Some(i) = id
@@ -1231,6 +1256,9 @@ mod tests {
             arguments: json!({}),
         };
         let frame = TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: own.clone(),
             messages: vec![ChatMessage::text(ChatRole::User, "核验")],
@@ -1320,6 +1348,7 @@ mod tests {
             .ok()
             .unwrap();
         let input = ContextSelectionInput {
+            model_session: None,
             query: "atlas".into(),
             candidates: vec![ContextCandidate {
                 id: "h0".into(),

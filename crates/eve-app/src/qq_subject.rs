@@ -394,8 +394,19 @@ impl ContextAssembler for Context {
         input: TurnInput,
         identity: Option<ContextScope>,
     ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, identity, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        identity: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async move {
-            let mut result = self.inner.assemble_scoped(input, identity.clone()).await?;
+            let mut result = self
+                .inner
+                .assemble_with_model_session(input, identity.clone(), model_session.clone())
+                .await?;
             if let Some(identity) = identity {
                 let snapshot = self
                     .subject
@@ -2383,6 +2394,9 @@ mod tests {
     }
     fn frame(task: &Task) -> eve_llm_api::TurnCheckpoint {
         eve_llm_api::TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: trusted(&task.owner.session_id, &task.owner.user_id),
             messages: vec![eve_llm_api::ChatMessage::text(
@@ -3615,6 +3629,9 @@ mod tests {
             .checkpoint(
                 &task.id,
                 eve_llm_api::TurnCheckpoint {
+                    pending_model_request: None,
+                    pending_request_fingerprint: None,
+                    model_session: None,
                     version: 1,
                     scope: trusted("a", "owner"),
                     messages: vec![eve_llm_api::ChatMessage::text(
@@ -4348,6 +4365,9 @@ mod tests {
             .execution
             .get_or_insert_with(Default::default)
             .checkpoint = Some(eve_llm_api::TurnCheckpoint {
+            pending_model_request: None,
+            pending_request_fingerprint: None,
+            model_session: None,
             version: 1,
             scope: trusted("a", "owner"),
             messages: vec![

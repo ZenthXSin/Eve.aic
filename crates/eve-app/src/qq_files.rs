@@ -1157,8 +1157,14 @@ impl Tool for DescribeImageTool {
             };
             let provider = OpenAiProvider::new(config, &self.api_key)
                 .map_err(|error| failed(format!("识图模型不可用：{error}")))?;
+            let session = context.model_session_for("vision").map_err(failed)?;
             match provider
-                .describe_image(&vision_prompt(question), &content_type, &bytes)
+                .describe_image_with_session(
+                    &vision_prompt(question),
+                    &content_type,
+                    &bytes,
+                    session.as_ref(),
+                )
                 .await
             {
                 Ok(description) => {

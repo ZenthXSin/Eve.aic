@@ -55,6 +55,18 @@ impl GroupDigester for ModelGroupDigester {
         messages: Vec<GroupMessage>,
     ) -> LlmFuture<'_, String> {
         Box::pin(async move {
+            let session = crate::model_session(
+                "group-digest",
+                messages
+                    .last()
+                    .ok_or_else(|| LlmError::Context("群摘要缺少可信消息范围".into()))?,
+            )?;
+            if messages
+                .iter()
+                .any(|message| message.conversation != messages[0].conversation)
+            {
+                return Err(LlmError::Context("群摘要消息来自不同群范围".into()));
+            }
             let messages: Vec<_> = messages
                 .iter()
                 .map(|m| {
@@ -64,6 +76,7 @@ impl GroupDigester for ModelGroupDigester {
                 .collect();
             let input = json!({"persona": persona, "previous": previous, "messages": messages});
             let request = ModelRequest {
+                session: Some(session),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, FORMAT_GUARD),

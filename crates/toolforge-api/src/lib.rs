@@ -269,6 +269,9 @@ pub struct ToolRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgeRequest {
+    /// 宿主已验证的作业所有者，只用于会话隔离。
+    #[serde(skip)]
+    pub owner: String,
     pub forge_id: String,
     pub forger_version: String,
     pub gap: GapRef,

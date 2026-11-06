@@ -48,6 +48,14 @@ impl eve_llm_api::ContextAssembler for WebContext {
         input: eve_llm_api::TurnInput,
         scope: Option<ContextScope>,
     ) -> eve_llm_api::LlmFuture<'_, eve_llm_api::ContextSnapshot> {
+        self.assemble_with_model_session(input, scope, None)
+    }
+    fn assemble_with_model_session(
+        &self,
+        input: eve_llm_api::TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> eve_llm_api::LlmFuture<'_, eve_llm_api::ContextSnapshot> {
         Box::pin(async move {
             let owner = scope.as_ref().is_some_and(is_owner);
             let source = if owner {
@@ -55,7 +63,9 @@ impl eve_llm_api::ContextAssembler for WebContext {
             } else {
                 &self.inner
             };
-            let mut context = source.assemble_scoped(input, scope).await?;
+            let mut context = source
+                .assemble_with_model_session(input, scope, model_session.clone())
+                .await?;
             if owner {
                 context.profile.push_str("\n宿主认证事实：当前通道为 Web，当前用户是主人；身份由面板专用访问令牌与服务端绑定，不来自用户自述。可以直接交流和使用实际已装配工具。\n");
             }

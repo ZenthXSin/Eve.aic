@@ -46,6 +46,23 @@ pub(crate) fn parse(text: &str) -> Result<StickerReview, LlmError> {
 
 impl StickerReviewer for ModelStickerReviewer {
     fn review(&self, image: ImageInput) -> LlmFuture<'_, StickerReview> {
+        self.review_bound(image, None)
+    }
+    fn review_with_session(
+        &self,
+        image: ImageInput,
+        session: eve_llm_api::ModelSession,
+    ) -> LlmFuture<'_, StickerReview> {
+        self.review_bound(image, Some(session))
+    }
+}
+
+impl ModelStickerReviewer {
+    fn review_bound(
+        &self,
+        image: ImageInput,
+        session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, StickerReview> {
         Box::pin(async move {
             let mut user = ChatMessage::text(
                 ChatRole::User,
@@ -56,6 +73,7 @@ impl StickerReviewer for ModelStickerReviewer {
             );
             user.images = vec![image];
             let request = ModelRequest {
+                session,
                 messages: vec![ChatMessage::text(ChatRole::System, system_prompt()), user],
                 tools: vec![],
             };

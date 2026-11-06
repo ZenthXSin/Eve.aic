@@ -128,6 +128,7 @@ fn review_request(
     let mut action = vec![a.program.clone()];
     action.extend(a.args.iter().cloned());
     let request = ActionReviewRequest {
+        model_session: context.model_session_for("review").map_err(failed)?,
         program: a.program.clone(),
         arguments: a.args.clone(),
         workspace: String::new(),

@@ -139,6 +139,17 @@ impl RelationJudge for LlmRelationJudge {
                 return Err(RelationError::Unavailable);
             }
             let request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::scoped(
+                        "relation-judge",
+                        &eve_llm_api::ContextScope {
+                            session_id: input.message.target.session.session_id.clone(),
+                            user_id: input.message.target.session.user_id.clone(),
+                        },
+                    )
+                    .and_then(|s| s.with_turn(&input.message.message_id))
+                    .map_err(relation_error)?,
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, INSTRUCTIONS),
                     ChatMessage::text(ChatRole::User, FORMAT_GUARD),

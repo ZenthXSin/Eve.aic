@@ -139,6 +139,14 @@ struct LimitedProvider {
     provider: Arc<dyn LlmProvider>,
 }
 impl LlmProvider for LimitedProvider {
+    fn request_fingerprint(
+        &self,
+        request: &ModelRequest,
+        mode: eve_llm_api::ResponseMode,
+    ) -> Result<Option<eve_llm_api::ModelRequestFingerprint>, LlmError> {
+        self.provider.request_fingerprint(request, mode)
+    }
+
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         Box::pin(async move {
             let _permit = self.gate.acquire().await?;

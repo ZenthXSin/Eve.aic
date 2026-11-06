@@ -300,6 +300,27 @@ impl fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 pub trait SessionService: Send + Sync {
+    /// 从最新轮次向前分页，包含 Pending、Failed 和 Interrupted，不删减单轮正文。
+    /// before 是独占的轮次 ID；None 从最新开始，0/1 返回空页。limit 为 1..=16。
+    /// 每页核对完整会话身份；不存在的会话返回空页，身份不匹配返回 OwnerMismatch。
+    /// 后续用本页末项 ID 作为 before，追加新轮次不会改变较早页的范围。
+    /// 内置实现只读取本页。兼容默认逐页扫描、最多保留 limit 轮；自定义实现若只提供
+    /// snapshot，scan_turns 的兼容路径仍会先生成完整快照，应按存储能力覆盖本方法。
+    fn recent_turns(
+        &self,
+        key: &SessionKey,
+        before: Option<u64>,
+        limit: usize,
+    ) -> SessionResult<Vec<SessionTurn>> {
+        key.validate()?;
+        if !(1..=MAX_SESSION_TURN_PAGE).contains(&limit) {
+            return Err(SessionError::InvalidInput);
+        }
+        let Some(cursor) = self.scan_turns(key)? else {
+            return Ok(vec![]);
+        };
+        scan::recent_from_cursor(cursor, key, before, limit)
+    }
     fn scan_turns(&self, key: &SessionKey) -> SessionResult<Option<Box<dyn SessionTurnCursor>>> {
         match self.snapshot(key)? {
             Some(snapshot) => {

@@ -93,6 +93,9 @@ fn task(corrective: bool, initial_valid: bool) -> Task {
         notice: None,
         execution: Some(TaskExecution {
             checkpoint: Some(TurnCheckpoint {
+                pending_model_request: None,
+                pending_request_fingerprint: None,
+                model_session: None,
                 version: 1,
                 scope: ContextScope {
                     user_id: "owner".into(),

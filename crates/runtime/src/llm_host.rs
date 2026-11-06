@@ -258,6 +258,7 @@ struct PreparedTool {
 struct ToolCaller {
     turn_id: Option<u64>,
     scope: Option<eve_llm_api::ContextScope>,
+    model_session: Option<eve_llm_api::ModelSession>,
     continuation: eve_llm_api::TaskContinuation,
     conversation: Arc<Vec<ChatMessage>>,
     review_user_messages: Arc<Vec<String>>,
@@ -510,6 +511,7 @@ pub struct LlmHost {
     review_source: Option<Arc<dyn eve_llm_api::ReviewUserMessageSource>>,
     review_anchor: Option<String>,
     background_task_id: Option<String>,
+    model_session: Option<eve_llm_api::ModelSession>,
     run_deadline: Option<std::time::Instant>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
@@ -577,6 +579,7 @@ impl LlmHost {
             review_source: None,
             review_anchor: None,
             background_task_id: None,
+            model_session: None,
             run_deadline: None,
             journal: None,
             image_source: None,
@@ -595,6 +598,13 @@ impl LlmHost {
     /// 显式启用每轮模型解析；原 new 构造路径继续固定 Provider。
     pub fn with_model_resolver(mut self, resolver: Arc<dyn LlmModelResolver>) -> Self {
         self.model_resolver = Some(resolver);
+        self
+    }
+
+    /// 由入口显式绑定的长期模型会话。主会话默认按可信 ContextScope 构造；
+    /// 独立任务和子代理须绑定持久 task ID，不能继承父 Provider 上的固定缓存键。
+    pub fn with_model_session(mut self, session: eve_llm_api::ModelSession) -> Self {
+        self.model_session = Some(session);
         self
     }
 
@@ -1039,6 +1049,32 @@ impl LlmHost {
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
+        let model_session = (|| {
+            let session = if let Some(session) = &self.model_session {
+                Some(session.clone())
+            } else if let Some(id) = &self.background_task_id {
+                Some(
+                    eve_llm_api::ModelSession::anchored("task", scope.as_ref(), id)?
+                        .with_turn(id)?,
+                )
+            } else {
+                scope
+                    .as_ref()
+                    .map(|scope| eve_llm_api::ModelSession::scoped("main", scope))
+                    .transpose()?
+            };
+            session
+                .map(|session| {
+                    session.validate_scope(scope.as_ref())?;
+                    if let Some(turn_id) = turn_id {
+                        session.with_turn(&turn_id.to_string())
+                    } else {
+                        Ok(session)
+                    }
+                })
+                .transpose()
+        })()
+        .map_err(|error| fail(error, diagnostics.clone()))?;
         if let Some((evidence_scope, _)) = &self.delegated_review
             && scope.as_ref() != Some(evidence_scope)
         {
@@ -1047,6 +1083,62 @@ impl LlmHost {
                 diagnostics,
             ));
         }
+        // 上下文组装和历史规划也可能请求模型；先只读核对恢复身份，不能发出后才拒绝。
+        let loaded_checkpoint = if let Some(journal) = &self.journal {
+            if self.execution_budget.is_some()
+                || scope.is_none()
+                || history.as_ref().is_some_and(|history| !history.is_empty())
+            {
+                return Err(fail(
+                    LlmError::Configuration("执行检查点只支持有可信范围的独立任务".into()),
+                    diagnostics,
+                ));
+            }
+            let loaded = catch_unwind(AssertUnwindSafe(|| journal.load()))
+                .map_err(|_| {
+                    fail(
+                        LlmError::Context("执行日志读取异常；未自动回退".into()),
+                        diagnostics.clone(),
+                    )
+                })?
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+            if let Some(frame) = &loaded {
+                frame
+                    .validate(self.config.max_tool_calls)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                if Some(&frame.scope) != scope.as_ref() || !frame.resumable() {
+                    return Err(fail(
+                        LlmError::Context("检查点身份不匹配或存在结果未知的工具；未重放".into()),
+                        diagnostics,
+                    ));
+                }
+                if frame
+                    .model_session
+                    .as_ref()
+                    .is_some_and(|saved| Some(saved) != model_session.as_ref())
+                {
+                    return Err(fail(
+                        LlmError::Context(
+                            "检查点模型会话与当前任务不匹配；原记录保留，未请求模型".into(),
+                        ),
+                        diagnostics,
+                    ));
+                }
+                if frame.messages.len() < 2
+                    || frame.messages[..2]
+                        .iter()
+                        .any(|message| message.role != ChatRole::System)
+                {
+                    return Err(fail(
+                        LlmError::Context("执行日志缺少宿主消息头；未自动回退".into()),
+                        diagnostics,
+                    ));
+                }
+            }
+            loaded
+        } else {
+            None
+        };
         let steering = match (&self.steering, scope.as_ref(), turn_id) {
             (Some(source), Some(scope), Some(turn_id)) => Some(
                 source
@@ -1071,7 +1163,7 @@ impl LlmHost {
         let prepared = tokio::select! {
             biased;
             _ = wait_closed(events) => Err(LlmError::Cancelled),
-            prepared = self.prepare(&input, scope.clone(), &mut diagnostics) => prepared,
+            prepared = self.prepare(&input, scope.clone(), model_session.clone(), &mut diagnostics) => prepared,
         };
         let mut prepared = match prepared {
             Ok(value) => value,
@@ -1137,7 +1229,7 @@ impl LlmHost {
             let plan = tokio::select! { biased;
                 _ = wait_closed(events) => Err(LlmError::Cancelled),
                 _ = wait_tool_deadline(Some(deadline)) => Err(LlmError::Cancelled),
-                result = contain_panic(async { planner.plan(scope.as_ref(), &input, &prepared.context.history).await }) => result,
+                result = contain_panic(async { planner.plan_with_model_session(scope.as_ref(), &input, &prepared.context.history, model_session.as_ref()).await }) => result,
             }.map_err(|error| fail(error, diagnostics.clone()))?;
             if let Some(plan) = plan {
                 validate_review_originals(&review_user_messages)
@@ -1228,27 +1320,19 @@ impl LlmHost {
         let progress_report_limit = 32;
         let continuation = eve_llm_api::TaskContinuation::default();
         let mut continuation_checks = 0;
-        let mut checkpoint = if let Some(journal) = &self.journal {
-            if self.execution_budget.is_some()
-                || scope.is_none()
-                || !prepared.context.history.is_empty()
-            {
+        let mut checkpoint = if self.journal.is_some() {
+            if !prepared.context.history.is_empty() {
                 return Err(fail(
                     LlmError::Configuration("执行检查点只支持有可信范围的独立任务".into()),
                     diagnostics,
                 ));
             }
-            let loaded = catch_unwind(AssertUnwindSafe(|| journal.load()))
-                .map_err(|_| {
-                    fail(
-                        LlmError::Context("执行日志读取异常；未自动回退".into()),
-                        diagnostics.clone(),
-                    )
-                })?
-                .map_err(|error| fail(error, diagnostics.clone()))?;
-            let mut frame = loaded.unwrap_or_else(|| eve_llm_api::TurnCheckpoint {
+            let mut frame = loaded_checkpoint.unwrap_or_else(|| eve_llm_api::TurnCheckpoint {
                 version: 1,
                 scope: scope.clone().expect("checked scope"),
+                model_session: model_session.clone(),
+                pending_model_request: None,
+                pending_request_fingerprint: None,
                 messages: messages.clone(),
                 pending_calls: vec![],
                 used_tool_calls: 0,
@@ -1264,24 +1348,10 @@ impl LlmHost {
             frame
                 .validate(self.config.max_tool_calls)
                 .map_err(|error| fail(error, diagnostics.clone()))?;
-            if Some(&frame.scope) != scope.as_ref() || !frame.resumable() {
-                return Err(fail(
-                    LlmError::Context("检查点身份不匹配或存在结果未知的工具；未重放".into()),
-                    diagnostics,
-                ));
-            }
+            // 旧检查点没有会话字段时，宿主只能用同一可信 scope/task ID 补齐。
+            frame.model_session = model_session.clone();
             let current_prefix = messages[..2].to_vec();
             messages = frame.messages.clone();
-            if messages.len() < 2
-                || messages[..2]
-                    .iter()
-                    .any(|message| message.role != ChatRole::System)
-            {
-                return Err(fail(
-                    LlmError::Context("执行日志缺少宿主消息头；未自动回退".into()),
-                    diagnostics,
-                ));
-            }
             // 历史和回执保持冻结，当前权威提示与工具能力重新取自本轮实际装配。
             messages.splice(..2, current_prefix);
             diagnostics.provider_requests = frame.provider_requests;
@@ -1345,6 +1415,12 @@ impl LlmHost {
         };
         let mut deferred_reply = crate::deferred_reply::DeferredReply::default();
         let mut retry_deadline = None;
+        let mut retry_request_ordinal = checkpoint
+            .as_ref()
+            .and_then(|frame| frame.pending_model_request);
+        let mut retry_request_fingerprint = checkpoint
+            .as_ref()
+            .and_then(|frame| frame.pending_request_fingerprint.clone());
         loop {
             if let Some(steering) = &steering {
                 let batch = steering
@@ -1399,7 +1475,7 @@ impl LlmHost {
                 let result = tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
                     _ = tokio::time::sleep(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT) => Err(LlmError::Context("上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
-                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, compaction_scope, fallback)) => result,
+                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, compaction_scope, model_session.as_ref(), fallback)) => result,
                 };
                 if let Err(error) = result {
                     return Err(fail(error, diagnostics));
@@ -1415,8 +1491,59 @@ impl LlmHost {
                     diagnostics,
                 ));
             }
+            let mut request = if reporting {
+                progress_report_request(
+                    &messages,
+                    continuation.remaining().as_deref(),
+                    expression.is_some(),
+                )
+                .map_err(|error| fail(error, diagnostics.clone()))?
+            } else {
+                ModelRequest {
+                    session: None,
+                    messages: messages.clone(),
+                    tools: if closing {
+                        expression
+                            .iter()
+                            .filter(|_| self.expression_available(diagnostics.calls.len()))
+                            .cloned()
+                            .collect()
+                    } else {
+                        definitions.clone()
+                    },
+                }
+            };
+            request.session = model_session.clone();
+            let request_fingerprint =
+                if self.journal.is_some() || self.config.deferred_reply.is_some() {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        self.provider
+                            .request_fingerprint(&request, self.config.response_mode)
+                    }))
+                    .map_err(|_| {
+                        fail(
+                            LlmError::Backend("模型请求指纹回调异常；未请求模型".into()),
+                            diagnostics.clone(),
+                        )
+                    })?
+                    .map_err(|error| fail(error, diagnostics.clone()))?
+                } else {
+                    None
+                };
+            // 只有相同实际正文、配置和目的地才是原请求重试。steering、压缩、配置更新
+            // 或旧 Provider 无法提供指纹时，继续原会话并分配新的逻辑请求序号。
+            let same_request =
+                request_fingerprint.is_some() && request_fingerprint == retry_request_fingerprint;
+            let request_ordinal = retry_request_ordinal
+                .filter(|_| same_request)
+                .unwrap_or(diagnostics.provider_requests as u64 + 1);
+            request.session = model_session
+                .as_ref()
+                .map(|session| session.for_request(request_ordinal));
             if let Some(frame) = &mut checkpoint {
                 frame.provider_requests = diagnostics.provider_requests + 1;
+                frame.pending_model_request = Some(request_ordinal);
+                frame.pending_request_fingerprint = request_fingerprint.clone();
                 frame.continuation_checks = continuation_checks;
                 if closing && !frame.closing {
                     frame.messages.push(ChatMessage::text(
@@ -1428,31 +1555,7 @@ impl LlmHost {
                 self.save_execution_checkpoint(frame, &diagnostics, &continuation)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
             }
-            let completion = self.complete(
-                if reporting {
-                    progress_report_request(
-                        &messages,
-                        continuation.remaining().as_deref(),
-                        expression.is_some(),
-                    )
-                    .map_err(|error| fail(error, diagnostics.clone()))?
-                } else {
-                    ModelRequest {
-                        messages: messages.clone(),
-                        tools: if closing {
-                            expression
-                                .iter()
-                                .filter(|_| self.expression_available(diagnostics.calls.len()))
-                                .cloned()
-                                .collect()
-                        } else {
-                            definitions.clone()
-                        },
-                    }
-                },
-                &mut diagnostics,
-                events,
-            );
+            let completion = self.complete(request, &mut diagnostics, events);
             let result = if let Some(deadline) = retry_deadline {
                 tokio::time::timeout_at(deadline, completion)
                     .await
@@ -1463,6 +1566,12 @@ impl LlmHost {
             let response = match result {
                 Ok(value) => {
                     retry_deadline = None;
+                    retry_request_ordinal = None;
+                    retry_request_fingerprint = None;
+                    if let Some(frame) = &mut checkpoint {
+                        frame.pending_model_request = None;
+                        frame.pending_request_fingerprint = None;
+                    }
                     value
                 }
                 Err(error) => {
@@ -1489,6 +1598,8 @@ impl LlmHost {
                         })
                     );
                     retry_deadline = Some(deadline);
+                    retry_request_ordinal = Some(request_ordinal);
+                    retry_request_fingerprint = request_fingerprint;
                     tokio::select! { biased;
                         _ = wait_closed(events) => return Err(fail(LlmError::Cancelled, diagnostics)),
                         _ = tokio::time::sleep(delay) => {},
@@ -1679,6 +1790,9 @@ impl LlmHost {
                     ToolCaller {
                         turn_id,
                         scope: scope.clone(),
+                        model_session: model_session
+                            .as_ref()
+                            .map(|session| session.for_request(request_ordinal)),
                         continuation: continuation.clone(),
                         conversation: Arc::new(messages.clone()),
                         review_user_messages: review_user_messages.clone(),
@@ -1861,14 +1975,19 @@ impl LlmHost {
         &self,
         input: &TurnInput,
         scope: Option<eve_llm_api::ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
         diagnostics: &mut TurnDiagnostics,
     ) -> Result<PreparedTurn, LlmError> {
         if input.text.trim().is_empty() {
             return Err(LlmError::Context("本轮输入不能为空".into()));
         }
         let assembler = self.context_service()?;
-        let context =
-            contain_panic(async { assembler.assemble_scoped(input.clone(), scope).await }).await?;
+        let context = contain_panic(async {
+            assembler
+                .assemble_with_model_session(input.clone(), scope, model_session)
+                .await
+        })
+        .await?;
         validate_context(&context)?;
         let tools = self.prepare_tools()?;
         diagnostics.stage = TurnStage::Provider;
@@ -2189,6 +2308,10 @@ impl LlmHost {
                 Some(guard) => context.with_review_evidence_guard(guard.clone()),
                 None => context,
             };
+            let context = match &caller.model_session {
+                Some(session) => context.with_model_session(session.clone()),
+                None => context,
+            };
             let context = match &self.shared_steps {
                 Some(steps) => context.with_shared_steps(steps.clone()),
                 None => context,
@@ -2494,6 +2617,7 @@ fn progress_report_request(
     }))
     .map_err(|_| LlmError::Context("进度汇报记录无法编码；原记录保留".into()))?;
     Ok(ModelRequest {
+        session: None,
         messages: vec![
             ChatMessage::text(
                 ChatRole::System,
@@ -2830,6 +2954,7 @@ mod tests {
         let latest = second[second.len() - 2].text.as_deref().unwrap();
         assert!(latest.contains("read_file") && latest.contains("历史助手自述"));
         ModelRequest {
+            session: None,
             messages: second,
             tools: definitions,
         }

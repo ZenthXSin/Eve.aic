@@ -383,6 +383,34 @@ impl QqOutreach for GuardedOutreach {
             .filter(|c| self.candidate_allowed(c))
             .collect())
     }
+    fn passive_candidates(
+        &self,
+        session: &eve_session_api::SessionKey,
+        anchor: &str,
+    ) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        if !self.allowed(session) {
+            return Ok(vec![]);
+        }
+        Ok(self
+            .inner
+            .passive_candidates(session, anchor)?
+            .into_iter()
+            .filter(|c| c.session.as_ref() == Some(session) && self.candidate_allowed(c))
+            .collect())
+    }
+    fn claim_passive_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !candidate.session.as_ref().is_some_and(|s| self.allowed(s))
+            || !self.candidate_allowed(candidate)
+        {
+            return Ok(None);
+        }
+        self.inner.claim_passive_candidate(candidate, text, anchor)
+    }
     fn claim_candidate(
         &self,
         candidate: &eve_qqbot_plugin::QqOutreachCandidate,

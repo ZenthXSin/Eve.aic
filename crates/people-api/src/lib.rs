@@ -152,6 +152,8 @@ pub struct ProfileSource {
 /// 绑定或可见范围改变）都会得到不同的指纹，旧画像随之失效。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileRequest {
+    /// 宿主对当前入站轮次派生的独立画像会话；fingerprint 不用于推断模型身份。
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub participant: String,
     pub fingerprint: String,
     pub sources: Vec<ProfileSource>,

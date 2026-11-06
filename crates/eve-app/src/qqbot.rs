@@ -2543,7 +2543,7 @@ async fn run_qqbot_composed(
         if let Some(store)=speech_store {
             let sessions=registry.get(&ServiceId::new(SESSION_SERVICE_ID)?)?.ok_or("发言决定缺少会话服务")?.value.downcast::<SessionServiceHandle>().map_err(|_|"会话服务类型错误")?;
             plugin=plugin.with_speech(Arc::new(crate::qq_speech::Speech{
-                store,resolver:observed_capped("dialogue",Some(59))?,background_resolver:budget_gate.wrap(observed_capped("dialogue",Some(59))?,"outreach")?,context:speech_context.ok_or("发言决定缺少上下文")?,sessions:sessions.0.clone(),host:speech_config,conversations:conversations.clone(),
+                store,resolver:observed_capped("speech",Some(59))?,background_resolver:budget_gate.wrap(observed_capped("speech",Some(59))?,"outreach")?,context:speech_context.ok_or("发言决定缺少上下文")?,sessions:sessions.0.clone(),host:speech_config,conversations:conversations.clone(),
             }));
         } else {
             plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed_capped("progress", Some(7))?)));
