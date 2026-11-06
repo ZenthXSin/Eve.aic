@@ -86,7 +86,7 @@ fn write(path: &str, content: &str) -> DeveloperOperation {
 }
 
 #[tokio::test]
-async fn only_github_access_and_execution_changes_require_review_before_actual_http() {
+async fn github_resource_limits_and_system_safety_review_precede_actual_http() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -106,14 +106,30 @@ async fn only_github_access_and_execution_changes_require_review_before_actual_h
     for (method, path) in [
         ("DELETE", "hooks/1"),
         ("PUT", "collaborators/new-member"),
-        ("PUT", "actions/permissions"),
         ("POST", "keys"),
     ] {
+        let error = backend
+            .execute(github(method, path), context())
+            .await
+            .unwrap_err();
         assert!(
-            backend
-                .execute(github(method, path), context())
-                .await
-                .is_err()
+            error.to_string().contains("GitHub resource 不支持此资源"),
+            "{method} {path}: {error}"
+        );
+    }
+    assert!(reviewer.seen.lock().unwrap().is_empty());
+    for (method, path) in [
+        ("PUT", "actions/permissions"),
+        ("DELETE", "branches/main/protection"),
+        ("PUT", "contents/.github/workflows/checks.yml"),
+    ] {
+        let error = backend
+            .execute(github(method, path), context())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("系统安全审查未放行"),
+            "{method} {path}: {error}"
         );
     }
     assert!(
@@ -121,7 +137,7 @@ async fn only_github_access_and_execution_changes_require_review_before_actual_h
             .await
             .is_err()
     );
-    assert_eq!(reviewer.seen.lock().unwrap().len(), 4);
+    assert_eq!(reviewer.seen.lock().unwrap().len(), 3);
     assert!(reviewer.seen.lock().unwrap().iter().all(|request| {
         request.program == "eve.github_api"
             && !serde_json::to_string(request)

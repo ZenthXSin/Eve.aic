@@ -1486,7 +1486,7 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         );
         fs::write(&path, original).unwrap();
     }
-    // 完整候选验证不能代替危险动作的独立授权审核。
+    // 完整候选验证不能代替切换前的系统安全审查。
     backend.action_reviewer = None;
     let error = backend
         .execute(
@@ -1497,7 +1497,10 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("审核器未配置"));
+    assert!(
+        error.to_string().contains("系统安全审查器未配置"),
+        "{error}"
+    );
     assert!(!queue.path().join("request.json").exists());
     for target in [
         candidate.join("source-diff.patch"),
