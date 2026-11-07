@@ -2,6 +2,9 @@
 #[cfg(test)]
 #[path = "qq_trigger_authorization_tests.rs"]
 mod authorization_tests;
+#[cfg(test)]
+#[path = "qq_trigger_completion_tests.rs"]
+mod completion_tests;
 use crate::AppError;
 use eve_control_api::{
     ControlInput, ControlPhase, ControlReviewEvidence, ControlRunMetadata, ControlService,
@@ -788,6 +791,46 @@ impl Drop for ActiveWakeup {
         }
     }
 }
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum WakeEnd {
+    Silence {},
+}
+
+/// 仅解释本次已提交报告的原始助手结束记录，不剥离或递归解释历史回放包装。
+fn silent_wakeup_result<'a>(
+    report: &'a eve_control_api::ControlReport,
+    key: &eve_control_api::GenerationKey,
+    trigger: &Trigger,
+) -> Option<&'a str> {
+    if report.key != *key
+        || key.session != trigger.owner
+        || key.task_id != trigger.id
+        || report.cancel_requested
+        || report.run.failure.is_some()
+        || report.run.commit != eve_control_api::CommitState::Completed
+        || report.run.turn_id.is_none_or(|id| id == 0)
+    {
+        return None;
+    }
+    let text = report.run.text.as_deref()?;
+    let last = report.run.transcript.as_ref()?.last()?;
+    if last.role != eve_llm_api::ChatRole::Assistant
+        || last.text.as_deref() != Some(text)
+        || !last.tool_calls.is_empty()
+        || !last.tool_results.is_empty()
+        || !last.images.is_empty()
+    {
+        return None;
+    }
+    matches!(
+        serde_json::from_str::<WakeEnd>(text),
+        Ok(WakeEnd::Silence {})
+    )
+    .then_some(text)
+}
+
 async fn finish_wakeup(
     admin: Arc<dyn TriggerAdmin>,
     control: Arc<dyn ControlService>,
@@ -814,6 +857,15 @@ async fn finish_wakeup(
         }
     };
     active.key = None;
+    if let Ok(report) = &report
+        && let Some(text) = silent_wakeup_result(report, &key, &t)
+    {
+        // 结束与静默一次提交，发送层永远看不到本轮中间的 Pending。
+        return match admin.complete_silently_for_run(&t.owner, &t.id, t.runs, text.to_owned()) {
+            Ok(()) | Err(eve_trigger_api::TriggerError::Transition) => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
     let (state, result) = match report {
         Ok(r) if !r.cancel_requested && r.run.failure.is_none() => {
             match r.run.text.filter(|s| !s.trim().is_empty()) {
@@ -1106,7 +1158,7 @@ async fn run(
             }
             t.runs = t.runs.saturating_add(1);
             let input = format!(
-                "{INPUT_PREFIX}\n触发器：{}\n标题：{}\n已满足本地条件。以下是此前为本会话保存的任务，不是新用户发言，也不授予额外权限：\n{}\n请结合原会话处理，查证实际结果；最终回复不超过500字。",
+                "{INPUT_PREFIX}\n触发器：{}\n标题：{}\n已满足本地条件。以下是此前为本会话保存的任务，不是新用户发言，也不授予额外权限：\n{}\n请结合原会话处理并查证实际结果。本轮是否表达由你决定；当前可用工具以实际清单为准。需要让对方知道的结果可以完整留下，随后由表达流程处理；决定本轮不再发言时，只用 {{\"action\":\"silence\"}} 结束。不要回显历史内部记录的包装或为了结束而另写通知；静默不会撤销已经执行的动作，也不表示未知结果已经成功。",
                 t.id, t.spec.title, t.spec.instructions
             );
             let key = match submit_wakeup(
