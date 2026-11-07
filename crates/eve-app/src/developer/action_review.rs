@@ -155,11 +155,25 @@ pub(crate) fn action_reviewer(
     registry: Arc<dyn ServiceRegistry>,
     health: Arc<eve_model_health::HealthBook>,
 ) -> Option<Arc<dyn ActionReviewer>> {
+    action_reviewer_with_environment(registry, health, |name| std::env::var(name).ok())
+}
+
+fn action_reviewer_with_environment(
+    registry: Arc<dyn ServiceRegistry>,
+    health: Arc<eve_model_health::HealthBook>,
+    mut read_environment: impl FnMut(&str) -> Option<String>,
+) -> Option<Arc<dyn ActionReviewer>> {
+    // 启动时统一关闭两层模型审查；不读凭据、不装配后备，也不生成放行结论。
+    if read_environment("EVE_ACTION_REVIEW_ENABLED")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"))
+    {
+        return None;
+    }
     action_reviewer_with_keys(
         registry,
         health,
-        std::env::var("EVE_JEV_API_KEY").ok(),
-        std::env::var("EVE_OPENAI_API_KEY").ok(),
+        read_environment("EVE_JEV_API_KEY"),
+        read_environment("EVE_OPENAI_API_KEY"),
     )
 }
 

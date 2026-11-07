@@ -17,6 +17,48 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 const JEV_SECRET: &str = "synthetic-jev-action-secret";
 const LLM_SECRET: &str = "synthetic-llm-action-secret";
 
+#[test]
+fn explicit_disable_does_not_read_credentials_or_register_model_review() {
+    for disabled in ["false", "FALSE", " false "] {
+        let registry = KernelServices::default().registry;
+        let health = Arc::new(eve_model_health::HealthBook::new());
+        let reviewer = action_reviewer_with_environment(registry, health.clone(), |name| {
+            assert_eq!(name, "EVE_ACTION_REVIEW_ENABLED");
+            Some(disabled.into())
+        });
+        assert!(reviewer.is_none());
+        assert!(health.snapshot().is_empty());
+    }
+}
+
+#[test]
+fn default_and_reenabled_review_keep_the_existing_model_factory() {
+    for setting in [None, Some("true"), Some(""), Some("invalid")] {
+        let registry = KernelServices::default().registry;
+        let health = Arc::new(eve_model_health::HealthBook::new());
+        let mut credential_reads = Vec::new();
+        let reviewer =
+            action_reviewer_with_environment(registry, health.clone(), |name| match name {
+                "EVE_ACTION_REVIEW_ENABLED" => setting.map(str::to_owned),
+                "EVE_JEV_API_KEY" => {
+                    credential_reads.push(name.to_owned());
+                    Some(JEV_SECRET.into())
+                }
+                "EVE_OPENAI_API_KEY" => {
+                    credential_reads.push(name.to_owned());
+                    Some(LLM_SECRET.into())
+                }
+                _ => panic!("unexpected environment key"),
+            });
+        assert!(reviewer.is_some());
+        assert_eq!(credential_reads, ["EVE_JEV_API_KEY", "EVE_OPENAI_API_KEY"]);
+        let health = health.snapshot();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].0, REVIEW_USE);
+        assert_eq!(health[0].1.requests, 0);
+    }
+}
+
 struct Harness {
     kernel: Kernel,
     registry: Arc<dyn ServiceRegistry>,
