@@ -172,7 +172,7 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.wait_for(lambda: bool(failures()), reason, 20)
         [failed] = failures()
         task_id = failed["id"]
-        # Failed 先落盘，250ms 通道扫描随后仍会发通知。须等真实回执再放行
+        # Failed 先落盘，通道随后仍会发通知。须等真实回执再放行
         # checkpoint，否则 fake bridge 退出会与宿主写命令竞争，导致收尾失败。
         self.wait_for(lambda: any(task["id"] == task_id
             and (task.get("notice") or {}).get("status") == "Delivered"
