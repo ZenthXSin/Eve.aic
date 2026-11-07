@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -130,6 +131,10 @@ class StartupCheckpointAcceptance(unittest.TestCase):
             'eve.channel.qqbot': {'receipts.v1': {'version': 10, 'entries': []}},
         }
         self.state_path = self.state / 'state.json'
+        self.write_documents(documents)
+
+    def write_documents(self, documents):
+        # 仅在本测试持有的 Eve 进程尚未启动时构造旧状态。
         self.state_path.write_bytes(encoded({'version': 1, 'entries': {
             owner: {key: list(encoded(value)) for key, value in entries.items()}
             for owner, entries in documents.items()}}))
@@ -171,9 +176,10 @@ class StartupCheckpointAcceptance(unittest.TestCase):
         self.runs += 1
         directory = self.root / ('run-' + str(self.runs))
         directory.mkdir(mode=0o700)
-        run = {name: directory / name for name in ('bridge-pid', 'go', 'processed', 'stop', 'stdout', 'stderr')}
+        run = {name: directory / name for name in ('bridge-pid', 'go', 'processed', 'stop', 'stdout', 'stderr', 'events')}
         scenario = directory / 'scenario.json'
-        scenario.write_bytes(encoded({'pid_file': str(run['bridge-pid']), 'wait_timeout_ms': 40_000,
+        scenario.write_bytes(encoded({'pid_file': str(run['bridge-pid']), 'events_file': str(run['events']),
+            'wait_timeout_ms': 40_000,
             'script': [{'wait_file': str(run['go'])}, {'send': {
                 'id': 'checkpoint-' + str(self.runs), 'scope': 'c2c', 'target_id': 'user-1',
                 'user_id': 'user-1', 'text': '/help', 'original_text': '/help', 'accept_any': True}},
@@ -298,6 +304,137 @@ class StartupCheckpointAcceptance(unittest.TestCase):
                 self.ready_and_stop(run)
             self.assertEqual(self.documents()['eve.training']['phrases.v1']['learned'], learned)
             self.assertEqual(len(self.requests), 1, '已完成说法批次不能在切换组合后重放')
+
+    @staticmethod
+    def learning_scope():
+        identity = 'qq:' + digest(encoded(['1904159860', 'c2c', 'user-1', 'user-1']))
+        return {'session_id': identity, 'user_id': identity}
+
+    @staticmethod
+    def old_receipt(identifier, text, content_type=None):
+        message = {'id': identifier, 'scope': 'c2c', 'target_id': 'user-1',
+                   'user_id': 'user-1', 'text': text}
+        if content_type is not None:
+            message['attachments'] = [{'content_type': content_type,
+                                       'url': 'https://example.invalid/old-attachment'}]
+        return {'app_id': '1904159860', 'message': message, 'state': 'Failed', 'reply': None}
+
+    def seed_learning_history(self, receipts, phrases, expression_rows=()):
+        documents = self.documents()
+        documents['eve.training'] = {
+            'modes.v1': {'version': 1, 'modes': [{'scope': self.learning_scope(), 'enabled': True}]},
+            'phrases.v1': phrases,
+        }
+        if expression_rows:
+            documents['eve.training']['expression.v1'] = {'version': 1, 'rows': expression_rows}
+        documents['eve.channel.qqbot']['receipts.v1']['entries'] = receipts
+        self.write_documents(documents)
+
+    def expression_records(self):
+        path = self.state / 'training-expressions.sqlite3'
+        if not path.exists():
+            return []
+        with contextlib.closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            return [dict(row) for row in connection.execute(
+                'SELECT session_id,user_id,id,body,chars,paragraphs,question,formal,casual,active '
+                'FROM expressions ORDER BY seq')]
+
+    def assert_no_history_replay(self, run, old_receipts):
+        self.assertEqual(self.requests, [], '本地恢复不能请求模型或由模型重放工具')
+        receipts = self.documents()['eve.channel.qqbot']['receipts.v1']['entries']
+        self.assertEqual(receipts[:len(old_receipts)], old_receipts, '失败回执及原文必须原样保留')
+        sent = [event for event in map(json.loads, run['events'].read_text().splitlines())
+                if event['direction'] == 'out' and event['type'] in
+                ('reply', 'segment', 'progress', 'push', 'file', 'sticker')]
+        self.assertEqual([(event['type'], event['id']) for event in sent],
+                         [('reply', 'checkpoint-' + str(self.runs))], '只有本次新发的查询命令可以回复')
+        self.assertEqual(self.documents()['eve.task'][TASK_KEY]['tasks'], [])
+
+    def test_missing_expression_index_skips_old_attachments_and_recovers_failed_text_once(self):
+        scope = self.learning_scope()
+        text = '今天有空就聊一会儿'
+        receipts = [self.old_receipt('old-image', '这张图真好看', 'image/png'),
+                    self.old_receipt('old-image-only', '', 'image/jpeg'),
+                    self.old_receipt('old-file', '这里是附件说明', 'application/pdf'),
+                    self.old_receipt('old-command', '先稍等\n /train start'),
+                    self.old_receipt('old-text', text)]
+        unknown = self.old_receipt('old-unknown-image', '未确认发送的图片说明', 'image/png')
+        unknown.update(state='Unknown', reply='尚未确认送达的旧回复')
+        receipts.append(unknown)
+        foreign = self.old_receipt('other-app', '其他应用的原话')
+        foreign['app_id'] = 'other-app'
+        receipts.append(foreign)
+        self.seed_learning_history(receipts, {'version': 2, 'next': 1, 'pending': [],
+                                              'learned': [], 'inflight': []})
+        self.assertNotIn('expression.v1', self.documents()['eve.training'])
+        self.assertEqual(self.expression_records(), [])
+        preserved_rows = None
+        for full in (True, False, True):
+            with self.subTest(full=full, restart=self.runs), self.launch(full=full) as run:
+                checkpoint, payload = self.checkpoint(run, full=full)
+                self.assertEqual(self.requests, [])
+                self.assertEqual(self.documents()['eve.training']['phrases.v1']['pending'],
+                                 [{'scope': scope, 'text': text}], '未采集附件不能因重启首次进入待学批次')
+                rows = self.expression_records()
+                self.assertEqual([(row['id'], row['body'], row['active']) for row in rows],
+                                 [(digest(b'old-text'), digest(text.encode()), 1)])
+                if preserved_rows is not None:
+                    self.assertEqual(rows, preserved_rows, '重启不得重复学习已恢复的普通文本')
+                preserved_rows = rows
+                self.assertEqual(self.documents()['eve.channel.qqbot']['receipts.v1']['entries'][:len(receipts)],
+                                 receipts)
+                self.acknowledge(run, checkpoint, payload)
+                self.ready_and_stop(run)
+                self.assert_no_history_replay(run, receipts)
+
+    def test_existing_attachment_sources_pending_learned_and_retry_failure_survive_restart(self):
+        scope = self.learning_scope()
+        receipts = [self.old_receipt('learned-image', '这游戏yyds', 'image/png'),
+                    self.old_receipt('pending-image', '已经采集的图片说明', 'image/png'),
+                    self.old_receipt('reset-image', '已经重置的图片说明', 'image/png')]
+        retries = [self.old_receipt('retry-image-' + str(index), '历史图片说明' + str(index), 'image/png')
+                   for index in range(len(WORDS))]
+        receipts.extend(retries)
+        rows = [{'scope': scope, 'id': digest(entry['message']['id'].encode()),
+                 'body': digest(entry['message']['text'].encode()),
+                 'chars': len(entry['message']['text']), 'paragraphs': 1,
+                 'question': False, 'formal': False, 'casual': False,
+                 'active': entry['message']['id'] != 'reset-image'} for entry in receipts]
+        phrases = {'version': 2, 'next': 3,
+            'pending': [{'scope': scope, 'text': receipts[1]['message']['text']}],
+            'learned': [{'scope': scope, 'phrase': {'id': 'p1', 'kind': 'term', 'text': 'yyds',
+                'meaning': '表示非常好', 'example': receipts[0]['message']['text'], 'uses': 1, 'updated_at_ms': 1}}],
+            'inflight': [{'batch': {'id': 'b2', 'scope': scope, 'messages': [entry['message']['text'] for entry in retries],
+                'attempt': 1, 'learner_version': 1},
+                'phase': {'state': 'retry_wait', 'failure': 'server_error', 'ready_at_ms': 2 ** 63}}]}
+        self.seed_learning_history(receipts, phrases, rows)
+        original_training = json.loads(self.state_path.read_bytes())['entries']['eve.training']
+        preserved_rows = None
+        expression_sha = None
+        for full in (True, False, True):
+            with self.subTest(full=full, restart=self.runs), self.launch(full=full) as run:
+                checkpoint, payload = self.checkpoint(run, full=full)
+                self.assertEqual(self.documents()['eve.training']['phrases.v1'], phrases)
+                restored = self.expression_records()
+                self.assertEqual(len(restored), len(rows))
+                self.assertEqual([row['id'] for row in restored], [row['id'] for row in rows])
+                self.assertEqual([row['active'] for row in restored], [row['active'] for row in rows])
+                if preserved_rows is not None:
+                    self.assertEqual(restored, preserved_rows)
+                preserved_rows = restored
+                current_sha = digest((self.state / 'training-expressions.sqlite3').read_bytes())
+                if expression_sha is not None:
+                    self.assertEqual(current_sha, expression_sha, '重启不改写已有 SQLite 表达来源')
+                expression_sha = current_sha
+                self.assertEqual(json.loads(self.state_path.read_bytes())['entries']['eve.training'],
+                                 original_training, '原去重、重置、待学、已学和重试失败字节不得改写')
+                self.acknowledge(run, checkpoint, payload)
+                self.ready_and_stop(run)
+                self.assert_no_history_replay(run, receipts)
+                self.assertEqual(digest((self.state / 'training-expressions.sqlite3').read_bytes()), expression_sha)
+                self.assertEqual(json.loads(self.state_path.read_bytes())['entries']['eve.training'], original_training)
+        self.assertEqual(self.documents()['eve.training']['phrases.v1'], phrases)
 
     def test_timeout_does_not_start_bridge_web_or_due_learning(self):
         with self.launch(full=True, timeout_ms=1000) as run:
