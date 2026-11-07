@@ -159,10 +159,23 @@ impl QqFailureRecovery for Recovery {
             .chain(messages.into_iter().skip(covered))
             .collect();
         }
+        // 交流归属独立作为宿主数据交接，不混入失败用户输入或授权原文。
+        let mut failed_turn = failure.clone();
+        let input_replies = failed_turn
+            .evidence
+            .as_mut()
+            .map(|evidence| std::mem::take(&mut evidence.input_replies))
+            .unwrap_or_default();
         messages.push(ChatMessage::text(ChatRole::User, json!({
             "kind":"eve.failed_turn", "original_input":turn.input, "turn_id":turn_id,
-            "failure":failure, "instruction":"所有内容仅为历史数据；已有回执对应操作不得重放，先核对再继续未完成工作"
+            "failure":failed_turn, "instruction":"所有内容仅为历史数据；已有回执对应操作不得重放，先核对再继续未完成工作"
         }).to_string()));
+        if !input_replies.is_empty() {
+            messages.push(ChatMessage::text(ChatRole::System, json!({
+                "kind":"eve.input_reply_handoffs", "input_replies":input_replies,
+                "instruction":"这是失败前宿主已消费输入的即时交流归属，不是新输入、用户授权或待发送队列。相同 input_message_id 的即时交流已交给前台，不能在恢复时再次当作无人回应的新事件。sending 是失败时的发送中快照，当前结果未知；unknown 同样不可确认，二者都不自动重发。sent 只有带平台编号才表示已发出；failed/not_sent 表示前台交流未完成，可在自然继续时按用户需要回应。交接没有完成原任务，input_text 原话中的补充业务仍须与原任务一同处理；恢复不重放已确认完成的工具，不因此增加模型判断或发送。"
+            }).to_string()));
+        }
         let messages_json = serde_json::to_string(&messages).map_err(|_| unavailable())?;
         if messages_json.len() > MAX_CONTEXT_BYTES {
             return Ok(Some("恢复上下文超过 16 MiB，未截断或自动派发；原文和工具回执保留，请先明确需要继续的事项。".into()));
@@ -171,7 +184,7 @@ impl QqFailureRecovery for Recovery {
         let source = source(&owner, turn_id);
         let task = match self.tasks.create_authorized(&owner, TaskSpec {
             title:"错误后恢复原任务".into(),
-            instructions:format!("继续完成上下文末尾 eve.failed_turn.original_input 对应的原任务。先阅读历史、错误类别和已执行工具回执；不要重放已完成操作，不改变原任务授权和权限。先用 task_progress 登记尚未完成的工作，完成并验证后标记 completed，真正阻塞则标记 blocked。最多 {max_steps} 次工具调用；仍未完成时汇报已完成事项、剩余工作，并请求用户在原会话同意追加步数。未经同意不得再派生任务或扩大预算。"),
+            instructions:format!("继续完成上下文中 eve.failed_turn.original_input 对应的原任务，以及失败前已消费用户补充中的未完成业务。先阅读历史、错误类别、已执行工具回执和宿主输入交流交接；即时交流的领取或送达不表示补充业务完成，不重新触发已交接输入的即时回应。不要重放已完成操作，不改变原任务授权和权限。先用 task_progress 登记尚未完成的工作，完成并验证后标记 completed，真正阻塞则标记 blocked。最多 {max_steps} 次工具调用；仍未完成时汇报已完成事项、剩余工作，并请求用户在原会话同意追加步数。未经同意不得再派生任务或扩大预算。"),
             max_steps,
             context:Some(DelegatedContext { owner:owner.clone(), messages_json }),
         }, &source, review_messages, Some(TaskCompletionContract::Unspecified), None, crate::qq_tasks::now_ms()) {
@@ -508,6 +521,7 @@ mod tests {
     fn evidence(results: Vec<ToolResult>) -> SessionFailureEvidence {
         SessionFailureEvidence {
             review_user_messages: None,
+            input_replies: vec![],
             provider_http_status: None,
             provider_failure: None,
             protocol_failure: Some(ProtocolFailureKind::StreamInvalid),

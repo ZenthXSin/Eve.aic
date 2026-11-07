@@ -276,6 +276,7 @@ impl SessionLlmHost {
                         || failure.error.protocol_failure().is_some()
                         || failure.error.provider_http_status().is_some()
                         || failure.diagnostics.review_user_messages.is_some()
+                        || !failure.diagnostics.input_replies.is_empty()
                         || !failure.diagnostics.calls.is_empty()
                         || !failure.diagnostics.tool_results.is_empty())
                     .then(|| SessionFailureEvidence {
@@ -293,6 +294,7 @@ impl SessionLlmHost {
                             .collect(),
                         tool_results: failure.diagnostics.tool_results.clone(),
                         review_user_messages: failure.diagnostics.review_user_messages.clone(),
+                        input_replies: failure.diagnostics.input_replies.clone(),
                     }),
                     code: failure_code(&failure.error),
                     started_tools: Some(failure.diagnostics.started_tools as u64),

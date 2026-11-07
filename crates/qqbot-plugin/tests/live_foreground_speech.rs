@@ -27,7 +27,22 @@ use std::{
 };
 
 #[derive(Default)]
-struct Archive(Mutex<Vec<QqOriginalMessage>>);
+struct Archive(Mutex<Vec<QqOriginalMessage>>, Option<Arc<ClaimGate>>);
+
+#[derive(Clone, Copy)]
+enum AfterClaim {
+    Finish,
+    Cancel,
+    Replace,
+}
+struct ClaimGate {
+    mode: AfterClaim,
+    directory: PathBuf,
+    claimed: AtomicBool,
+    crossed: AtomicBool,
+    changed: std::sync::Condvar,
+    outcome: Mutex<(bool, bool)>,
+}
 impl QqReceiptArchive for Archive {
     fn identity(&self) -> PluginResult<(String, u64)> {
         Ok(("0123456789abcdef0123456789abcdef".into(), 0))
@@ -59,6 +74,21 @@ impl QqReceiptArchive for Archive {
         id: &str,
         expected: &QqOriginalBinding,
     ) -> PluginResult<bool> {
+        if let Some(gate) = &self.1
+            && gate.claimed.load(Ordering::SeqCst)
+            && !gate.crossed.swap(true, Ordering::SeqCst)
+        {
+            // 主轮只能在领取锁释放后消费；最后的原话核对让另一执行线程完成精确竞态。
+            std::fs::write(gate.directory.join("release-tool"), b"release").unwrap();
+            let outcome = gate.outcome.lock().unwrap();
+            let (outcome, waited) = gate
+                .changed
+                .wait_timeout_while(outcome, Duration::from_secs(3), |(ready, _)| !ready)
+                .unwrap();
+            if waited.timed_out() || !outcome.0 || !outcome.1 {
+                return Err(PluginError::State("领取后的确定性收尾闸门失败".into()));
+            }
+        }
         let rows = self.0.lock().unwrap();
         assert!(expected.matches("abcdef0123456789abcdef0123456789", rows.len() as u64));
         Ok(rows
@@ -95,6 +125,10 @@ impl ControlRunner for Runner {
         metadata: Option<eve_control_api::ControlRunMetadata>,
         sink: &'a dyn TurnEventSink,
     ) -> RunFuture<'a> {
+        if input.text == "新的控制代" {
+            assert!(metadata.is_none());
+            return self.run(input, sink);
+        }
         let metadata = metadata.expect("真实入站元数据");
         metadata.validate_scope(&input.key).unwrap();
         assert!(
@@ -104,6 +138,18 @@ impl ControlRunner for Runner {
     }
     fn run<'a>(&'a self, input: SessionInput, sink: &'a dyn TurnEventSink) -> RunFuture<'a> {
         Box::pin(async move {
+            if input.text == "新的控制代" {
+                sink.closed().await.unwrap();
+                return RunReport {
+                    turn_id: None,
+                    commit: CommitState::NotStarted,
+                    text: None,
+                    transcript: None,
+                    started_tools: Some(0),
+                    tool_results: vec![],
+                    failure: None,
+                };
+            }
             self.observed.runs.fetch_add(1, Ordering::SeqCst);
             let started = self.sessions.begin(input.clone()).unwrap();
             let turn_id = started.lease.turn_id;
@@ -323,6 +369,9 @@ impl QqSpeech for Speech {
     }
     fn dispatched(&self, event: &QqSpeechEvent) -> PluginResult<()> {
         self.events.lock().unwrap().remove(&event.id);
+        if let Some(gate) = &self.archive.1 {
+            gate.claimed.store(true, Ordering::SeqCst);
+        }
         Ok(())
     }
     fn delivered(&self, _: &QqSpeechEvent, result: QqOutreachResult) -> PluginResult<()> {
@@ -342,13 +391,21 @@ impl QqSpeech for Speech {
 enum Scenario {
     Speak,
     DelayedReceipt,
+    FinishAfterClaim,
+    CancelAfterClaim,
+    ReplaceAfterClaim,
     ToolCompletesDuringDecision,
     StopDuringDecision,
     StopWithRetireFailure,
 }
 
 async fn scenario(mode: Scenario) {
-    let hold = !matches!(mode, Scenario::Speak | Scenario::DelayedReceipt);
+    let hold = matches!(
+        mode,
+        Scenario::ToolCompletesDuringDecision
+            | Scenario::StopDuringDecision
+            | Scenario::StopWithRetireFailure
+    );
     let delayed_receipt = matches!(mode, Scenario::DelayedReceipt);
     let stopping = matches!(
         mode,
@@ -380,7 +437,23 @@ async fn scenario(mode: Scenario) {
         .clone();
     let live = Arc::new(LiveDialogue::default());
     let observed = Arc::new(Observed::default());
-    let archive = Arc::new(Archive::default());
+    let after_claim = match mode {
+        Scenario::FinishAfterClaim => Some(AfterClaim::Finish),
+        Scenario::CancelAfterClaim => Some(AfterClaim::Cancel),
+        Scenario::ReplaceAfterClaim => Some(AfterClaim::Replace),
+        _ => None,
+    };
+    let gate = after_claim.map(|mode| {
+        Arc::new(ClaimGate {
+            mode,
+            directory: directory.path().into(),
+            claimed: AtomicBool::new(false),
+            crossed: AtomicBool::new(false),
+            changed: std::sync::Condvar::new(),
+            outcome: Mutex::new((false, false)),
+        })
+    });
+    let archive = Arc::new(Archive(Mutex::new(vec![]), gate.clone()));
     let speech = Arc::new(Speech {
         archive: archive.clone(),
         observed: observed.clone(),
@@ -406,6 +479,79 @@ async fn scenario(mode: Scenario) {
             .unwrap(),
         ))
         .unwrap();
+    kernel
+        .start(&PluginId::new(eve_control_api::CONTROL_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let control = registry
+        .get(&ServiceId::new(eve_control_api::CONTROL_SERVICE_ID).unwrap())
+        .unwrap()
+        .unwrap()
+        .value
+        .downcast::<eve_control_api::ControlServiceHandle>()
+        .unwrap()
+        .0
+        .clone();
+    let race = gate.clone().map(|gate| {
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                let state = loop {
+                    if gate.crossed.load(Ordering::SeqCst) {
+                        let sessions = control.list_keys(None, 10).unwrap();
+                        if let Some(session) = sessions.first()
+                            && let Some(state) = control.snapshot(session).unwrap()
+                            && state.phase == eve_control_api::ControlPhase::Finished
+                        {
+                            break state;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                assert!(!state.cancel_requested);
+                assert!(!state.events_retired);
+                assert_eq!(
+                    state.report.as_ref().unwrap().run.commit,
+                    CommitState::Completed
+                );
+                match gate.mode {
+                    AfterClaim::Finish => {}
+                    AfterClaim::Cancel => {
+                        assert_eq!(
+                            control.cancel(&state.key).unwrap(),
+                            eve_control_api::CancelDisposition::AlreadyFinished
+                        );
+                        assert!(
+                            control
+                                .snapshot(&state.key.session)
+                                .unwrap()
+                                .unwrap()
+                                .events_retired
+                        );
+                    }
+                    AfterClaim::Replace => {
+                        let next = control
+                            .submit_if_current(
+                                &state.key,
+                                eve_control_api::ControlInput {
+                                    session: SessionInput {
+                                        key: state.key.session.clone(),
+                                        text: "新的控制代".into(),
+                                    },
+                                    task_id: "replacement".into(),
+                                },
+                                Arc::new(eve_control_api::DiscardControlEvents),
+                            )
+                            .unwrap();
+                        assert_ne!(next, state.key);
+                    }
+                }
+            })
+            .await;
+            *gate.outcome.lock().unwrap() = (true, result.is_ok());
+            gate.changed.notify_all();
+            result.expect("原轮未在领取后完成");
+        })
+    });
     kernel
         .register(Box::new(
             ConfigPlugin::new(ConfigBootstrap::new(
@@ -560,7 +706,12 @@ async fn scenario(mode: Scenario) {
     kernel.stop_all().await.unwrap();
     reviewed.expect("长工具期间没有交流机会");
     completed.expect("主轮没有消费原输入并完成");
-    assert!(still_running, "交流前工具应仍在执行");
+    if after_claim.is_none() {
+        assert!(still_running, "交流前工具应仍在执行");
+    }
+    if let Some(race) = race {
+        race.await.unwrap();
+    }
     assert_eq!(observed.runs.load(Ordering::SeqCst), 1);
     assert_eq!(
         *observed.consumed.lock().unwrap(),
@@ -578,7 +729,17 @@ async fn scenario(mode: Scenario) {
         .iter()
         .filter(|row| row["type"] == "platform")
         .collect();
-    if hold {
+    if matches!(after_claim, Some(AfterClaim::Cancel | AfterClaim::Replace)) {
+        assert!(sent.is_empty(), "领取后真实取消或换代不得发送");
+        assert_eq!(
+            *speech.deliveries.lock().unwrap(),
+            [QqOutreachResult::NotSent]
+        );
+        assert_eq!(
+            observed.input_replies.lock().unwrap()[0].delivery,
+            InputReplyDelivery::Sending
+        );
+    } else if hold {
         assert!(sent.is_empty());
         assert!(speech.deliveries.lock().unwrap().is_empty());
         assert!(speech.retired.load(Ordering::SeqCst) > 0);
@@ -608,7 +769,7 @@ async fn scenario(mode: Scenario) {
         );
         assert_eq!(
             handoffs[0].delivery,
-            if delayed_receipt {
+            if delayed_receipt || after_claim.is_some() {
                 InputReplyDelivery::Sending
             } else {
                 InputReplyDelivery::Sent {
@@ -641,6 +802,21 @@ async fn new_input_can_be_answered_while_the_original_tool_runs_and_is_consumed_
 #[tokio::test]
 async fn receipt_after_foreground_removal_updates_only_the_original_live_turn() {
     scenario(Scenario::DelayedReceipt).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claimed_input_reply_still_sends_once_after_original_turn_finishes() {
+    scenario(Scenario::FinishAfterClaim).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_finished_generation_after_claim_still_revokes_the_send() {
+    scenario(Scenario::CancelAfterClaim).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_finished_generation_after_claim_still_revokes_the_send() {
+    scenario(Scenario::ReplaceAfterClaim).await;
 }
 
 #[tokio::test]

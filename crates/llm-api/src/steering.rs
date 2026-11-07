@@ -3,6 +3,10 @@ use crate::{ContextScope, LlmError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// 单轮与持久失败证据共享的有界交接快照上限。
+pub const MAX_INPUT_REPLY_HANDOFFS: usize = 64;
+pub const MAX_INPUT_REPLY_HANDOFF_BYTES: usize = 512 * 1024;
+
 /// 同一次消费的消息与审核锚点必须原子取出；后到的消息不能提前成为本批授权。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SteeringBatch {
@@ -23,7 +27,7 @@ pub struct InputReplyHandoff {
     pub delivery: InputReplyDelivery,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputReplyDelivery {
     Sending,
@@ -31,6 +35,32 @@ pub enum InputReplyDelivery {
     Unknown,
     Failed,
     NotSent,
+}
+
+impl<'de> Deserialize<'de> for InputReplyDelivery {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // 内部标签的 unit variant 会忽略未知键，持久交接须用空 struct 严格读取。
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Sending {},
+            Sent { platform_message_id: String },
+            Unknown {},
+            Failed {},
+            NotSent {},
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Sending {} => Self::Sending,
+            Wire::Sent {
+                platform_message_id,
+            } => Self::Sent {
+                platform_message_id,
+            },
+            Wire::Unknown {} => Self::Unknown,
+            Wire::Failed {} => Self::Failed,
+            Wire::NotSent {} => Self::NotSent,
+        })
+    }
 }
 
 impl InputReplyHandoff {
@@ -53,6 +83,29 @@ impl InputReplyHandoff {
         }
         Ok(())
     }
+}
+
+/// 每条真实入站消息、每个前台事件只保留一个最新状态；不按正文查重。
+pub fn validate_input_reply_handoffs(handoffs: &[InputReplyHandoff]) -> Result<(), LlmError> {
+    if handoffs.len() > MAX_INPUT_REPLY_HANDOFFS {
+        return Err(LlmError::Context("输入交流交接批次过大".into()));
+    }
+    let mut inputs = std::collections::BTreeSet::new();
+    let mut events = std::collections::BTreeSet::new();
+    for handoff in handoffs {
+        handoff.validate()?;
+        if !inputs.insert(&handoff.input_message_id) || !events.insert(&handoff.event_id) {
+            return Err(LlmError::Context("输入交流交接身份重复".into()));
+        }
+    }
+    if serde_json::to_vec(handoffs)
+        .map_err(|_| LlmError::Context("输入交流交接数据无法序列化".into()))?
+        .len()
+        > MAX_INPUT_REPLY_HANDOFF_BYTES
+    {
+        return Err(LlmError::Context("输入交流交接数据过大".into()));
+    }
+    Ok(())
 }
 
 /// 用户消息与同消息的即时交流交接必须在同一锁/事务中取出。
@@ -151,5 +204,18 @@ mod tests {
         );
         handoff.input_message_id = "input\nother".into();
         assert!(handoff.validate().is_err());
+    }
+
+    #[test]
+    fn input_reply_delivery_rejects_unknown_persisted_fields_in_every_state() {
+        for state in ["sending", "sent", "unknown", "failed", "not_sent"] {
+            let mut valid = serde_json::json!({"state":state});
+            if state == "sent" {
+                valid["platform_message_id"] = "platform-1".into();
+            }
+            assert!(serde_json::from_value::<InputReplyDelivery>(valid.clone()).is_ok());
+            valid["unexpected"] = true.into();
+            assert!(serde_json::from_value::<InputReplyDelivery>(valid).is_err());
+        }
     }
 }

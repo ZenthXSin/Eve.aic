@@ -32,11 +32,18 @@ jobs:
       - name: 检查格式与受影响契约
         run: |
           cargo +stable fmt -- --check
-          cargo +stable clippy -p eve-llm-api -p eve-runtime -p eve-qqbot-plugin --all-targets --locked -- -D warnings
+          cargo +stable clippy -p eve-llm-api -p eve-session-api -p eve-session-plugin -p eve-runtime -p eve-qqbot-plugin -p eve-app --all-targets --locked -- -D warnings
       - name: 验证输入原子交接与自然模型请求
         run: |
           cargo +stable test -p eve-llm-api --lib steering::tests --locked -- --nocapture
           cargo +stable test -p eve-qqbot-plugin --lib live::tests --locked -- --nocapture
           cargo +stable test -p eve-runtime --test llm_host handoff --locked -- --nocapture
+      - name: 验证失败证据冷恢复与后台真实执行
+        run: |
+          cargo +stable test -p eve-session-api --lib enumeration_compatibility --locked -- --nocapture
+          cargo +stable test -p eve-session-plugin --test cold_archive --locked -- --nocapture
+          cargo +stable test -p eve-runtime --test session_host --locked -- --nocapture
+          cargo +stable test -p eve-app --lib input_reply_recovery_tests --locked -- --nocapture
+          cargo +stable test -p eve-app --lib qq_failure_recovery::tests --locked -- --nocapture
       - name: 验证真实通道与长工具进程竞争
         run: cargo +stable test -p eve-qqbot-plugin --test live_foreground_speech --locked -- --nocapture

@@ -1573,6 +1573,7 @@ mod tests {
                     code: eve_session_api::SessionFailureCode::ProviderTimeout,
                     started_tools: Some(1),
                     evidence: Some(eve_session_api::SessionFailureEvidence {
+                        input_replies: vec![],
                         review_user_messages: None,
                         provider_http_status: Some(504),
                         provider_failure: None,
