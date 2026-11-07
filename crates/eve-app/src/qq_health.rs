@@ -581,7 +581,7 @@ mod tests {
         assert!(snapshot.notices[0].owner.is_none());
         assert_eq!(
             snapshot.notices[0].resolutions[0].reason,
-            eve_health_watch::ResolutionReason::Recovered
+            eve_health_watch::ResolutionReason::Recovered {}
         );
         for at in 107..=109 {
             health.record("dialogue", ModelOutcome::TimedOut, at);

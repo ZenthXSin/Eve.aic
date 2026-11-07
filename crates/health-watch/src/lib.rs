@@ -51,7 +51,7 @@ pub enum Delivery {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResolutionReason {
-    Recovered,
+    Recovered {},
     /// 旧格式只在 code 离开 active 后建立后继；不推断中间是否发生了实际成功。
     Superseded {
         notice_id: String,
@@ -163,7 +163,7 @@ fn validate_resolutions(notice: &Notice, snapshot: &Snapshot) -> bool {
             && codes.insert(&r.code)
             && notice.findings.iter().any(|f| f.code == r.code)
             && match &r.reason {
-                ResolutionReason::Recovered => true,
+                ResolutionReason::Recovered {} => true,
                 ResolutionReason::Superseded { notice_id } => {
                     notice_number(notice_id).is_some_and(|id| {
                         id > notice_number(&notice.id).unwrap_or(u64::MAX) && id < snapshot.next_id
@@ -380,7 +380,7 @@ impl HealthWatch {
                 .map(|f| Resolution {
                     code: f.code.clone(),
                     at_ms: now,
-                    reason: ResolutionReason::Recovered,
+                    reason: ResolutionReason::Recovered {},
                 })
                 .collect();
             notice.resolutions.extend(resolved);
@@ -850,7 +850,7 @@ mod tests {
         assert_eq!(notice.delivery, Delivery::Retired);
         assert!(notice.owner.is_none());
         assert_eq!(notice.findings, original.findings);
-        assert_eq!(notice.resolutions[0].reason, ResolutionReason::Recovered);
+        assert_eq!(notice.resolutions[0].reason, ResolutionReason::Recovered {});
         assert_eq!(notice.resolutions[0].at_ms, 101);
         assert!(watch.claim_candidate(&original, owner()).unwrap().is_none());
         assert!(watch.delivered(&original.id, Delivery::Sent).is_err());
@@ -981,7 +981,7 @@ mod tests {
         assert_eq!(snapshot.notices[0].delivery, Delivery::Retired);
         assert_eq!(
             snapshot.notices[0].resolutions[0].reason,
-            ResolutionReason::Recovered
+            ResolutionReason::Recovered {}
         );
         assert_eq!(snapshot.candidates().len(), 1);
         assert_ne!(snapshot.candidates()[0].id, original.id);
