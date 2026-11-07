@@ -685,13 +685,13 @@ pub(crate) struct WebRuntime {
     conversation: crate::conversation_learning::Background,
 }
 impl WebRuntime {
-    pub(crate) fn activate(&self) -> Result<(), AppError> {
+    pub(crate) async fn activate(&self) -> Result<(), AppError> {
         self.subject.activate()?;
         self.task.activate();
         self.trigger.activate();
         self.digest.activate();
         self.conversation.activate();
-        self.goals.activate();
+        self.goals.activate().await?;
         Ok(())
     }
     pub(crate) fn finished(&self) -> Vec<watch::Receiver<bool>> {

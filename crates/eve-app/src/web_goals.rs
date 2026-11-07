@@ -230,8 +230,8 @@ impl Runtime {
     pub(crate) fn reader(&self) -> Result<Arc<dyn CognitionReader>, AppError> {
         self.cognition.reader()
     }
-    pub(crate) fn activate(&self) {
-        self.cognition.activate();
+    pub(crate) async fn activate(&self) -> Result<(), AppError> {
+        self.cognition.activate().await?;
         if let Some(plan) = &self.plan {
             plan.activate();
         }
@@ -241,6 +241,7 @@ impl Runtime {
         if let Some(practice) = &self.practice {
             practice.activate();
         }
+        Ok(())
     }
     pub(crate) fn finished(&self) -> Vec<watch::Receiver<bool>> {
         let mut result = vec![self.cognition.finished()];
