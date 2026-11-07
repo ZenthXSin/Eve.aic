@@ -165,6 +165,27 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
                 for task in ended)
         self.wait_for(saved, "终态与真实经历尚未完整保存到主体历史", 20)
 
+    def wait_rejected_reflection_and_notice(self, reason):
+        def failures():
+            return [task for task in self.tasks()
+                    if task["source"].startswith("subject-idle:") and task["status"] == "Failed"]
+        self.wait_for(lambda: bool(failures()), reason, 20)
+        [failed] = failures()
+        task_id = failed["id"]
+        # Failed 先落盘，250ms 通道扫描随后仍会发通知。须等真实回执再放行
+        # checkpoint，否则 fake bridge 退出会与宿主写命令竞争，导致收尾失败。
+        self.wait_for(lambda: any(task["id"] == task_id
+            and (task.get("notice") or {}).get("status") == "Delivered"
+            for task in self.tasks()), "拒绝回顾的通知尚未得到桥接回执", 12)
+        settled = next(task for task in self.tasks() if task["id"] == task_id)
+        [attempt] = settled["notice"]["attempts"]
+        self.assertEqual(attempt["channel"], "proactive")
+        self.assertEqual(attempt["result"], {"sent": {"platform_message_id": "push-" + task_id}})
+        self.assertIsNotNone(attempt["finished_at_ms"])
+        self.assertEqual(len([event for event in self.read_events(
+            self.work / f"events-{self.runs}.jsonl")
+            if event.get("type") == "push" and event.get("id") == task_id]), 1)
+
     def review_free(self, request):
         # 配置及普通探索均无需模型审批；恒定拒绝才能暴露残留的审批依赖。
         return {"risk": "low", "authorization": "high", "outcome": "deny",
@@ -538,10 +559,8 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
                     "evidence": ["fabricated-external-evidence"]}]
         self.after_reflection = invent
         self.due()
-        def rejected():
-            self.wait_for(lambda: any(t["source"].startswith("subject-idle:")
-                and t["status"] == "Failed" for t in self.tasks()), "伪造经历来源没有拒绝", 20)
-        self.run_idle(self.checkpoint("forged"), checkpoints={"forged": rejected})
+        self.run_idle(self.checkpoint("forged"), checkpoints={"forged": lambda:
+            self.wait_rejected_reflection_and_notice("伪造经历来源没有拒绝")})
         self.assertEqual(self.reflections, 2)
         self.assertEqual(self.mind()["revision"], before["revision"])
         self.assertEqual(self.mind().get("self_interests", []), before.get("self_interests", []))
@@ -570,9 +589,8 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
                     "evidence": [task["id"]]}]
         self.after_reflection = invent
         self.due()
-        self.run_idle(self.checkpoint("imagined"), checkpoints={"imagined": lambda: self.wait_for(
-            lambda: any(t["source"].startswith("subject-idle:") and t["status"] == "Failed"
-                        for t in self.tasks()), "零工具感想被当成外部新证据", 20)})
+        self.run_idle(self.checkpoint("imagined"), checkpoints={"imagined": lambda:
+            self.wait_rejected_reflection_and_notice("零工具感想被当成外部新证据")})
         self.assertEqual(self.reflections, 2)
         self.assertEqual(self.mind()["revision"], before["revision"])
         self.assertEqual(self.mind().get("self_interests", []), before.get("self_interests", []))
