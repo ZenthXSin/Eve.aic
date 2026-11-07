@@ -15,6 +15,8 @@ import threading
 import time
 
 VERSION = 1
+STARTUP_CHECKPOINT_PROTOCOL = 1
+STARTUP_CHECKPOINT_ENV = 'EVE_STARTUP_CHECKPOINT_REQUEST'
 MAX_JSON = 1024 * 1024
 # 文件状态用 JSON 整数数组保存插件字节；16 MiB 回执可膨胀为约 64 MiB。
 MAX_STATE_JSON = 256 * 1024 * 1024
@@ -1010,6 +1012,9 @@ class Child:
             # 独立进程组但继承监督器会话；内层可关闭桥接，外层仍可收拢整场会话。
             options['process_group'] = 0
         self.process = subprocess.Popen(execution_command(command), stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, **options)
+        # 发布检查点只交给本监督器的第一次成功创建的业务进程。
+        # 自动重启不复用上一次 nonce/确认，显式发布恢复须由启动器提供新请求。
+        os.environ.pop(STARTUP_CHECKPOINT_ENV, None)
         def copy():
             for chunk in iter(lambda: self.process.stderr.readline(65536), b''):
                 if b'EVE_QQBOT_READY' in chunk:
@@ -1100,6 +1105,7 @@ class Supervisor:
         self.handoff = False
         self.host_confirmed = False
         self.child = None
+        self.startup_checkpoint_pending = STARTUP_CHECKPOINT_ENV in os.environ
         self.status_lock = threading.RLock()
         self.status = dict(format_version=VERSION, pid=os.getpid(), heartbeat_ms=0, phase='starting',
                            active_sha256=digest(Path(self.command[0])), candidate_sha256=None, result=None, error=None,
@@ -1470,6 +1476,8 @@ class Supervisor:
         """有限恢复；仅重启程序，绝不还原状态、重放旧请求或重试未知投递。"""
         if self.stopping:
             return
+        if self.startup_checkpoint_pending:
+            raise ValueError('startup_checkpoint_not_ready')
         if self.child.process.poll() is None:
             raise ValueError('old_process_still_running')
         if self.host_bridge is not None:
@@ -1553,8 +1561,12 @@ class Supervisor:
             except (ValueError, OSError, subprocess.SubprocessError) as error:
                 self.failure_evidence(error)
                 self.child.stop(self.options.stop_timeout)
+                if self.startup_checkpoint_pending:
+                    raise ValueError('startup_checkpoint_not_ready') from None
                 if not self.stopping:
                     self.recover()
+            else:
+                self.startup_checkpoint_pending = False
             self.publish(phase='running')
             waiting_since = None
             quiet_since = None

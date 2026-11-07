@@ -20,6 +20,29 @@ spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
 class DigestTests(unittest.TestCase):
+    def test_failed_process_creation_keeps_the_startup_request_for_the_first_process(self):
+        with patch.dict(os.environ, {'EVE_STARTUP_CHECKPOINT_REQUEST': '/owned/request.json'}):
+            with patch.object(runtime.subprocess, 'Popen', side_effect=OSError('fixture spawn failure')):
+                with self.assertRaises(OSError):
+                    runtime.Child([sys.executable, '-c', 'pass'])
+            self.assertEqual(os.environ['EVE_STARTUP_CHECKPOINT_REQUEST'], '/owned/request.json')
+
+    def test_startup_checkpoint_environment_is_transferred_only_to_first_business_process(self):
+        with tempfile.TemporaryDirectory(prefix='eve-checkpoint-child-') as directory:
+            result = Path(directory) / 'received.jsonl'
+            code = ('import json,os,sys; from pathlib import Path; '
+                    'p=Path(sys.argv[1]); '
+                    'p.open("a").write(json.dumps(os.environ.get("EVE_STARTUP_CHECKPOINT_REQUEST"))+"\\n")')
+            with patch.dict(os.environ, {'EVE_STARTUP_CHECKPOINT_REQUEST': '/owned/request.json'}):
+                for _ in range(2):
+                    child = runtime.Child([sys.executable, '-c', code, str(result)])
+                    self.assertEqual(child.process.wait(timeout=5), 0)
+                    child.thread.join(timeout=5)
+                    child.process.stderr.close()
+                self.assertNotIn('EVE_STARTUP_CHECKPOINT_REQUEST', os.environ)
+            self.assertEqual([json.loads(row) for row in result.read_text().splitlines()],
+                             ['/owned/request.json', None])
+
     def test_bridge_ingress_diagnostics_changes_invalidate_runtime_snapshot(self):
         with tempfile.TemporaryDirectory(prefix='eve-bridge-snapshot-') as directory:
             root = Path(directory)
@@ -722,6 +745,7 @@ agent=Path(sys.argv[sys.argv.index('--agent')+1]);tag=agent.read_text()
 state=Path(sys.argv[sys.argv.index('--state-dir')+1])/'state.json'
 events=Path(sys.argv[sys.argv.index('--events')+1])
 with events.open('a') as f:f.write(tag+'\\n')
+with (events.parent/'checkpoint-env.jsonl').open('a') as f:f.write(json.dumps(os.environ.get('EVE_STARTUP_CHECKPOINT_REQUEST'))+'\\n')
 if '--spawn-child' in sys.argv:
  worker=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)'])
  with (state.parent/'workers').open('a') as f:f.write(str(worker.pid)+'\\n')
@@ -1039,6 +1063,24 @@ while True:
         history=runtime.read_json(self.queue/'recovery.json')
         self.assertEqual(len(history['crashes']),2)
         self.assertEqual(history['result'],'runtime_restarted_state_preserved')
+
+    def test_checkpoint_startup_failure_never_retries_without_the_barrier(self):
+        (self.initial / 'AGENT.md').write_text('startup-retry')
+        before = (self.state / 'state.json').read_bytes()
+        self.env['EVE_STARTUP_CHECKPOINT_REQUEST'] = '/owned/request.json'
+        self.launch(wait_running=False)
+        self.assertEqual(self.process.wait(timeout=10), runtime.RECOVERY_STOP)
+        self.assertEqual(self.events.read_text().splitlines(), ['startup-retry'])
+        self.assertEqual(runtime.read_json(self.queue / 'recovery.json')['result'], 'startup_checkpoint_not_ready')
+        self.assertEqual((self.state / 'state.json').read_bytes(), before)
+
+    def test_checkpoint_first_ready_allows_ordinary_restart_without_reusing_request(self):
+        self.env['EVE_STARTUP_CHECKPOINT_REQUEST'] = '/owned/request.json'
+        self.launch()
+        (self.state / 'old.crash').touch()
+        self.wait(lambda data: data['phase'] == 'running' and data['result'] == 'runtime_restarted_state_preserved')
+        received = [json.loads(row) for row in (self.root / 'checkpoint-env.jsonl').read_text().splitlines()]
+        self.assertEqual(received, ['/owned/request.json', None])
 
     def test_repeated_pre_ready_failures_stop_after_restart_budget_without_clearing_state(self):
         (self.initial/'AGENT.md').write_text('never-ready')
