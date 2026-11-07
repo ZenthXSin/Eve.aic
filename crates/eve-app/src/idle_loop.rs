@@ -4,7 +4,10 @@ use eve_task_api::IDLE_TASK_SOURCE_PREFIX;
 use eve_task_api::{Task, TaskCompletionContract, TaskStatus};
 use std::sync::Arc;
 
+mod evidence;
 mod strict_json;
+
+pub(crate) use evidence::observation_with_mind;
 
 pub(crate) const MIND_ID: &str = "idle-mind-v1";
 /// 失败可成为下一次回顾的经历，但待确认调用和未知副作用必须继续阻塞。
@@ -133,83 +136,7 @@ pub(crate) fn observation(
     interests: &[String],
 ) -> SubjectResult<Observation> {
     let previous = mind(snapshot)?;
-    observation_with_mind(snapshot, tasks, scope, interests, previous)
-}
-
-pub(crate) fn observation_with_mind(
-    snapshot: &SubjectSnapshot,
-    tasks: &[Task],
-    scope: &SubjectScope,
-    interests: &[String],
-    previous: Mind,
-) -> SubjectResult<Observation> {
-    let mut recent: Vec<_> = tasks
-        .iter()
-        .filter(|t| {
-            t.owner.session_id == scope.conversation_id
-                && t.owner.user_id == scope.principal_id
-                && t.status.finished()
-                && !t.is_exploration()
-        })
-        .collect();
-    recent.sort_by_key(|t| std::cmp::Reverse((t.finished_at_ms, &t.id)));
-    let internal = |t: &&Task| {
-        t.source.starts_with(IDLE_TASK_SOURCE_PREFIX)
-            || t.source
-                .starts_with(crate::qq_subject::PLAN_TASK_SOURCE_PREFIX)
-    };
-    let last_reflection = recent.iter().copied().find(internal);
-    let mut evidence: Vec<_> = snapshot
-        .foci
-        .iter()
-        .rev()
-        .filter(|f| {
-            f.id != MIND_ID
-                && f.id != "autonomy-policy-v1"
-                && !f.id.starts_with("contract-")
-                && !f.goal.starts_with(IDLE_INPUT_PREFIX)
-                && !f.goal.starts_with(crate::qq_subject::PLAN_INPUT_PREFIX)
-                && !f.goal.starts_with(crate::qq_exploration::INPUT_PREFIX)
-        })
-        .take(6 - usize::from(last_reflection.is_some()))
-        .map(|f| Evidence {
-            id: f.id.clone(),
-            kind: "focus".into(),
-            text: eve_task_api::bounded(&format!("{}\n{}", f.title, f.goal), 1200),
-            excerpt: true,
-        })
-        .collect();
-    // 给最新一次回顾（含确认失败）单独留一个位置，不占四个实际行动结果名额。
-    for task in recent
-        .into_iter()
-        .filter(|t| !internal(t))
-        .take(4)
-        .chain(last_reflection)
-    {
-        evidence.push(Evidence {
-            id: task.id.clone(),
-            kind: if internal(&task) { "self_reflection" } else { "task_result" }.into(),
-            text: {
-                let steps=crate::qq_task_diagnostics::task_step_tail(task,3);
-                serde_json::to_string(&serde_json::json!({"title":task.spec.title,"status":task.status,
-                    "model_result_excerpt":task.result.as_deref().map(|s|eve_task_api::bounded(s,900)),
-                    "failure_excerpt":task.failure.as_deref().map(|s|eve_task_api::bounded(s,500)),
-                    "tool_receipts":steps.steps,"step_total":steps.total,"step_offset":steps.offset,
-                    "notice":"结果正文为模型自述；工具状态来自已保存回执，均为有界节选，不代替完整核验"}))
-                    .map_err(|_|SubjectError::InvalidInput)?
-            },
-            excerpt: true,
-        });
-    }
-    Ok(Observation {
-        scope: scope.clone(),
-        revision: previous.revision,
-        interests: interests.to_vec(),
-        self_interests: previous.self_interests,
-        interest_consumed: Default::default(),
-        evidence,
-        judgments: previous.judgments,
-    })
+    observation_with_mind(snapshot, tasks, scope, interests, previous, None, vec![])
 }
 
 pub(crate) fn decode(input: &str, output: &str) -> SubjectResult<IdleReflection> {

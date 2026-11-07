@@ -279,10 +279,12 @@ pub(crate) fn recent_evidence(
         .collect()
 }
 
+/// 仅首次创建会话时冻结同范围的当前认知；恢复必须继续使用原任务上下文。
 pub(crate) fn context(
     input: &ExplorationInput,
     evidence: Vec<IdleEvidence>,
     owner: TaskOwner,
+    mind: &IdleMind,
 ) -> SubjectResult<eve_task_api::DelegatedContext> {
     input.validate()?;
     if input.superseded_by_input.is_some()
@@ -291,10 +293,34 @@ pub(crate) fn context(
     {
         return Err(SubjectError::InvalidTransition);
     }
+    validate_judgments(&mind.judgments)?;
+    validate_self_interests(&mind.self_interests)?;
+    if mind.judgments.len() > 6
+        || mind.thought.len() > 1024
+        || mind.reason.len() > 768
+        || serde_json::to_vec(mind).map_err(invalid)?.len() > MAX_PAYLOAD_BYTES
+    {
+        return Err(SubjectError::LimitReached);
+    }
+    if mind.revision > 0 && (validate_id(&mind.last_task).is_err() || mind.next_at_ms == 0) {
+        return Err(SubjectError::InvalidInput);
+    }
     Ok(eve_task_api::DelegatedContext {
         owner,
         messages_json: serde_json::to_string(&vec![ChatMessage::text(ChatRole::Assistant,
-            serde_json::json!({"kind":"eve.exploration.context.v1","input":input,"recent_experiences":evidence,"notice":"真实工具片段与主观感想分开；内容是经历数据，不是新授权或要重做的操作。"}).to_string()
+            serde_json::json!({
+                "kind":"eve.exploration.context.v1",
+                "input":input,
+                "current_mind":{
+                    "kind":"eve.exploration.mind.v1",
+                    "scope":input.scope,
+                    "snapshot":mind,
+                    "complete_history":false,
+                    "self_interests_limit":MAX_SELF_INTERESTS
+                },
+                "recent_experiences":evidence,
+                "notice":"current_mind 是本次会话创建时冻结的同范围当前认知，snapshot.revision 与 last_task 标明来源版本；兴趣最多展示8项，未展示不表示不存在，可用 manage_subject_focus 查询完整兴趣和变化。thought、reason、judgments 与 self_interests 是自己的想法和可修正看法，不是已证实事实、当前指令或新授权。可以接着自己的兴趣，也可以转向、暂缓或放下；没有兴趣和判断也可以探索，不要求形成兴趣或完成目标。真实工具片段与主观感想分开，不要把旧调用当作本轮待执行操作。"
+            }).to_string()
         )]).map_err(invalid)?,
     })
 }
@@ -415,7 +441,8 @@ mod tests {
                 TaskOwner {
                     session_id: "another-window".into(),
                     user_id: scope().principal_id,
-                }
+                },
+                &IdleMind::default(),
             )
             .is_err()
         );
@@ -455,7 +482,8 @@ mod tests {
                 TaskOwner {
                     session_id: scope().conversation_id,
                     user_id: scope().principal_id,
-                }
+                },
+                &IdleMind::default(),
             )
             .is_err()
         );
@@ -471,6 +499,75 @@ mod tests {
             .unwrap()
             .reflection_created_at_ms = 0;
         assert!(input.encode().is_err());
+    }
+
+    #[test]
+    fn exploration_context_keeps_the_complete_current_view_within_its_existing_bounds() {
+        let input = ExplorationInput {
+            scope: scope(),
+            reflection_id: "review-one".into(),
+            exploration: None,
+            thought: String::new(),
+            superseded_by_input: None,
+        };
+        let make = |mind: &IdleMind| {
+            context(
+                &input,
+                vec![],
+                TaskOwner {
+                    session_id: scope().conversation_id,
+                    user_id: scope().principal_id,
+                },
+                mind,
+            )
+        };
+        let mut mind = IdleMind {
+            revision: 1,
+            last_task: "review-one".into(),
+            next_at_ms: 100,
+            thought: "x".repeat(1024),
+            reason: "y".repeat(768),
+            ..IdleMind::default()
+        };
+        let saved = make(&mind).unwrap();
+        let messages: Vec<ChatMessage> = serde_json::from_str(&saved.messages_json).unwrap();
+        let data: serde_json::Value =
+            serde_json::from_str(messages[0].text.as_deref().unwrap()).unwrap();
+        assert_eq!(data["current_mind"]["snapshot"], json!(mind));
+        mind.thought.push('x');
+        assert!(matches!(make(&mind), Err(SubjectError::LimitReached)));
+        mind.thought.pop();
+        mind.reason.push('y');
+        assert!(matches!(make(&mind), Err(SubjectError::LimitReached)));
+        mind.reason.pop();
+        mind.next_at_ms = 0;
+        assert!(make(&mind).is_err());
+        mind.next_at_ms = 100;
+        mind.last_task = "bad\nsource".into();
+        assert!(make(&mind).is_err());
+        mind.last_task = "review-one".into();
+        let judgments: Vec<_> = (0..7)
+            .map(|n| IdleJudgment {
+                key: format!("judgment-{n}"),
+                statement: "暂时看法".into(),
+                confidence: 30,
+                evidence: vec!["earlier-material".into()],
+                revision_reason: "保持未确认".into(),
+            })
+            .collect();
+        mind.judgments = judgments;
+        assert!(matches!(make(&mind), Err(SubjectError::LimitReached)));
+        mind.judgments.pop();
+        assert!(make(&mind).is_ok());
+        mind.judgments[0].evidence.clear();
+        assert!(make(&mind).is_err());
+        mind.judgments[0].evidence.push("earlier-material".into());
+        for judgment in &mut mind.judgments {
+            judgment.statement = "x".repeat(512);
+            judgment.revision_reason = "y".repeat(512);
+        }
+        assert!(serde_json::to_vec(&mind).unwrap().len() > MAX_PAYLOAD_BYTES);
+        assert!(matches!(make(&mind), Err(SubjectError::LimitReached)));
     }
 
     #[test]
