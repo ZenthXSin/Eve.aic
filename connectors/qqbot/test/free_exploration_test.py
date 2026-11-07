@@ -579,6 +579,141 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.assertEqual(self.workspace_files(), self.initial_files)
         self.assert_no_replay()
 
+    def test_exploration_notes_persist_into_next_context_and_history_stays_readable(self):
+        self.mode = "notes"
+        original_explore = self.explore
+        written = {}
+
+        def keep_notes(body):
+            results = self.results(body)
+            frozen = self.exploration_context(body)["notes_context"]
+            self.assertEqual(frozen["revision"], 0)
+            self.assertIsNone(frozen["rendered"])
+            if len(results) < 3:
+                return original_explore(body)
+            if len(results) == 3:
+                self.assertIn(self.nonce, results[-1]["content"])
+                path = re.search(r"另一个方向的材料路径：([^\n]+)",
+                                 results[1]["content"]).group(1)
+                written["text"] = (f"资料：{path}\n未解问题：声音和色彩的变化有什么联系？\n"
+                                   + "还没有答案，可以以后再看。" * 700)
+                return self.call("context_notes", {"operation": "update", "expected_revision": 0,
+                                                    "text": written["text"]})
+            self.assertEqual(len(results), 4)
+            self.assertEqual(results[-1]["view"]["revision"], 1)
+            self.assertTrue(results[-1]["view"]["truncated"])
+            return text_response("留下一点疑问，先休息。")
+
+        self.explore = keep_notes
+        first = self.start_and_end(tools=4, requests=5)
+        before_first = copy.deepcopy(first)
+        original_record = copy.deepcopy(self.experience(first))
+        self.assertEqual(original_record["total_tool_calls"], 4)
+        self.assertEqual(original_record["tools"][3]["tool"], "context_notes")
+        self.assertEqual(original_record["tools"][3]["outcome"], "succeeded")
+        note_bytes = written["text"].encode("utf8")
+        self.assertGreater(len(note_bytes), 16384)
+
+        def continue_freely(observation, result):
+            if self.reflections == 2:
+                result["choice"] = "explore"
+                result["thought"] = "看看之前留下了什么，也可以继续放下"
+                result["reason"] = "有一点好奇"
+                actual = next(item for item in observation["evidence"] if item["id"] == first["id"])
+                self.assertEqual(json.loads(actual["text"]), original_record)
+
+        self.after_reflection = continue_freely
+        readback = {"note": bytearray(), "record": bytearray(), "hash": None}
+        current_note = "现在想先放下这个问题；旧资料仍可按版本回查。"
+
+        def follow_notes(body):
+            context = self.exploration_context(body)
+            self.assertEqual(context["current_mind"]["snapshot"]["revision"], 2)
+            frozen = context["notes_context"]
+            self.assertEqual(frozen["kind"], "eve.exploration.notes.v1")
+            self.assertEqual(frozen["revision"], 1)
+            self.assertEqual(frozen["owner"], {"channel": context["input"]["scope"]["channel"],
+                "session_id": context["input"]["scope"]["conversation_id"],
+                "user_id": context["input"]["scope"]["principal_id"]})
+            view = json.loads(frozen["rendered"].splitlines()[-1])
+            prefix = view["text_prefix"].encode("utf8")
+            self.assertEqual(view["revision"], 1)
+            self.assertEqual(view["total_bytes"], len(note_bytes))
+            self.assertTrue(view["truncated"])
+            self.assertLessEqual(len(prefix), 16384)
+            self.assertEqual(prefix, note_bytes[:len(prefix)])
+            self.assertIn(self.second_name, view["text_prefix"])
+            self.assertIn("未解问题", view["text_prefix"])
+            results = self.results(body)
+            if not results:
+                return self.call("context_notes", {"operation": "read_range", "revision": 1,
+                                                    "offset": 0, "limit": 16384})
+            last = results[-1]
+            if "page" in last:
+                page = last["page"]
+                self.assertEqual(page["revision"], 1)
+                self.assertEqual(page["offset"], len(readback["note"]))
+                readback["note"].extend(page["text"].encode("utf8"))
+                if page["next_offset"] is not None:
+                    return self.call("context_notes", {"operation": "read_range", "revision": 1,
+                        "offset": page["next_offset"], "limit": 16384})
+                self.assertEqual(bytes(readback["note"]), note_bytes)
+                return self.call("read_exploration", {"action": "list", "limit": 1})
+            if "items" in last:
+                self.assertEqual(last["total"], 1)
+                [index] = last["items"]
+                self.assertEqual(index["session_id"], first["id"])
+                self.assertEqual(index["subjective_notes"], original_record["subjective_notes"])
+                self.assertIsNone(last["next_before"])
+                return self.call("read_exploration", {"action": "read", "id": index["session_id"],
+                                                       "offset": 0, "limit": 8192})
+            if "sha256" in last and "text" in last:
+                self.assertEqual(last["id"], first["id"])
+                self.assertEqual(last["scope"], original_record["scope"])
+                self.assertEqual(last["offset"], len(readback["record"]))
+                if readback["hash"] is None:
+                    readback["hash"] = last["sha256"]
+                self.assertEqual(last["sha256"], readback["hash"])
+                readback["record"].extend(last["text"].encode("utf8"))
+                if last["next_offset"] is not None:
+                    return self.call("read_exploration", {"action": "read", "id": first["id"],
+                        "offset": last["next_offset"], "limit": 8192})
+                raw = bytes(readback["record"])
+                self.assertEqual(len(raw), last["total_bytes"])
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), readback["hash"])
+                self.assertEqual(json.loads(raw), original_record)
+                return self.call("context_notes", {"operation": "update", "expected_revision": 1,
+                                                    "text": current_note})
+            self.assertEqual(last["view"]["revision"], 2)
+            self.assertEqual(last["view"]["text"], current_note)
+            # 本次工具已保存修订2，但当前探索的冻结预览仍是修订1。
+            return text_response("看到了旧问题和真实经历，现在先放下。")
+
+        self.explore = follow_notes
+        self.due()
+
+        def second_ended():
+            self.wait_for(lambda: len(self.explorations()) == 2 and all(
+                task["status"] == NORMAL_STATUS for task in self.explorations()),
+                "第二段探索未保存笔记和回查结果", 20)
+            self.wait_reconciled()
+            self.assertFalse(self.run_release.wait(0.8))
+
+        self.run_idle(self.checkpoint("notes-followed"), checkpoints={"notes-followed": second_ended})
+        second = next(task for task in self.explorations() if task["id"] != first["id"])
+        self.assertEqual(next(task for task in self.explorations() if task["id"] == first["id"]), before_first)
+        self.assertEqual(self.experience(first), original_record)
+        self.assertEqual(json.loads(bytes(readback["record"])), original_record)
+        self.assertEqual(bytes(readback["note"]), note_bytes)
+        self.assert_session_binding(first)
+        self.assert_session_binding(second)
+        self.assertNotEqual(self.worker_requests(first)[0]["body"]["prompt_cache_key"],
+                            self.worker_requests(second)[0]["body"]["prompt_cache_key"])
+        self.assertEqual(self.grant()["issued"], 4)
+        self.assertEqual(len(self.kind("review")), 0)
+        self.assertEqual(self.workspace_files(), self.initial_files)
+        self.assert_no_replay()
+
     def test_empty_exploration_can_rest_without_any_tool_or_artifact(self):
         self.mode = "rest"
         self.exploration_field = {}
@@ -708,6 +843,22 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
 
     def test_saved_receipt_resumes_same_session_without_replaying_tool(self):
         self.mode = "resume"
+        original_explore = self.explore
+        note = "先记下一个未解问题；这次会话的原始便笺仍为空。"
+
+        def save_note_then_wait(body):
+            frozen = self.exploration_context(body)["notes_context"]
+            self.assertEqual(frozen["revision"], 0)
+            self.assertIsNone(frozen["rendered"])
+            results = self.results(body)
+            if not results:
+                return self.call("context_notes", {"operation": "update", "expected_revision": 0,
+                                                    "text": note})
+            self.assertEqual(results[-1]["view"]["revision"], 1)
+            self.assertEqual(results[-1]["view"]["text"], note)
+            return original_explore(body)
+
+        self.explore = save_note_then_wait
         self.initialize()
         self.due()
         stop = self.gate("stop-saved")
@@ -739,6 +890,9 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.assertIsNone(restored_checkpoint.get("pending_request_fingerprint"))
         self.assertEqual(after["execution"]["recoveries"], 1)
         self.assertEqual(len(self.worker_calls), 1)
+        [record] = self.documents()["eve.context-notes"]["index.v1"]["records"].values()
+        self.assertEqual(len(record["versions"]), 1, "恢复不得重放便笺保存")
+        self.assertEqual(record["versions"][0]["revision"], 1)
         self.assert_no_replay()
 
     def test_real_inflight_operation_stays_unknown_and_is_never_replayed(self):
