@@ -67,9 +67,10 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         return result
 
     def run_live_failure(self, script, notifications, **options):
-        """只允许逐条指定的失败回执发系统通知；普通 live 断言保持不变。"""
+        """显式开启固定故障通知；普通 live 默认保持安静。"""
         self.assertTrue(notifications)
-        options['env_extra'] = dict(options.pop('env_extra', {}), EVE_QQ_LIVE_INTERACTION='true')
+        options['env_extra'] = dict(options.pop('env_extra', {}), EVE_QQ_LIVE_INTERACTION='true',
+                                    EVE_PROGRESS_FAILURE_NOTICES='true')
         result = self.run_eve(script, milestones=None, **options)
         self.assertFalse(self.narrations, '故障通知不得调用措辞模型')
         outputs = [e for e in self.events if e.get('direction') == 'out' and
@@ -333,6 +334,55 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.assertIn('已启动 2 次工具调用，收到 2 条工具回执', receipt['reply'])
         self.assertEqual(self.turn(message['text'])['status']['failure']['started_tools'], 2)
         self.assertFalse(self.speech_requests)
+
+    def silent_failure_preserves_delivery(self, delivery_state):
+        marker = self.source / 'executions.txt'
+        program = "from pathlib import Path; p=Path('executions.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('command-complete')"
+        def respond(body):
+            results = self.all_results(body)
+            if not results:
+                return self.choose('send_message', {'text': '核对到的一条事实'})
+            if len(results) == 1:
+                self.assertEqual(results[0]['delivery_status'], delivery_state.lower())
+                return self.choose('run_command', {'program': sys.executable, 'args': ['-c', program]})
+            return self.malformed_tool_response()
+        self.callback = respond
+        message = self.message('quiet-failure', '检查实际执行与消息回执')
+        if delivery_state == 'Unknown':
+            message |= {'fail_progress': True, 'progress_diagnostic': {'failure_kind': 'timeout'}}
+        summary = self.run_live([{'send': message}, self.wait_receipt(message['id'], 'Failed'),
+            self.wait_command(message['id'], 'finish'), {'send': message},
+            self.wait_command(message['id'], 'finish', count=2)], memory=True, env_extra={
+                'EVE_OPENAI_TRANSIENT_RETRIES': 'true', 'EVE_DEVELOPER_CONFIG': str(self.developer_config)})
+        self.assertEqual(self.chat_rounds, 4)
+        self.assertEqual(marker.read_text(), 'x')
+        self.assertEqual([e['text'] for e in self.progress(message['id'])], ['核对到的一条事实'])
+        before = self.receipt(message['id'])
+        self.assertIsNone(before['reply'])
+        self.assertIsNone(before.get('control_turn_id'))
+        self.assertEqual(before['progress'][0]['state'], delivery_state)
+        self.assertEqual(bool(before['progress'][0].get('platform_message_id')), delivery_state == 'Sent')
+        failure = self.turn(message['text'])['status']['failure']
+        self.assertEqual(failure['code'], 'Protocol')
+        self.assertEqual(failure['started_tools'], 2)
+        self.assertEqual(summary['failed'], 1 + int(delivery_state == 'Unknown'))
+        self.assertEqual(summary['sent'], int(delivery_state == 'Sent'))
+        self.assertFalse(self.speech_requests)
+        self.assertFalse(self.interactions(), '失败轮不进入成功交互学习')
+        self.callback = lambda _: dialogue.text_response('内部结束')
+        self.run_live([{'send': message}, self.wait_command(message['id'], 'finish'),
+            *self.send(self.message('after-quiet-failure', '重启后这次先不回复'))], memory=True)
+        self.assertEqual(self.chat_rounds, 5, '重启只处理新输入')
+        self.assertEqual(self.receipt(message['id']), before)
+        self.assertEqual(marker.read_text(), 'x', '重复输入和重启均不得重放命令')
+        self.assertFalse(self.progress(message['id']))
+        self.assertFalse(self.speech_requests)
+
+    def test_default_failure_releases_input_and_preserves_sent_expression_after_restart(self):
+        self.silent_failure_preserves_delivery('Sent')
+
+    def test_default_failure_preserves_unknown_expression_without_replay_after_restart(self):
+        self.silent_failure_preserves_delivery('Unknown')
 
     def failure_notice_not_replayed(self, state, diagnostic):
         self.callback = lambda _: self.malformed_tool_response()

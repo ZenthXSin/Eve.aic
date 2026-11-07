@@ -1,6 +1,8 @@
 //! 真实 Rust 通道和生产 Node bridge-core；失败事实不依赖模型或真实 QQ。
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
-use eve_control_api::{CommitState, ControlRunner, RunFailure, RunFuture, RunReport};
+use eve_control_api::{
+    CommitState, ControlReport, ControlRunner, RunFailure, RunFuture, RunReport,
+};
 use eve_control_plugin::ControlPlugin;
 use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
 use eve_llm_api::{LlmError, LlmFuture, TurnEventSink};
@@ -16,13 +18,13 @@ use serde_json::Value;
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-struct FailedRunner(Arc<dyn SessionService>);
+struct FailedRunner(Arc<dyn SessionService>, CommitState);
 impl ControlRunner for FailedRunner {
     fn run<'a>(&'a self, _: SessionInput, _: &'a dyn TurnEventSink) -> RunFuture<'a> {
         panic!("QQ 必须传入可信原消息元数据")
@@ -39,19 +41,21 @@ impl ControlRunner for FailedRunner {
             eve_control_api::ControlReviewEvidence::ChannelAnchor(anchor) if anchor == "failed-input"));
         Box::pin(async move {
             let started = self.0.begin(input).unwrap();
-            self.0
-                .fail(
-                    &started.lease,
-                    SessionFailure {
-                        code: SessionFailureCode::Protocol,
-                        started_tools: Some(0),
-                        evidence: None,
-                    },
-                )
-                .unwrap();
+            if self.1 == CommitState::Failed {
+                self.0
+                    .fail(
+                        &started.lease,
+                        SessionFailure {
+                            code: SessionFailureCode::Protocol,
+                            started_tools: Some(0),
+                            evidence: None,
+                        },
+                    )
+                    .unwrap();
+            }
             RunReport {
                 turn_id: Some(started.lease.turn_id),
-                commit: CommitState::Failed,
+                commit: self.1,
                 text: None,
                 transcript: None,
                 started_tools: Some(0),
@@ -61,6 +65,25 @@ impl ControlRunner for FailedRunner {
                 ))),
             }
         })
+    }
+}
+
+struct EnabledFailureNotices;
+impl QqSlowProgress for EnabledFailureNotices {
+    fn after(&self) -> Option<Duration> {
+        None
+    }
+    fn failure_notices(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Default)]
+struct Recovery(Mutex<Vec<ControlReport>>);
+impl QqFailureRecovery for Recovery {
+    fn recover(&self, report: &ControlReport) -> PluginResult<Option<String>> {
+        self.0.lock().unwrap().push(report.clone());
+        Ok(None)
     }
 }
 
@@ -110,7 +133,7 @@ fn receipts(store: &MemoryStateStore) -> Option<Value> {
         .map(|bytes| serde_json::from_slice(&bytes).unwrap())
 }
 
-async fn scenario(with_speech: bool, unknown: bool) {
+async fn scenario(with_speech: bool, unknown: bool, notices: bool, commit: CommitState) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryStateStore::default());
     let services = KernelServices {
@@ -137,7 +160,7 @@ async fn scenario(with_speech: bool, unknown: bool) {
         .clone();
     kernel
         .register(Box::new(
-            ControlPlugin::new(Arc::new(FailedRunner(sessions)), vec![]).unwrap(),
+            ControlPlugin::new(Arc::new(FailedRunner(sessions, commit)), vec![]).unwrap(),
         ))
         .unwrap();
     kernel
@@ -156,13 +179,21 @@ async fn scenario(with_speech: bool, unknown: bool) {
         .register(Box::new(MessageRouterPlugin::builtin().unwrap()))
         .unwrap();
     let speech = Arc::new(UnavailableSpeech::default());
+    let recovery = Arc::new(Recovery::default());
     let mut plugin = QqBotPlugin::new(QqBotConfig {
         node_program: "node".into(),
         bridge_script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../connectors/qqbot/test/live-failure-bridge.mjs"),
         bridge_args: vec![
             directory.path().into(),
-            if unknown { "unknown" } else { "sent" }.into(),
+            if !notices {
+                "silent"
+            } else if unknown {
+                "unknown"
+            } else {
+                "sent"
+            }
+            .into(),
         ],
         app_id: "app".into(),
         app_secret: "local-fixture".into(),
@@ -170,7 +201,11 @@ async fn scenario(with_speech: bool, unknown: bool) {
         markdown: false,
     })
     .unwrap()
-    .with_live_dialogue(Arc::new(LiveDialogue::default()));
+    .with_live_dialogue(Arc::new(LiveDialogue::default()))
+    .with_failure_recovery(recovery.clone());
+    if notices {
+        plugin = plugin.with_slow_progress(Arc::new(EnabledFailureNotices));
+    }
     if with_speech {
         plugin = plugin.with_speech(speech.clone());
     }
@@ -186,10 +221,30 @@ async fn scenario(with_speech: bool, unknown: bool) {
         .value
         .downcast::<QqBotStatusHandle>()
         .unwrap();
-    let expected = if unknown { "Unknown" } else { "Sent" };
+    let expected = if !notices {
+        "Failed"
+    } else if unknown {
+        "Unknown"
+    } else {
+        "Sent"
+    };
     let finished = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if receipts(&store).is_some_and(|value| value["entries"][0]["state"] == expected) {
+            let input_released = notices
+                || std::fs::read_to_string(directory.path().join("bridge.jsonl")).is_ok_and(
+                    |rows| {
+                        rows.lines()
+                            .filter(|line| {
+                                serde_json::from_str::<Value>(line)
+                                    .is_ok_and(|row| row["type"] == "finished")
+                            })
+                            .count()
+                            == 2
+                    },
+                );
+            if input_released
+                && receipts(&store).is_some_and(|value| value["entries"][0]["state"] == expected)
+            {
                 break;
             }
             if status.status.borrow().closed {
@@ -201,10 +256,15 @@ async fn scenario(with_speech: bool, unknown: bool) {
     .await;
     status.request_stop();
     let stopped = kernel.stop_all().await;
-    finished.expect("故障事实应直接到达 Node，不依赖自主发言模型");
+    finished.expect("失败应完成原输入收尾，不依赖自主发言模型");
     stopped.unwrap();
     assert!(!status.status.borrow().terminal_error);
     assert_eq!(speech.0.load(Ordering::SeqCst), 0);
+    let recovered = recovery.0.lock().unwrap();
+    assert_eq!(recovered.len(), 1, "重复输入不重新执行或创建恢复任务");
+    assert_eq!(recovered[0].run.commit, commit);
+    assert!(recovered[0].run.turn_id.is_some());
+    assert!(recovered[0].run.failure.is_some());
     let rows: Vec<Value> = std::fs::read_to_string(directory.path().join("bridge.jsonl"))
         .unwrap()
         .lines()
@@ -214,6 +274,32 @@ async fn scenario(with_speech: bool, unknown: bool) {
         .iter()
         .filter(|row| row["type"] == "platform")
         .collect();
+    let ledger = receipts(&store).unwrap();
+    assert_eq!(ledger["entries"][0]["state"], expected);
+    assert!(ledger["entries"][0]["control_turn_id"].is_null());
+    assert_eq!(status.status.borrow().completed, 0);
+    assert_eq!(
+        status.status.borrow().failed,
+        1 + u64::from(notices && unknown)
+    );
+    assert_eq!(status.status.borrow().sent, u64::from(notices && !unknown));
+    if !notices {
+        assert!(requests.is_empty());
+        assert!(ledger["entries"][0]["reply"].is_null());
+        assert!(!rows.iter().any(|row| row["direction"] == "host"
+            && matches!(
+                row["type"].as_str(),
+                Some("reply" | "push" | "progress" | "segment" | "sticker")
+            )));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["direction"] == "channel" && row["type"] == "message")
+                .count(),
+            2,
+            "原输入已释放，重复投递由持久回执去重"
+        );
+        return;
+    }
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["target"]["scope"], "c2c");
     assert_eq!(requests[0]["target"]["targetId"], "alice");
@@ -226,25 +312,30 @@ async fn scenario(with_speech: bool, unknown: bool) {
             row["type"].as_str(),
             Some("push" | "segment" | "sticker" | "finish")
         )));
-    let ledger = receipts(&store).unwrap();
-    assert_eq!(ledger["entries"][0]["state"], expected);
     assert_eq!(ledger["entries"][0]["reply"], text);
-    assert!(ledger["entries"][0]["control_turn_id"].is_null());
-    assert_eq!(status.status.borrow().completed, 0);
-    assert_eq!(status.status.borrow().sent, u64::from(!unknown));
 }
 
 #[tokio::test]
 async fn failure_notice_reaches_the_original_route_without_a_speech_service() {
-    scenario(false, false).await;
+    scenario(false, false, true, CommitState::Failed).await;
 }
 
 #[tokio::test]
 async fn unavailable_speech_service_cannot_swallow_the_failure_notice() {
-    scenario(true, false).await;
+    scenario(true, false, true, CommitState::Failed).await;
 }
 
 #[tokio::test]
 async fn unknown_platform_result_is_recorded_without_retry_or_speech_fallback() {
-    scenario(true, true).await;
+    scenario(true, true, true, CommitState::Failed).await;
+}
+
+#[tokio::test]
+async fn default_failure_keeps_recovery_and_releases_input_without_speech_or_notice() {
+    scenario(false, false, false, CommitState::Failed).await;
+}
+
+#[tokio::test]
+async fn unknown_control_result_is_preserved_and_releases_input_without_a_notice() {
+    scenario(true, false, false, CommitState::Unknown).await;
 }
