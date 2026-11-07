@@ -17,10 +17,21 @@ use std::{
     time::Duration,
 };
 const BROKEN: &str = "群消息数据库不可用；原记录保留，停止本次观察和发送";
+
+struct ExclusiveLock(std::fs::File);
+
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        // fork/dup 可暂留同一打开文件描述；所有者结束时显式释放锁。
+        let _ = self.0.unlock();
+    }
+}
+
 pub struct SqliteGroupObservations {
     db: Mutex<Connection>,
     healthy: AtomicBool,
-    _exclusive: std::fs::File,
+    // 字段按声明顺序释放，数据库连接关闭后才交还独占锁。
+    _exclusive: ExclusiveLock,
 }
 impl SqliteGroupObservations {
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -52,6 +63,16 @@ impl SqliteGroupObservations {
         exclusive
             .try_lock()
             .map_err(|_| "群消息数据库已由另一宿主持有")?;
+        let exclusive = ExclusiveLock(exclusive);
+        Self::open_locked(path, &marker, exists, exclusive)
+    }
+
+    fn open_locked(
+        path: &Path,
+        marker: &Path,
+        exists: bool,
+        exclusive: ExclusiveLock,
+    ) -> Result<Self, String> {
         let mut db = Connection::open(path).map_err(|_| BROKEN)?;
         db.busy_timeout(Duration::from_millis(100))
             .map_err(|_| BROKEN)?;
@@ -107,7 +128,7 @@ impl SqliteGroupObservations {
             let mut file = std::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .open(&marker)
+                .open(marker)
                 .map_err(|_| BROKEN)?;
             file.write_all(b"group-observations-v1\n")
                 .and_then(|()| file.sync_all())
@@ -140,6 +161,9 @@ impl SqliteGroupObservations {
         result
     }
 }
+
+#[cfg(all(test, unix))]
+mod lock_tests;
 /// 旧格式已经有成功投递正文和原消息，只补齐可验证问答，不推断未知发送结果。
 fn recover_confirmed(db: &mut Connection) -> Result<(), String> {
     let tx = db.transaction().map_err(|_| BROKEN)?;
