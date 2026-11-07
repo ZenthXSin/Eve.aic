@@ -344,7 +344,7 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
-    async fn scoped_consent_preserves_six_originals_is_idempotent_and_revokes_after_restart() {
+    async fn scoped_consent_preserves_originals_and_revokes_after_restart_without_review() {
         let dir = tempfile::tempdir().unwrap();
         let services = KernelServices {
             state: Arc::new(FileStateStore::open(dir.path()).unwrap()),
@@ -388,6 +388,26 @@ mod tests {
         assert!(!list.to_string().contains("隐私偏好"));
         assert_eq!(list["sources"][0]["source"], hash(&source).unwrap());
         let grant = json!({"action":"grant","source":hash(&source).unwrap(),"interactions":true});
+        let no_review = SharingTool {
+            memory: tool.memory.clone(),
+            unified: unified.clone(),
+            identities: identity.clone(),
+            reviewer: None,
+        };
+        assert_eq!(
+            no_review
+                .execute(call(json!({"action":"list"})), ctx.clone())
+                .await
+                .unwrap(),
+            list
+        );
+        let unavailable = no_review
+            .execute(call(grant.clone()), ctx.clone())
+            .await
+            .unwrap_err();
+        assert!(unavailable.to_string().contains("独立授权审核不可用"));
+        assert_eq!(unified.snapshot().unwrap().revision, 0);
+        assert!(reviewer.requests.lock().unwrap().is_empty());
         assert!(
             tool.execute(call(grant.clone()), context("alice", vec![]))
                 .await
@@ -485,15 +505,21 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            tool.execute(
-                call(json!({"action":"revoke","binding_id":id})),
-                context("bob", vec![])
-            )
+        let bindings = no_review
+            .execute(call(json!({"action":"list"})), ctx.clone())
             .await
-            .is_err()
+            .unwrap();
+        assert_eq!(bindings["bindings"][0]["binding_id"], id);
+        assert!(
+            no_review
+                .execute(
+                    call(json!({"action":"revoke","binding_id":id})),
+                    context("bob", vec![])
+                )
+                .await
+                .is_err()
         );
-        let revoked = tool
+        let revoked = no_review
             .execute(call(json!({"action":"revoke","binding_id":id})), ctx)
             .await
             .unwrap();

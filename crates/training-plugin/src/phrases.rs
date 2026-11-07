@@ -347,12 +347,22 @@ impl Phrases {
             // 合并和容量检查都未触及存储。明确拒绝时不留下部分 uses、序号或候选，
             // 只结束这批；实际提交终态的后端错误仍由调用方封住旧快照。
             let mut accepted = self.clone();
-            if let Ok(changed) = accepted.merge(batch, drafts, now_ms) {
+            if let Ok((saved, skipped)) = accepted.merge(batch, drafts, now_ms) {
                 accepted.inflight.remove(index);
                 if accepted.bytes().is_ok() {
                     *self = accepted;
-                    return Ok(PhraseFinish::Saved(changed));
+                    return Ok(if skipped == 0 {
+                        PhraseFinish::Saved(saved)
+                    } else {
+                        PhraseFinish::CapacityLimited { saved, skipped }
+                    });
                 }
+                // 总字节不足时仍完整回退本批候选，不把未提交的更新计为保存。
+                self.inflight.remove(index);
+                return Ok(PhraseFinish::CapacityLimited {
+                    saved: 0,
+                    skipped: drafts.len(),
+                });
             }
         }
         self.inflight.remove(index);
@@ -363,13 +373,13 @@ impl Phrases {
         self.inflight.retain(|entry| entry.batch.scope != *scope);
         self.inflight.len() != before
     }
-    /// 核对候选并合并；返回新增或更新的条数。
+    /// 核对候选并合并；返回新增/更新条数与因本范围容量跳过的新说法数。
     fn merge(
         &mut self,
         batch: &PhraseBatch,
         drafts: &[PhraseDraft],
         now_ms: u64,
-    ) -> PluginResult<usize> {
+    ) -> PluginResult<(usize, usize)> {
         if !drafts_valid(batch, drafts) {
             return Err(error("说法学习结果不合格；本批不保存"));
         }
@@ -379,6 +389,7 @@ impl Phrases {
             return Err(error("说法学习范围容量已满；保留旧状态，不接纳迟到新范围"));
         }
         let mut changed = 0;
+        let mut skipped = 0;
         for draft in drafts {
             if let Some(stored) = self.learned.iter_mut().find(|s| {
                 s.scope == batch.scope && s.phrase.kind == draft.kind && s.phrase.text == draft.text
@@ -398,6 +409,7 @@ impl Phrases {
                 .count()
                 >= MAX_PHRASES
             {
+                skipped += 1;
                 continue;
             }
             let id = format!("p{}", self.next);
@@ -419,7 +431,7 @@ impl Phrases {
             });
             changed += 1;
         }
-        Ok(changed)
+        Ok((changed, skipped))
     }
     pub(crate) fn list(&self, scope: &ContextScope) -> Vec<LearnedPhrase> {
         let mut list: Vec<_> = self
@@ -592,13 +604,13 @@ mod tests {
                     1
                 )
                 .unwrap(),
-            2
+            (2, 0)
         );
         assert_eq!(
             phrases
                 .merge(&batch, &[draft(PhraseKind::Term, "yyds", "第1句 yyds")], 2)
                 .unwrap(),
-            1
+            (1, 0)
         );
         let list = phrases.list(&scope("a"));
         assert_eq!(list[0].text, "yyds");
@@ -790,13 +802,16 @@ mod tests {
         let mut expanded = phrases.clone();
         assert_eq!(
             expanded.merge(&batch, &drafts, 3).unwrap(),
-            MAX_PHRASE_DRAFTS
+            (MAX_PHRASE_DRAFTS, 0)
         );
         expanded.cancel_scope(&owner);
         assert!(expanded.bytes().is_err(), "合法候选超过释放 batch 后的容量");
         assert_eq!(
             phrases.finish(&batch, &drafts, 3).unwrap(),
-            PhraseFinish::Rejected
+            PhraseFinish::CapacityLimited {
+                saved: 0,
+                skipped: MAX_PHRASE_DRAFTS,
+            }
         );
         let after: serde_json::Value = serde_json::from_slice(&phrases.bytes().unwrap()).unwrap();
         for field in ["pending", "learned", "next"] {

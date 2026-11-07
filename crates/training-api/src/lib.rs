@@ -74,7 +74,7 @@ pub struct ExpressionSnapshot {
 /// 每批交给学习器的用户原话条数；攒够才学习。
 pub const PHRASE_BATCH: usize = 12;
 /// 每个作用域保存的已学说法上限。
-pub const MAX_PHRASES: usize = 64;
+pub const MAX_PHRASES: usize = 256;
 /// 学习器单批至多返回的说法条数。
 pub const MAX_PHRASE_DRAFTS: usize = 6;
 /// 词语或场合的字符上限；词义、说法特点与原话摘录的字符上限。
@@ -150,10 +150,17 @@ impl PhraseFailure {
     }
 }
 
-/// Saved、Rejected 已确认持久保存；Stale 不写。存储结果未知须返回 Err，不能伪装 Rejected。
+/// Saved、CapacityLimited、Rejected 已确认持久保存；Stale 不写。存储结果未知须返回 Err。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PhraseFinish {
+    /// 实际新增或更新的条数；零表示合法空候选。
     Saved(usize),
+    /// 合法候选因容量未全部保存。saved 是实际新增/更新，skipped 是未提交的候选数。
+    /// 条数满时只跳过新说法；总字节满导致整批回退时，skipped 包含回退的更新，不重试。
+    CapacityLimited {
+        saved: usize,
+        skipped: usize,
+    },
     Rejected,
     Stale,
 }

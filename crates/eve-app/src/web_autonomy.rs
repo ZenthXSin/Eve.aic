@@ -17,6 +17,7 @@ pub(crate) struct WebAutonomy {
     pub training: Arc<dyn eve_training_api::TrainingService>,
     pub goals: crate::web_goals::Assembly,
     subject: Arc<dyn eve_subject_api::SubjectAdmin>,
+    exploration_notes: Arc<crate::context_notes::NotesTool>,
     pub admission: Arc<crate::qq_subject_admission::Admission>,
     late: Arc<crate::qq_tasks::Late>,
     observations: Arc<OnceLock<Arc<crate::qq_triggers::Observations>>>,
@@ -38,6 +39,7 @@ impl WebAutonomy {
         bootstrap: &mut CoreBootstrap,
         state: &Path,
         health: Arc<eve_model_health::HealthBook>,
+        exploration_notes: Arc<crate::context_notes::NotesTool>,
     ) -> Result<Self, AppError> {
         kernel.register(Box::new(
             eve_training_plugin::TrainingPlugin::new(true)?
@@ -359,6 +361,12 @@ impl WebAutonomy {
             .push(Arc::new(crate::qq_subject::FocusTool(subject.clone())));
         bootstrap
             .tools
+            .push(Arc::new(crate::qq_exploration_history::ReadExploration {
+                subject: subject.clone(),
+                binding: exploration_notes.binding.clone(),
+            }));
+        bootstrap
+            .tools
             .push(Arc::new(crate::qq_subject::ConfigureTool {
                 subject: subject.clone(),
                 owner: admin.clone(),
@@ -525,6 +533,7 @@ impl WebAutonomy {
             training,
             goals,
             subject,
+            exploration_notes,
             admission,
             late,
             observations,
@@ -665,6 +674,7 @@ impl WebAutonomy {
                 self.admin.clone(),
                 Some(sessions),
                 Some(control),
+                Some(self.exploration_notes.clone()),
             ),
             digest: crate::qq_history_digest::Background::start(
                 self.digests.clone(),

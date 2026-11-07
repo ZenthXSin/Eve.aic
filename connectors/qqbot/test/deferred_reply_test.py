@@ -19,7 +19,6 @@ class DeferredReplyAcceptance(live.LiveToolAcceptance):
         notifications = options.pop('failure_notifications', None)
         environment = {
             'EVE_DEFERRED_REPLY_ENABLED': 'true',
-            'EVE_DEFERRED_REPLY_MAX_RETRIES': '3',
             'EVE_DEFERRED_REPLY_INITIAL_DELAY_MS': '40',
             'EVE_DEFERRED_REPLY_MAX_DELAY_MS': '80',
             'EVE_DEFERRED_REPLY_WINDOW_MS': '4000',
@@ -32,6 +31,77 @@ class DeferredReplyAcceptance(live.LiveToolAcceptance):
         if notifications is not None:
             return self.run_live_failure(script, notifications, panel=True, env_extra=environment, **options)
         return self.run_live(script, panel=True, env_extra=environment, **options)
+
+    def test_default_window_recovers_after_more_than_three_failures_in_one_turn(self):
+        self.http_status = lambda kind, number: 503 if kind == 'chat' and number <= 5 else 200
+        answer = '模型恢复了，接着把刚才的问题完整回答。'
+        self.callback = lambda body: self.choose('send_message', {'text': answer}) if not self.all_results(body) else dialogue.text_response('{"action":"silence"}')
+        self.run_deferred(self.send(self.message('full-window', '别提前结束这轮，恢复后继续回答')))
+        requests = self.kind('chat')
+        self.assertEqual(len(requests), 7)
+        self.assertTrue(all(request['body'] == requests[0]['body'] for request in requests[:6]))
+        self.assertTrue(all(request['session_headers'] == requests[0]['session_headers']
+                            for request in requests[:6]))
+        self.assertTrue(all(requests[0]['session_headers'].values()))
+        self.assertEqual(len({request['session_headers']['session-id'] for request in requests}), 1)
+        self.assertEqual(len({request['session_headers']['thread-id'] for request in requests}), 1)
+        self.assertNotEqual(requests[0]['session_headers']['x-client-request-id'],
+                            requests[-1]['session_headers']['x-client-request-id'])
+        for request in requests:
+            sessions = request['state']['eve.session']['sessions.v1']['sessions']
+            self.assertEqual(len(sessions), 1)
+            turns = next(iter(sessions.values()))['turns']
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0]['status']['state'], 'Pending')
+        turns = next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]['status']['state'], 'Completed')
+        self.assertEqual([event['text'] for event in self.progress('full-window')], [answer])
+        self.assertFalse(self.speech_requests)
+        self.assertIsNone(self.receipt('full-window')['reply'])
+        retries = [json.loads(line.split(' ', 1)[1])
+                   for line in self.panel_stderr.read_text().splitlines()
+                   if line.startswith('EVE_DEFERRED_REPLY ')]
+        self.assertEqual([event['retry'] for event in retries], [1, 2, 3, 4, 5])
+        self.assertEqual({event['turn'] for event in retries}, {turns[0]['id']})
+
+    def test_default_window_exhaustion_stays_failed_without_system_notice_or_new_task(self):
+        unavailable_requests = []
+
+        def status(kind, number):
+            if kind == 'chat':
+                unavailable_requests.append(number)
+                return 503
+            return 200
+
+        self.http_status = status
+        message = self.message('quiet-window', '这轮故障如实保留')
+        self.run_deferred([{'send': message}, self.wait_receipt(message['id'], 'Failed'),
+                           self.wait_command(message['id'], 'finish')],
+                          more=['--background-tasks'],
+                          env_extra={'EVE_DEFERRED_REPLY_WINDOW_MS': '700'})
+        requests = self.kind('chat')
+        attempts = len(requests)
+        self.assertGreaterEqual(attempts, 1)
+        self.assertLess(attempts, 20)
+        self.assertTrue(unavailable_requests, '本地模型须实际收到请求并返回 503')
+        self.assertTrue(all(1 <= number <= attempts for number in unavailable_requests))
+        turn = copy.deepcopy(self.turn(message['text']))
+        failure = turn['status']['failure']
+        # 总期限可能在退避中或下一次请求中到达，保留真实失败类型。
+        self.assertIn(failure['code'], ('Provider', 'ProviderTimeout'))
+        self.assertEqual(failure['started_tools'], 0)
+        self.assertFalse(self.progress(message['id']))
+        self.assertFalse(self.speech_requests)
+        receipt = self.receipt(message['id'])
+        self.assertIsNone(receipt['reply'])
+        self.assertIsNone(receipt.get('control_turn_id'))
+        self.assertFalse(self.documents().get('eve.task', {}).get('tasks.v1', {}).get('tasks', []))
+        self.run_deferred([{'send': message}, self.wait_command(message['id'], 'finish')])
+        self.assertEqual(len(self.kind('chat')), attempts, '重启不能复活已终结的失败轮')
+        self.assertEqual(self.turn(message['text']), turn)
+        self.assertEqual(self.receipt(message['id']), receipt)
+        self.assertFalse(self.progress(message['id']))
 
     def test_unavailable_service_then_full_reply_without_acknowledgement(self):
         self.http_status = lambda kind, number: 503 if kind == 'chat' and number <= 2 else 200

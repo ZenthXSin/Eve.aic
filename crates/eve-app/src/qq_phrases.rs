@@ -94,14 +94,39 @@ fn finish_result(
     result: Result<Vec<eve_training_api::PhraseDraft>, LlmError>,
     now: u64,
 ) -> bool {
+    finish_result_with_report(training, batch, result, now, report)
+}
+
+fn finish_result_with_report(
+    training: &dyn TrainingService,
+    batch: &PhraseBatch,
+    result: Result<Vec<eve_training_api::PhraseDraft>, LlmError>,
+    now: u64,
+    mut report: impl FnMut(&str, &PhraseBatch, serde_json::Value),
+) -> bool {
     match result {
         Ok(drafts) => {
             let proposed = drafts.len();
             match training.finish_phrase_batch(batch, drafts, now) {
                 Ok(PhraseFinish::Saved(saved)) => report(
-                    if saved == 0 { "empty" } else { "learned" },
+                    if proposed == 0 {
+                        "empty"
+                    } else if saved == 0 {
+                        "unchanged"
+                    } else {
+                        "learned"
+                    },
                     batch,
-                    json!({"proposed": proposed, "saved": saved}),
+                    json!({"proposed": proposed, "saved": saved, "skipped": 0}),
+                ),
+                Ok(PhraseFinish::CapacityLimited { saved, skipped }) => report(
+                    if saved == 0 {
+                        "capacity_limited"
+                    } else {
+                        "learned_partial"
+                    },
+                    batch,
+                    json!({"proposed": proposed, "saved": saved, "skipped": skipped}),
                 ),
                 Ok(PhraseFinish::Rejected) => {
                     report("rejected", batch, json!({"proposed": proposed}))

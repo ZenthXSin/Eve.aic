@@ -664,7 +664,13 @@ async fn capacity_rejection_is_persisted_and_only_backend_errors_stop_the_instan
         state.next_fault.store(fault, Ordering::SeqCst);
         let result = training.finish_phrase_batch(&batch, capacity_drafts(), 3);
         if fault == 0 {
-            assert_eq!(result.unwrap(), PhraseFinish::Rejected);
+            assert_eq!(
+                result.unwrap(),
+                PhraseFinish::CapacityLimited {
+                    saved: 0,
+                    skipped: MAX_PHRASE_DRAFTS,
+                }
+            );
             assert_eq!(training.phrases(&scope("one")).unwrap()[0].uses, 1);
             assert_eq!(
                 training

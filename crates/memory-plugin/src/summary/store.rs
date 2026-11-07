@@ -544,7 +544,23 @@ impl StoredSummaries {
                 }
             }
         }
-        // 只读失败候选正文；未选中的旧输入不进入常驻索引。
+        let previous_job = latest(&mut inner, scope)?;
+        if let Some(job) = &previous_job {
+            if job.batch.source_revision > summary.revision {
+                return Err(MemoryError::StaleRevision);
+            }
+            validate_batch(&job.batch)?;
+            validate_summary_points(&job.batch, &job.points)?;
+        }
+        // 完整验证当前摘要来源，但只将有效要点引用的来源送入补做。
+        struct RepairCandidate {
+            root: history::RepairRoot,
+            sources: Vec<SummarySource>,
+            previous: Vec<SummaryPoint>,
+            expected: Vec<SummarySource>,
+            seen: BTreeSet<String>,
+            invalid: bool,
+        }
         let mut candidates = Vec::new();
         for root in roots.into_iter().take(8) {
             after = root.sequence;
@@ -563,7 +579,48 @@ impl StoredSummaries {
             {
                 continue;
             }
-            candidates.push((root, sources, BTreeSet::new(), false));
+            let mut expected = sources.clone();
+            // 从当前成功摘要接续，不能复用失败批次中可能已经失效的 previous。
+            // 更晚覆盖的摘要不进入旧修复，同修订下也保留正常新批次的顺序。
+            let previous = previous_job
+                .as_ref()
+                .filter(|job| {
+                    (
+                        job.batch.source_revision,
+                        job.repair
+                            .as_ref()
+                            .map_or(job.batch.sequence, |repair| repair.original_sequence),
+                    ) <= (root.revision, root.sequence)
+                })
+                .map(|job| {
+                    expected.extend(job.batch.sources.iter().cloned());
+                    let points = filter_points(job, &summary.preferences);
+                    let referenced: BTreeSet<_> = points
+                        .iter()
+                        .flat_map(|point| point.quotes.iter().map(|quote| &quote.evidence_id))
+                        .collect();
+                    sources.extend(
+                        job.batch
+                            .sources
+                            .iter()
+                            .filter(|source| referenced.contains(&source.evidence_id))
+                            .cloned(),
+                    );
+                    points
+                })
+                .unwrap_or_default();
+            sources.sort_by_key(|source| source.revision);
+            sources.dedup_by(|a, b| a.evidence_id == b.evidence_id);
+            expected.sort_by_key(|source| source.revision);
+            expected.dedup_by(|a, b| a.evidence_id == b.evidence_id);
+            candidates.push(RepairCandidate {
+                root,
+                sources,
+                previous,
+                expected,
+                seen: BTreeSet::new(),
+                invalid: false,
+            });
             // 单次准入只核对前八个到期候选，下一次仍可公平检查新鲜工作。
         }
         let next_at = if after >= last_sequence {
@@ -580,22 +637,28 @@ impl StoredSummaries {
                 break;
             }
             for evidence in page {
-                for (_, sources, seen, invalid) in &mut candidates {
-                    if let Some(expected) = sources
+                for candidate in &mut candidates {
+                    if let Some(expected) = candidate
+                        .expected
                         .iter()
                         .find(|source| source.evidence_id == evidence.id)
                     {
                         if user_source(&evidence).as_ref() != Some(expected) {
-                            *invalid = true;
+                            candidate.invalid = true;
                         }
-                        seen.insert(evidence.id.clone());
+                        candidate.seen.insert(evidence.id.clone());
                     }
                 }
             }
         }
-        let Some((root, sources, _, _)) = candidates
-            .into_iter()
-            .find(|(_, sources, seen, invalid)| !invalid && sources.len() == seen.len())
+        let Some(RepairCandidate {
+            root,
+            sources,
+            previous,
+            ..
+        }) = candidates.into_iter().find(|candidate| {
+            !candidate.invalid && candidate.expected.len() == candidate.seen.len()
+        })
         else {
             return Ok(None);
         };
@@ -610,8 +673,16 @@ impl StoredSummaries {
             extractor_version: version.into(),
             consumed_ids: root.consumed_ids,
             sources,
-            previous: vec![],
+            previous,
         };
+        // 修复不能通过丢弃已验证的前文凑足容量，否则会再次截断累计摘要。
+        if serde_json::to_vec(&batch)
+            .map_err(|_| MemoryError::InvalidInput)?
+            .len()
+            > MAX_SUMMARY_INPUT_BYTES
+        {
+            return Err(MemoryError::LimitReached);
+        }
         validate_batch(&batch)?;
         let mut next = inner.document.clone();
         next.jobs.push(SummaryJob {

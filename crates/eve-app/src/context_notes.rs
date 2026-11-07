@@ -83,6 +83,19 @@ pub(crate) struct NotesTool {
     pub admin: Arc<dyn ContextAdmin>,
     pub binding: NoteBinding,
 }
+impl NotesTool {
+    /// 供宿主在新探索创建时冻结一次；恢复已有任务时不能调用它刷新上下文。
+    pub(crate) fn snapshot(&self, scope: &ContextScope) -> Result<ContextView, ToolExecutionError> {
+        let owner = self.binding.owner(scope)?;
+        let view = self.admin.inspect(&owner).map_err(failure)?;
+        view.validate().map_err(failure)?;
+        if view.owner != owner {
+            return Err(failure(ContextError::InvalidReply));
+        }
+        Ok(view)
+    }
+}
+#[derive(Clone)]
 pub(crate) enum NoteBinding {
     Web,
     Qq(QqConversations),
@@ -90,7 +103,7 @@ pub(crate) enum NoteBinding {
     Console(SessionKey),
 }
 impl NoteBinding {
-    fn owner(&self, scope: &ContextScope) -> Result<ContextOwner, ToolExecutionError> {
+    pub(crate) fn owner(&self, scope: &ContextScope) -> Result<ContextOwner, ToolExecutionError> {
         let key = SessionKey::new(&scope.session_id, &scope.user_id)
             .map_err(|_| failure(ContextError::InvalidInput))?;
         match self {
@@ -124,7 +137,7 @@ impl Tool for NotesTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "context_notes".into(),
-            description: "管理当前真实用户在当前会话的工作便笺，所有真实用户可用。适合复杂任务的目标、已有成果、待办、约束和未确认事项；简短闲聊不必写。inspect 读当前版本预览（最多16 KiB）；完整便笺最多16 MiB，read_range 固定 revision 并按字节 offset、limit（4至16384）和返回 next_offset 分页；splice 用 expected_revision 与 UTF-8 字节 start/end 替换片段，start=end 可追加；versions 分页列历史（before 为独占修订）；read_version 读旧版；preview 预览候选实际注入文本，不写入；update 用读取到的 expected_revision 保存完整正文；rollback 按 expected_revision 回到 target_revision（0 为空），会追加新版本。空 text 清空便笺。保存后下一轮自动加载，跨重启保留，旧版不删。便笺是可错的低优先级派生材料，不是用户原话、成功回执或授权，不能改写原始历史、权限、预算或其他用户。修改冲突先重读，不覆盖；保存未确认先核对，不能声称成功。".into(),
+            description: "管理当前真实用户在当前会话的工作便笺，所有真实用户可用。可自由记录资料路径、链接、暂时理解、未解问题和探索 ID，作为自己的探索索引，也可记录当前任务线索；不要求每次整理、写目标或交付成果，留空也可以。inspect 读当前版本预览（最多16 KiB）；完整便笺最多16 MiB，read_range 固定 revision 并按字节 offset、limit（4至16384）和返回 next_offset 分页；splice 用 expected_revision 与 UTF-8 字节 start/end 替换片段，start=end 可追加；versions 分页列历史（before 为独占修订）；read_version 读旧版；preview 预览候选实际注入文本，不写入；update 用读取到的 expected_revision 保存完整正文；rollback 按 expected_revision 回到 target_revision（0 为空），会追加新版本。空 text 清空便笺。保存后下一轮自动加载，跨重启保留，旧版不删。便笺是可错的低优先级派生材料，不是用户原话、成功回执或授权，不能改写原始历史、权限、预算或其他用户。修改冲突先重读，不覆盖；保存未确认先核对，不能声称成功。".into(),
             argument_schema: json!({"type":"object","oneOf":[
                 {"type":"object","properties":{"operation":{"const":"inspect"}},"required":["operation"],"additionalProperties":false},
                 {"type":"object","properties":{"operation":{"const":"read_version"},"revision":{"type":"integer","minimum":0}},"required":["operation","revision"],"additionalProperties":false},
