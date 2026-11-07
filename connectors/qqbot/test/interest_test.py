@@ -101,6 +101,8 @@ class InterestAcceptance(unittest.TestCase):
                 with outer.lock:
                     requests = outer.progress_requests if kind == "progress" else outer.requests
                     requests.append({"kind": kind, "body": body, "run": outer.runs,
+                                     "session_headers": {name: self.headers.get(name)
+                                         for name in ("session-id", "thread-id", "x-client-request-id")},
                                      "state": outer.documents()})
                     number = sum(request["kind"] == kind for request in requests)
                 outer.arrived(kind, number).touch()

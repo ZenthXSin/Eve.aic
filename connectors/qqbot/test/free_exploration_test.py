@@ -366,13 +366,43 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.assertEqual(session["version"], 1)
         for key in ("session_id", "scope_id", "turn_id"):
             self.assertRegex(session[key], r"^[0-9a-f]{64}$")
-        worker_keys = {body.get("prompt_cache_key") for body in self.worker_bodies}
+        records = self.worker_requests(task)
+        self.assertTrue(records, "没有观察到该探索的实际模型请求")
+        worker_keys = {record["body"].get("prompt_cache_key") for record in records}
         self.assertEqual(len(worker_keys), 1, "工具往返和恢复必须沿用同一探索缓存键")
         [worker_key] = worker_keys
         self.assertRegex(worker_key, r"^[0-9a-f]{64}$")
+        for name in ("session-id", "thread-id"):
+            values = {record["session_headers"].get(name) for record in records}
+            self.assertEqual(len(values), 1, "同一探索必须沿用模型会话头：" + name)
+            self.assertRegex(next(iter(values)), r"^[0-9a-f]{64}$")
+        self.assertEqual(records[0]["session_headers"]["session-id"], session["session_id"])
+        for record in records:
+            self.assertRegex(record["session_headers"].get("x-client-request-id"), r"^[0-9a-f]{64}$")
         other_keys = {request["body"].get("prompt_cache_key") for request in self.requests
                       if request["kind"] == "chat" and not self.is_worker(request["body"])}
         self.assertNotIn(worker_key, other_keys, "探索不能复用前台或空闲回顾会话")
+
+    @staticmethod
+    def exploration_context(body):
+        for message in body["messages"]:
+            text = message.get("content") or ""
+            prefix = '{"kind":"eve.delegated_context"'
+            if prefix not in text:
+                continue
+            packet = json.JSONDecoder().raw_decode(text[text.index(prefix):])[0]
+            for saved in packet["messages"]:
+                value = json.loads(saved["text"])
+                if value.get("kind") == "eve.exploration.context.v1":
+                    return value
+        raise AssertionError("探索请求没有携带已冻结的上下文")
+
+    def worker_requests(self, task):
+        messages = json.loads(task["spec"]["context"]["messages_json"])
+        reflection_id = json.loads(messages[0]["text"])["input"]["reflection_id"]
+        return [record for record in self.requests
+                if record["kind"] == "chat" and self.is_worker(record["body"])
+                and self.exploration_context(record["body"])["input"]["reflection_id"] == reflection_id]
 
     def wait_end(self, status=NORMAL_STATUS, tools=None, requests=None):
         self.wait_for(lambda: len(self.explorations()) == 1
@@ -470,6 +500,83 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.assertEqual(interest["current"]["evidence"], [task["id"]])
         self.assertEqual(len(self.explorations()), 1)
         self.assertEqual(len(self.experience_rows()), 1)
+        self.assert_no_replay()
+
+    def test_new_exploration_receives_saved_interest_and_judgment_without_merging_sessions(self):
+        first = self.start_and_end(tools=3, requests=4)
+        before_first = copy.deepcopy(first)
+        first_context = self.exploration_context(self.worker_requests(first)[0]["body"])
+        first_calls = len(self.worker_calls)
+
+        def continue_freely(observation, result):
+            if self.reflections != 2:
+                return
+            result["choice"] = "explore"
+            result["thought"] = "再随便看看，也可以休息"
+            result["reason"] = "自己决定这次怎么过"
+            result["judgments"] = [{
+                "key": "materials-view", "statement": "这些材料的变化值得慢慢看",
+                "confidence": 40, "evidence": [first["id"]],
+                "revision_reason": "实际读过这段材料后形成的暂时看法"}]
+            # 保留由前一段真实读取形成的 resting 兴趣；探索无需把它强行改回 active。
+            self.assertEqual(result["interest_updates"][0]["phase"], "resting")
+
+        self.after_reflection = continue_freely
+        original_explore = self.explore
+
+        def next_explore(body):
+            context = self.exploration_context(body)
+            if context["input"]["reflection_id"] == first_context["input"]["reflection_id"]:
+                return original_explore(body)
+            # 当前主观背景由宿主传递，不靠工具重新检索、预填目标或夹具补写持久库。
+            return text_response("这次想到这里，先休息。")
+
+        self.explore = next_explore
+        self.due()
+
+        def second_ended():
+            self.wait_for(lambda: len(self.explorations()) == 2 and all(
+                task["status"] == NORMAL_STATUS for task in self.explorations()),
+                "第二段独立探索未自然结束", 20)
+            self.wait_reconciled()
+            self.assertFalse(self.run_release.wait(0.8))
+
+        self.run_idle(self.checkpoint("second-exploration"), checkpoints={
+            "second-exploration": second_ended})
+        second = next(task for task in self.explorations() if task["id"] != first["id"])
+        self.assertEqual(next(task for task in self.explorations() if task["id"] == first["id"]),
+                         before_first, "后续兴趣变化不能改写原任务")
+        self.assertEqual(self.grant()["issued"], 4)
+        self.assertEqual(len(self.worker_calls), first_calls)
+        self.assertEqual(second["usage"]["tool_calls"], 0)
+        self.assert_quiet(second)
+        self.assert_session_binding(first)
+        self.assert_session_binding(second)
+        first_requests, second_requests = self.worker_requests(first), self.worker_requests(second)
+        first_body, second_body = first_requests[0]["body"], second_requests[0]["body"]
+        self.assertNotEqual(first_body["prompt_cache_key"], second_body["prompt_cache_key"])
+        for name in ("session-id", "thread-id", "x-client-request-id"):
+            self.assertTrue({request["session_headers"][name] for request in first_requests}.isdisjoint(
+                {request["session_headers"][name] for request in second_requests}), name)
+        second_context = self.exploration_context(second_body)
+        self.assertNotIn("action", second_context["input"])
+        self.assertNotIn("exploration", second_context["input"])
+        self.assertTrue(any(item["id"] == first["id"] for item in second_context["recent_experiences"]))
+        self.assertIn("current_mind", second_context, "新探索缺少自己的持续认知")
+        view = second_context["current_mind"]
+        self.assertEqual(view["kind"], "eve.exploration.mind.v1")
+        self.assertEqual(view["scope"], second_context["input"]["scope"])
+        self.assertFalse(view["complete_history"])
+        self.assertEqual(view["snapshot"], self.mind())
+        self.assertEqual(view["snapshot"]["revision"], 2)
+        self.assertEqual(view["snapshot"]["last_task"], second_context["input"]["reflection_id"])
+        self.assertEqual(view["snapshot"]["self_interests"][0]["current"]["phase"], "resting")
+        self.assertEqual(view["snapshot"]["judgments"][0]["key"], "materials-view")
+        self.assertIn("current_mind", first_context)
+        self.assertEqual(first_context["current_mind"]["snapshot"].get("self_interests", []), [])
+        self.assertEqual(first_context["current_mind"]["snapshot"]["revision"], 1)
+        self.assertEqual(len(self.kind("review")), 0)
+        self.assertEqual(self.workspace_files(), self.initial_files)
         self.assert_no_replay()
 
     def test_empty_exploration_can_rest_without_any_tool_or_artifact(self):
