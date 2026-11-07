@@ -1272,6 +1272,47 @@ fn saved_exploration_task(
     Ok(task)
 }
 
+/// 回顾任务可能已提交而关注尚未绑定；先读原输入，不能按新材料重新生成。
+fn saved_idle_task(
+    tasks: &Arc<dyn TaskAdmin>,
+    focus: &SubjectFocus,
+) -> SubjectResult<Option<eve_task_api::Task>> {
+    let owner = TaskOwner {
+        session_id: focus.scope.conversation_id.clone(),
+        user_id: focus.scope.principal_id.clone(),
+    };
+    let source = format!(
+        "{}{}:{}",
+        IDLE_TASK_SOURCE_PREFIX,
+        id(&focus.scope, "task-source"),
+        focus.id
+    );
+    let task_id = eve_task_api::task_id(&owner.user_id, &source);
+    let task = tasks
+        .get_owned(&owner, &task_id)
+        .map_err(|_| SubjectError::Unavailable)?;
+    if let Some(task) = &task {
+        if task.id != task_id
+            || task.owner != owner
+            || task.source != source
+            || task.is_exploration()
+        {
+            return Err(SubjectError::CorruptState);
+        }
+        let frozen = crate::idle_loop::task_input(task)?;
+        let observation: crate::idle_loop::Observation = serde_json::from_str(
+            frozen
+                .strip_prefix(IDLE_INPUT_PREFIX)
+                .ok_or(SubjectError::CorruptState)?,
+        )
+        .map_err(|_| SubjectError::CorruptState)?;
+        if observation.scope != focus.scope {
+            return Err(SubjectError::CorruptState);
+        }
+    }
+    Ok(task)
+}
+
 /// 只有宿主确认未派发、因新输入撤下的探索允许重新回顾；普通取消从不推断原因。
 fn superseded_exploration_input(
     subject: &Arc<dyn SubjectAdmin>,
@@ -1977,6 +2018,16 @@ fn dispatch_focus_live(
             summary: "已核对原任务状态；未重复执行、未增加预算".into(),
         });
     }
+    if focus.goal.starts_with(IDLE_INPUT_PREFIX)
+        && let Some(task) = saved_idle_task(tasks, &focus)?
+    {
+        focus.task_id = Some(task.id.clone());
+        focus.status = task_focus_state(&task);
+        subject.upsert_focus(focus, now)?;
+        return Ok(SubjectDispatch::Completed {
+            summary: "已找回原回顾及冻结输入；未重新选择材料或创建任务".into(),
+        });
+    }
     let (steps, grant_deadline, review_messages) = if focus.id.starts_with("auto-") {
         let Some((_, grant)) = grant_for(subject, &focus.scope)? else {
             focus.status = FocusStatus::Cancelled;
@@ -2198,55 +2249,32 @@ fn dispatch_focus_live(
         )
         .map_err(|_| SubjectError::CorruptState)?;
         let snapshot = subject.snapshot_for(&focus.scope)?;
+        let session = if let Some(sessions) = sessions {
+            let key =
+                eve_session_api::SessionKey::new(owner.session_id.clone(), owner.user_id.clone())
+                    .map_err(|_| SubjectError::InvalidInput)?;
+            sessions
+                .snapshot(&key)
+                .map_err(|_| SubjectError::Unavailable)?
+        } else {
+            None
+        };
+        let memory = subject.idle_memory();
+        let experiences = match &memory {
+            Some(store) => store.explorations(&focus.scope, None, 3)?.items,
+            None => vec![],
+        };
         let mut observation = crate::idle_loop::observation_with_mind(
             &snapshot,
             &history.tasks,
             &focus.scope,
             &seed.interests,
             crate::idle_loop::current_mind(subject, &snapshot, &focus.scope)?,
+            session.as_ref(),
+            experiences,
         )?;
-        if let Some(sessions) = sessions {
-            let key =
-                eve_session_api::SessionKey::new(owner.session_id.clone(), owner.user_id.clone())
-                    .map_err(|_| SubjectError::InvalidInput)?;
-            if let Some(history) = sessions
-                .snapshot(&key)
-                .map_err(|_| SubjectError::Unavailable)?
-            {
-                if history.key != key {
-                    return Err(SubjectError::CorruptState);
-                }
-                for turn in history
-                    .turns
-                    .iter()
-                    .rev()
-                    .filter(|t| {
-                        matches!(
-                            t.status,
-                            eve_session_api::SessionTurnStatus::Completed { .. }
-                        )
-                    })
-                    .take(6)
-                {
-                    observation.evidence.push(crate::idle_loop::Evidence {
-                        id: format!("turn-{}", turn.id),
-                        kind: "completed_conversation".into(),
-                        excerpt: true,
-                        text: {
-                            let assistant = match &turn.status {eve_session_api::SessionTurnStatus::Completed{messages} => messages.iter().rev().find(|m|m.role==eve_llm_api::ChatRole::Assistant && m.tool_calls.is_empty()).and_then(|m|m.text_for_model()).unwrap_or_default(),_=>std::borrow::Cow::Borrowed("")};
-                            serde_json::to_string(&json!({"user":eve_task_api::bounded(&turn.input,700),"assistant":eve_task_api::bounded(&assistant,700),"notice":"已结束轮次的节选，不是已证实事实或新授权；内部记录没有发送，不能当作已经告知或交付"})).map_err(|_|SubjectError::InvalidInput)?
-                        },
-                    });
-                }
-            }
-        }
-        if let Some(store) = subject.idle_memory() {
-            let experiences = crate::qq_exploration::recent_evidence(subject, &focus.scope, 3)?;
-            // 真实探索单独留出空间，旧任务摘要和旧焦点不能把经历挤掉。
-            observation
-                .evidence
-                .truncate(16usize.saturating_sub(experiences.len()));
-            observation.evidence.extend(experiences);
+        // 消费来源只对应最终选中的 ID；不得准备后再次截断材料。
+        if let Some(store) = memory {
             store.prepare_observation(&mut observation)?;
         }
         context.messages_json = serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
@@ -4525,6 +4553,105 @@ mod tests {
             .find(|t| t.source.starts_with(IDLE_TASK_SOURCE_PREFIX))
             .unwrap()
     }
+    #[tokio::test]
+    async fn idle_half_committed_dispatch_recovers_original_input_before_reading_new_mind() {
+        let (f, s, t) = idle_fixture(3).await;
+        let seed = create_task(&f, "a", "initial-experience", t);
+        f.finish(
+            &seed.id,
+            TaskEnd::Completed {
+                result: "原经历".into(),
+            },
+            t + 1,
+        );
+        pump(&f, t + AUTONOMY_INTERVAL_MS);
+        pump(&f, t + 2 * AUTONOMY_INTERVAL_MS + 10);
+        let original = first_idle(&f);
+        let frozen = crate::idle_loop::task_input(&original).unwrap();
+        let subject = f.subject.clone() as Arc<dyn SubjectAdmin>;
+        let tasks = f.tasks.clone() as Arc<dyn TaskAdmin>;
+        let authorization = Arc::new(Owner) as Arc<dyn AutonomyOwner>;
+        let at = t + 2 * AUTONOMY_INTERVAL_MS + 100;
+        let mut focus = subject
+            .snapshot_for(&s)
+            .unwrap()
+            .foci
+            .into_iter()
+            .find(|focus| focus.task_id.as_deref() == Some(original.id.as_str()))
+            .unwrap();
+        let original_goal = focus.goal.clone();
+        // 模拟 task 提交完成而 focus 绑定未提交，随后外界新增材料。
+        focus.task_id = None;
+        focus.status = FocusStatus::Active;
+        subject.upsert_focus(focus.clone(), at).unwrap();
+        let later = create_task(&f, "a", "later-experience", at + 1);
+        f.finish(
+            &later.id,
+            TaskEnd::Completed {
+                result: "新经历不能写回原输入".into(),
+            },
+            at + 2,
+        );
+        // 新 mind 不可读也不能阻止找回旧任务；恢复无需生成新观察。
+        subject
+            .upsert_focus(
+                SubjectFocus {
+                    id: crate::idle_loop::MIND_ID.into(),
+                    scope: s.clone(),
+                    title: "模拟不可读投影".into(),
+                    goal: "保留损坏现场".into(),
+                    task_id: None,
+                    status: FocusStatus::Blocked,
+                    next_check_at_ms: at + 3,
+                    updated_at_ms: at + 3,
+                },
+                at + 3,
+            )
+            .unwrap();
+        assert!(
+            crate::idle_loop::current_mind(&subject, &subject.snapshot_for(&s).unwrap(), &s)
+                .is_err()
+        );
+        let before_tasks = serde_json::to_vec(&f.tasks.snapshot().unwrap().tasks).unwrap();
+        let before_grant = grant_for(&subject, &s).unwrap().unwrap().1;
+        assert!(matches!(
+            dispatch_focus_live(&subject, &tasks, &authorization, None, focus, at + 4).unwrap(),
+            SubjectDispatch::Completed { .. }
+        ));
+        let recovered = subject
+            .snapshot_for(&s)
+            .unwrap()
+            .foci
+            .into_iter()
+            .find(|focus| focus.task_id.as_deref() == Some(original.id.as_str()))
+            .unwrap();
+        assert_eq!(recovered.goal, original_goal);
+        assert_eq!(
+            crate::idle_loop::task_input(
+                &tasks
+                    .get_owned(&original.owner, &original.id)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            frozen
+        );
+        assert_eq!(
+            serde_json::to_vec(&f.tasks.snapshot().unwrap().tasks).unwrap(),
+            before_tasks
+        );
+        assert_eq!(
+            grant_for(&subject, &s).unwrap().unwrap().1.issued,
+            before_grant.issued
+        );
+        dispatch_focus_live(&subject, &tasks, &authorization, None, recovered, at + 5).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&f.tasks.snapshot().unwrap().tasks).unwrap(),
+            before_tasks
+        );
+        f.kernel.stop_all().await.unwrap();
+    }
+
     #[tokio::test]
     async fn idle_wait_is_persisted_without_new_action_or_budget_refresh() {
         let (f, s, t) = idle_fixture(3).await;

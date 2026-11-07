@@ -128,11 +128,12 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             observation=json.loads(next(m['text'][len(PREFIX):] for m in messages if (m.get('text') or '').startswith(PREFIX)))
             self.observations.append(observation)
             self.reflections+=1
-            ids=[e['id'] for e in observation['evidence']]
             self.assertFalse(any(e['kind']=='focus' and e['id'].startswith('contract-')
                 for e in observation['evidence']),'冻结合同和授权原话不能作为普通经历节选')
             choice='act' if self.mode in ('act','legacy-act','text-act','own-interest') and self.reflections==1 else 'wait'
-            evidence=ids[0] if ids else None
+            # 判断优先引用实际任务结果；材料顺序变化不能使改观沿用旧交流。
+            evidence=next((e['id'] for kind in ('task_result','completed_conversation')
+                for e in observation['evidence'] if e['kind']==kind),None)
             result={'choice':choice,'thought':'依据实际经历决定下一步','reason':'值得验证时行动，没有新证据时等待',
                 'judgments':[],'action':None,'revisit_after_minutes':30}
             if self.mode=='malicious-tools':
@@ -224,10 +225,16 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         first=self.mind();self.assertEqual(first['revision'],1)
         self.due()
         self.run_idle(self.checkpoint('reconsider'),checkpoints={'reconsider':lambda:self.wait_revision(2)})
-        self.assertEqual(self.mind()['revision'],2)
-        self.assertEqual(self.mind()['judgments'][0]['statement'],'实验结果改变了原来判断')
+        second=self.mind();self.assertEqual(second['revision'],2)
+        self.assertEqual(second['judgments'][0]['statement'],'实验结果改变了原来判断')
         actions=[t for t in self.tasks() if t['spec']['title']=='隔离验证空闲想法']
         self.assertEqual(len(actions),1)
+        self.assertIn(('task_result',actions[0]['id']),
+            [(e['kind'],e['id']) for e in self.observations[-1]['evidence']])
+        self.assertEqual(second['judgments'][0]['evidence'],[actions[0]['id']],
+            '改观须引用实际完成的行动结果')
+        self.assertNotEqual(second['judgments'][0]['evidence'],first['judgments'][0]['evidence'],
+            '修改判断须有新的实际证据')
         self.assertEqual(actions[0]['usage'],{'tool_calls':2,'model_requests':3})
         self.assertEqual(actions[0]['execution']['completion_contract'],ACTION_CONTRACT)
         self.assertEqual(actions[0]['execution']['recoveries'],0)
@@ -268,6 +275,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             self.wait_for(lambda:any(t['spec']['title']=='隔离验证空闲想法' and t['status']=='Completed'
                 for t in self.tasks()),'兴趣驱动的实际行动未完成',15)
         self.run_idle(self.checkpoint('own-action'),checkpoints={'own-action':completed})
+        first_judgment_evidence=self.mind()['judgments'][0]['evidence']
         first=self.mind()['self_interests'][0]
         self.assertEqual(first['revision'],1)
         self.assertEqual(first['current']['phase'],'curious')
@@ -280,6 +288,11 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(current['first_recorded_at_ms'],first['first_recorded_at_ms'])
         self.assertEqual(current['current']['phase'],'resting')
         self.assertNotEqual(current['current']['evidence'],first['current']['evidence'])
+        [action]=[t for t in self.tasks() if t['spec']['title']=='隔离验证空闲想法']
+        self.assertEqual(action['status'],'Completed')
+        self.assertEqual(current['current']['evidence'],[action['id']])
+        self.assertEqual(self.mind()['judgments'][0]['evidence'],[action['id']])
+        self.assertNotEqual(self.mind()['judgments'][0]['evidence'],first_judgment_evidence)
         tasks_before=json.dumps(self.tasks(),sort_keys=True)
         mind_before=json.dumps(self.mind(),sort_keys=True)
         def chat(body):
