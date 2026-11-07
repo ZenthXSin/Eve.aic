@@ -47,6 +47,8 @@ use tokio::{
 
 mod action_capabilities;
 #[cfg(test)]
+mod input_reply_recovery_tests;
+#[cfg(test)]
 mod passive_tests;
 
 pub(crate) const DISPATCH_TOOL: &str = "dispatch_background_task";

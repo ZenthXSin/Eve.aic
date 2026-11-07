@@ -20,6 +20,29 @@ spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
 class DigestTests(unittest.TestCase):
+    def test_failed_process_creation_keeps_the_startup_request_for_the_first_process(self):
+        with patch.dict(os.environ, {'EVE_STARTUP_CHECKPOINT_REQUEST': '/owned/request.json'}):
+            with patch.object(runtime.subprocess, 'Popen', side_effect=OSError('fixture spawn failure')):
+                with self.assertRaises(OSError):
+                    runtime.Child([sys.executable, '-c', 'pass'])
+            self.assertEqual(os.environ['EVE_STARTUP_CHECKPOINT_REQUEST'], '/owned/request.json')
+
+    def test_startup_checkpoint_environment_is_transferred_only_to_first_business_process(self):
+        with tempfile.TemporaryDirectory(prefix='eve-checkpoint-child-') as directory:
+            result = Path(directory) / 'received.jsonl'
+            code = ('import json,os,sys; from pathlib import Path; '
+                    'p=Path(sys.argv[1]); '
+                    'p.open("a").write(json.dumps(os.environ.get("EVE_STARTUP_CHECKPOINT_REQUEST"))+"\\n")')
+            with patch.dict(os.environ, {'EVE_STARTUP_CHECKPOINT_REQUEST': '/owned/request.json'}):
+                for _ in range(2):
+                    child = runtime.Child([sys.executable, '-c', code, str(result)])
+                    self.assertEqual(child.process.wait(timeout=5), 0)
+                    child.thread.join(timeout=5)
+                    child.process.stderr.close()
+                self.assertNotIn('EVE_STARTUP_CHECKPOINT_REQUEST', os.environ)
+            self.assertEqual([json.loads(row) for row in result.read_text().splitlines()],
+                             ['/owned/request.json', None])
+
     def test_bridge_ingress_diagnostics_changes_invalidate_runtime_snapshot(self):
         with tempfile.TemporaryDirectory(prefix='eve-bridge-snapshot-') as directory:
             root = Path(directory)
@@ -101,6 +124,223 @@ class DigestTests(unittest.TestCase):
                          ['eve','--interest-learning','--practice-mindustry-server','s.jar','--research-corpus','corpus'])
         self.assertEqual(runtime.without_removed_flags(['eve','--training']),['eve','--training'])
 
+class ReplyAnchorReceiptTests(unittest.TestCase):
+    """用真实状态文件和冷库校验多回复窗口，不构建或启动 Eve。"""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='eve-reply-anchor-runtime-')
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / 'state.json'
+        message = dict(id='original', scope='group', target_id='group-1', user_id='user-1', text='升级')
+        self.parent = dict(app_id='app', message=message, state='Handled', reply=None,
+                           control_turn_id=1, progress=[])
+        self.first = dict(app_id='app', message={**message, 'id': 'followup-1', 'text': '继续'},
+                          state='Merged', reply=None, merged_into='original')
+        self.second = dict(app_id='app', message={**message, 'id': 'followup-2', 'text': '还有'},
+                           state='Merged', reply=None, merged_into='original')
+        self.ledger = dict(version=10, entries=[self.parent, self.first, self.second])
+        identity = json.dumps(['app', 'group', 'group-1', 'user-1'], separators=(',', ':')).encode()
+        self.session = 'qq:' + hashlib.sha256(identity).hexdigest()
+        self.request = dict(session_id=self.session, requested_by=self.session, turn_id=1)
+        self.sessions = dict(format_version=1, sessions={self.session: dict(
+            key=dict(session_id=self.session, user_id=self.session), turns=[dict(
+                id=1, input='升级', status=dict(state='Completed', messages=[
+                    dict(role='User', text='升级'), dict(role='Assistant', text='内部结束')]))])})
+
+    def part(self, index, anchor=None, state='Sent', **extra):
+        part = dict(text='明确发言 ' + str(index), state=state, decision_id='call-' + str(index))
+        if state == 'Sent':
+            part['platform_message_id'] = 'platform-' + str(index)
+        if anchor is not None:
+            part['reply_anchor'] = anchor
+        return {**part, **extra}
+
+    def save(self):
+        runtime.atomic(self.path, dict(version=1, entries={
+            'eve.session': {'sessions.v1': list(json.dumps(self.sessions).encode())},
+            'eve.channel.qqbot': {'receipts.v1': list(json.dumps(self.ledger).encode())}}))
+
+    def assert_rejected_without_write(self, code):
+        self.save()
+        before = self.path.read_bytes()
+        for reader in (runtime.delivery_documents, runtime.inherited_receipts, runtime.runtime_idle_gate):
+            with self.subTest(reader=reader.__name__):
+                with self.assertRaisesRegex(ValueError, code):
+                    reader(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_distinct_anchors_have_separate_budgets_and_keep_real_delivery_gate(self):
+        self.parent['progress'] = [self.part(i, anchor) for anchor, i in (
+            (None, 1), (None, 2), (None, 3), ('followup-1', 4), ('followup-1', 5),
+            ('followup-1', 6), ('followup-2', 7), ('followup-2', 8), ('followup-2', 9))]
+        self.parent['progress'][0]['reply_anchor'] = None
+        self.save()
+        before = self.path.read_bytes()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+        self.assertTrue(runtime.runtime_idle_gate(self.path))
+        self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_failed_unknown_and_sending_still_consume_their_actual_window(self):
+        for anchor in (None, 'followup-1'):
+            with self.subTest(anchor=anchor):
+                self.parent['progress'] = [self.part(i, anchor, state) for i, state in
+                                           enumerate(('Sent', 'Sending', 'Failed', 'Unknown'))]
+                self.assert_rejected_without_write('invalid_passive_progress_budget')
+
+    def test_missing_and_null_anchors_share_original_window(self):
+        self.parent['progress'] = [self.part(i) for i in range(4)]
+        self.parent['progress'][1]['reply_anchor'] = None
+        self.assert_rejected_without_write('invalid_passive_progress_budget')
+
+    def test_sending_blocks_current_gate_and_unknown_is_preserved_without_replay(self):
+        self.parent['progress'] = [self.part(1, 'followup-1', 'Sending')]
+        self.save()
+        self.assertFalse(runtime.delivery_gate(self.path, self.request))
+        self.assertFalse(runtime.runtime_idle_gate(self.path))
+        inherited = runtime.inherited_receipts(self.path)
+        self.assertEqual(len(inherited), 1)
+        self.assertTrue(runtime.runtime_idle_gate(self.path, inherited))
+        self.assertFalse(runtime.delivery_gate(self.path, self.request, inherited))
+        self.parent['progress'][0]['state'] = 'Unknown'
+        self.save()
+        before = self.path.read_bytes()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request, inherited))
+        self.assertTrue(runtime.runtime_idle_gate(self.path, inherited))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_proactive_uses_total_budget_but_cannot_claim_passive_anchor(self):
+        self.parent['progress'] = [self.part(i, proactive=True) for i in range(64)]
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.parent['progress'].append(self.part(64, proactive=True))
+        self.assert_rejected_without_write('invalid_progress_ledger')
+        self.parent['progress'] = [self.part(1, 'followup-1', proactive=True)]
+        self.assert_rejected_without_write('invalid_reply_anchor')
+
+    def test_anchor_ids_and_authorship_cannot_be_fabricated(self):
+        for anchor in ('', ' ', ' latest', 'latest\n', 'x\x7f', 'x\x85', 'x' * 254, '界' * 85,
+                       'original', 1, False, [], {}):
+            with self.subTest(anchor=anchor):
+                self.parent['progress'] = [self.part(1, anchor)]
+                self.assert_rejected_without_write('invalid_reply_anchor')
+        self.parent['progress'] = [dict(text='系统进展', state='Sent', reply_anchor='followup-1')]
+        self.assert_rejected_without_write('invalid_reply_anchor')
+        self.parent['progress'] = [self.part(1, 'followup-1', state='Sent', platform_message_id=None)]
+        self.assert_rejected_without_write('invalid_expression_receipt')
+
+    def test_anchor_must_belong_to_same_app_user_scope_target_and_merge_parent(self):
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        original = copy.deepcopy(self.ledger)
+        mutations = (
+            lambda: self.first.update(app_id='other-app'),
+            lambda: self.first['message'].update(user_id='other-user'),
+            lambda: self.first['message'].update(scope='c2c', target_id='user-1'),
+            lambda: self.first['message'].update(target_id='other-group'),
+            lambda: self.first.update(merged_into='missing'),
+            lambda: self.first.update(merged_into='followup-2'),
+            lambda: self.first.update(state='Handled', merged_into=None),
+            lambda: self.ledger['entries'].remove(self.first),
+            lambda: self.ledger['entries'].append(copy.deepcopy(self.first)),
+        )
+        for mutate in mutations:
+            self.ledger = copy.deepcopy(original)
+            self.parent, self.first, self.second = self.ledger['entries']
+            mutate()
+            self.assert_rejected_without_write('invalid_merged_receipt|invalid_reply_anchor_relation')
+        self.ledger = copy.deepcopy(original)
+        self.parent, self.first, self.second = self.ledger['entries']
+        for receipt in self.ledger['entries']:
+            receipt['message'].update(scope='c2c', target_id='user-1')
+        self.assert_rejected_without_write('invalid_reply_anchor')
+
+    def test_same_identity_receipt_in_another_merge_group_is_not_a_window(self):
+        other = copy.deepcopy(self.parent)
+        other.update(message={**other['message'], 'id': 'other-parent'}, progress=[])
+        self.first['merged_into'] = 'other-parent'
+        self.ledger['entries'].append(other)
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.assert_rejected_without_write('invalid_reply_anchor_relation')
+
+    def test_v9_accepts_null_but_cannot_hide_an_actual_anchor(self):
+        self.ledger['version'] = 9
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.assert_rejected_without_write('invalid_reply_anchor_version')
+        self.parent['progress'][0]['reply_anchor'] = None
+        self.save()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+        self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
+
+    def test_sticky_v10_survives_without_hot_anchors(self):
+        self.ledger['entries'] = [self.parent]
+        self.save()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+        self.ledger['entries'] = []
+        self.save()
+        self.assertTrue(runtime.runtime_idle_gate(self.path))
+        self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
+
+    def test_original_window_counts_segments_and_sticker_but_not_other_window(self):
+        self.parent.update(state='Sent', control_turn_id=None, reply='一\n\n二',
+            segments=dict(planner='fixture', parts=[dict(start=0, end=3, state='Sent'),
+                                                   dict(start=5, end=8, state='Sent')]),
+            sticker=dict(path='/fixture/image.png', state='Sent'))
+        self.parent['progress'] = [self.part(1), self.part(2),
+                                  *[self.part(i, 'followup-1') for i in range(3, 6)]]
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.parent['progress'].append(self.part(6))
+        self.assert_rejected_without_write('invalid_passive_progress_budget')
+        self.parent['progress'].pop()
+        self.parent['segments']['parts'][1]['start'] = 4
+        self.assert_rejected_without_write('invalid_segment_ledger')
+
+    def test_v10_segments_preserve_a_complete_code_block(self):
+        reply = '前言\n\n```py\nx\n```'
+        encoded = reply.encode()
+        start = len('前言\n\n'.encode())
+        segments = dict(planner='fixture', parts=[dict(start=0, end=6, state='Sent'),
+                                                 dict(start=start, end=len(encoded), state='Sent')])
+        self.parent.update(state='Sent', control_turn_id=None, reply=reply, segments=segments)
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        cut = start + len('```py'.encode())
+        segments['parts'][1]['end'] = cut
+        segments['parts'].append(dict(start=cut + 1, end=len(encoded), state='Sent'))
+        self.assert_rejected_without_write('invalid_segment_ledger')
+        # Rust 仅按 LF 划分围栏行；裸 CR 仍属于同一行，不能误判新增围栏。
+        self.parent.update(reply='a\r```\nx\n```\nz', segments=dict(planner='fixture', parts=[
+            dict(start=0, end=5, state='Sent'), dict(start=6, end=13, state='Sent')]))
+        self.save()
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+
+    def test_v10_archive_binding_does_not_supply_a_missing_hot_sibling(self):
+        import sqlite3
+        self.parent['progress'] = [self.part(1, 'followup-1')]
+        self.ledger['archive'] = dict(identity='a' * 32, records=1)
+        self.save()
+        with self.assertRaisesRegex(ValueError, 'receipt_archive_missing'):
+            runtime.inherited_receipts(self.path)
+        database = self.path.parent / 'qq-receipts.sqlite3'
+        with sqlite3.connect(database) as db:
+            db.executescript('CREATE TABLE metadata(version INTEGER,identity TEXT); '
+                             'CREATE TABLE receipts(seq INTEGER PRIMARY KEY,app TEXT,message_id TEXT,payload BLOB);')
+            db.execute('INSERT INTO metadata VALUES (1,?)', ('b' * 32,))
+            db.execute('INSERT INTO receipts VALUES (1,?,?,?)',
+                       ('app', 'followup-1', json.dumps(self.first).encode()))
+        with self.assertRaisesRegex(ValueError, 'receipt_archive_mismatch'):
+            runtime.delivery_documents(self.path)
+        with sqlite3.connect(database) as db:
+            db.execute('UPDATE metadata SET identity=?', ('a' * 32,))
+        self.assertTrue(runtime.delivery_documents(self.path)[2])
+        self.ledger['entries'].remove(self.first)
+        self.assert_rejected_without_write('invalid_reply_anchor_relation')
+        self.ledger['entries'].append(self.first)
+        self.ledger['archive']['records'] = 2
+        self.assert_rejected_without_write('receipt_archive_mismatch')
+
+
 class ExplorationIdleGateTests(unittest.TestCase):
     """直接读取合成热账本/冷档案并调用真实空闲门，不构建或启动 Eve。"""
     def setUp(self):
@@ -129,10 +369,10 @@ class ExplorationIdleGateTests(unittest.TestCase):
             execution=dict(kind='exploration', session_end_reason='natural_stop', checkpoint=checkpoint,
                 recoveries=0, resume_at_ms=None, deadline_at_ms=None, last_finished_at_ms=40))
 
-    def save(self, tasks, version):
+    def save(self, tasks, version, archived=None):
         entries = []
         for task in tasks:
-            if version == 4:
+            if version in (4, 5):
                 raw = json.dumps(task, ensure_ascii=False).encode()
                 digest = hashlib.sha256(raw).hexdigest()
                 (self.archive / (digest + '.json')).write_bytes(raw)
@@ -142,7 +382,10 @@ class ExplorationIdleGateTests(unittest.TestCase):
                 if isinstance(directory.get('execution'), dict):
                     directory['execution']['checkpoint'] = None
                     directory['execution'].pop('review_messages', None)
-                entries.append(dict(directory=directory, record=dict(hash=digest, bytes=len(raw))))
+                entry = dict(directory=directory, record=dict(hash=digest, bytes=len(raw)))
+                if version == 5:
+                    entry['archived'] = archived is not None and task['id'] in archived
+                entries.append(entry)
             else:
                 entries.append(task)
         ledger = dict(format_version=version, tasks=entries)
@@ -178,7 +421,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_session_ended_hot_and_cold_records_are_idle_with_or_without_experience_ack(self):
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for acknowledged in (None, 40, 50):
                 with self.subTest(version=version, acknowledged=acknowledged):
                     task = self.ended()
@@ -187,7 +430,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
                     self.assert_gate([task], version, True)
 
     def test_resource_stops_without_summary_and_delegated_usage_remain_idle(self):
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for reason in ('natural_stop', 'tool_budget_exhausted', 'deadline_expired', 'recovery_limit_reached'):
                 with self.subTest(version=version, reason=reason):
                     task = self.ended(result=None)
@@ -211,7 +454,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
         self.assert_gate([task], 4, True)
 
     def test_finished_exploration_does_not_hide_busy_act_or_delivery(self):
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for status, idle in (('Queued', False), ('Running', False), ('Completed', True),
                                  ('Failed', True), ('Cancelled', True), ('Interrupted', True)):
                 with self.subTest(version=version, status=status):
@@ -261,14 +504,14 @@ class ExplorationIdleGateTests(unittest.TestCase):
             ('unknown closing flag', lambda t: t['execution']['checkpoint'].update(closing='false')),
             ('wrong result', lambda t: t.update(result='编造的小结')),
         ]
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for label, mutate in mutations:
                 with self.subTest(version=version, problem=label):
                     task = self.ended()
                     mutate(task)
                     self.assert_rejected(task, version)
         self.assert_rejected(self.ended(), 1)
-        self.assert_rejected(self.ended(), 5)
+        self.assert_rejected(self.ended(), 6)
 
     def tool_end(self, output):
         task = self.ended()
@@ -282,7 +525,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
         return task
 
     def test_tool_receipts_must_be_paired_and_have_no_unknown_effect(self):
-        for version in (2, 4):
+        for version in (2, 4, 5):
             self.assert_gate([self.tool_end({'Success': {'text': '真实材料'}})], version, True)
             self.assert_gate([self.tool_end({'Failure': {'code': 'PermissionDenied', 'message': '范围拒绝'}})], version, True)
             for code in ('TimedOut', 'Cancelled', 'ExecutionFailed', 'NewFailure'):
@@ -317,6 +560,164 @@ class ExplorationIdleGateTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
 
+class TaskWorkingSetGateTests(unittest.TestCase):
+    """格式 5 只分开运行与历史容量；完整冷文件仍经真实读取器核对。"""
+    setUp = ExplorationIdleGateTests.setUp
+    save = ExplorationIdleGateTests.save
+    snapshot = ExplorationIdleGateTests.snapshot
+    ended = ExplorationIdleGateTests.ended
+
+    def cancelled(self, number, payload=0):
+        owner = dict(session_id='archive-session', user_id='archive-owner')
+        source = 'archive-fixture-' + str(number)
+        identity = hashlib.sha256()
+        for part in ('eve.task:v1', owner['user_id'], source):
+            raw = part.encode()
+            identity.update(len(raw).to_bytes(8, 'big'))
+            identity.update(raw)
+        task = dict(id='task-' + identity.hexdigest()[:32], owner=owner, source=source,
+                    status='Cancelled', cancel_requested=False, started_at_ms=None,
+                    created_at_ms=10, finished_at_ms=20, usage=None, result=None, failure=None,
+                    notice=None, spec=dict(title='保留历史', instructions='合成任务正文', max_steps=4),
+                    execution=dict(checkpoint=None, recoveries=0, resume_at_ms=None,
+                                   deadline_at_ms=None, last_finished_at_ms=20))
+        if payload:
+            messages = [dict(role='User', text='x' * payload, tool_calls=[], tool_results=[])]
+            task['spec']['context'] = dict(owner=owner, messages_json=json.dumps(messages))
+        return task
+
+    def save_ledger(self, ledger):
+        state = runtime.read_json(self.state)
+        state['entries']['eve.task']['tasks.v1'] = list(json.dumps(ledger).encode())
+        runtime.atomic(self.state, state)
+
+    def assert_ledger_rejected(self, ledger, message):
+        self.save_ledger(ledger)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, message):
+            list(runtime.task_documents(self.state, ledger))
+        with self.assertRaisesRegex(ValueError, message):
+            runtime.runtime_idle_gate(self.state)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_40_archived_records_over_old_byte_limit_remain_fully_readable(self):
+        tasks = [self.cancelled(number, 420 * 1024) for number in range(40)]
+        ledger = self.save(tasks, 5, {task['id'] for task in tasks[:2]})
+        self.assertGreater(sum(entry['record']['bytes'] for entry in ledger['tasks']), 16 * 1024**2)
+        before = self.snapshot()
+        self.assertEqual(list(runtime.task_documents(self.state, ledger)), tasks)
+        self.assertTrue(runtime.runtime_idle_gate(self.state))
+        self.assertEqual(self.snapshot(), before)
+        legacy = copy.deepcopy(ledger)
+        legacy['format_version'] = 4
+        for entry in legacy['tasks']:
+            entry.pop('archived')
+        self.assert_ledger_rejected(legacy, 'task_archive_size_limit')
+        for entry in ledger['tasks']:
+            entry['archived'] = False
+        self.assert_ledger_rejected(ledger, 'task_working_set_size_limit')
+
+    def test_v5_requires_explicit_boolean_and_v4_rejects_archival_fields(self):
+        task = self.cancelled(1)
+        for value in (None, 0, 1, 'true', [], {}):
+            with self.subTest(value=value):
+                ledger = self.save([task], 5)
+                ledger['tasks'][0]['archived'] = value
+                self.assert_ledger_rejected(ledger, 'invalid_task_archive_index')
+        ledger = self.save([task], 5)
+        ledger['tasks'][0].pop('archived')
+        self.assert_ledger_rejected(ledger, 'invalid_task_archive_index')
+        for value in (True, False, None):
+            ledger = self.save([task], 4)
+            ledger['tasks'][0]['archived'] = value
+            self.assert_ledger_rejected(ledger, 'invalid_task_archive_index')
+
+    def test_archival_needs_settled_status_notice_progress_and_exploration_ack(self):
+        mutations = [
+            lambda task: task.update(status='Queued'),
+            lambda task: task.update(status='Running'),
+            lambda task: task.update(finished_at_ms=None),
+            lambda task: task.update(notice=dict(status='Pending')),
+            lambda task: task.update(notice=dict(status='Delivering')),
+            lambda task: task.update(execution=dict(progress_notices=[dict(attempt=dict(result=None))])),
+            lambda task: task.update(execution=dict(kind='exploration')),
+            lambda task: task.update(execution=dict(kind='exploration', exploration_acknowledged_at_ms=19)),
+        ]
+        for number, mutate in enumerate(mutations):
+            with self.subTest(problem=number):
+                task = self.cancelled(number)
+                mutate(task)
+                ledger = self.save([task], 5, {task['id']})
+                self.assert_ledger_rejected(ledger, 'invalid_task_archive_settlement')
+        for status in ('Completed', 'Failed', 'Cancelled', 'Interrupted', 'Blocked'):
+            for notice in (None, 'Delivered', 'Expired', 'Unknown'):
+                task = self.cancelled(status + str(notice))
+                task['status'] = status
+                task['notice'] = None if notice is None else dict(status=notice)
+                ledger = self.save([task], 5, {task['id']})
+                before = self.snapshot()
+                self.assertEqual(list(runtime.task_documents(self.state, ledger)), [task])
+                self.assertTrue(runtime.runtime_idle_gate(self.state))
+                self.assertEqual(self.snapshot(), before)
+        task = self.ended()
+        task['execution']['exploration_acknowledged_at_ms'] = 50
+        ledger = self.save([task], 5, {task['id']})
+        self.assertEqual(list(runtime.task_documents(self.state, ledger)), [task])
+        self.assertTrue(runtime.runtime_idle_gate(self.state))
+
+    def test_archived_reference_still_requires_hash_body_and_exact_identity_projection(self):
+        task = self.cancelled(1, 1024)
+        ledger = self.save([task], 5, {task['id']})
+        record = ledger['tasks'][0]['record']
+        path = self.archive / (record['hash'] + '.json')
+        original = path.read_bytes()
+        path.unlink()
+        self.assert_ledger_rejected(ledger, 'invalid_task_archive_file')
+        path.write_bytes(original[:-1] + b' ')
+        self.assert_ledger_rejected(ledger, 'task_archive_digest_mismatch')
+        path.write_bytes(original)
+        for field, value in [('id', 'other'), ('owner', {'user_id': 'other'}), ('source', 'other'),
+                             ('created_at_ms', 11)]:
+            changed = copy.deepcopy(ledger)
+            changed['tasks'][0]['directory'][field] = value
+            self.assert_ledger_rejected(changed, 'task_archive_directory_mismatch')
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_history_total_working_overhead_and_original_closeout_reserve_are_independent(self):
+        limit = 16 * 1024**2
+        tasks = [self.cancelled(number) for number in range(5)]
+        ledger = self.save(tasks, 5, {task['id'] for task in tasks})
+        for entry in ledger['tasks']:
+            entry['record']['bytes'] = limit
+        # 容量先于正文 IO；不需要写五份越界文件或伪造摘要。
+        with self.assertRaisesRegex(ValueError, 'task_archive_size_limit'):
+            list(runtime.task_documents(self.state, ledger))
+        for count in (1, 4):
+            ledger = self.save(tasks[:count], 5, {task['id'] for task in tasks})
+            for entry in ledger['tasks']:
+                entry['record']['bytes'] = limit
+            runtime.task_archive_capacity(ledger)
+        ledger = self.save(tasks[:2], 5, {tasks[0]['id']})
+        ledger['tasks'][0]['directory']['notice'] = dict(status='Expired')
+        ledger['tasks'][1]['directory']['status'] = 'Queued'
+        ledger['tasks'][1]['record']['bytes'] = limit - 32768 - 320 - len(b'{"format_version":2,"tasks":[]}')
+        runtime.task_archive_capacity(ledger)
+        ledger['tasks'][1]['record']['bytes'] += 1
+        with self.assertRaisesRegex(ValueError, 'task_working_set_size_limit'):
+            runtime.task_archive_capacity(ledger)
+        for value in (0, -1, True, limit + 1):
+            ledger['tasks'][1]['record']['bytes'] = value
+            with self.assertRaisesRegex(ValueError, 'invalid_task_archive_reference'):
+                runtime.task_archive_capacity(ledger)
+
+    def test_unknown_or_malformed_execution_is_not_hidden_by_v5_flags(self):
+        for value in (False, 0, [], ''):
+            # 使用真实索引结构；避开夹具只支持正常 execution 的投影分支。
+            ledger = self.save([self.cancelled(1)], 5)
+            ledger['tasks'][0]['directory']['execution'] = value
+            self.assert_ledger_rejected(ledger, 'invalid_task_archive_execution')
+
+
 class UpgradeRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -344,6 +745,7 @@ agent=Path(sys.argv[sys.argv.index('--agent')+1]);tag=agent.read_text()
 state=Path(sys.argv[sys.argv.index('--state-dir')+1])/'state.json'
 events=Path(sys.argv[sys.argv.index('--events')+1])
 with events.open('a') as f:f.write(tag+'\\n')
+with (events.parent/'checkpoint-env.jsonl').open('a') as f:f.write(json.dumps(os.environ.get('EVE_STARTUP_CHECKPOINT_REQUEST'))+'\\n')
 if '--spawn-child' in sys.argv:
  worker=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)'])
  with (state.parent/'workers').open('a') as f:f.write(str(worker.pid)+'\\n')
@@ -662,6 +1064,24 @@ while True:
         self.assertEqual(len(history['crashes']),2)
         self.assertEqual(history['result'],'runtime_restarted_state_preserved')
 
+    def test_checkpoint_startup_failure_never_retries_without_the_barrier(self):
+        (self.initial / 'AGENT.md').write_text('startup-retry')
+        before = (self.state / 'state.json').read_bytes()
+        self.env['EVE_STARTUP_CHECKPOINT_REQUEST'] = '/owned/request.json'
+        self.launch(wait_running=False)
+        self.assertEqual(self.process.wait(timeout=10), runtime.RECOVERY_STOP)
+        self.assertEqual(self.events.read_text().splitlines(), ['startup-retry'])
+        self.assertEqual(runtime.read_json(self.queue / 'recovery.json')['result'], 'startup_checkpoint_not_ready')
+        self.assertEqual((self.state / 'state.json').read_bytes(), before)
+
+    def test_checkpoint_first_ready_allows_ordinary_restart_without_reusing_request(self):
+        self.env['EVE_STARTUP_CHECKPOINT_REQUEST'] = '/owned/request.json'
+        self.launch()
+        (self.state / 'old.crash').touch()
+        self.wait(lambda data: data['phase'] == 'running' and data['result'] == 'runtime_restarted_state_preserved')
+        received = [json.loads(row) for row in (self.root / 'checkpoint-env.jsonl').read_text().splitlines()]
+        self.assertEqual(received, ['/owned/request.json', None])
+
     def test_repeated_pre_ready_failures_stop_after_restart_budget_without_clearing_state(self):
         (self.initial/'AGENT.md').write_text('never-ready')
         before=(self.state/'state.json').read_bytes()
@@ -691,7 +1111,7 @@ while True:
         self.assertEqual(self.events.read_text().splitlines(),['old','new'])
         self.assertFalse((Path(request['candidate_directory'])/'resources/connectors/qqbot/node_modules').exists())
 
-    def cold_task(self, status='Completed', notice='Delivered'):
+    def cold_task(self, status='Completed', notice='Delivered', version=4, archived=False):
         task = dict(id='task-1', owner={'session_id': self.session, 'user_id': self.session},
                     source='fixture', spec={'title': '验证升级', 'instructions': '真实隔离验收', 'max_steps': 10,
                     'context': {'owner': {'session_id': self.session, 'user_id': self.session}, 'messages_json': '[]'}},
@@ -712,7 +1132,10 @@ while True:
         archive = self.state / 'task-archive'; archive.mkdir(exist_ok=True)
         key = hashlib.sha256(raw).hexdigest()
         cold = archive / (key + '.json'); cold.write_bytes(raw)
-        ledger = {'format_version': 4, 'tasks': [{'directory': directory, 'record': {'hash': key, 'bytes': len(raw)}}]}
+        entry = {'directory': directory, 'record': {'hash': key, 'bytes': len(raw)}}
+        if version == 5:
+            entry['archived'] = archived
+        ledger = {'format_version': version, 'tasks': [entry]}
         self.save_tasks(ledger)
         return cold, ledger
 
@@ -739,6 +1162,20 @@ while True:
         self.assertEqual(((self.state / 'state.json').read_bytes(), archive.read_bytes()), before)
         self.assertEqual(next((self.queue / 'backups').glob('*/task-archive/' + archive.name)).read_bytes(), before[1])
 
+    def test_v5_upgrade_waits_for_running_work_and_backs_up_archived_body_without_rewriting_it(self):
+        self.cold_task('Running', version=5)
+        self.launch()
+        request = self.candidate('new')
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda document: document['phase'] == 'waiting')
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+        archive, _ = self.cold_task(version=5, archived=True)
+        before = (self.state / 'state.json').read_bytes(), archive.read_bytes()
+        self.wait(lambda document: document['result'] == 'applied')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'new'])
+        self.assertEqual(((self.state / 'state.json').read_bytes(), archive.read_bytes()), before)
+        self.assertEqual(next((self.queue / 'backups').glob('*/task-archive/' + archive.name)).read_bytes(), before[1])
+
     def test_cold_task_gate_rejects_missing_tampered_directory_unknown_version_and_duplicate_ids(self):
         archive, ledger = self.cold_task()
         path = self.state / 'state.json'
@@ -752,7 +1189,7 @@ while True:
         ledger['tasks'][0]['directory']['status'] = 'Running'; self.save_tasks(ledger)
         with self.assertRaisesRegex(ValueError, 'task_archive_directory_mismatch'): runtime.runtime_idle_gate(path)
         ledger['tasks'][0]['directory']['status'] = 'Completed'
-        ledger['format_version'] = 5; self.save_tasks(ledger)
+        ledger['format_version'] = 6; self.save_tasks(ledger)
         with self.assertRaisesRegex(ValueError, 'unknown_task_ledger_version'): runtime.runtime_idle_gate(path)
         ledger['format_version'] = 4
         ledger['tasks'].append(ledger['tasks'][0]); self.save_tasks(ledger)

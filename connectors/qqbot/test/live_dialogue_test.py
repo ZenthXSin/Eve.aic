@@ -42,8 +42,17 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
             self.assertIn('以下 JSON 是固定宿主资料', body['messages'][2]['content'])
             self.assertIn('以下 JSON 是历史事实视图', body['messages'][3]['content'])
             self.assertIn('以下 JSON 是当前资料', body['messages'][4]['content'])
-            self.assertEqual(facts['current_user_message']['id'], facts['current_message_id'])
-            self.assertIsInstance(facts['current_user_message']['text'], str)
+            context = json.loads(body['messages'][4]['content'].split('：', 1)[1])
+            latest = context['latest_user_message']
+            self.assertIsInstance(latest['text'], str)
+            if facts['trigger'] == 'user_input':
+                self.assertEqual(facts['current_user_message'], latest)
+                self.assertEqual(latest['id'], facts['current_message_id'])
+            else:
+                self.assertEqual(facts['trigger'], 'background_event')
+                self.assertNotIn('current_user_message', facts)
+                self.assertNotIn('latest_user_message', facts)
+                self.assertNotIn('current_message_id', facts)
             self.speech_requests.append(body)
             return dialogue.text_response(json.dumps(self.speech_callback(facts), ensure_ascii=False))
         return super().provider_response(body, kind, fallback)
@@ -423,7 +432,9 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         current = '我先忙，这条不用回复，也不要继续旧话题。'
         self.status_for_body = lambda body: 503 if body['messages'][-1].get('content') == current else 200
         def decide(facts):
-            self.assertEqual(facts['current_user_message'], {'id': 'new-failed', 'text': current})
+            context = json.loads(self.speech_requests[-1]['messages'][4]['content'].split('：', 1)[1])
+            self.assertEqual(context['latest_user_message'], {'id': 'new-failed', 'text': current})
+            self.assertNotIn('current_user_message', facts)
             if facts['host_event']['user_text'] == '/help':
                 self.gate('new-original-seen').touch()
             return {'action': 'silence'}

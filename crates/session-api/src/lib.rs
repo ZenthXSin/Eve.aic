@@ -76,7 +76,7 @@ pub enum SessionFailureCode {
     Cancelled,
 }
 
-/// 持久化已完成的工具回执、可信审核原话和受限诊断，不保存供应商原始错误或系统提示词。
+/// 持久化工具回执、可信审核原话、输入交流交接和受限诊断，不保存原始错误或系统提示词。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionFailureEvidence {
@@ -93,6 +93,10 @@ pub struct SessionFailureEvidence {
     /// None只表示旧版本未捕获；Some空数组明确表示没有用户授权证据。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_user_messages: Option<Vec<String>>,
+    /// 运行时已消费输入的即时交流归属，每个入站消息只保存最新投递状态。
+    /// 这是宿主事实，不是用户原话授权；旧记录缺省为空，不从历史推测回填。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_replies: Vec<eve_llm_api::InputReplyHandoff>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,6 +113,8 @@ pub struct SessionFailure {
 impl SessionFailure {
     pub fn validate(&self) -> SessionResult<()> {
         if let Some(e) = &self.evidence {
+            eve_llm_api::validate_input_reply_handoffs(&e.input_replies)
+                .map_err(|_| SessionError::InvalidInput)?;
             if let Some(messages) = &e.review_user_messages
                 && (messages.len() > 6
                     || messages
@@ -476,6 +482,68 @@ mod enumeration_compatibility {
             vec!["x".repeat(eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES)],
         ] {
             record.evidence.as_mut().unwrap().review_user_messages = Some(invalid);
+            assert_eq!(record.validate(), Err(SessionError::InvalidInput));
+        }
+    }
+
+    #[test]
+    fn failure_input_handoffs_restore_old_records_and_reject_corrupt_identity_or_state() {
+        use eve_llm_api::{InputReplyDelivery, InputReplyHandoff};
+        let old = serde_json::json!({"code":"Provider","started_tools":0,
+            "evidence":{"provider_http_status":null,"tool_names":[],"tool_results":[]}});
+        let mut record: SessionFailure = serde_json::from_value(old).unwrap();
+        record.validate().unwrap();
+        assert!(record.evidence.as_ref().unwrap().input_replies.is_empty());
+        assert!(
+            serde_json::to_value(&record).unwrap()["evidence"]
+                .get("input_replies")
+                .is_none()
+        );
+        let handoffs: Vec<_> = [
+            InputReplyDelivery::Sending,
+            InputReplyDelivery::Sent {
+                platform_message_id: "platform-1".into(),
+            },
+            InputReplyDelivery::Unknown,
+            InputReplyDelivery::Failed,
+            InputReplyDelivery::NotSent,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, delivery)| InputReplyHandoff {
+            input_message_id: format!("input-{index}"),
+            input_text: "继续处理 {{NAME_ab12cd34}}".into(),
+            event_id: format!("event-{index}"),
+            reply_text: "我在继续处理".into(),
+            delivery,
+        })
+        .collect();
+        record.evidence.as_mut().unwrap().input_replies = handoffs.clone();
+        record.validate().unwrap();
+        let restored: SessionFailure =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(restored, record);
+        assert!(restored.evidence.unwrap().review_user_messages.is_none());
+        let mut duplicate_input = handoffs.clone();
+        duplicate_input[1].input_message_id = duplicate_input[0].input_message_id.clone();
+        let mut duplicate_event = handoffs.clone();
+        duplicate_event[1].event_id = duplicate_event[0].event_id.clone();
+        let mut invalid_sent = handoffs.clone();
+        invalid_sent[1].delivery = InputReplyDelivery::Sent {
+            platform_message_id: String::new(),
+        };
+        let mut too_large = handoffs.clone();
+        for handoff in &mut too_large {
+            handoff.input_text = "x".repeat(128 * 1024);
+        }
+        for invalid in [
+            duplicate_input,
+            duplicate_event,
+            invalid_sent,
+            too_large,
+            vec![handoffs[0].clone(); 65],
+        ] {
+            record.evidence.as_mut().unwrap().input_replies = invalid;
             assert_eq!(record.validate(), Err(SessionError::InvalidInput));
         }
     }

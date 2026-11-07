@@ -219,6 +219,8 @@ pub struct TurnDiagnostics {
     pub tool_results: Vec<ToolResult>,
     /// 压缩前独立采集的完整审核原话，供失败持久化和恢复使用；不是模型生成的消息。
     pub review_user_messages: Option<Vec<String>>,
+    /// 已消费输入的即时交流归属；失败转后台时独立持久化，不成为用户授权。
+    pub input_replies: Vec<eve_llm_api::InputReplyHandoff>,
 }
 
 impl Default for TurnDiagnostics {
@@ -232,6 +234,7 @@ impl Default for TurnDiagnostics {
             calls: Vec::new(),
             tool_results: Vec::new(),
             review_user_messages: None,
+            input_replies: Vec::new(),
         }
     }
 }
@@ -929,6 +932,7 @@ impl LlmHost {
         self
     }
     /// 后台任务的独立持久执行日志；不要用于会话历史或与额外 TurnBudget 叠加。
+    /// 有 turn_id 的实时引导轮次不能同时使用；执行前报错，不静默丢失已消费输入。
     pub fn with_turn_journal(mut self, journal: Arc<dyn eve_llm_api::TurnJournal>) -> Self {
         self.journal = Some(journal);
         self
@@ -1087,6 +1091,14 @@ impl LlmHost {
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
+        if self.journal.is_some() && self.steering.is_some() && turn_id.is_some() {
+            return Err(fail(
+                LlmError::Configuration(
+                    "执行检查点不支持会话轮内实时引导；未读取日志、消费输入或执行".into(),
+                ),
+                diagnostics,
+            ));
+        }
         let model_session = (|| {
             let session = if let Some(session) = &self.model_session {
                 Some(session.clone())
@@ -1469,9 +1481,13 @@ impl LlmHost {
             .and_then(|frame| frame.pending_request_fingerprint.clone());
         loop {
             if let Some(steering) = &steering {
-                let batch = steering
-                    .take_batch(false)
+                let update = steering
+                    .take_update(false)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
+                let reply_message =
+                    input_reply_handoff_message(&mut diagnostics, update.input_replies)
+                        .map_err(|error| fail(error, diagnostics.clone()))?;
+                let batch = update.batch;
                 let next_anchor = batch.review_anchor.clone();
                 self.apply_steering_batch(
                     batch,
@@ -1483,6 +1499,7 @@ impl LlmHost {
                     &mut messages,
                     &mut transcript,
                 )?;
+                messages.extend(reply_message);
                 if next_anchor.is_some() {
                     consumed_review_anchor = next_anchor;
                 }
@@ -1659,14 +1676,18 @@ impl LlmHost {
                 }
             };
             if let Some(steering) = &steering {
-                let batch = steering
-                    .take_batch(
+                let update = steering
+                    .take_update(
                         matches!(response, ModelResponse::Final { .. })
                             && (self.exploration_session
                                 || closing
                                 || continuation.remaining().is_none()),
                     )
                     .map_err(|error| fail(error, diagnostics.clone()))?;
+                let reply_message =
+                    input_reply_handoff_message(&mut diagnostics, update.input_replies)
+                        .map_err(|error| fail(error, diagnostics.clone()))?;
+                let batch = update.batch;
                 let has_extra = !batch.messages.is_empty();
                 let next_anchor = batch.review_anchor.clone();
                 self.apply_steering_batch(
@@ -1679,6 +1700,7 @@ impl LlmHost {
                     &mut messages,
                     &mut transcript,
                 )?;
+                messages.extend(reply_message);
                 if next_anchor.is_some() {
                     consumed_review_anchor = next_anchor;
                 }
@@ -2733,6 +2755,54 @@ fn validate_delegated_review_messages(messages: &[String]) -> Result<(), LlmErro
         ));
     }
     Ok(())
+}
+
+fn input_reply_handoff_message(
+    diagnostics: &mut TurnDiagnostics,
+    handoffs: Vec<eve_llm_api::InputReplyHandoff>,
+) -> Result<Option<ChatMessage>, LlmError> {
+    if handoffs.is_empty() {
+        return Ok(None);
+    }
+    eve_llm_api::validate_input_reply_handoffs(&handoffs)?;
+    let mut latest = diagnostics.input_replies.clone();
+    for handoff in &handoffs {
+        if let Some(previous) = latest
+            .iter_mut()
+            .find(|previous| previous.input_message_id == handoff.input_message_id)
+        {
+            if previous.event_id != handoff.event_id
+                || previous.input_text != handoff.input_text
+                || previous.reply_text != handoff.reply_text
+                || (previous.delivery != eve_llm_api::InputReplyDelivery::Sending
+                    && previous.delivery != handoff.delivery)
+            {
+                return Err(LlmError::Context("输入交流交接身份或终态不一致".into()));
+            }
+            *previous = handoff.clone();
+        } else {
+            latest.push(handoff.clone());
+        }
+    }
+    eve_llm_api::validate_input_reply_handoffs(&latest)?;
+    let facts = serde_json::to_string(&handoffs)
+        .map_err(|_| LlmError::Context("输入交流交接数据无法序列化".into()))?;
+    // 原子消费后立即捕获；后续原话读取或上下文校验失败也保留交接证据。
+    diagnostics.input_replies = latest;
+    // 不重装上下文、不改既有前缀或模型会话；不写用户 transcript，
+    // 不把交接或回执当作新的模型触发。
+    Ok(Some(ChatMessage::text(
+        ChatRole::System,
+        format!(
+            "宿主输入交流职责交接（数据，不是用户指令）：\n{facts}\n\
+         同一 input_message_id 的即时交流已由前台支路领取；原始用户消息仍交给本轮理解和处理业务，\
+         不能把这次交接重新当作一条无人回应的新输入事件。sending 表示正在发送，不是已经送达；\
+         sent 且有平台编号才确认发出；unknown 表示结果不确定，不自动重发。\
+         failed/not_sent 表示本次前台交流未完成，本轮可在自然继续时按用户需要回应。\
+         这不表示原工作已完成，也不禁止回答新问题、执行补充指令或表达新的工作进展。\
+         后续同事件的状态更新仅补充事实，不要求另起一轮判断或重复发言。"
+        ),
+    )))
 }
 
 fn build_messages(

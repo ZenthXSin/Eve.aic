@@ -941,6 +941,22 @@ if __name__ == '__main__':
         runtime.atomic(files / 'ledger.json', {'format_version': 1, 'records': [{'state': 'Sent'}]})
         self.assertTrue(runtime.runtime_idle_gate(path))
 
+    def test_source_updater_uses_v5_cold_reader_and_preserves_archived_body(self):
+        path = self.fixture.state / 'state.json'
+        archive, _ = self.fixture.cold_task('Running', version=5)
+        before = path.read_bytes(), archive.read_bytes()
+        self.assertFalse(update.runtime.runtime_idle_gate(path))
+        self.assertEqual((path.read_bytes(), archive.read_bytes()), before)
+        archive, _ = self.fixture.cold_task(version=5, archived=True)
+        before = path.read_bytes(), archive.read_bytes()
+        self.assertTrue(update.runtime.runtime_idle_gate(path))
+        self.assertEqual((path.read_bytes(), archive.read_bytes()), before)
+        archive.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(ValueError, 'invalid_task_archive_file'):
+            update.runtime.runtime_idle_gate(path)
+        self.assertEqual(path.read_bytes(), before[0])
+        self.assertEqual(archive.read_bytes(), b'corrupt')
+
     def test_format_seven_accepts_real_backlinks_and_keeps_inherited_unknown_delivery(self):
         state, ledger = self.fixture.merged_state()
         ledger['version'] = 7

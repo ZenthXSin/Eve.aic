@@ -2210,7 +2210,7 @@ async fn sql_task_cold_index_restarts_and_missing_body_never_clears_sql_records(
     let task = tasks.create(&owner, spec, "sql-source", 10).unwrap();
     let stored = rows(&database);
     let index = document(&stored, TASK_PLUGIN_ID, TASK_STATE_KEY);
-    assert_eq!(index["format_version"], 4);
+    assert!(matches!(index["format_version"].as_u64(), Some(4 | 5)));
     assert!(serde_json::to_vec(&index).unwrap().len() < 5000);
     let hash = index["tasks"][0]["record"]["hash"].as_str().unwrap();
     let path = root

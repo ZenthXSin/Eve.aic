@@ -1,4 +1,5 @@
 """验收观察器遇到 Windows 快照替换竞争时有界等待，真实损坏仍失败。"""
+import copy
 import ctypes
 import hashlib
 import json
@@ -119,6 +120,60 @@ class SnapshotReaderTest(unittest.TestCase):
             self.reader.documents()
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(record.read_bytes(), b"corrupt")
+
+    def task_archive(self, version, archived=False, task=None):
+        if task is None:
+            task = dict(id='task-fixture', status='Cancelled', created_at_ms=10, finished_at_ms=20,
+                        spec=dict(title='历史任务', context={'messages_json': 'x' * (4 * 1024**2 + 1)}),
+                        result=None, failure=None)
+        body = json.dumps(task, ensure_ascii=False).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        archive = self.path.parent / 'task-archive'
+        archive.mkdir(exist_ok=True)
+        record = archive / (digest + '.json')
+        record.write_bytes(body)
+        directory = copy.deepcopy(task)
+        directory['spec'].pop('context', None)
+        if directory.get('execution') is not None:
+            directory['execution']['checkpoint'] = None
+            directory['execution'].pop('review_messages', None)
+        entry = dict(directory=directory, record=dict(hash=digest, bytes=len(body)))
+        if version == 5:
+            entry['archived'] = archived
+        index = dict(format_version=version, tasks=[entry])
+        state = dict(version=1, entries={'eve.task': {'tasks.v1': list(json.dumps(index).encode())}})
+        self.path.write_text(json.dumps(state), encoding='utf8')
+        return record, task
+
+    def test_v4_and_v5_task_reader_keep_complete_bodies_above_old_documented_four_mib(self):
+        for version, archived in ((4, False), (5, False), (5, True)):
+            record, task = self.task_archive(version, archived)
+            before = self.path.read_bytes(), record.read_bytes()
+            self.assertEqual(self.reader.documents()['eve.task']['tasks.v1'],
+                             dict(format_version=version, tasks=[task]))
+            self.assertEqual((self.path.read_bytes(), record.read_bytes()), before)
+
+    def test_archived_task_reader_still_rejects_changed_body_without_rewriting_state(self):
+        record, _ = self.task_archive(5, True)
+        before = self.path.read_bytes()
+        record.write_bytes(b'corrupt')
+        with self.assertRaises(AssertionError):
+            self.reader.documents()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(record.read_bytes(), b'corrupt')
+
+    def test_v5_reader_does_not_accept_archived_active_unconfirmed_or_undelivered_tasks(self):
+        for change in (dict(status='Running'), dict(notice={'status': 'Pending'}),
+                       dict(execution={'kind': 'exploration'}),
+                       dict(execution={'progress_notices': [{'attempt': {'result': None}}]})):
+            task = dict(id='task-fixture', status='Cancelled', created_at_ms=10, finished_at_ms=20,
+                        spec={}, result=None, failure=None)
+            task.update(change)
+            record, _ = self.task_archive(5, True, task)
+            before = self.path.read_bytes(), record.read_bytes()
+            with self.assertRaises(AssertionError):
+                self.reader.documents()
+            self.assertEqual((self.path.read_bytes(), record.read_bytes()), before)
 
     @unittest.skipUnless(os.name == "nt", "Windows 文件共享语义")
     def test_real_windows_exclusive_handle_is_released_before_retry(self):

@@ -358,13 +358,26 @@ pub(crate) struct Progress {
     /// 显式图片表达；text 是库中描述，不是发送的文字。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
+    /// 群聊显式发言实际使用的后到消息窗口；缺省仍使用原轮消息。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_anchor: Option<String>,
 }
 pub(crate) fn passive_progress(entry: &Receipt) -> usize {
-    entry.progress.iter().filter(|p| !p.proactive).count()
+    passive_progress_at(entry, &entry.message.id)
+}
+pub(crate) fn passive_progress_at(entry: &Receipt, anchor: &str) -> usize {
+    entry
+        .progress
+        .iter()
+        .filter(|p| {
+            !p.proactive && p.reply_anchor.as_deref().unwrap_or(&entry.message.id) == anchor
+        })
+        .count()
 }
 /// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息，5 包含附带的表情包，
 /// 6 绑定归档库，7 允许后到的轮内引导并入较早的原轮回执，8 区分主动阶段消息与被动配额。
 /// 9 区分内部处理结束与显式发言，并保存发言决定 ID 和真实平台编号。
+/// 10 保存群聊显式发言实际使用的后到消息窗口，各窗口独立占用原被动额度。
 /// 旧版本拒绝读取而不是忽略投递记录。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -412,66 +425,26 @@ impl Ledger {
             return Err(corrupt());
         }
         let mut identities = std::collections::BTreeSet::new();
-        for (index, entry) in ledger.entries.iter().enumerate() {
-            if !valid_id(&entry.app_id)
-                || !entry.message.valid()
-                || !identities.insert((&entry.app_id, &entry.message.id))
-                || entry
-                    .reply
-                    .as_ref()
-                    .is_some_and(|r| r.trim().is_empty() || r.len() > 32768)
-                || (matches!(entry.state, ReceiptState::ReplyPending | ReceiptState::Sent | ReceiptState::Unknown)
-                    && entry.reply.is_none())
-                || entry.segments.as_ref().is_some_and(|segments| {
-                    !valid_segments(segments, entry.reply.as_deref(), entry.state)
-                })
-                || entry.progress.len() > 64
-                || passive_progress(entry) > 3
-                || entry.progress.iter().any(|p| {
-                    p.text.trim().is_empty()
-                        || p.text.len() > if p.decision_id.is_some() {32768} else {1024}
-                        || p.decision_id.as_ref().is_some_and(|id| !valid_message_id(id))
-                        || (p.decision_id.is_some() && p.state == PartState::Sent && p.platform_message_id.is_none())
-                        || p.image_path.as_ref().is_some_and(|path|p.decision_id.is_none() || path.is_empty() || path.len()>4096 || path.chars().any(char::is_control))
-                        || p.platform_message_id.as_ref().is_some_and(|id| p.decision_id.is_none() || !valid_message_id(id) || p.state != PartState::Sent)
-                        || !matches!(
-                            p.state,
-                            PartState::Sending | PartState::Sent | PartState::Failed | PartState::Unknown
-                        )
-                })
-                || passive_progress(entry)
-                    + entry.segments.as_ref().map_or(1, |s| s.parts.len())
-                    + usize::from(entry.sticker.is_some())
-                    > crate::QQ_MAX_SEGMENTS
-                || entry.sticker.as_ref().is_some_and(|sticker| {
-                    sticker.path.is_empty()
-                        || sticker.path.len() > 4096
-                        || sticker.path.chars().any(char::is_control)
-                        || !matches!(entry.state, ReceiptState::ReplyPending | ReceiptState::Sent | ReceiptState::Failed | ReceiptState::Unknown)
-                        // 正文没有发完时表情包只能还在等待；正文失败时表情包从未写出。
-                        || (entry.state == ReceiptState::ReplyPending && sticker.state != PartState::Pending)
-                        || (entry.state == ReceiptState::Failed
-                            && !matches!(sticker.state, PartState::Pending | PartState::Skipped))
-                })
-                || (entry.state == ReceiptState::Merged) != entry.merged_into.is_some()
-                || (entry.state == ReceiptState::Handled && (entry.reply.is_some() || entry.segments.is_some() || entry.sticker.is_some()))
-                || (entry.state == ReceiptState::Merged
-                    && (entry.reply.is_some()
-                        || entry.segments.is_some()
-                        || !entry.progress.is_empty()))
+        for entry in &ledger.entries {
+            validate_receipt_shape(entry)?;
+            if !identities.insert((&entry.app_id, &entry.message.id))
                 || entry.merged_into.as_ref().is_some_and(|into| {
-                    into == &entry.message.id
-                        || !ledger.entries.iter().enumerate().any(|(target_index, e)| {
-                            target_index != index
-                                && e.app_id == entry.app_id
-                                && &e.message.id == into
-                                && e.state != ReceiptState::Merged
-                                && e.message.scope == entry.message.scope
-                                && e.message.target_id == entry.message.target_id
-                                && e.message.user_id == entry.message.user_id
-                        })
+                    !ledger.entries.iter().any(|target| {
+                        &target.message.id == into
+                            && target.state != ReceiptState::Merged
+                            && same_receipt_session(entry, target)
+                    })
                 })
-                || entry.control_turn_id.is_some_and(|id|id==0 || entry.state!=ReceiptState::Handled)
+                || entry.progress.iter().any(|progress| {
+                    progress.reply_anchor.as_ref().is_some_and(|anchor| {
+                        !ledger.entries.iter().any(|source| {
+                            &source.message.id == anchor
+                                && source.state == ReceiptState::Merged
+                                && source.merged_into.as_ref() == Some(&entry.message.id)
+                                && same_receipt_session(entry, source)
+                        })
+                    })
+                })
             {
                 return Err(corrupt());
             }
@@ -480,7 +453,16 @@ impl Ledger {
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self.entries.iter().any(|e| {
+        if self.version == 10
+            || self.entries.iter().any(|entry| {
+                entry
+                    .progress
+                    .iter()
+                    .any(|progress| progress.reply_anchor.is_some())
+            })
+        {
+            10
+        } else if self.entries.iter().any(|e| {
             e.state == ReceiptState::Handled
                 || e.control_turn_id.is_some()
                 || e.progress
@@ -845,30 +827,127 @@ pub(crate) fn decode_archived(bytes: &[u8]) -> PluginResult<Receipt> {
         return Err(corrupt());
     }
     let entry: Receipt = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-    if entry.state == ReceiptState::Merged {
-        if !valid_id(&entry.app_id)
-            || !entry.message.valid()
-            || entry.reply.is_some()
-            || entry.control_turn_id.is_some()
-            || entry.segments.is_some()
-            || !entry.progress.is_empty()
-            || entry.sticker.is_some()
-            || entry
-                .merged_into
-                .as_ref()
-                .is_none_or(|id| !valid_message_id(id) || id == &entry.message.id)
-        {
-            return Err(corrupt());
-        }
-    } else {
-        let mut single = Ledger {
-            entries: vec![serde_json::from_slice(bytes).map_err(|_| corrupt())?],
-            ..Ledger::default()
-        };
-        Ledger::decode(&single.encode()?)?;
-    }
+    // 归档逐条读取，只检查本记录可知的形状和额度；不虚构缺少的同组窗口。
+    validate_receipt_shape(&entry)?;
     Ok(entry)
 }
+fn same_receipt_session(left: &Receipt, right: &Receipt) -> bool {
+    left.app_id == right.app_id
+        && left.message.scope == right.message.scope
+        && left.message.target_id == right.message.target_id
+        && left.message.user_id == right.message.user_id
+}
+
+fn validate_receipt_shape(entry: &Receipt) -> PluginResult<()> {
+    if !valid_id(&entry.app_id)
+        || !entry.message.valid()
+        || entry
+            .reply
+            .as_ref()
+            .is_some_and(|reply| reply.trim().is_empty() || reply.len() > 32768)
+        || (matches!(
+            entry.state,
+            ReceiptState::ReplyPending | ReceiptState::Sent | ReceiptState::Unknown
+        ) && entry.reply.is_none())
+        || entry
+            .segments
+            .as_ref()
+            .is_some_and(|segments| !valid_segments(segments, entry.reply.as_deref(), entry.state))
+        || entry.progress.len() > 64
+        || entry.progress.iter().any(|progress| {
+            progress.text.trim().is_empty()
+                || progress.text.len()
+                    > if progress.decision_id.is_some() {
+                        32768
+                    } else {
+                        1024
+                    }
+                || progress
+                    .decision_id
+                    .as_ref()
+                    .is_some_and(|id| !valid_message_id(id))
+                || (progress.decision_id.is_some()
+                    && progress.state == PartState::Sent
+                    && progress.platform_message_id.is_none())
+                || progress.image_path.as_ref().is_some_and(|path| {
+                    progress.decision_id.is_none()
+                        || path.is_empty()
+                        || path.len() > 4096
+                        || path.chars().any(char::is_control)
+                })
+                || progress.platform_message_id.as_ref().is_some_and(|id| {
+                    progress.decision_id.is_none()
+                        || !valid_message_id(id)
+                        || progress.state != PartState::Sent
+                })
+                || progress.reply_anchor.as_ref().is_some_and(|anchor| {
+                    !valid_message_id(anchor)
+                        || anchor == &entry.message.id
+                        || entry.message.scope != "group"
+                        || progress.proactive
+                        || progress.decision_id.is_none()
+                })
+                || !matches!(
+                    progress.state,
+                    PartState::Sending | PartState::Sent | PartState::Failed | PartState::Unknown
+                )
+        })
+        || passive_progress(entry)
+            + entry
+                .segments
+                .as_ref()
+                .map_or(1, |segments| segments.parts.len())
+            + usize::from(entry.sticker.is_some())
+            > crate::QQ_MAX_SEGMENTS
+        || entry.sticker.as_ref().is_some_and(|sticker| {
+            sticker.path.is_empty()
+                || sticker.path.len() > 4096
+                || sticker.path.chars().any(char::is_control)
+                || !matches!(
+                    entry.state,
+                    ReceiptState::ReplyPending
+                        | ReceiptState::Sent
+                        | ReceiptState::Failed
+                        | ReceiptState::Unknown
+                )
+                || (entry.state == ReceiptState::ReplyPending
+                    && sticker.state != PartState::Pending)
+                || (entry.state == ReceiptState::Failed
+                    && !matches!(sticker.state, PartState::Pending | PartState::Skipped))
+        })
+        || (entry.state == ReceiptState::Merged) != entry.merged_into.is_some()
+        || (entry.state == ReceiptState::Handled
+            && (entry.reply.is_some() || entry.segments.is_some() || entry.sticker.is_some()))
+        || (entry.state == ReceiptState::Merged
+            && (entry.reply.is_some()
+                || entry.segments.is_some()
+                || !entry.progress.is_empty()
+                || entry.sticker.is_some()))
+        || entry
+            .merged_into
+            .as_ref()
+            .is_some_and(|id| !valid_message_id(id) || id == &entry.message.id)
+        || entry
+            .control_turn_id
+            .is_some_and(|id| id == 0 || entry.state != ReceiptState::Handled)
+    {
+        return Err(corrupt());
+    }
+    let mut passive = std::collections::BTreeMap::new();
+    for progress in entry.progress.iter().filter(|progress| !progress.proactive) {
+        let anchor = progress
+            .reply_anchor
+            .as_deref()
+            .unwrap_or(&entry.message.id);
+        let count = passive.entry(anchor).or_insert(0usize);
+        *count += 1;
+        if *count > 3 {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
 fn valid_segments(segments: &Segments, reply: Option<&str>, state: ReceiptState) -> bool {
     let Some(reply) = reply else {
         return false;
@@ -954,6 +1033,7 @@ mod tests {
                 decision_id: Some("text-call".into()),
                 platform_message_id: Some("platform-text".into()),
                 image_path: None,
+                reply_anchor: None,
             },
             Progress {
                 text: "开心的猫，图片描述不是文字发言".into(),
@@ -963,6 +1043,7 @@ mod tests {
                 decision_id: Some("image-call".into()),
                 platform_message_id: Some("platform-image".into()),
                 image_path: Some("/stickers/cat.png".into()),
+                reply_anchor: None,
             },
             Progress {
                 text: "投递未知的话".into(),
@@ -972,6 +1053,7 @@ mod tests {
                 decision_id: Some("unknown-call".into()),
                 platform_message_id: None,
                 image_path: None,
+                reply_anchor: None,
             },
             Progress {
                 text: "明确失败的话".into(),
@@ -981,6 +1063,7 @@ mod tests {
                 decision_id: Some("failed-call".into()),
                 platform_message_id: None,
                 image_path: None,
+                reply_anchor: None,
             },
         ];
         let ledger = round_trip(entry).unwrap();
@@ -1008,6 +1091,7 @@ mod tests {
             decision_id: Some("call".into()),
             platform_message_id: Some("message".into()),
             image_path: None,
+            reply_anchor: None,
         });
         let mut ledger = round_trip(entry).unwrap();
         let valid: serde_json::Value = serde_json::from_slice(&ledger.encode().unwrap()).unwrap();
@@ -1052,6 +1136,7 @@ mod tests {
                 decision_id: Some(format!("call-{index}")),
                 platform_message_id: (index < 63).then(|| format!("platform-{index}")),
                 image_path: None,
+                reply_anchor: None,
             });
         }
         let bytes = serde_json::to_vec(&entry).unwrap();
@@ -1140,6 +1225,7 @@ mod tests {
                 decision_id: None,
                 platform_message_id: None,
                 image_path: None,
+                reply_anchor: None,
                 necessary: false,
                 text: "资料检索已返回结果。".into(),
                 state,
@@ -1157,6 +1243,7 @@ mod tests {
                 decision_id: None,
                 platform_message_id: None,
                 image_path: None,
+                reply_anchor: None,
                 necessary: false,
                 text: "回执".into(),
                 state: Sent,
@@ -1173,6 +1260,7 @@ mod tests {
             decision_id: None,
             platform_message_id: None,
             image_path: None,
+            reply_anchor: None,
             text: "需要保留哪个目录？".into(),
             state: Sent,
             proactive: false,
@@ -1195,6 +1283,7 @@ mod tests {
                 decision_id: None,
                 platform_message_id: None,
                 image_path: None,
+                reply_anchor: None,
                 necessary: false,
                 text: "真实阶段".into(),
                 state: if i == 5 { Sending } else { Sent },
@@ -1214,6 +1303,259 @@ mod tests {
             Ledger::decode(&ledger.encode().unwrap()).is_err(),
             "三条被动进度与三段正文超出平台额度"
         );
+    }
+
+    fn anchored_progress(anchor: Option<&str>, state: PartState, index: usize) -> Progress {
+        Progress {
+            text: format!("表达 {index}"),
+            state,
+            proactive: false,
+            necessary: false,
+            decision_id: Some(format!("decision-{index}")),
+            platform_message_id: (state == Sent).then(|| format!("platform-{index}")),
+            image_path: None,
+            reply_anchor: anchor.map(str::to_owned),
+        }
+    }
+
+    fn group_anchor_ledger(state: PartState) -> Ledger {
+        let mut parent = receipt(ReceiptState::Handled, None);
+        parent.reply = None;
+        parent.control_turn_id = Some(7);
+        parent.message.scope = "group".into();
+        parent.message.target_id = "group-1".into();
+        parent.progress = (0..3)
+            .map(|index| anchored_progress(None, Sent, index))
+            .collect();
+        parent
+            .progress
+            .push(anchored_progress(Some("child-1"), state, 3));
+        let mut child = receipt(ReceiptState::Merged, None);
+        child.message = parent.message.clone();
+        child.message.id = "child-1".into();
+        child.reply = None;
+        child.merged_into = Some(parent.message.id.clone());
+        Ledger {
+            entries: vec![parent, child],
+            ..Ledger::default()
+        }
+    }
+
+    #[test]
+    fn group_anchor_migrates_v9_and_keeps_v10_after_the_last_anchor_leaves_the_hot_ledger() {
+        let mut ledger = group_anchor_ledger(Sent);
+        let anchored = ledger.entries[0].progress.pop().unwrap();
+        let old = ledger.encode().unwrap();
+        assert_eq!(ledger.version, 9);
+        assert!(
+            !String::from_utf8(old.clone())
+                .unwrap()
+                .contains("reply_anchor")
+        );
+        let mut ledger = Ledger::decode(&old).unwrap();
+        assert_eq!(ledger.encode().unwrap(), old);
+        assert_eq!(passive_progress(&ledger.entries[0]), 3);
+        let original_progress = serde_json::to_value(&ledger.entries[0].progress).unwrap();
+        // 缺省与显式 null 沿用同一个旧窗口语义。
+        let mut nullable: serde_json::Value = serde_json::from_slice(&old).unwrap();
+        nullable["entries"][0]["progress"][0]["reply_anchor"] = serde_json::Value::Null;
+        assert_eq!(
+            Ledger::decode(&serde_json::to_vec(&nullable).unwrap())
+                .unwrap()
+                .version,
+            9
+        );
+        ledger.entries[0].progress.push(anchored);
+        let current = ledger.encode().unwrap();
+        assert_eq!(ledger.version, 10);
+        assert_eq!(Ledger::decode(&current).unwrap().version, 10);
+        for version in [9, 11, 255] {
+            let mut wrong: serde_json::Value = serde_json::from_slice(&current).unwrap();
+            wrong["version"] = version.into();
+            assert!(Ledger::decode(&serde_json::to_vec(&wrong).unwrap()).is_err());
+        }
+        ledger.entries[0].progress.pop();
+        ledger.entries.pop();
+        let retained = ledger.encode().unwrap();
+        assert_eq!(ledger.version, 10);
+        let restored = Ledger::decode(&retained).unwrap();
+        assert_eq!(restored.version, 10);
+        assert_eq!(
+            serde_json::to_value(&restored.entries[0].progress).unwrap(),
+            original_progress
+        );
+    }
+
+    #[test]
+    fn group_progress_counts_each_real_reply_window_and_never_refunds_failed_or_unknown_attempts() {
+        let mut ledger = group_anchor_ledger(Sending);
+        ledger.entries[0]
+            .progress
+            .push(anchored_progress(Some("child-1"), Failed, 4));
+        ledger.entries[0]
+            .progress
+            .push(anchored_progress(Some("child-1"), Unknown, 5));
+        let encoded = ledger.encode().unwrap();
+        let restored = Ledger::decode(&encoded).unwrap();
+        assert_eq!(restored.entries[0].progress.len(), 6);
+        assert_eq!(passive_progress(&restored.entries[0]), 3);
+        assert_eq!(passive_progress_at(&restored.entries[0], "child-1"), 3);
+        assert_eq!(passive_progress_at(&restored.entries[0], "absent"), 0);
+        for anchor in [None, Some("child-1")] {
+            for state in [Sending, Sent, Failed, Unknown] {
+                let mut excess = Ledger::decode(&encoded).unwrap();
+                excess.entries[0]
+                    .progress
+                    .push(anchored_progress(anchor, state, 6));
+                assert!(Ledger::decode(&excess.encode().unwrap()).is_err());
+                assert!(decode_archived(&serde_json::to_vec(&excess.entries[0]).unwrap()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn group_anchor_does_not_spend_the_parent_segment_slot_or_expand_the_total_progress_limit() {
+        let mut ledger = group_anchor_ledger(Sent);
+        ledger.entries[0].progress.remove(2);
+        let original_reply = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
+        ledger.entries[0].state = original_reply.state;
+        ledger.entries[0].control_turn_id = None;
+        ledger.entries[0].reply = original_reply.reply;
+        ledger.entries[0].segments = original_reply.segments;
+        ledger.entries[0]
+            .progress
+            .push(anchored_progress(Some("child-1"), Sent, 4));
+        ledger.entries[0]
+            .progress
+            .push(anchored_progress(Some("child-1"), Sent, 5));
+        let decoded = Ledger::decode(&ledger.encode().unwrap()).unwrap();
+        assert_eq!(passive_progress(&decoded.entries[0]), 2);
+        assert_eq!(passive_progress_at(&decoded.entries[0], "child-1"), 3);
+        ledger.entries[0].sticker = Some(StickerPart {
+            path: "/stickers/extra.png".into(),
+            state: Sent,
+        });
+        assert!(Ledger::decode(&ledger.encode().unwrap()).is_err());
+
+        let mut ledger = group_anchor_ledger(Sent);
+        ledger.entries.truncate(1);
+        ledger.entries[0].progress = vec![anchored_progress(None, Sent, 0)];
+        for number in 0..21 {
+            let anchor = format!("window-{number}");
+            let mut child = receipt(ReceiptState::Merged, None);
+            child.message = ledger.entries[0].message.clone();
+            child.message.id = anchor.clone();
+            child.reply = None;
+            child.merged_into = Some(ledger.entries[0].message.id.clone());
+            ledger.entries.push(child);
+            for _ in 0..3 {
+                let index = ledger.entries[0].progress.len();
+                ledger.entries[0]
+                    .progress
+                    .push(anchored_progress(Some(&anchor), Sent, index));
+            }
+        }
+        assert_eq!(ledger.entries[0].progress.len(), 64);
+        Ledger::decode(&ledger.encode().unwrap()).unwrap();
+        ledger.entries[0]
+            .progress
+            .push(anchored_progress(None, Sent, 64));
+        assert_eq!(passive_progress(&ledger.entries[0]), 2);
+        assert!(Ledger::decode(&ledger.encode().unwrap()).is_err());
+        assert!(decode_archived(&serde_json::to_vec(&ledger.entries[0]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn group_anchor_shape_is_checked_for_hot_and_single_archived_records() {
+        let mut ledger = group_anchor_ledger(Sent);
+        let valid: serde_json::Value = serde_json::from_slice(&ledger.encode().unwrap()).unwrap();
+        for anchor in [
+            serde_json::json!(""),
+            serde_json::json!(" child-1"),
+            serde_json::json!("child\n1"),
+            serde_json::json!("msg-1"),
+            serde_json::json!("x".repeat(MAX_MESSAGE_ID_BYTES + 1)),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let mut broken = valid.clone();
+            broken["entries"][0]["progress"][3]["reply_anchor"] = anchor;
+            assert!(Ledger::decode(&serde_json::to_vec(&broken).unwrap()).is_err());
+            assert!(decode_archived(&serde_json::to_vec(&broken["entries"][0]).unwrap()).is_err());
+        }
+        for (field, value) in [
+            ("proactive", serde_json::json!(true)),
+            ("decision_id", serde_json::Value::Null),
+        ] {
+            let mut broken = valid.clone();
+            broken["entries"][0]["progress"][3][field] = value;
+            assert!(Ledger::decode(&serde_json::to_vec(&broken).unwrap()).is_err());
+            assert!(decode_archived(&serde_json::to_vec(&broken["entries"][0]).unwrap()).is_err());
+        }
+        let mut private = valid.clone();
+        for entry in private["entries"].as_array_mut().unwrap() {
+            entry["message"]["scope"] = "c2c".into();
+            entry["message"]["target_id"] = "user-1".into();
+        }
+        assert!(Ledger::decode(&serde_json::to_vec(&private).unwrap()).is_err());
+        assert!(decode_archived(&serde_json::to_vec(&private["entries"][0]).unwrap()).is_err());
+        let maximum = format!("{}a", "界".repeat(84));
+        assert_eq!(maximum.len(), MAX_MESSAGE_ID_BYTES);
+        ledger.entries[1].message.id = maximum.clone();
+        ledger.entries[0].progress[3].reply_anchor = Some(maximum);
+        Ledger::decode(&ledger.encode().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn group_anchor_requires_a_same_identity_child_merged_into_its_exact_parent() {
+        let mut ledger = group_anchor_ledger(Sent);
+        let valid = ledger.encode().unwrap();
+        for change in [
+            |l: &mut Ledger| l.entries[1].message.user_id = "other-user".into(),
+            |l: &mut Ledger| l.entries[1].message.target_id = "other-group".into(),
+            |l: &mut Ledger| l.entries[1].app_id = "other-app".into(),
+            |l: &mut Ledger| l.entries[1].message.id = "other-message".into(),
+            |l: &mut Ledger| {
+                l.entries[1].state = ReceiptState::Handled;
+                l.entries[1].merged_into = None;
+            },
+        ] {
+            let mut broken = Ledger::decode(&valid).unwrap();
+            change(&mut broken);
+            assert!(Ledger::decode(&broken.encode().unwrap()).is_err());
+        }
+        let mut other_parent = receipt(ReceiptState::Handled, None);
+        other_parent.message = ledger.entries[0].message.clone();
+        other_parent.message.id = "other-parent".into();
+        other_parent.reply = None;
+        ledger.entries[1].merged_into = Some(other_parent.message.id.clone());
+        ledger.entries.push(other_parent);
+        assert!(Ledger::decode(&ledger.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn anchored_archive_reads_only_its_record_and_preserves_unconfirmed_delivery() {
+        for state in [Sending, Sent, Failed, Unknown] {
+            let mut ledger = group_anchor_ledger(state);
+            Ledger::decode(&ledger.encode().unwrap()).unwrap();
+            let parent = serde_json::to_vec(&ledger.entries[0]).unwrap();
+            let restored = decode_archived(&parent).unwrap();
+            assert_eq!(serde_json::to_vec(&restored).unwrap(), parent);
+            assert_eq!(restored.progress[3].state, state);
+            assert_eq!(
+                restored.progress[3].reply_anchor.as_deref(),
+                Some("child-1")
+            );
+            assert_eq!(
+                restored.progress[3].platform_message_id.is_some(),
+                state == Sent
+            );
+            assert_eq!(restored.spoken_text().contains("表达 3"), state == Sent);
+            decode_archived(&serde_json::to_vec(&ledger.entries[1]).unwrap()).unwrap();
+            ledger.entries.truncate(1);
+            assert!(Ledger::decode(&ledger.encode().unwrap()).is_err());
+        }
     }
 
     #[test]
@@ -1360,6 +1702,61 @@ mod tests {
         }
         fn latest_failed(&self, _app: &str, _session: &str) -> PluginResult<Option<Vec<u8>>> {
             Ok(None)
+        }
+    }
+    #[test]
+    fn anchored_groups_remain_together_and_v10_survives_archiving_all_reply_anchors() {
+        for sending in [false, true] {
+            let db = Arc::new(ArchiveMemory::default());
+            let mut ledger = group_anchor_ledger(if sending { Sending } else { Unknown });
+            for index in 0..350 {
+                let mut entry = receipt(ReceiptState::Sent, None);
+                entry.message = ledger.entries[0].message.clone();
+                entry.message.id = format!("later-{index}");
+                entry.reply = Some("x".repeat(32768));
+                ledger.entries.push(entry);
+            }
+            let before = ledger.encode().unwrap();
+            assert_eq!(ledger.version, 10);
+            Ledger::decode(&before).unwrap();
+            ledger.attach_archive(Some(db.clone())).unwrap();
+            assert!(ledger.archive_with(|_| Err(corrupt())).is_err());
+            assert_eq!(ledger.encode().unwrap(), before);
+            let mut hot = None;
+            ledger
+                .archive_with(|bytes| {
+                    hot = Some(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            let mut restored = Ledger::decode(hot.as_ref().unwrap()).unwrap();
+            assert_eq!(restored.version, 10);
+            restored.attach_archive(Some(db)).unwrap();
+            for id in ["msg-1", "child-1"] {
+                assert_eq!(restored.find("1904159860", id).is_some(), sending);
+                assert_eq!(
+                    restored.archived("1904159860", id).unwrap().is_some(),
+                    !sending
+                );
+            }
+            if !sending {
+                assert!(restored.entries.iter().all(|entry| {
+                    entry
+                        .progress
+                        .iter()
+                        .all(|progress| progress.reply_anchor.is_none())
+                }));
+                let archived = restored.archived("1904159860", "msg-1").unwrap().unwrap();
+                assert_eq!(archived.progress[3].state, Unknown);
+                assert_eq!(
+                    archived.progress[3].reply_anchor.as_deref(),
+                    Some("child-1")
+                );
+                assert_eq!(archived.progress[3].platform_message_id, None);
+            }
+            let saved = restored.encode().unwrap();
+            assert_eq!(restored.version, 10);
+            assert_eq!(Ledger::decode(&saved).unwrap().version, 10);
         }
     }
     #[test]

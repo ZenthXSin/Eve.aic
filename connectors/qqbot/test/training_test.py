@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,173 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("training", Path(__file__).resolve().parents[1] / "training-window.py")
 training = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(training)
+
+
+class ReplyAnchorReports(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="eve-reply-anchor-training-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        self.path = self.source / "state.json"
+        message = dict(id="original", scope="group", target_id="group-1", user_id="user-1", text="继续读源码")
+        self.parent = dict(app_id="app", message=message, state="Handled", reply=None,
+                           control_turn_id=1, progress=[])
+        self.followup = dict(app_id="app", message={**message, "id": "later", "text": "然后呢"},
+                             state="Merged", reply=None, merged_into="original")
+        self.ledger = dict(version=10, entries=[self.parent, self.followup])
+        routing = json.dumps(["app", "group", "group-1", "user-1"], separators=(",", ":")).encode()
+        self.identity = "qq:" + hashlib.sha256(routing).hexdigest()
+        self.sessions = dict(format_version=1, sessions={self.identity: dict(
+            key=dict(session_id=self.identity, user_id=self.identity), turns=[dict(
+                id=1, input=message["text"], status=dict(state="Completed", messages=[
+                    dict(role="User", text=message["text"]), dict(role="Assistant", text="仅供内部收尾")]))])})
+
+    def part(self, index, anchor=None, state="Sent", **extra):
+        part = dict(text="实际发言 " + str(index), state=state, decision_id="call-" + str(index))
+        if state == "Sent":
+            part["platform_message_id"] = "platform-" + str(index)
+        if anchor is not None:
+            part["reply_anchor"] = anchor
+        return {**part, **extra}
+
+    def save(self):
+        training.write_json(self.path, dict(version=1, entries={
+            "eve.channel.qqbot": {"receipts.v1": list(json.dumps(self.ledger).encode())},
+            "eve.session": {"sessions.v1": list(json.dumps(self.sessions).encode())}}))
+
+    def archive(self, entries):
+        database = self.source / "qq-receipts.sqlite3"
+        with sqlite3.connect(database) as db:
+            db.executescript("CREATE TABLE IF NOT EXISTS metadata(version INTEGER,identity TEXT); "
+                            "CREATE TABLE IF NOT EXISTS receipts(seq INTEGER PRIMARY KEY,app TEXT,message_id TEXT,payload BLOB);")
+            db.execute("DELETE FROM metadata")
+            db.execute("INSERT INTO metadata VALUES(1,?)", ("a" * 32,))
+            db.execute("DELETE FROM receipts")
+            for index, entry in enumerate(entries, 1):
+                db.execute("INSERT INTO receipts VALUES(?,?,?,?)",
+                           (index, entry["app_id"], entry["message"]["id"], json.dumps(entry).encode()))
+        self.ledger["archive"] = dict(identity="a" * 32, records=len(entries))
+
+    def assert_rejected_without_write(self, code):
+        self.save()
+        before = {path: path.read_bytes() for path in self.source.rglob("*") if path.is_file()}
+        with self.assertRaisesRegex(ValueError, code):
+            training.collect(self.path)
+        self.assertEqual({path: path.read_bytes() for path in self.source.rglob("*") if path.is_file()}, before)
+
+    def test_report_preserves_each_actual_anchor_and_proactive_has_no_passive_window(self):
+        self.parent["progress"] = [self.part(i) for i in range(3)] + [self.part(i, "later") for i in range(3, 6)]
+        self.parent["progress"].append(self.part(6, proactive=True))
+        self.save()
+        before = self.path.read_bytes()
+        report = training.collect(self.path)
+        self.assertEqual(report["counts"]["received_records"], 2)
+        self.assertEqual(report["counts"]["model_sent"], 1)
+        self.assertEqual(report["counts"]["unconfirmed"], 0)
+        evidence = report["evidence"][0]
+        self.assertEqual(evidence["control_turn_id"], 1)
+        self.assertNotIn("仅供内部收尾", evidence["reply"])
+        self.assertEqual([p["reply_anchor"] for p in evidence["deliveries"]],
+                         ["original"] * 3 + ["later"] * 3 + [None])
+        self.assertEqual([p["proactive"] for p in evidence["deliveries"]], [False] * 6 + [True])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_cold_whole_group_retains_v10_and_seed_copies_unmodified_history(self):
+        self.parent["progress"] = [self.part(1, "later"), self.part(2, state="Unknown")]
+        self.archive(self.ledger["entries"])
+        self.ledger["entries"] = []
+        self.save()
+        before = {p.name: p.read_bytes() for p in self.source.iterdir()}
+        receipts, _ = training.evidence_documents(self.path)
+        self.assertEqual(receipts["version"], 10)
+        self.assertEqual(len(receipts["entries"]), 2)
+        report = training.collect(self.path)
+        self.assertEqual(report["counts"]["model_sent"], 1)
+        self.assertEqual(report["counts"]["unconfirmed"], 1)
+        self.assertEqual(report["evidence"][0]["deliveries"][0]["reply_anchor"], "later")
+        destination = self.root / "next"
+        destination.mkdir()
+        training.seed_round(destination, self.source)
+        self.assertEqual(training.collect(destination / "state/state.json")["counts"]["received_records"], 0)
+        self.assertEqual({p.name: p.read_bytes() for p in self.source.iterdir()}, before)
+        for name, payload in before.items():
+            self.assertEqual((destination / "state" / name).read_bytes(), payload)
+
+    def test_hot_and_cold_cannot_complete_each_others_anchor_group(self):
+        self.parent["progress"] = [self.part(1, "later")]
+        cases = ([self.parent], [self.followup]), ([self.followup], [self.parent]), ([], [self.parent]), ([], [self.followup])
+        for hot, cold in cases:
+            with self.subTest(hot=[r["message"]["id"] for r in hot]):
+                self.archive(cold)
+                self.ledger["entries"] = hot
+                self.assert_rejected_without_write("invalid_reply_anchor_relation|invalid_merged_receipt")
+
+    def test_cold_anchors_require_the_persistent_v10_format_marker(self):
+        self.parent["progress"] = [self.part(1, "later")]
+        self.archive(self.ledger["entries"])
+        self.ledger["entries"] = []
+        for version in (6, 9):
+            with self.subTest(version=version):
+                self.ledger["version"] = version
+                self.assert_rejected_without_write("invalid_reply_anchor_version")
+
+    def test_invalid_ids_relations_and_overdrawn_windows_are_rejected_in_both_partitions(self):
+        self.parent["progress"] = [self.part(1, "later")]
+        original = copy.deepcopy(self.ledger["entries"])
+        cases = (
+            lambda: self.followup["message"].update(user_id="other-user"),
+            lambda: self.followup["message"].update(target_id="other-group"),
+            lambda: self.followup.update(app_id="other-app"),
+            lambda: self.followup.update(merged_into="missing"),
+            lambda: self.parent["progress"][0].update(reply_anchor="later\n"),
+            lambda: self.parent["progress"][0].update(proactive=True),
+            lambda: self.parent["progress"].extend(self.part(i, "later") for i in range(2, 5)),
+            lambda: self.parent["progress"].extend(self.part(i) for i in range(2, 6)),
+        )
+        for cold in (False, True):
+            for index, mutate in enumerate(cases):
+                with self.subTest(cold=cold, case=index):
+                    self.ledger = dict(version=10, entries=copy.deepcopy(original))
+                    self.parent, self.followup = self.ledger["entries"]
+                    mutate()
+                    if cold:
+                        self.archive(self.ledger["entries"])
+                        self.ledger["entries"] = []
+                    self.assert_rejected_without_write("invalid_merged_receipt|invalid_reply_anchor|invalid_passive_progress_budget")
+
+    def test_v10_silent_and_unconfirmed_turns_do_not_become_training_successes(self):
+        for state in ("Sending", "Unknown", "Failed"):
+            with self.subTest(state=state):
+                self.parent["progress"] = [self.part(1, "later", state)]
+                self.save()
+                report = training.collect(self.path)
+                self.assertEqual(report["evidence"], [])
+                self.assertEqual(report["counts"]["model_sent"], 0)
+                self.assertEqual(report["counts"]["failed" if state == "Failed" else "unconfirmed"], 1)
+        self.parent["progress"] = []
+        self.save()
+        self.assertEqual(training.collect(self.path)["counts"]["silent_turns"], 1)
+        self.parent["progress"] = [self.part(1, "later", platform_message_id=None)]
+        self.assert_rejected_without_write("invalid_expression_receipt")
+        self.parent["progress"] = [self.part(1, "later")]
+        self.parent["control_turn_id"] = 99
+        self.save()
+        report = training.collect(self.path)
+        self.assertEqual(report["counts"]["model_sent"], 0)
+        self.assertEqual(report["counts"]["unconfirmed"], 1)
+
+    def test_identical_archive_overlap_is_allowed_but_conflicts_and_duplicates_are_rejected(self):
+        self.parent["progress"] = [self.part(1, "later")]
+        self.archive(self.ledger["entries"])
+        self.save()
+        self.assertEqual(training.collect(self.path)["counts"]["model_sent"], 1)
+        self.parent["progress"][0]["text"] = "不一致的新值"
+        self.assert_rejected_without_write("receipt_archive_conflict")
+        self.archive([self.parent, self.followup, copy.deepcopy(self.followup)])
+        self.ledger["entries"] = []
+        self.assert_rejected_without_write("invalid_merged_receipt")
 
 
 class Reports(unittest.TestCase):

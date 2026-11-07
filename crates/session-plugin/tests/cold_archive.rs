@@ -102,6 +102,25 @@ fn completed(text: &str) -> Vec<ChatMessage> {
         ChatMessage::text(ChatRole::Assistant, "已完成"),
     ]
 }
+fn input_handoffs() -> Vec<eve_llm_api::InputReplyHandoff> {
+    [
+        eve_llm_api::InputReplyDelivery::Sending,
+        eve_llm_api::InputReplyDelivery::Sent {
+            platform_message_id: "platform-1".into(),
+        },
+        eve_llm_api::InputReplyDelivery::Unknown,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, delivery)| eve_llm_api::InputReplyHandoff {
+        input_message_id: format!("input-{index}"),
+        input_text: "继续处理 {{NAME_ab12cd34}}".into(),
+        event_id: format!("event-{index}"),
+        reply_text: "我在继续处理".into(),
+        delivery,
+    })
+    .collect()
+}
 fn document(state: &dyn StateStore) -> Value {
     serde_json::from_slice(&state.get(&id(), SESSION_STATE_KEY).unwrap().unwrap()).unwrap()
 }
@@ -185,6 +204,7 @@ async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_
                 SessionFailureCode::Provider,
                 Some(0),
                 Some(SessionFailureEvidence {
+                    input_replies: vec![],
                     review_user_messages: None,
                     provider_http_status: None,
                     provider_failure: Some(eve_llm_api::ProviderFailureKind::Truncated),
@@ -198,6 +218,7 @@ async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_
                 SessionFailureCode::ProviderTimeout,
                 Some(1),
                 Some(SessionFailureEvidence {
+                    input_replies: input_handoffs(),
                     review_user_messages: None,
                     provider_http_status: Some(503),
                     provider_failure: None,
@@ -261,6 +282,11 @@ async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_
         host.stop_all().await.unwrap();
         let (host, registry) = kernel(state, archive_backend);
         host.start(&id()).await.unwrap();
+        let restored = service(registry.as_ref())
+            .snapshot(&key("a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.turns[2].status, raw.turns[2].status);
         assert_eq!(
             service(registry.as_ref())
                 .begin(input("a", "重启检查"))
@@ -504,6 +530,7 @@ async fn unacknowledged_begin_recovers_interrupted_and_failed_evidence_stays_exa
         code: SessionFailureCode::Provider,
         started_tools: Some(1),
         evidence: Some(SessionFailureEvidence {
+            input_replies: input_handoffs(),
             review_user_messages: None,
             provider_http_status: Some(503),
             provider_failure: None,

@@ -311,6 +311,34 @@ impl TriggerAdmin for TriggerController {
             Ok(())
         })
     }
+    fn complete_silently_for_run(
+        &self,
+        owner: &SessionKey,
+        id: &str,
+        run: u32,
+        result: String,
+    ) -> Result<()> {
+        owner.validate().map_err(|_| TriggerError::Invalid)?;
+        self.change(|ledger| {
+            let trigger = ledger
+                .triggers
+                .iter_mut()
+                .find(|trigger| trigger.id == id && &trigger.owner == owner)
+                .ok_or(TriggerError::NotFound)?;
+            if run == 0
+                || trigger.runs != run
+                || trigger.status != Status::Running
+                || trigger.delivery.is_some()
+            {
+                return Err(TriggerError::Transition);
+            }
+            trigger.status = Status::Completed;
+            trigger.result = Some(result);
+            trigger.delivery = Some(Delivery::Silenced);
+            ledger.format_version = 4;
+            Ok(())
+        })
+    }
     fn rearm(&self, id: &str, now: u64) -> Result<()> {
         self.change(|l| {
             let t = l

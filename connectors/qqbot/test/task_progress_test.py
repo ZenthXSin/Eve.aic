@@ -90,7 +90,7 @@ class TaskProgressAcceptance(default.DefaultCapabilitiesAcceptance):
         snapshot = json.loads(self.state_path.read_text())
         encoded = snapshot["entries"]["eve.task"]["tasks.v1"]
         index = json.loads(bytes(encoded))
-        self.assertEqual(index["format_version"], 4, "验收必须覆盖默认冷正文格式")
+        self.assertIn(index["format_version"], (4, 5), "验收必须覆盖冷正文格式")
         [entry] = index["tasks"]
         [task] = self.tasks()  # 公共读者先核对正文摘要和目录。
         execution = task["execution"]

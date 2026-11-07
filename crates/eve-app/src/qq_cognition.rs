@@ -481,14 +481,21 @@ pub(crate) struct Background {
     pub commands: Arc<Commands>,
     enabled: Arc<AtomicBool>,
     controller: LoopController,
+    kernel: Kernel,
+    loop_started: Arc<AtomicBool>,
     stop: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
     task: JoinHandle<Result<(), AppError>>,
 }
 impl Background {
-    pub(crate) fn activate(&self) {
+    pub(crate) async fn activate(&self) -> Result<(), AppError> {
+        // 仅关闭 QqPolicy 还不够：循环会先更新已有自主驱动，再询问策略。
+        // 将没有业务恢复工作的循环本身延迟到组合层入站检查点之后。
+        self.kernel.start(&PluginId::new(LOOP_PLUGIN_ID)?).await?;
+        self.loop_started.store(true, Ordering::SeqCst);
         self.enabled.store(true, Ordering::SeqCst);
         self.commands.accepting.store(true, Ordering::SeqCst);
+        Ok(())
     }
     pub(crate) fn finished(&self) -> watch::Receiver<bool> {
         self.finished.clone()
@@ -510,7 +517,11 @@ impl Background {
     pub(crate) async fn stop(self) -> Result<(), AppError> {
         self.request_stop();
         // 即使规划任务 panic，仍先取消、等待循环，再允许 Kernel 关闭。
-        let settled = self.controller.shutdown().await;
+        let settled = if self.loop_started.load(Ordering::SeqCst) {
+            self.controller.shutdown().await
+        } else {
+            Ok(())
+        };
         let joined = self
             .task
             .await
@@ -662,7 +673,8 @@ pub(crate) async fn start(
     let accepting = commands.accepting.clone();
     let active = enabled.clone();
     let (done, finished) = watch::channel(false);
-    kernel.start(&PluginId::new(LOOP_PLUGIN_ID)?).await?;
+    let loop_started = Arc::new(AtomicBool::new(false));
+    let started = loop_started.clone();
     let worker = controller.clone();
     let task = tokio::spawn(async move {
         let result: Result<(), AppError> = async {
@@ -703,7 +715,11 @@ pub(crate) async fn start(
         }
         .await;
         accepting.store(false, Ordering::SeqCst);
-        let settled = worker.shutdown().await;
+        let settled = if started.load(Ordering::SeqCst) {
+            worker.shutdown().await
+        } else {
+            Ok(())
+        };
         done.send_replace(true);
         // 循环自身先失败时，规划任务随后只会看到“不可用”；优先报告循环的真实错误。
         match (result, settled) {
@@ -716,6 +732,8 @@ pub(crate) async fn start(
         commands,
         enabled,
         controller,
+        kernel: kernel.clone(),
+        loop_started,
         stop,
         finished,
         task,

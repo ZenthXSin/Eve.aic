@@ -78,12 +78,16 @@ async fn reset_rejects_inflight_learning_without_affecting_another_user() {
         meaning: "永远的神".into(),
         example: "这游戏yyds".into(),
     }];
-    assert!(
+    assert_eq!(
         modes
             .finish_phrase_batch(&first, drafts.clone(), 3)
-            .is_err()
+            .unwrap(),
+        PhraseFinish::Stale
     );
-    assert_eq!(modes.finish_phrase_batch(&second, drafts, 4).unwrap(), 1);
+    assert_eq!(
+        modes.finish_phrase_batch(&second, drafts, 4).unwrap(),
+        PhraseFinish::Saved(1)
+    );
     assert!(modes.phrases(&one).unwrap().is_empty());
     assert_eq!(modes.phrases(&two).unwrap().len(), 1);
     kernel.stop(&id).await.unwrap();

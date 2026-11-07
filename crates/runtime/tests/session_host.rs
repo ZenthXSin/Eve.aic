@@ -641,6 +641,7 @@ async fn provider_timeout_records_failure_and_releases_admission() {
         SessionTurnStatus::Failed {
             failure: SessionFailure {
                 evidence: Some(eve_session_api::SessionFailureEvidence {
+                    input_replies: vec![],
                     review_user_messages: Some(vec!["问题".into()]),
                     provider_http_status: None,
                     provider_failure: None,

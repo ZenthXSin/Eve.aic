@@ -93,11 +93,35 @@ pub const DELIVERY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 每条通知至多投递尝试次数（其中至多一次主动私聊）。
 pub const MAX_ATTEMPTS: usize = 6;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+/// 冷正文的总保留上限；历史归档仍占此配额，运行工作集另受 MAX_STATE_BYTES 限制。
+pub const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+/// 不可变正文引用；相同摘要在物理容量中只计一次。
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskArchiveRecord {
+    pub hash: String,
+    pub bytes: usize,
+}
+/// 在任何正文写入前核对整批提交及其后续收尾空间；不提交索引、不回收文件。
+/// current 是已确认索引，retained 是整个候选索引，writes 是本批全部新正文。
+/// reserve 包含候选未来增长及整批恢复所需的完整替换正文/目录项。
+pub struct TaskArchivePlan<'a> {
+    pub current: &'a [TaskArchiveRecord],
+    pub retained: &'a [TaskArchiveRecord],
+    pub writes: &'a [TaskArchiveRecord],
+    pub reserve_bytes: usize,
+    pub reserve_files: usize,
+}
 /// 内容寻址的不可变任务正文；实现须核对大小/摘要、持久化后确认，不允许覆盖。
 /// 冷正文与索引共同备份；缺失或损坏不能伪装成任务不存在。
 pub trait TaskArchiveStore: Send + Sync {
     fn get(&self, hash: &str) -> TaskResult<Vec<u8>>;
     fn put(&self, hash: &str, bytes: &[u8]) -> TaskResult<()>;
+    /// 替换实现须核对真实物理占用、新旧共存及提交后预留，不能默认假装有空间。
+    /// 调用方独占索引与档案，在预检、正文写入、索引提交之间不允许另一写者。
+    fn check_capacity(&self, _plan: &TaskArchivePlan<'_>) -> TaskResult<()> {
+        Err(TaskError::UnsupportedVersion)
+    }
     /// 只供可信宿主在完整索引提交确认后回收无引用正文；不是用户工具。
     /// 索引和正文必须使用独占的同一存储；替换实现可保留历史并另设磁盘配额。
     fn compact(&self, _retained: &[String]) -> TaskResult<()> {

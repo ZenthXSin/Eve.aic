@@ -1,6 +1,8 @@
 //! 健康巡检组合层：读取宿主统计，不请求模型；按可信主人路由投递一次。
 use crate::AppError;
-use eve_health_watch::{Delivery, Finding, HealthSource, HealthWatch};
+use eve_health_watch::{
+    Delivery, Finding, HealthSource, HealthWatch, NoticeCandidate, Observation,
+};
 use eve_llm_api::{
     ContextScope, Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext,
     ToolExecutionError, ToolFuture, ToolValidationError,
@@ -14,7 +16,7 @@ use eve_session_api::SessionKey;
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 fn error(s: impl ToString) -> PluginError {
@@ -33,8 +35,15 @@ pub(crate) struct Source {
 }
 impl HealthSource for Source {
     fn inspect(&self) -> Result<Vec<Finding>, String> {
+        self.observe(&[], 0).map(|observation| observation.findings)
+    }
+
+    fn observe(&self, previous: &[Finding], checked_at_ms: u64) -> Result<Observation, String> {
         let mut findings = vec![];
-        for (role, state) in self.health.snapshot() {
+        let mut unknown = vec![];
+        let mut recovered = vec![];
+        let roles = self.health.snapshot();
+        for (role, state) in &roles {
             if state.last_succeeded == Some(false) && state.consecutive_failures >= 3 {
                 findings.push(Finding {
                     code: format!("model.{role}"),
@@ -48,7 +57,21 @@ impl HealthSource for Source {
                 });
             }
         }
-        match free_bytes(&self.directory) {
+        for finding in previous {
+            if let Some(role) = finding.code.strip_prefix("model.") {
+                let state = roles.iter().find(|(name, _)| name == role).map(|(_, s)| s);
+                if state.is_some_and(|s| s.last_success_at_ms.is_some_and(|at| at > checked_at_ms))
+                {
+                    recovered.push(finding.code.clone());
+                } else if state
+                    .is_none_or(|s| s.last_succeeded != Some(true) && s.consecutive_failures < 3)
+                {
+                    unknown.push(finding.code.clone());
+                }
+            }
+        }
+        let disk = free_bytes(&self.directory);
+        match disk {
             Ok(Some((free, total)))
                 if free < self.min_free_bytes
                     || (total > 0 && (free as u128) * 100 < (total as u128) * 5) =>
@@ -67,18 +90,43 @@ impl HealthSource for Source {
             }),
             _ => {}
         }
+        for finding in previous {
+            if (finding.code == "disk.low" && !matches!(disk, Ok(Some(_))))
+                || (finding.code == "disk.unreadable" && matches!(disk, Ok(None)))
+            {
+                unknown.push(finding.code.clone());
+            }
+        }
         if let Some(budget) = self.budget.budget() {
             match budget.snapshot(crate::qq_tasks::now_ms()) {
                 Ok(snapshot) if snapshot.remaining() == 0 => findings.push(Finding {
                     code: "autonomy.exhausted".into(),
                     summary: "本窗口自主运行预算已用尽，等待原定窗口重置；没有自动增加额度".into(),
                 }),
-                Err(_) => findings.push(Finding {
-                    code: "autonomy.storage".into(),
-                    summary: "自主预算记录不可读，需核对持久状态".into(),
-                }),
+                Err(_) => {
+                    findings.push(Finding {
+                        code: "autonomy.storage".into(),
+                        summary: "自主预算记录不可读，需核对持久状态".into(),
+                    });
+                    if previous.iter().any(|f| f.code == "autonomy.exhausted") {
+                        unknown.push("autonomy.exhausted".into());
+                    }
+                }
                 _ => {}
             }
+        } else {
+            // 未装配预算探针不证明旧预算账本已恢复。
+            unknown.extend(
+                previous
+                    .iter()
+                    .filter(|finding| {
+                        matches!(
+                            finding.code.as_str(),
+                            "autonomy.exhausted" | "autonomy.storage"
+                        )
+                    })
+                    .map(|finding| finding.code.clone()),
+            );
         }
         if let Some(handle) = self.channel.get() {
             let status = *handle.status.borrow();
@@ -107,7 +155,22 @@ impl HealthSource for Source {
                 });
             }
         }
-        Ok(findings)
+        for finding in previous {
+            let known = finding.code.starts_with("model.")
+                || matches!(
+                    finding.code.as_str(),
+                    "disk.low" | "disk.unreadable" | "autonomy.exhausted" | "autonomy.storage"
+                );
+            // 通道计数仅在本进程内有效，零值或尚未挂接不证明重启前的问题已恢复。
+            if !known && !findings.iter().any(|f| f.code == finding.code) {
+                unknown.push(finding.code.clone());
+            }
+        }
+        Ok(Observation {
+            findings,
+            unknown,
+            recovered,
+        })
     }
 }
 #[cfg(unix)]
@@ -142,6 +205,7 @@ pub(crate) struct Monitor {
     /// 主人判断；由组合层注入，与群白名单共用同一份绑定。
     admin: Arc<dyn OwnerCheck>,
     interval_ms: u64,
+    first_check: Mutex<bool>,
 }
 impl Monitor {
     pub(crate) fn open(
@@ -179,11 +243,51 @@ impl Monitor {
             conversations,
             admin,
             interval_ms: number("EVE_HEALTH_CHECK_MS", 30_000, 1000, 3_600_000)?,
+            first_check: Mutex::new(true),
         }))
     }
     fn check(&self) -> Result<(), String> {
-        self.store
-            .check(&self.source, crate::qq_tasks::now_ms(), self.interval_ms)
+        self.check_inner(false)
+    }
+    fn check_inner(&self, before_delivery: bool) -> Result<(), String> {
+        let mut first = self.first_check.lock().map_err(|_| "健康首检不可用")?;
+        self.store.check(
+            &self.source,
+            crate::qq_tasks::now_ms(),
+            if *first || before_delivery {
+                0
+            } else {
+                self.interval_ms
+            },
+        )?;
+        *first = false;
+        Ok(())
+    }
+
+    fn notice_candidate(
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<NoticeCandidate> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Facts {
+            kind: String,
+            at_ms: u64,
+            findings: Vec<Finding>,
+            unknown: Vec<Finding>,
+            resolutions: Vec<eve_health_watch::Resolution>,
+        }
+        let facts: Facts = serde_json::from_value(candidate.facts.clone())
+            .map_err(|_| error("健康候选事实无效"))?;
+        if facts.kind != "health_findings" {
+            return Err(error("健康候选类别无效"));
+        }
+        Ok(NoticeCandidate {
+            id: candidate.id.clone(),
+            at_ms: facts.at_ms,
+            findings: facts.findings,
+            unknown: facts.unknown,
+            resolutions: facts.resolutions,
+        })
     }
 }
 impl QqOutreach for Monitor {
@@ -207,9 +311,22 @@ impl QqOutreach for Monitor {
         else {
             return Ok(vec![]);
         };
-        self.store.snapshot().map_err(error)?.notices.into_iter().filter(|n|n.delivery==Delivery::Pending).map(|notice|{
-            crate::qq_speech::candidate(notice.id.clone(),Some(identity.session.clone()),identity.session.user_id.clone(),serde_json::json!({"kind":"health_findings","at_ms":notice.at_ms,"findings":notice.findings}))
-        }).collect()
+        self.store
+            .snapshot()
+            .map_err(error)?
+            .candidates()
+            .into_iter()
+            .map(|notice| {
+                crate::qq_speech::candidate(
+                    notice.id,
+                    Some(identity.session.clone()),
+                    identity.session.user_id.clone(),
+                    json!({"kind":"health_findings","at_ms":notice.at_ms,
+                        "findings":notice.findings,"unknown":notice.unknown,
+                        "resolutions":notice.resolutions}),
+                )
+            })
+            .collect()
     }
     fn claim_candidate(
         &self,
@@ -217,20 +334,18 @@ impl QqOutreach for Monitor {
         text: &str,
         _anchor: &str,
     ) -> PluginResult<Option<QqOutreachPush>> {
+        self.check_inner(true).map_err(error)?;
         if !self.candidates()?.contains(candidate) {
             return Ok(None);
         }
         let Some(session) = &candidate.session else {
             return Ok(None);
         };
-        let at = candidate.facts["at_ms"]
-            .as_u64()
-            .ok_or_else(|| error("健康候选缺少时点"))?;
+        let selected = Self::notice_candidate(candidate)?;
         let Some(notice) = self
             .store
-            .claim_id(
-                &candidate.id,
-                at,
+            .claim_candidate(
+                &selected,
                 ContextScope {
                     session_id: session.session_id.clone(),
                     user_id: session.user_id.clone(),
@@ -253,6 +368,7 @@ impl QqOutreach for Monitor {
         &self,
         candidate: &eve_qqbot_plugin::QqOutreachCandidate,
     ) -> PluginResult<()> {
+        self.check_inner(true).map_err(error)?;
         if !self.candidates()?.contains(candidate) {
             return Ok(());
         }
@@ -260,11 +376,8 @@ impl QqOutreach for Monitor {
             return Ok(());
         };
         self.store
-            .suppress(
-                &candidate.id,
-                candidate.facts["at_ms"]
-                    .as_u64()
-                    .ok_or_else(|| error("健康候选缺少时点"))?,
+            .suppress_candidate(
+                &Self::notice_candidate(candidate)?,
                 ContextScope {
                     session_id: session.session_id.clone(),
                     user_id: session.user_id.clone(),
@@ -302,17 +415,30 @@ impl QqOutreach for Monitor {
             return Ok(None);
         };
         let session = identity.session.clone();
+        let Some(candidate) = self
+            .store
+            .snapshot()
+            .map_err(error)?
+            .candidates()
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
         let Some(notice) = self
             .store
-            .claim(ContextScope {
-                session_id: session.session_id.clone(),
-                user_id: session.user_id.clone(),
-            })
+            .claim_candidate(
+                &candidate,
+                ContextScope {
+                    session_id: session.session_id.clone(),
+                    user_id: session.user_id.clone(),
+                },
+            )
             .map_err(error)?
         else {
             return Ok(None);
         };
-        let details = notice
+        let details = candidate
             .findings
             .iter()
             .take(3)
@@ -347,7 +473,7 @@ impl QqOutreach for Monitor {
 pub(crate) struct ReadTool(pub(crate) Arc<Monitor>);
 impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition{name:"inspect_runtime_health".into(),description:"读取宿主低成本巡检结果：模型连续失败、磁盘余量、记忆和回执容量、自主预算及通知状态；不请求模型、不执行修复，不含日志正文或凭据。自动检查只向绑定主人通知新出现的问题一次。原始原因仍应结合日志和代码核对，未知问题先问一次。".into(),argument_schema:json!({"type":"object","properties":{},"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::ParallelSafe)}
+        ToolDefinition{name:"inspect_runtime_health".into(),description:"读取宿主低成本巡检结果：模型连续失败、磁盘余量、记忆和回执容量、自主预算及通知状态；不请求模型、不执行修复，不含日志正文或凭据。active 是本次确认的异常，unknown 是尚无恢复观测的旧问题，通知保留逐项恢复或后继替代原因。结合日志、代码和现有工具自行核对具体原因。".into(),argument_schema:json!({"type":"object","properties":{},"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::ParallelSafe)}
     }
     fn validate_arguments(&self, a: &Value) -> Result<(), ToolValidationError> {
         if a.as_object().is_none_or(|o| !o.is_empty()) {
@@ -371,7 +497,7 @@ impl Tool for ReadTool {
                 .snapshot()
                 .map_err(ToolExecutionError::Rejected)?;
             Ok(
-                json!({"checked_at_ms":snapshot.checked_at_ms,"active":snapshot.active,"notices":snapshot.notices.iter().rev().take(20).collect::<Vec<_>>(),"automatic_repair":false}),
+                json!({"checked_at_ms":snapshot.checked_at_ms,"active":snapshot.active,"unknown":snapshot.unknown,"notices":snapshot.notices.iter().rev().take(20).collect::<Vec<_>>(),"automatic_repair":false}),
             )
         })
     }
@@ -418,5 +544,153 @@ mod tests {
                 .iter()
                 .any(|f| f.code == "model.dialogue")
         );
+    }
+
+    fn source(directory: &std::path::Path, health: Arc<eve_model_health::HealthBook>) -> Source {
+        Source {
+            health,
+            channel: OnceLock::new(),
+            budget: crate::qq_budget::Gate::default(),
+            directory: directory.to_path_buf(),
+            min_free_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn restarted_model_requires_observation_before_retiring_or_notifying_the_old_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        let health = Arc::new(eve_model_health::HealthBook::new());
+        let before_restart = source(dir.path(), health.clone());
+        for at in 1..=3 {
+            health.record("dialogue", ModelOutcome::TimedOut, at);
+        }
+        let watch = HealthWatch::open(path.clone()).unwrap();
+        watch.check(&before_restart, 100, 1).unwrap();
+        let old = watch.snapshot().unwrap().candidates().remove(0);
+        let health = Arc::new(eve_model_health::HealthBook::new());
+        let after_restart = source(dir.path(), health.clone());
+        let watch = HealthWatch::open(path).unwrap();
+        watch.check(&after_restart, 101, 1).unwrap();
+        let snapshot = watch.snapshot().unwrap();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.unknown, old.findings);
+        assert!(snapshot.candidates().is_empty());
+        assert_eq!(snapshot.notices[0].delivery, Delivery::Pending);
+        assert!(snapshot.notices[0].resolutions.is_empty());
+        health.register("dialogue");
+        watch.check(&after_restart, 102, 1).unwrap();
+        for at in 103..=104 {
+            health.record("dialogue", ModelOutcome::TimedOut, at);
+            watch.check(&after_restart, at, 1).unwrap();
+            assert!(watch.snapshot().unwrap().candidates().is_empty());
+            assert!(watch.snapshot().unwrap().notices[0].resolutions.is_empty());
+        }
+        health.record("dialogue", ModelOutcome::Succeeded, 105);
+        watch.check(&after_restart, 106, 1).unwrap();
+        let snapshot = watch.snapshot().unwrap();
+        assert!(snapshot.unknown.is_empty());
+        assert_eq!(snapshot.notices[0].delivery, Delivery::Retired);
+        assert!(snapshot.notices[0].owner.is_none());
+        assert_eq!(
+            snapshot.notices[0].resolutions[0].reason,
+            eve_health_watch::ResolutionReason::Recovered {}
+        );
+        for at in 107..=109 {
+            health.record("dialogue", ModelOutcome::TimedOut, at);
+        }
+        watch.check(&after_restart, 110, 1).unwrap();
+        let candidate = watch.snapshot().unwrap().candidates().remove(0);
+        assert_ne!(candidate.id, old.id);
+        assert_eq!(candidate.findings[0].code, "model.dialogue");
+    }
+
+    #[test]
+    fn success_then_failure_between_checks_is_a_distinct_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let health = Arc::new(eve_model_health::HealthBook::new());
+        let source = source(dir.path(), health.clone());
+        let watch = HealthWatch::open(dir.path().join("health.json")).unwrap();
+        for at in 1..=3 {
+            health.record("dialogue", ModelOutcome::TimedOut, at);
+        }
+        watch.check(&source, 100, 1).unwrap();
+        health.record("dialogue", ModelOutcome::Succeeded, 101);
+        for at in 102..=104 {
+            health.record("dialogue", ModelOutcome::TimedOut, at);
+        }
+        watch.check(&source, 105, 1).unwrap();
+        let snapshot = watch.snapshot().unwrap();
+        assert_eq!(snapshot.notices.len(), 2);
+        assert_eq!(snapshot.notices[0].delivery, Delivery::Retired);
+        assert_eq!(snapshot.candidates()[0].id, snapshot.notices[1].id);
+        watch.check(&source, 106, 1).unwrap();
+        assert_eq!(
+            watch.snapshot().unwrap().candidates(),
+            snapshot.candidates()
+        );
+        assert_eq!(watch.snapshot().unwrap().notices.len(), 2);
+    }
+
+    #[test]
+    fn absent_process_counters_or_removed_probes_are_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source(dir.path(), Arc::new(eve_model_health::HealthBook::new()));
+        let previous = [
+            "model.retired_role",
+            "autonomy.exhausted",
+            "autonomy.storage",
+            "memory.unsaved",
+            "receipts.full",
+            "qq.terminal",
+            "custom.probe",
+        ]
+        .map(|code| Finding {
+            code: code.into(),
+            summary: "旧异常".into(),
+        });
+        let observation = source.observe(&previous, 100).unwrap();
+        assert_eq!(
+            observation.unknown,
+            previous.iter().map(|f| f.code.clone()).collect::<Vec<_>>()
+        );
+        assert!(observation.recovered.is_empty());
+        assert!(observation.findings.is_empty());
+    }
+
+    #[test]
+    fn first_monitor_check_ignores_the_previous_process_interval() {
+        struct Owner;
+        impl OwnerCheck for Owner {
+            fn is_owner(&self, _: &ContextScope) -> bool {
+                true
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health-watch.json");
+        let health = Arc::new(eve_model_health::HealthBook::new());
+        let before_restart = source(dir.path(), health.clone());
+        for at in 1..=3 {
+            health.record("dialogue", ModelOutcome::TimedOut, at);
+        }
+        let watch = HealthWatch::open(path.clone()).unwrap();
+        watch
+            .check(&before_restart, crate::qq_tasks::now_ms(), 1)
+            .unwrap();
+        assert_eq!(watch.snapshot().unwrap().candidates().len(), 1);
+        let monitor = Monitor {
+            store: HealthWatch::open(path).unwrap(),
+            source: source(dir.path(), Arc::new(eve_model_health::HealthBook::new())),
+            conversations: QqConversations::default(),
+            admin: Arc::new(Owner),
+            interval_ms: 3_600_000,
+            first_check: Mutex::new(true),
+        };
+        assert!(monitor.candidates().unwrap().is_empty());
+        let snapshot = monitor.store.snapshot().unwrap();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.unknown[0].code, "model.dialogue");
+        assert_eq!(snapshot.notices[0].delivery, Delivery::Pending);
+        assert!(!*monitor.first_check.lock().unwrap());
     }
 }

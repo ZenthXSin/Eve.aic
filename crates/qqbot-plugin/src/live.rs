@@ -3,7 +3,7 @@ use eve_llm_api::*;
 use eve_plugin_api::{PluginError, PluginResult};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
@@ -23,11 +23,56 @@ struct Input {
     messages: Vec<(String, Option<String>)>,
     bytes: usize,
     accepted: usize,
+    replies: BTreeMap<String, InputReplyHandoff>,
+    reply_updates: BTreeSet<String>,
+    reply_bytes: usize,
 }
 struct Turn {
     id: u64,
     input: Mutex<Input>,
     changed: Notify,
+}
+
+/// 发出时冻结的原轮句柄；工具结束后移除 ForegroundInput 也不能丢失终态归属。
+pub(crate) struct ClaimedInputReply {
+    turn: Weak<Turn>,
+    input_message_id: String,
+    event_id: String,
+}
+impl ClaimedInputReply {
+    pub(crate) fn complete(self, delivery: InputReplyDelivery) -> PluginResult<()> {
+        let Some(turn) = self.turn.upgrade() else {
+            return Ok(());
+        };
+        let mut input = turn
+            .input
+            .lock()
+            .map_err(|_| PluginError::Task("交流交接队列锁不可用".into()))?;
+        if !input.accepting {
+            return Ok(());
+        }
+        let handoff = input
+            .replies
+            .get_mut(&self.input_message_id)
+            .ok_or_else(|| PluginError::Task("交流交接事实缺失".into()))?;
+        if handoff.event_id != self.event_id || handoff.delivery != InputReplyDelivery::Sending {
+            return Err(PluginError::Task("交流交接身份或终态不一致".into()));
+        }
+        if delivery == InputReplyDelivery::Sending {
+            return Err(PluginError::Task("交流交接尚无终态".into()));
+        }
+        let updated = InputReplyHandoff {
+            delivery,
+            ..handoff.clone()
+        };
+        updated
+            .validate()
+            .map_err(|_| PluginError::Task("交流交接结果无效".into()))?;
+        *handoff = updated;
+        input.reply_updates.insert(self.input_message_id);
+        // 不通知 wait_for_input：这只是同一输入的投递更新，不是用户又说了话。
+        Ok(())
+    }
 }
 pub(crate) struct LiveSend {
     pub scope: ContextScope,
@@ -45,7 +90,29 @@ pub(crate) enum LiveDelivery {
     Sent(String),
     Unknown,
     NotSent,
+    NotSentReason(&'static str),
     Stale,
+}
+impl LiveDelivery {
+    /// 只交给模型固定原因，不透传 SDK 原始错误或改变未知投递语义。
+    pub(crate) fn not_sent(reason: Option<&str>) -> Self {
+        let reason = match reason {
+            Some("passive_window_elapsed") => "passive_window_elapsed",
+            Some("passive_window_missing") => "passive_window_missing",
+            Some("passive_quota_exhausted") => "passive_quota_exhausted",
+            Some("reply_anchor_mismatch") => "reply_anchor_mismatch",
+            Some("duplicate_text") => "duplicate_text",
+            Some("progress_limit") => "progress_limit",
+            Some("progress_rate_limit") => "progress_rate_limit",
+            Some("reply_limit") => "reply_limit",
+            Some("outbound_limit") => "outbound_limit",
+            Some("http") => "http",
+            Some("dns") => "dns",
+            Some("tls") => "tls",
+            _ => return Self::NotSent,
+        };
+        Self::NotSentReason(reason)
+    }
 }
 impl LiveSend {
     pub fn cancelled(&self) -> bool {
@@ -73,6 +140,72 @@ pub struct LiveDialogue {
     outgoing: Mutex<VecDeque<LiveSend>>,
 }
 impl LiveDialogue {
+    /// 与主轮消费争用同一个输入锁。主轮已取走输入时，前台不能再领取其即时交流。
+    /// 先持久保存 sending，再让同消息批次看见交接；失败不吞输入、不宣称接手。
+    /// persist 在锁内复核活动身份；返回 false 表示资格已撤销且没有写入发送状态。
+    pub(crate) fn claim_input_reply(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        input_message_id: &str,
+        event_id: &str,
+        reply_text: &str,
+        persist: impl FnOnce() -> PluginResult<bool>,
+    ) -> PluginResult<Option<ClaimedInputReply>> {
+        let turn = self
+            .turns
+            .lock()
+            .map_err(|_| PluginError::Task("交互队列锁不可用".into()))?
+            .get(&key(scope))
+            .and_then(Weak::upgrade);
+        let Some(turn) = turn.filter(|turn| turn.id == turn_id) else {
+            return Ok(None);
+        };
+        let mut input = turn
+            .input
+            .lock()
+            .map_err(|_| PluginError::Task("交流交接队列锁不可用".into()))?;
+        let pending = input
+            .messages
+            .last()
+            .filter(|(_, anchor)| anchor.as_deref() == Some(input_message_id));
+        let Some((input_text, _)) = pending else {
+            return Ok(None);
+        };
+        if !input.accepting
+            || input.replies.contains_key(input_message_id)
+            || input.replies.len() >= 64
+        {
+            return Ok(None);
+        }
+        let handoff = InputReplyHandoff {
+            input_message_id: input_message_id.into(),
+            input_text: input_text.clone(),
+            event_id: event_id.into(),
+            reply_text: reply_text.into(),
+            delivery: InputReplyDelivery::Sending,
+        };
+        handoff
+            .validate()
+            .map_err(|_| PluginError::Task("交流交接事实无效".into()))?;
+        let bytes = serde_json::to_vec(&handoff)
+            .map_err(|_| PluginError::Task("交流交接事实无法序列化".into()))?
+            .len();
+        if input.reply_bytes.saturating_add(bytes) > 256 * 1024 {
+            return Ok(None);
+        }
+        if !persist()? {
+            return Ok(None);
+        }
+        input.reply_bytes += bytes;
+        input.replies.insert(input_message_id.into(), handoff);
+        input.reply_updates.insert(input_message_id.into());
+        Ok(Some(ClaimedInputReply {
+            turn: Arc::downgrade(&turn),
+            input_message_id: input_message_id.into(),
+            event_id: event_id.into(),
+        }))
+    }
     /// 持有入口锁时先保存平台回执，成功后才让运行时看见正文。
     #[cfg(test)]
     pub(crate) fn steer(
@@ -246,6 +379,9 @@ impl TurnSteering for Turn {
         self.take_batch(finish).map(|batch| batch.messages)
     }
     fn take_batch(&self, finish: bool) -> Result<SteeringBatch, LlmError> {
+        self.take_update(finish).map(|update| update.batch)
+    }
+    fn take_update(&self, finish: bool) -> Result<SteeringUpdate, LlmError> {
         let mut input = self.input.lock().map_err(|_| unavailable())?;
         if finish && input.messages.is_empty() {
             input.accepting = false;
@@ -255,9 +391,16 @@ impl TurnSteering for Turn {
         if review_anchor.is_some() && pending.iter().any(|(_, anchor)| anchor.is_none()) {
             return Err(unavailable());
         }
-        Ok(SteeringBatch {
-            messages: pending.into_iter().map(|(text, _)| text).collect(),
-            review_anchor,
+        let input_replies = std::mem::take(&mut input.reply_updates)
+            .into_iter()
+            .filter_map(|anchor| input.replies.get(&anchor).cloned())
+            .collect();
+        Ok(SteeringUpdate {
+            batch: SteeringBatch {
+                messages: pending.into_iter().map(|(text, _)| text).collect(),
+                review_anchor,
+            },
+            input_replies,
         })
     }
 }
@@ -267,7 +410,7 @@ impl Tool for SendMessage {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "由你决定在当前会话说什么；用于闲聊、提问、进展和最终回应。只在你想说且内容值得说时调用，没有固定汇报次数。普通 final 只结束内部处理，不自动发送。每次一条完整消息，最多 32768 UTF-8 字节；长内容自行决定分条。after_ms 可选择 0 至 10000 毫秒后再说，默认现在；期间有新消息则旧决定不发，返回 stale，交给你重新考虑。不会结束当前任务。只向可信的原会话发送，不接受地址。sent=true 且有 message_id 才确认送达；unknown 不重发；not_sent/stale 没有发出。不要把未完成说成完成，不重复已说过的话。".into(),
+            description: "由你决定在当前会话说什么；用于闲聊、提问、进展和最终回应。只在你想说且内容值得说时调用，没有固定汇报次数。普通 final 只结束内部处理，不自动发送。每次一条完整消息，最多 32768 UTF-8 字节；长内容自行决定分条。after_ms 可选择 0 至 10000 毫秒后再说，默认现在；期间有新消息则旧决定不发，返回 stale，交给你重新考虑。不会结束当前任务。只向可信的原会话发送，不接受地址。sent=true 且有 message_id 才确认送达；unknown 不重发；not_sent/stale 没有确认送达。not_sent 的 failure_kind 若为 passive_window_elapsed / passive_window_missing / passive_quota_exhausted，需等待同一用户的新输入带来有效回复窗口，不要改写正文反复尝试；duplicate_text 表示已有相同正文的投递记录，不重放。不要把未完成说成完成，不重复已说过的话。".into(),
             argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":32768},"after_ms":{"type":"integer","minimum":0,"maximum":10000},"purpose":{"type":"string","enum":["conversation","progress","question","authorization","answer"]}},"required":["text"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "eve.qq.live-send".into() }),
@@ -401,13 +544,18 @@ impl Tool for SendMessage {
 }
 
 fn delivery_json(result: LiveDelivery, session_id: &str) -> Value {
-    let (status, message_id) = match result {
-        LiveDelivery::Sent(id) => ("sent", Some(id)),
-        LiveDelivery::Unknown => ("unknown", None),
-        LiveDelivery::NotSent => ("not_sent", None),
-        LiveDelivery::Stale => ("stale", None),
+    let (status, message_id, reason) = match result {
+        LiveDelivery::Sent(id) => ("sent", Some(id), None),
+        LiveDelivery::Unknown => ("unknown", None, None),
+        LiveDelivery::NotSent => ("not_sent", None, None),
+        LiveDelivery::NotSentReason(reason) => ("not_sent", None, Some(reason)),
+        LiveDelivery::Stale => ("stale", None, None),
     };
-    json!({"sent":message_id.is_some(),"message_id":message_id,"session_id":session_id,"delivery_status":status})
+    let mut value = json!({"sent":message_id.is_some(),"message_id":message_id,"session_id":session_id,"delivery_status":status});
+    if let Some(reason) = reason {
+        value["failure_kind"] = json!(reason);
+    }
+    value
 }
 
 struct WaitForInput(Arc<LiveDialogue>);
@@ -473,6 +621,48 @@ impl Tool for WaitForInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn confirmed_delivery_rejection_exposes_reason_without_claiming_sent() {
+        let live = Arc::new(LiveDialogue::default());
+        let scope = ContextScope {
+            session_id: "trusted-session".into(),
+            user_id: "owner".into(),
+        };
+        let _turn = live.open(&scope, 7).unwrap();
+        let tool = live.send_tool();
+        let call = ToolCall {
+            id: "expired-window".into(),
+            name: "send_message".into(),
+            arguments: json!({"text":"处理结果"}),
+        };
+        let context = ToolExecutionContext::new()
+            .with_scope(Some(scope))
+            .with_turn_id(Some(7));
+        let sending = tokio::spawn(async move { tool.execute(call, context).await });
+        let outgoing = loop {
+            if let Some(outgoing) = live.next() {
+                break outgoing;
+            }
+            tokio::task::yield_now().await;
+        };
+        outgoing.complete(LiveDelivery::not_sent(Some("passive_window_elapsed")));
+        let result = sending.await.unwrap().unwrap();
+        assert_eq!(result["sent"], false);
+        assert!(result["message_id"].is_null());
+        assert_eq!(result["session_id"], "trusted-session");
+        assert_eq!(result["delivery_status"], "not_sent");
+        assert_eq!(result["failure_kind"], "passive_window_elapsed");
+        let unknown = delivery_json(LiveDelivery::Unknown, "trusted-session");
+        assert_eq!(unknown["delivery_status"], "unknown");
+        assert!(unknown.get("failure_kind").is_none());
+        let unrecognized = delivery_json(
+            LiveDelivery::not_sent(Some("untrusted raw SDK error")),
+            "trusted-session",
+        );
+        assert_eq!(unrecognized["delivery_status"], "not_sent");
+        assert!(unrecognized.get("failure_kind").is_none());
+    }
 
     #[tokio::test]
     async fn question_send_stays_in_live_turn_and_success_returns_both_bound_ids() {
@@ -638,5 +828,346 @@ mod tests {
         assert_eq!(consumed.messages, ["先看看我"]);
         assert_eq!(consumed.review_anchor.as_deref(), Some("new-input"));
         assert_eq!(live.pending_anchor(&scope, 7), None);
+    }
+
+    #[test]
+    fn consumed_input_cannot_be_claimed_and_failed_persistence_keeps_the_original() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        live.steer_anchored(
+            &scope,
+            1,
+            "继续查源码".into(),
+            Some("child".into()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(
+            live.claim_input_reply(&scope, 1, "child", "event", "我在看", || {
+                Err(PluginError::State("保存失败".into()))
+            })
+            .is_err()
+        );
+        assert!(
+            live.claim_input_reply(&scope, 1, "child", "event", "我在看", || Ok(false))
+                .unwrap()
+                .is_none()
+        );
+        let update = turn.take_update(false).unwrap();
+        assert_eq!(update.batch.messages, ["继续查源码"]);
+        assert_eq!(update.batch.review_anchor.as_deref(), Some("child"));
+        assert!(update.input_replies.is_empty());
+        assert!(
+            live.claim_input_reply(&scope, 1, "child", "event", "我在看", || {
+                panic!("主轮先消费后，前台不能持久化或发出")
+            })
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn claiming_and_consuming_the_same_input_share_one_persistence_boundary() {
+        use std::{sync::mpsc, thread};
+        let live = Arc::new(LiveDialogue::default());
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        live.steer_anchored(
+            &scope,
+            1,
+            "你还在吗？继续查源码".into(),
+            Some("child".into()),
+            || Ok(()),
+        )
+        .unwrap();
+        let (saving, saved) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let claimant = {
+            let live = live.clone();
+            let scope = scope.clone();
+            thread::spawn(move || {
+                live.claim_input_reply(
+                    &scope,
+                    1,
+                    "child",
+                    "event",
+                    "我在，命令还在运行",
+                    || {
+                        saving.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(3)).unwrap();
+                        Ok(true)
+                    },
+                )
+                .unwrap()
+                .unwrap()
+            })
+        };
+        saved.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (started, starting) = mpsc::channel();
+        let (consumed, consumption) = mpsc::channel();
+        let consumer = {
+            let turn = turn.clone();
+            thread::spawn(move || {
+                started.send(()).unwrap();
+                consumed.send(turn.take_update(false).unwrap()).unwrap();
+            })
+        };
+        starting.recv_timeout(Duration::from_secs(3)).unwrap();
+        let blocked = consumption.recv_timeout(Duration::from_millis(30));
+        release.send(()).unwrap();
+        let claim = claimant.join().unwrap();
+        consumer.join().unwrap();
+        assert!(
+            matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)),
+            "持久化未完成时不能消费半份交接"
+        );
+        let update = consumption.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(update.batch.messages, ["你还在吗？继续查源码"]);
+        assert_eq!(update.batch.review_anchor.as_deref(), Some("child"));
+        assert_eq!(
+            update.input_replies,
+            [InputReplyHandoff {
+                input_message_id: "child".into(),
+                input_text: "你还在吗？继续查源码".into(),
+                event_id: "event".into(),
+                reply_text: "我在，命令还在运行".into(),
+                delivery: InputReplyDelivery::Sending,
+            }]
+        );
+        claim
+            .complete(InputReplyDelivery::Sent {
+                platform_message_id: "platform-1".into(),
+            })
+            .unwrap();
+        let terminal = turn.take_update(false).unwrap();
+        assert_eq!(terminal.batch, SteeringBatch::default());
+        assert_eq!(
+            terminal.input_replies[0].delivery,
+            InputReplyDelivery::Sent {
+                platform_message_id: "platform-1".into()
+            }
+        );
+        assert_eq!(turn.take_update(false).unwrap(), SteeringUpdate::default());
+    }
+
+    #[test]
+    fn each_child_keeps_its_own_handoff_even_when_the_words_are_identical() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        let mut claims = Vec::new();
+        for id in ["first", "second"] {
+            live.steer_anchored(&scope, 1, "继续".into(), Some(id.into()), || Ok(()))
+                .unwrap();
+            claims.push(
+                live.claim_input_reply(
+                    &scope,
+                    1,
+                    id,
+                    &format!("event-{id}"),
+                    "我在继续",
+                    || Ok(true),
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            assert!(
+                live.claim_input_reply(&scope, 1, id, "second-event", "我在继续", || panic!(
+                    "同输入二次领取"
+                ))
+                .unwrap()
+                .is_none()
+            );
+        }
+        let update = turn.take_update(false).unwrap();
+        assert_eq!(update.batch.messages, ["继续", "继续"]);
+        assert_eq!(update.batch.review_anchor.as_deref(), Some("second"));
+        assert_eq!(
+            update
+                .input_replies
+                .iter()
+                .map(|r| (r.input_message_id.as_str(), r.event_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("first", "event-first"), ("second", "event-second")]
+        );
+        for claim in claims {
+            claim.complete(InputReplyDelivery::Unknown).unwrap();
+        }
+        live.steer_anchored(
+            &scope,
+            1,
+            "新的问题".into(),
+            Some("third".into()),
+            || Ok(()),
+        )
+        .unwrap();
+        let next = turn.take_update(false).unwrap();
+        assert_eq!(next.batch.messages, ["新的问题"]);
+        assert_eq!(next.batch.review_anchor.as_deref(), Some("third"));
+        assert_eq!(next.input_replies.len(), 2);
+        assert!(next.input_replies.iter().all(|r| r.input_message_id != "third" && r.delivery == InputReplyDelivery::Unknown));
+    }
+
+    #[test]
+    fn input_reply_handoffs_do_not_cross_scope_turn_or_reopen_closed_inputs() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        live.steer_anchored(&scope, 1, "继续".into(), Some("child".into()), || Ok(()))
+            .unwrap();
+        for (candidate, id) in [
+            (
+                ContextScope {
+                    user_id: "other".into(),
+                    ..scope.clone()
+                },
+                1,
+            ),
+            (
+                ContextScope {
+                    session_id: "elsewhere".into(),
+                    ..scope.clone()
+                },
+                1,
+            ),
+            (scope.clone(), 2),
+        ] {
+            assert!(
+                live.claim_input_reply(&candidate, id, "child", "event", "我在", || panic!(
+                    "跨身份或轮次领取"
+                ))
+                .unwrap()
+                .is_none()
+            );
+        }
+        let claim = live
+            .claim_input_reply(&scope, 1, "child", "event", "我在", || Ok(true))
+            .unwrap()
+            .unwrap();
+        turn.take_update(false).unwrap();
+        assert_eq!(turn.take_update(true).unwrap(), SteeringUpdate::default());
+        claim.complete(InputReplyDelivery::Unknown).unwrap();
+        assert_eq!(turn.take_update(false).unwrap(), SteeringUpdate::default());
+        assert!(
+            !live
+                .steer_anchored(
+                    &scope,
+                    1,
+                    "晚到原话".into(),
+                    Some("late".into()),
+                    || panic!("轮次已关闭")
+                )
+                .unwrap()
+        );
+        drop(turn);
+        let next = live.open(&scope, 2).unwrap();
+        live.steer_anchored(&scope, 2, "继续".into(), Some("next".into()), || Ok(()))
+            .unwrap();
+        let abandoned = live
+            .claim_input_reply(&scope, 2, "next", "next-event", "我在", || Ok(true))
+            .unwrap()
+            .unwrap();
+        drop(next);
+        let replacement = live.open(&scope, 3).unwrap();
+        abandoned
+            .complete(InputReplyDelivery::Sent {
+                platform_message_id: "late-platform-id".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            replacement.take_update(false).unwrap(),
+            SteeringUpdate::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_updates_are_not_new_input_and_do_not_wake_wait_for_input() {
+        let live = Arc::new(LiveDialogue::default());
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        let original = live
+            .turns
+            .lock()
+            .unwrap()
+            .get(&key(&scope))
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        for (index, delivery) in [
+            InputReplyDelivery::Sent {
+                platform_message_id: "platform-1".into(),
+            },
+            InputReplyDelivery::Unknown,
+            InputReplyDelivery::Failed,
+            InputReplyDelivery::NotSent,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let anchor = format!("child-{index}");
+            live.steer_anchored(&scope, 1, "继续".into(), Some(anchor.clone()), || Ok(()))
+                .unwrap();
+            let claim = live
+                .claim_input_reply(
+                    &scope,
+                    1,
+                    &anchor,
+                    &format!("event-{index}"),
+                    "我在",
+                    || Ok(true),
+                )
+                .unwrap()
+                .unwrap();
+            let first = turn.take_update(false).unwrap();
+            assert_eq!(first.input_replies[0].delivery, InputReplyDelivery::Sending);
+            let tool = live.wait_tool();
+            let waiting = tool.execute(
+                ToolCall {
+                    id: format!("wait-{index}"),
+                    name: "wait_for_input".into(),
+                    arguments: json!({"timeout_ms":100}),
+                },
+                ToolExecutionContext::new()
+                    .with_scope(Some(scope.clone()))
+                    .with_turn_id(Some(1)),
+            );
+            tokio::pin!(waiting);
+            tokio::select! {
+                result = &mut waiting => panic!("交接后没有新的用户输入：{result:?}"),
+                _ = tokio::task::yield_now() => {},
+            }
+            let changed = original.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            claim.complete(delivery.clone()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), &mut changed)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(waiting.await.unwrap(), json!({"new_input":false}));
+            let update = turn.take_update(false).unwrap();
+            assert_eq!(update.batch, SteeringBatch::default());
+            assert_eq!(update.input_replies.len(), 1);
+            assert_eq!(update.input_replies[0].input_message_id, anchor);
+            assert_eq!(update.input_replies[0].delivery, delivery);
+            assert_eq!(turn.take_update(false).unwrap(), SteeringUpdate::default());
+        }
     }
 }

@@ -269,7 +269,7 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         stage.complete();
         let stage = StartupStage::start("activate");
         let runtime = background.as_ref().ok_or("Web 后台未装配")?;
-        runtime.activate()?;
+        runtime.activate().await?;
         stage.complete();
         eprintln!("EVE_WEB_READY http://{}", panel.address());
         let mut finished = panel.finished();

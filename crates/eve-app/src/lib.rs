@@ -108,6 +108,7 @@ mod record_json_page;
 mod segment_advice;
 mod segment_commands;
 mod services;
+pub mod startup_checkpoint;
 mod subject_memory;
 mod task_cognition;
 mod task_strategy_catalog;

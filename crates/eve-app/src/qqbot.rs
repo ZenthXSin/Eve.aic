@@ -215,6 +215,8 @@ pub struct QqBotOptions {
     pub task_strategy_catalog: Option<PathBuf>,
     /// 可信宿主接收持久化认知管理句柄；不暴露给聊天或模型工具。
     pub cognitive_services: Option<Arc<dyn crate::CognitiveServices>>,
+    /// 可信宿主在所有恢复完成、入站开放前接收实际持久状态摘要；默认不等待。
+    pub startup_checkpoint: Option<Arc<dyn crate::startup_checkpoint::StartupCheckpointSink>>,
     pub disable_error_recovery: bool,
     /// 模型可以把子任务委托给子代理并在本轮拿回结果。
     pub subagents: bool,
@@ -286,6 +288,7 @@ impl Default for QqBotOptions {
             task_strategy_policy: None,
             task_strategy_catalog: None,
             cognitive_services: None,
+            startup_checkpoint: None,
             disable_error_recovery: false,
             subagents: false,
             triggers: false,
@@ -835,6 +838,10 @@ async fn run_qqbot_composed(
     interest_components: InterestComponents,
 ) -> Result<QqBotStatus, AppError> {
     // 明确的启动依赖错误仍在打开存储前拒绝；面板允许预装热启用所需记忆。
+    let startup_checkpoint = crate::startup_checkpoint::configured_sink(
+        options.startup_checkpoint.clone(),
+        options.database_config.is_some(),
+    )?;
     let memory_available = options.memory
         || options.self_learning
         || options.interest_learning
@@ -1131,6 +1138,16 @@ async fn run_qqbot_composed(
         .with_participant_observer(Arc::new(crate::qq_people::Observer(people.clone())))
         .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off)
         .with_timing_diagnostics(crate::models::timing_enabled());
+        let plugin = if let Some(sink) = startup_checkpoint {
+            plugin.with_before_ingress(Arc::new(crate::startup_checkpoint::Boundary::new(
+                backends.state.clone(),
+                &options.state_directory,
+                options.automatic_capabilities,
+                sink,
+            )?))
+        } else {
+            plugin
+        };
         // 会话是私聊还是群聊由通道登记；只在私聊中成立的能力据此判断。
         let conversations = plugin.conversations();
         bootstrap.review_source = Some(Arc::new(crate::qq_review_source::QqReviewSource {
@@ -3303,16 +3320,8 @@ async fn run_qqbot_composed(
                 &sessions, crate::qq_tasks::now_ms(),
             )?;
         }
-        kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
-        let handle = registry
-            .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?
-            .ok_or("QQBot 状态服务缺失")?
-            .value
-            .downcast::<QqBotStatusHandle>()
-            .map_err(|_| "QQBot 状态服务类型错误")?;
-        channel = Some(handle.clone());
-        if let Some(monitor)=&health_monitor { let _=monitor.source.channel.set(handle.clone()); }
-        if let Some(config) = panel_config {
+        // Web 的同步恢复同样早于 QQ 开放入站；真正 HTTP 监听和通知后台仍在检查点之后。
+        if panel_config.is_some() {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
                 .ok_or("面板会话服务缺失")?
@@ -3332,14 +3341,33 @@ async fn run_qqbot_composed(
                 browser_chat = browser_chat.with_memory(memory.clone(), sessions.0.clone());
             }
             browser_chat.recover_memory().map_err(|_| "Web 交互记忆恢复无法确认；保留原记录")?;
-            let browser_chat = Arc::new(browser_chat);
-            web_chat = Some(browser_chat.clone());
-            let inbox = web_inbox.clone().ok_or("Web 通知账本未装配")?;
+            web_chat = Some(Arc::new(browser_chat));
+            let inbox = web_inbox.as_ref().ok_or("Web 通知账本未装配")?;
             let notification_tasks = tasks.clone().map(|tasks| Arc::new(tasks) as Arc<dyn eve_task_api::TaskAdmin>);
             match inbox.collect_available(notification_tasks.as_deref(), trigger_admin.as_deref(), qq_tasks::now_ms()) {
                 Ok(()) | Err(eve_web_panel_api::PanelError::Capacity) => {},
                 Err(_) => return Err("Web 通知恢复不可用；保留原记录".into()),
             }
+        }
+        kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
+        let handle = registry
+            .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?
+            .ok_or("QQBot 状态服务缺失")?
+            .value
+            .downcast::<QqBotStatusHandle>()
+            .map_err(|_| "QQBot 状态服务类型错误")?;
+        channel = Some(handle.clone());
+        if let Some(monitor)=&health_monitor { let _=monitor.source.channel.set(handle.clone()); }
+        if let Some(config) = panel_config {
+            let sessions = registry
+                .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
+                .ok_or("面板会话服务缺失")?
+                .value
+                .downcast::<SessionServiceHandle>()
+                .map_err(|_| "面板会话服务类型错误")?;
+            let browser_chat = web_chat.clone().ok_or("Web 恢复未完成")?;
+            let inbox = web_inbox.clone().ok_or("Web 通知账本未装配")?;
+            let notification_tasks = tasks.clone().map(|tasks| Arc::new(tasks) as Arc<dyn eve_task_api::TaskAdmin>);
             web_notifications = Some(crate::qq_web_notifications::Background::start(
                 inbox.clone(), notification_tasks, trigger_admin.clone(),
             ));
@@ -3418,7 +3446,7 @@ async fn run_qqbot_composed(
             panel = Some(started);
         }
         if let Some(background) = &background {
-            background.activate();
+            background.activate().await?;
         }
         if let Some(learning) = &learning_background {
             learning.activate();
