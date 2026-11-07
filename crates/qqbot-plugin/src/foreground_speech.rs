@@ -143,6 +143,25 @@ impl ForegroundInput {
         activity: &ForegroundActivity,
         control: &dyn ControlService,
     ) -> bool {
+        self.activity_is_current(activity, control)
+            && live
+                .pending_anchor(
+                    &ContextScope {
+                        session_id: self.key.session.session_id.clone(),
+                        user_id: self.key.session.user_id.clone(),
+                    },
+                    self.turn_id,
+                )
+                .as_deref()
+                == Some(&self.event.anchor)
+    }
+
+    /// 领取输入的临界区已经持有 LiveDialogue 的输入锁，不能再递归读取 pending_anchor。
+    pub(super) fn activity_is_current(
+        &self,
+        activity: &ForegroundActivity,
+        control: &dyn ControlService,
+    ) -> bool {
         activity
             .current(&self.key, self.turn_id)
             .is_some_and(|batch| batch.version == self.batch)
@@ -155,17 +174,27 @@ impl ForegroundInput {
                         && !s.events_retired
                 })
             })
-            && live
-                .pending_anchor(
-                    &ContextScope {
-                        session_id: self.key.session.session_id.clone(),
-                        user_id: self.key.session.user_id.clone(),
-                    },
-                    self.turn_id,
-                )
-                .as_deref()
-                == Some(&self.event.anchor)
     }
+}
+
+/// 已持久领取后，业务自然结束不会撤销即时交流；真实取消、退役和换代仍撤销。
+pub(super) fn claimed_reply_is_current(
+    control: &dyn ControlService,
+    key: &GenerationKey,
+    turn_id: u64,
+) -> bool {
+    control.snapshot(&key.session).is_ok_and(|snapshot| {
+        snapshot.is_some_and(|state| {
+            state.key == *key
+                && state.turn_id == Some(turn_id)
+                && !state.cancel_requested
+                && !state.events_retired
+                && !matches!(
+                    state.phase,
+                    ControlPhase::Cancelling | ControlPhase::Blocked
+                )
+        })
+    })
 }
 
 #[cfg(test)]
