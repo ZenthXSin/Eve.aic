@@ -13,7 +13,9 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
         let state_directory = root.join("state");
         fs::create_dir(&state_directory).unwrap();
