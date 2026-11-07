@@ -92,9 +92,18 @@ async fn deferred_reply_window_recovers_after_five_failures_in_the_original_sess
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 6);
         assert!(requests.iter().all(|request| request == &requests[0]));
-        let session = requests[0].session.as_ref().unwrap();
-        assert_eq!(session.turn_id(), Some(result.turn_id.to_string().as_str()));
-        assert!(!session.client_request_id().is_empty());
+        let expected = ModelSession::scoped(
+            "main",
+            &eve_llm_api::ContextScope {
+                session_id: "recovery".into(),
+                user_id: "user".into(),
+            },
+        )
+        .unwrap()
+        .with_turn(&result.turn_id.to_string())
+        .unwrap()
+        .for_request(1);
+        assert_eq!(requests[0].session, Some(expected));
     }
     kernel.stop_all().await.unwrap();
 }
