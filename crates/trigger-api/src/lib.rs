@@ -190,6 +190,19 @@ pub trait TriggerAdmin: Send + Sync {
     }
     fn ready(&self, id: &str, evidence: Vec<String>) -> Result<()>;
     fn transition(&self, id: &str, from: Status, to: Status, result: Option<String>) -> Result<()>;
+    /// 本轮已提交的控制报告明确选择静默时，一次写入 Completed 与 Silenced。
+    /// 须同时 CAS 完整身份、实际周期、Running 及未进入投递的状态，并保存原结果。
+    /// 不能组合 transition 与 silence_for_run 留下可被发送层认领的 Pending 间隙。
+    /// 旧实现默认拒绝；旧终态或旧 Pending 不由此重新分类。
+    fn complete_silently_for_run(
+        &self,
+        _owner: &SessionKey,
+        _id: &str,
+        _run: u32,
+        _result: String,
+    ) -> Result<()> {
+        Err(TriggerError::Unavailable)
+    }
     /// 仅上轮明确完成且投递已了结或明确选择安静时推进，不补跑、不开启未知结果。
     fn rearm(&self, _id: &str, _now: u64) -> Result<()> {
         Err(TriggerError::Transition)
@@ -304,6 +317,15 @@ mod tests {
                 &SessionKey::new("trusted-session", "trusted-user").unwrap(),
                 "wake-reviewed",
                 1,
+            ),
+            Err(TriggerError::Unavailable)
+        );
+        assert_eq!(
+            custom.complete_silently_for_run(
+                &SessionKey::new("trusted-session", "trusted-user").unwrap(),
+                "wake-reviewed",
+                1,
+                r#"{"action":"silence"}"#.into(),
             ),
             Err(TriggerError::Unavailable)
         );
