@@ -153,7 +153,20 @@ impl Metadata {
                     || repair.attempt != original.attempt + 1
                     || job.batch.source_revision != original.revision
                     || job.batch.consumed_ids != original.consumed_ids
-                    || !job.batch.previous.is_empty()
+                    || (!job.batch.previous.is_empty()
+                        && prior.latest.as_ref().is_none_or(|latest| {
+                            (latest.revision, latest.origin_sequence)
+                                > (original.revision, original.sequence)
+                        }))
+                    || job.batch.sources.iter().any(|source| {
+                        !original.consumed_ids.contains(&source.evidence_id)
+                            && !job.batch.previous.iter().any(|point| {
+                                point
+                                    .quotes
+                                    .iter()
+                                    .any(|quote| quote.evidence_id == source.evidence_id)
+                            })
+                    })
                 {
                     return Err(MemoryError::CorruptState);
                 }
