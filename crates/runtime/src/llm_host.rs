@@ -1624,9 +1624,11 @@ impl LlmHost {
             }
             let completion = self.complete(request, &mut diagnostics, events);
             let result = if let Some(deadline) = retry_deadline {
-                tokio::time::timeout_at(deadline, completion)
-                    .await
-                    .unwrap_or(Err(LlmError::ProviderTimeout))
+                tokio::select! { biased;
+                    _ = wait_closed(events) => Err(LlmError::Cancelled),
+                    _ = tokio::time::sleep_until(deadline) => Err(LlmError::ProviderTimeout),
+                    result = completion => result,
+                }
             } else {
                 completion.await
             };
@@ -1670,6 +1672,9 @@ impl LlmHost {
                     tokio::select! { biased;
                         _ = wait_closed(events) => return Err(fail(LlmError::Cancelled, diagnostics)),
                         _ = tokio::time::sleep(delay) => {},
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(fail(error, diagnostics));
                     }
                     // 回到轮次入口先消费新消息、核对授权；旧工具回执和计数保持原样。
                     continue;
