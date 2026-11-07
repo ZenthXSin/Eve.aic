@@ -114,6 +114,19 @@ impl HealthSource for Source {
                 }
                 _ => {}
             }
+        } else {
+            // 未装配预算探针不证明旧预算账本已恢复。
+            unknown.extend(
+                previous
+                    .iter()
+                    .filter(|finding| {
+                        matches!(
+                            finding.code.as_str(),
+                            "autonomy.exhausted" | "autonomy.storage"
+                        )
+                    })
+                    .map(|finding| finding.code.clone()),
+            );
         }
         if let Some(handle) = self.channel.get() {
             let status = *handle.status.borrow();
@@ -625,6 +638,8 @@ mod tests {
         let source = source(dir.path(), Arc::new(eve_model_health::HealthBook::new()));
         let previous = [
             "model.retired_role",
+            "autonomy.exhausted",
+            "autonomy.storage",
             "memory.unsaved",
             "receipts.full",
             "qq.terminal",
