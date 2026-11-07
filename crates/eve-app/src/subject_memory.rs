@@ -171,7 +171,8 @@ fn parse(arguments: &Value) -> Result<Arguments, ToolValidationError> {
         }
         "save" | "correct" => {
             args.query.is_none()
-                && args.id.as_ref().is_some_and(|id| validate_id(id).is_ok())
+                && (args.action == "save" && args.id.is_none()
+                    || args.id.as_ref().is_some_and(|id| validate_id(id).is_ok()))
                 && args
                     .text
                     .as_ref()
@@ -186,7 +187,14 @@ fn parse(arguments: &Value) -> Result<Arguments, ToolValidationError> {
     };
     if !valid {
         return Err(ToolValidationError {
-            message: "经验操作需要有效action及对应id/text或query".into(),
+            message: match args.action.as_str() {
+                "save" => "save 需要有效 text；id 可省略，由宿主生成；不接受 query",
+                "correct" => "correct 需要有效 id 和 text；不接受 query",
+                "revoke" | "archive" => "revoke/archive 需要有效 id；不接受 text 或 query",
+                "recall" => "recall 需要有效 query；不接受 id 或 text",
+                _ => "action 必须是 save、correct、revoke、archive 或 recall",
+            }
+            .into(),
         });
     }
     Ok(args)
@@ -214,7 +222,19 @@ pub(crate) fn tools_with_principal_resolver(
 }
 impl Tool for ExperienceTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition { name: "experience_memory".into(), description: "保存本会话可复用的任务经验草稿；下次相关请求自动召回。支持save/correct/revoke/archive与recall。草稿不等于已验证事实，不在这里保存个人偏好，私聊或群聊资料不会通过本工具发布为全局经验。correct/revoke/archive使用原来提交的id或召回id。".into(), argument_schema: json!({"type":"object","properties":{"action":{"type":"string","enum":["save","correct","revoke","archive","recall"]},"id":{"type":"string"},"text":{"type":"string"},"query":{"type":"string"}},"required":["action"],"additionalProperties":false}), required_permissions: vec![], concurrency: Some(ToolConcurrency::Serial { scope: "experience-memory".into() }) }
+        ToolDefinition {
+            name: "experience_memory".into(),
+            description: "保存本会话可复用的任务经验草稿；下次相关请求自动召回。save 传 text 即可，例如 {\"action\":\"save\",\"text\":\"编译前先核对依赖版本\"}；id 可自行指定，省略时由宿主生成并在成功回执返回。correct 需要 id 和 text，revoke/archive 需要 id，recall 需要 query。更正、撤销、归档使用保存回执的 id 或召回 id。草稿不等于已验证事实，不在这里保存个人偏好，私聊或群聊资料不会通过本工具发布为全局经验。".into(),
+            argument_schema: json!({"type":"object","oneOf":[
+                {"type":"object","properties":{"action":{"const":"save"},"id":{"type":"string","minLength":1},"text":{"type":"string","minLength":1}},"required":["action","text"],"additionalProperties":false},
+                {"type":"object","properties":{"action":{"const":"correct"},"id":{"type":"string","minLength":1},"text":{"type":"string","minLength":1}},"required":["action","id","text"],"additionalProperties":false},
+                {"type":"object","properties":{"action":{"const":"revoke"},"id":{"type":"string","minLength":1}},"required":["action","id"],"additionalProperties":false},
+                {"type":"object","properties":{"action":{"const":"archive"},"id":{"type":"string","minLength":1}},"required":["action","id"],"additionalProperties":false},
+                {"type":"object","properties":{"action":{"const":"recall"},"query":{"type":"string","minLength":1}},"required":["action","query"],"additionalProperties":false}
+            ]}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::Serial { scope: "experience-memory".into() }),
+        }
     }
     fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolValidationError> {
         parse(arguments).map(|_| ())
@@ -247,7 +267,14 @@ impl Tool for ExperienceTool {
                 .turn_id()
                 .filter(|t| *t > 0)
                 .ok_or_else(|| ToolExecutionError::Rejected("经验写入需要持久轮次".into()))?;
-            let local_id = args.id.as_deref().unwrap_or_default();
+            let operation_id = fingerprint(
+                &serde_json::to_string(&(&access.scope, turn, &call.id)).expect("操作可序列化"),
+            );
+            // 省略 ID 的保存绑定原持久轮次和工具调用；重放不受墙钟或模型正文影响。
+            let local_id = args
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("auto-{operation_id}"));
             let snapshot = self.admin.snapshot().map_err(memory_error)?;
             let id = if args.action != "save"
                 && snapshot.records.iter().any(|r| {
@@ -257,13 +284,10 @@ impl Tool for ExperienceTool {
                                 scope: access.scope.clone(),
                             })
                 }) {
-                local_id.to_owned()
+                local_id.clone()
             } else {
-                record_id(&access, local_id)
+                record_id(&access, &local_id)
             };
-            let operation_id = fingerprint(
-                &serde_json::to_string(&(&access.scope, turn, &call.id)).expect("操作可序列化"),
-            );
             let replay = snapshot
                 .records
                 .iter()
@@ -560,6 +584,143 @@ mod tests {
         ToolExecutionContext::new()
             .with_scope(Some(scope(session)))
             .with_turn_id(Some(turn))
+    }
+    #[tokio::test]
+    async fn save_without_id_is_replay_safe_and_returns_an_editable_scoped_id() {
+        let (kernel, admin) = open().await;
+        let tool = tools("qq", admin.clone()).unwrap().remove(0);
+        let args = json!({"action":"save","text":"Rust编译前先核对依赖版本"});
+        tool.validate_arguments(&args).unwrap();
+        for invalid in [
+            json!({"action":"save"}),
+            json!({"action":"save","id":"","text":"Rust"}),
+            json!({"action":"save","text":"Rust","query":"Rust"}),
+            json!({"action":"correct","text":"Rust"}),
+            json!({"action":"revoke"}),
+            json!({"action":"archive"}),
+        ] {
+            assert!(tool.validate_arguments(&invalid).is_err());
+            assert!(
+                tool.execute(call("invalid", invalid), execution("private", 1))
+                    .await
+                    .is_err()
+            );
+        }
+        for missing_identity in [
+            ToolExecutionContext::new().with_turn_id(Some(1)),
+            ToolExecutionContext::new().with_scope(Some(scope("private"))),
+        ] {
+            assert!(
+                tool.execute(call("missing", args.clone()), missing_identity)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(admin.snapshot().unwrap().records.is_empty());
+        let saved = tool
+            .execute(call("save", args.clone()), execution("private", 1))
+            .await
+            .unwrap();
+        let id = saved["id"].as_str().unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(saved["revision"], 1);
+        let replay = tool
+            .execute(call("save", args.clone()), execution("private", 1))
+            .await
+            .unwrap();
+        assert_eq!(saved, replay);
+        let original = admin.snapshot().unwrap();
+        assert_eq!(original.revision, 1);
+        assert_eq!(original.records.len(), 1);
+        assert_eq!(original.records[0].history.len(), 1);
+        assert!(
+            tool.execute(
+                call("save", json!({"action":"save","text":"改写原调用正文"})),
+                execution("private", 1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(admin.snapshot().unwrap() == original);
+        let recalled = tool
+            .execute(
+                call("recall", json!({"action":"recall","query":"Rust"})),
+                execution("private", 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recalled["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(recalled["hits"][0]["version"]["text"], args["text"]);
+        for foreign in [
+            scope("other-session"),
+            ContextScope {
+                session_id: "private".into(),
+                user_id: "other-user".into(),
+            },
+        ] {
+            let context = || {
+                ToolExecutionContext::new()
+                    .with_scope(Some(foreign.clone()))
+                    .with_turn_id(Some(2))
+            };
+            let hits = tool
+                .execute(
+                    call("recall", json!({"action":"recall","query":"Rust"})),
+                    context(),
+                )
+                .await
+                .unwrap();
+            assert!(hits["hits"].as_array().unwrap().is_empty());
+            assert!(
+                tool.execute(
+                    call("correct", json!({"action":"correct","id":id,"text":"覆盖"})),
+                    context(),
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(admin.snapshot().unwrap() == original);
+        let corrected = tool
+            .execute(
+                call(
+                    "correct",
+                    json!({"action":"correct","id":id,"text":"Rust检查锁文件"}),
+                ),
+                execution("private", 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(corrected["id"], id);
+        assert_eq!(corrected["revision"], 2);
+        tool.execute(
+            call("revoke", json!({"action":"revoke","id":id})),
+            execution("private", 3),
+        )
+        .await
+        .unwrap();
+        let recalled = tool
+            .execute(
+                call("recall", json!({"action":"recall","query":"Rust"})),
+                execution("private", 4),
+            )
+            .await
+            .unwrap();
+        assert!(recalled["hits"].as_array().unwrap().is_empty());
+        let different_call = tool
+            .execute(call("another-save", args.clone()), execution("private", 1))
+            .await
+            .unwrap();
+        let different_turn = tool
+            .execute(call("save", args), execution("private", 4))
+            .await
+            .unwrap();
+        assert_ne!(different_call["id"], saved["id"]);
+        assert_ne!(different_turn["id"], saved["id"]);
+        assert_ne!(different_turn["id"], different_call["id"]);
+        assert_eq!(admin.snapshot().unwrap().records.len(), 3);
+        kernel.stop_all().await.unwrap();
     }
     #[tokio::test]
     async fn real_tool_persists_and_next_turn_automatically_recalls_only_related_scope() {
