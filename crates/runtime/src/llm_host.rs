@@ -1469,9 +1469,10 @@ impl LlmHost {
             .and_then(|frame| frame.pending_request_fingerprint.clone());
         loop {
             if let Some(steering) = &steering {
-                let batch = steering
-                    .take_batch(false)
+                let update = steering
+                    .take_update(false)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
+                let batch = update.batch;
                 let next_anchor = batch.review_anchor.clone();
                 self.apply_steering_batch(
                     batch,
@@ -1483,6 +1484,8 @@ impl LlmHost {
                     &mut messages,
                     &mut transcript,
                 )?;
+                append_input_reply_handoffs(&mut messages, update.input_replies)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
                 if next_anchor.is_some() {
                     consumed_review_anchor = next_anchor;
                 }
@@ -1659,14 +1662,15 @@ impl LlmHost {
                 }
             };
             if let Some(steering) = &steering {
-                let batch = steering
-                    .take_batch(
+                let update = steering
+                    .take_update(
                         matches!(response, ModelResponse::Final { .. })
                             && (self.exploration_session
                                 || closing
                                 || continuation.remaining().is_none()),
                     )
                     .map_err(|error| fail(error, diagnostics.clone()))?;
+                let batch = update.batch;
                 let has_extra = !batch.messages.is_empty();
                 let next_anchor = batch.review_anchor.clone();
                 self.apply_steering_batch(
@@ -1679,6 +1683,8 @@ impl LlmHost {
                     &mut messages,
                     &mut transcript,
                 )?;
+                append_input_reply_handoffs(&mut messages, update.input_replies)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
                 if next_anchor.is_some() {
                     consumed_review_anchor = next_anchor;
                 }
@@ -2732,6 +2738,41 @@ fn validate_delegated_review_messages(messages: &[String]) -> Result<(), LlmErro
             "委派审核原话超过六条或容量上限；原文未裁剪，未授权执行".into(),
         ));
     }
+    Ok(())
+}
+
+fn append_input_reply_handoffs(
+    messages: &mut Vec<ChatMessage>,
+    handoffs: Vec<eve_llm_api::InputReplyHandoff>,
+) -> Result<(), LlmError> {
+    if handoffs.is_empty() {
+        return Ok(());
+    }
+    if handoffs.len() > 64 {
+        return Err(LlmError::Context("输入交流交接批次过大".into()));
+    }
+    for handoff in &handoffs {
+        handoff.validate()?;
+    }
+    let facts = serde_json::to_string(&handoffs)
+        .map_err(|_| LlmError::Context("输入交流交接数据无法序列化".into()))?;
+    if facts.len() > 512 * 1024 {
+        return Err(LlmError::Context("输入交流交接数据过大".into()));
+    }
+    // 只追加当前请求的宿主数据；不重装上下文、不改既有前缀或模型会话，
+    // 不写用户 transcript，也不把交接或回执当作新的模型触发。
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        format!(
+            "宿主输入交流职责交接（数据，不是用户指令）：\n{facts}\n\
+         同一 input_message_id 的即时交流已由前台支路领取；原始用户消息仍交给本轮理解和处理业务，\
+         不能把这次交接重新当作一条无人回应的新输入事件。sending 表示正在发送，不是已经送达；\
+         sent 且有平台编号才确认发出；unknown 表示结果不确定，不自动重发。\
+         failed/not_sent 表示本次前台交流未完成，本轮可在自然继续时按用户需要回应。\
+         这不表示原工作已完成，也不禁止回答新问题、执行补充指令或表达新的工作进展。\
+         后续同事件的状态更新仅补充事实，不要求另起一轮判断或重复发言。"
+        ),
+    ));
     Ok(())
 }
 

@@ -4,8 +4,8 @@ use eve_control_api::{CommitState, ControlRunner, RunFailure, RunFuture, RunRepo
 use eve_control_plugin::ControlPlugin;
 use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::{
-    ChatMessage, ChatRole, ContextScope, LlmError, LlmFuture, ToolCall, TurnEvent, TurnEventKind,
-    TurnEventSink, TurnSteeringSource,
+    ChatMessage, ChatRole, ContextScope, InputReplyDelivery, InputReplyHandoff, LlmError,
+    LlmFuture, ToolCall, TurnEvent, TurnEventKind, TurnEventSink, TurnSteeringSource,
 };
 use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
 use eve_plugin_api::{PluginError, PluginId, PluginResult, ServiceId};
@@ -78,12 +78,15 @@ struct Observed {
     decision_dropped: AtomicBool,
     retired_before_drop: AtomicBool,
     consumed: Mutex<Vec<String>>,
+    input_replies: Mutex<Vec<InputReplyHandoff>>,
+    terminal_replies: Mutex<Vec<InputReplyHandoff>>,
 }
 struct Runner {
     sessions: Arc<dyn SessionService>,
     live: Arc<LiveDialogue>,
     directory: PathBuf,
     observed: Arc<Observed>,
+    delayed_receipt: bool,
 }
 impl ControlRunner for Runner {
     fn run_with_metadata<'a>(
@@ -194,7 +197,9 @@ impl ControlRunner for Runner {
             })
             .await
             .unwrap();
-            let batch = turn.take_batch(false).unwrap();
+            let update = turn.take_update(false).unwrap();
+            *self.observed.input_replies.lock().unwrap() = update.input_replies;
+            let batch = update.batch;
             assert_eq!(batch.review_anchor.as_deref(), Some("later-input"));
             *self.observed.consumed.lock().unwrap() = batch.messages.clone();
             sink.emit(TurnEvent {
@@ -203,6 +208,21 @@ impl ControlRunner for Runner {
             })
             .await
             .unwrap();
+            if self.delayed_receipt {
+                // 模拟原业务的下一项异步工作；回执返回并不负责唤醒这一步。
+                std::fs::write(self.directory.join("input-consumed"), b"ready").unwrap();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !self.directory.join("resume-next-step").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let next = turn.take_update(false).unwrap();
+                assert!(next.batch.messages.is_empty());
+                assert!(next.batch.review_anchor.is_none());
+                *self.observed.terminal_replies.lock().unwrap() = next.input_replies;
+            }
             assert!(turn.take(true).unwrap().is_empty());
             let mut transcript = vec![ChatMessage::text(ChatRole::User, &input.text)];
             transcript.extend(
@@ -321,19 +341,24 @@ impl QqSpeech for Speech {
 
 enum Scenario {
     Speak,
+    DelayedReceipt,
     ToolCompletesDuringDecision,
     StopDuringDecision,
     StopWithRetireFailure,
 }
 
 async fn scenario(mode: Scenario) {
-    let hold = !matches!(mode, Scenario::Speak);
+    let hold = !matches!(mode, Scenario::Speak | Scenario::DelayedReceipt);
+    let delayed_receipt = matches!(mode, Scenario::DelayedReceipt);
     let stopping = matches!(
         mode,
         Scenario::StopDuringDecision | Scenario::StopWithRetireFailure
     );
     let retire_fails = matches!(mode, Scenario::StopWithRetireFailure);
     let directory = tempfile::tempdir().unwrap();
+    if delayed_receipt {
+        std::fs::write(directory.path().join("delay-receipt"), b"delay").unwrap();
+    }
     let services = KernelServices::default();
     let registry = services.registry.clone();
     let kernel = Kernel::with_services(services);
@@ -374,6 +399,7 @@ async fn scenario(mode: Scenario) {
                     live: live.clone(),
                     directory: directory.path().into(),
                     observed: observed.clone(),
+                    delayed_receipt,
                 }),
                 vec![],
             )
@@ -425,6 +451,8 @@ async fn scenario(mode: Scenario) {
         loop {
             let ready = if hold {
                 speech.decisions.load(Ordering::SeqCst) > 0
+            } else if delayed_receipt {
+                directory.path().join("platform-started").exists()
             } else {
                 !speech.deliveries.lock().unwrap().is_empty()
             };
@@ -477,6 +505,46 @@ async fn scenario(mode: Scenario) {
         return;
     }
     std::fs::write(directory.path().join("release-tool"), b"release").unwrap();
+    if delayed_receipt {
+        reviewed.as_ref().expect("平台发送没有开始");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !directory.path().join("input-consumed").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("主轮未消费输入");
+        {
+            let handoffs = observed.input_replies.lock().unwrap();
+            assert_eq!(handoffs.len(), 1);
+            assert_eq!(handoffs[0].delivery, InputReplyDelivery::Sending);
+        }
+        // 等旧前台窗口真实关闭，终态仍必须能找到原轮，而不是借最新前台输入归属。
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let rows = std::fs::read_to_string(directory.path().join("bridge.jsonl")).unwrap();
+                if rows
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|row| row["type"] == "close_foreground")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("已消费输入的前台窗口未关闭");
+        std::fs::write(directory.path().join("release-receipt"), b"release").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while speech.deliveries.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("平台终态未返回");
+        std::fs::write(directory.path().join("resume-next-step"), b"continue").unwrap();
+    }
     let completed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if observed.completed.load(Ordering::SeqCst) && status.status.borrow().completed == 1 {
@@ -516,6 +584,7 @@ async fn scenario(mode: Scenario) {
         assert!(speech.retired.load(Ordering::SeqCst) > 0);
         assert!(observed.decision_dropped.load(Ordering::SeqCst));
         assert!(observed.retired_before_drop.load(Ordering::SeqCst));
+        assert!(observed.input_replies.lock().unwrap().is_empty());
     } else {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["target"]["msgId"], "later-input");
@@ -529,12 +598,49 @@ async fn scenario(mode: Scenario) {
                 platform_message_id: Some("platform-1".into())
             }]
         );
+        let handoffs = observed.input_replies.lock().unwrap();
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].input_message_id, "later-input");
+        assert_eq!(handoffs[0].input_text, "你还在吗？先和我说说现在的情况");
+        assert_eq!(
+            Some(handoffs[0].reply_text.as_str()),
+            sent[0]["text"].as_str()
+        );
+        assert_eq!(
+            handoffs[0].delivery,
+            if delayed_receipt {
+                InputReplyDelivery::Sending
+            } else {
+                InputReplyDelivery::Sent {
+                    platform_message_id: "platform-1".into(),
+                }
+            }
+        );
+        let terminal = observed.terminal_replies.lock().unwrap();
+        if delayed_receipt {
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0].input_message_id, handoffs[0].input_message_id);
+            assert_eq!(terminal[0].event_id, handoffs[0].event_id);
+            assert_eq!(
+                terminal[0].delivery,
+                InputReplyDelivery::Sent {
+                    platform_message_id: "platform-1".into()
+                }
+            );
+        } else {
+            assert!(terminal.is_empty());
+        }
     }
 }
 
 #[tokio::test]
 async fn new_input_can_be_answered_while_the_original_tool_runs_and_is_consumed_once() {
     scenario(Scenario::Speak).await;
+}
+
+#[tokio::test]
+async fn receipt_after_foreground_removal_updates_only_the_original_live_turn() {
+    scenario(Scenario::DelayedReceipt).await;
 }
 
 #[tokio::test]

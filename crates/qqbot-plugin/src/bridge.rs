@@ -804,6 +804,20 @@ fn expression_receipt(
     },&progress.text,result)
 }
 
+fn input_reply_delivery(result: &QqOutreachResult) -> eve_llm_api::InputReplyDelivery {
+    use eve_llm_api::InputReplyDelivery;
+    match result {
+        QqOutreachResult::Sent {
+            platform_message_id: Some(id),
+        } if valid_message_id(id) => InputReplyDelivery::Sent {
+            platform_message_id: id.clone(),
+        },
+        QqOutreachResult::Sent { .. } | QqOutreachResult::Unknown => InputReplyDelivery::Unknown,
+        QqOutreachResult::NotSent => InputReplyDelivery::NotSent,
+        QqOutreachResult::Failed { .. } => InputReplyDelivery::Failed,
+    }
+}
+
 fn source_event(
     ledger: &Ledger,
     app: &str,
@@ -1473,6 +1487,7 @@ pub(crate) async fn run(
     let mut authored_cursor: Option<String> = None;
     let mut next_authored = tokio::time::Instant::now();
     let mut pushing_speech: Option<crate::QqSpeechEvent> = None;
+    let mut pushing_input_reply: Option<crate::live::ClaimedInputReply> = None;
     let mut considering_speech: Option<ConsideringSpeech> = None;
     let mut ready_speech: Option<ReadySpeech> = None;
     let mut speech_retries = speech_retry::SpeechRetry::default();
@@ -2394,15 +2409,35 @@ pub(crate) async fn run(
                         return Err(failure("前台交流身份不匹配"));
                     }
                     let id=format!("speech-{}",ready.event.id.strip_prefix("foreground-input:").expect("前台事实编号"));
-                    speaker.dispatched(&ready.event)?;
+                    let input=foreground_inputs.get(&ready.event.anchor).expect("当前前台输入");
+                    let Some(claim)=live.claim_input_reply(&scope,input.turn_id,&ready.event.anchor,&ready.event.id,&ready.text,
+                        || {
+                            if !input.activity_is_current(&foreground_activity,control.as_ref()) {return Ok(false);}
+                            speaker.dispatched(&ready.event)?;
+                            Ok(true)
+                        })? else {
+                        // 主轮已经消费了同一输入，交流职责没有交给前台；该支路零发送。
+                        speaker.retire(&ready.event)?;
+                        if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
+                        continue;
+                    };
+                    let claimed_key=input.key.clone();
+                    let claimed_turn=input.turn_id;
                     if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
                     if let Some(window)=foreground_windows.get_mut(&ready.event.anchor) {window.remaining-=1;}
-                    // 本地取消仍可能与已经开始的平台操作相遇；写出后的未知结局不会重发。
-                    if !foreground_inputs.get(&ready.event.anchor).is_some_and(|input|input.current(live,&foreground_activity,control.as_ref())) {
+                    // 领取后主轮可以消费输入并恢复工作，不能据此撤销已经交接的即时交流。
+                    // 取消或新的原话仍使尚未写出的操作失效。
+                    let cancelled=!control.snapshot(&claimed_key.session).is_ok_and(|snapshot|snapshot.is_some_and(|s|
+                        s.key==claimed_key && s.turn_id==Some(claimed_turn) && !s.cancel_requested && !s.events_retired
+                        && !matches!(s.phase,ControlPhase::Cancelling|ControlPhase::Finished|ControlPhase::Blocked)))
+                        || !conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false);
+                    if cancelled {
                         speaker.delivered(&ready.event,QqOutreachResult::NotSent)?;
+                        claim.complete(eve_llm_api::InputReplyDelivery::NotSent)?;
                         speaker.retire(&ready.event)?;
                         continue;
                     }
+                    pushing_input_reply=Some(claim);
                     write(&mut stdin,json!({"type":"passive_push","version":1,"id":id,"scope":"c2c","target_id":route.target_id,
                         "text":ready.text,"based_on_message_id":ready.event.anchor,"sender_id":route.user_id,"foreground":true})).await?;
                     pushing=Some(AuxiliaryDelivery{id,scope:route.scope.clone(),target:route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
@@ -2696,6 +2731,7 @@ pub(crate) async fn run(
                         let delivery = pushing.take().expect("timed out push");
                         if let Some(event)=pushing_speech.take() {
                             if let Some(speaker)=&speech {speaker.delivered(&event,QqOutreachResult::Unknown)?;}
+                            if let Some(claim)=pushing_input_reply.take() {claim.complete(eve_llm_api::InputReplyDelivery::Unknown)?;}
                             if event.id.starts_with("outreach:") && let Some(hook)=&outreach {report(hook,&ctx,&delivery.id,QqOutreachResult::Unknown);}
                         } else if let Some(hook) = &outreach { report(hook, &ctx, &delivery.id, QqOutreachResult::Unknown); }
                     }
@@ -2979,6 +3015,7 @@ pub(crate) async fn run(
                             let result=outreach_result(&frame,ok);
                             if let Some(event)=pushing_speech.take() {
                                 if let Some(speaker)=&speech {speaker.delivered(&event,result.clone())?;}
+                                if let Some(claim)=pushing_input_reply.take() {claim.complete(input_reply_delivery(&result))?;}
                                 if event.id.starts_with("outreach:") && let Some(hook)=&outreach {report(hook,&ctx,current,result);}
                             } else if let Some(hook)=&outreach {report(hook,&ctx,current,result);}
                             pushing = None;
