@@ -1004,6 +1004,422 @@ async fn failed_summary_repairs_are_finite_persistent_and_never_replace_newer_sa
 }
 
 #[tokio::test]
+async fn repairs_continue_current_verified_points_through_cold_history_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive =
+        Arc::new(eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap());
+    let (kernel, admin) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    let scope = snapshot(0).scope;
+    let first = admin
+        .reserve_reader(&scope, &reader(1), 1, "v1", options())
+        .unwrap()
+        .unwrap();
+    let first_points = vec![point("e-1")];
+    admin.finish(&first, 2, Ok(first_points.clone())).unwrap();
+    let mut failures = vec![];
+    for n in 2..=3 {
+        let failed = admin
+            .reserve_reader(&scope, &reader(n), n * 2, "v1", options())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.previous, first_points);
+        admin
+            .finish(&failed, n * 2 + 1, Err(SummaryFailure::Timeout))
+            .unwrap();
+        failures.push(failed);
+    }
+    for n in 1..=100 {
+        let mut other = snapshot(n);
+        other.scope.user_id = "bob".into();
+        let batch = admin
+            .reserve(&other, n + 10, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&batch, n + 10, Ok(vec![])).unwrap();
+    }
+    assert!(saved_summary(&store)["tail"]["last"].as_u64().unwrap() >= failures[1].sequence);
+    kernel.stop_all().await.unwrap();
+    drop(admin);
+    drop(kernel);
+    let (kernel, admin) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    let mut accumulated = first_points;
+    let mut last_repair = None;
+    for (index, at) in [(0, 70_000), (1, 140_000)] {
+        let repair = admin
+            .reserve_repair_reader(&scope, &reader(3), at, "v2", options())
+            .unwrap()
+            .unwrap();
+        assert_eq!(repair.previous, accumulated);
+        assert_eq!(repair.consumed_ids, failures[index].consumed_ids);
+        assert_eq!(repair.sources.len(), index + 2);
+        let mut added = point(&format!("e-{}", index + 2));
+        added.text = format!("第{}次交流仍需要模组创作帮助", index + 2);
+        accumulated.push(added);
+        admin
+            .finish(&repair, at + 1, Ok(accumulated.clone()))
+            .unwrap();
+        last_repair = Some(repair);
+    }
+    let repair = last_repair.unwrap();
+    // 第二次补做继承第一次补做的新结果，而非原失败批次只含一条的 previous。
+    assert_eq!(repair.previous.len(), 2);
+    for n in 101..=160 {
+        let mut other = snapshot(n);
+        other.scope.user_id = "bob".into();
+        let batch = admin
+            .reserve(&other, 140_010 + n, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&batch, 140_010 + n, Ok(vec![])).unwrap();
+    }
+    assert!(saved_summary(&store)["tail"]["last"].as_u64().unwrap() >= repair.sequence);
+    kernel.stop_all().await.unwrap();
+    drop(admin);
+    drop(kernel);
+    drop(store);
+    drop(archive);
+    let store = Store::open(&root.path().join("state"));
+    let archive =
+        Arc::new(eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap());
+    let (kernel, admin) = cold_open(store, archive).await.unwrap();
+    let latest = admin.latest_completed(&scope).unwrap().unwrap();
+    assert_eq!(latest.batch, repair);
+    assert_eq!(latest.points, accumulated);
+    assert_eq!(
+        effective_points_reader(&latest, &reader(3)).unwrap().points,
+        accumulated
+    );
+    let next = admin
+        .reserve_reader(&scope, &reader(4), 200_000, "v2", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.previous, accumulated);
+    assert_eq!(next.sources.len(), 4);
+    assert_eq!(
+        admin
+            .jobs(&scope)
+            .unwrap()
+            .iter()
+            .filter(|job| job.repair.is_none()
+                && job.status == SummaryStatus::Failed(SummaryFailure::Timeout))
+            .count(),
+        2
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn repair_context_rechecks_previous_sources_and_filters_revoked_points() {
+    for scenario in ["changed", "missing", "late_page", "revoked"] {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path());
+        let (kernel, admin) = open(store.clone()).await;
+        let scope = snapshot(0).scope;
+        let first = admin
+            .reserve_reader(&scope, &reader(1), 1, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&first, 2, Ok(vec![point("e-1")])).unwrap();
+        let failed = admin
+            .reserve_reader(&scope, &reader(2), 3, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin
+            .finish(&failed, 4, Err(SummaryFailure::Timeout))
+            .unwrap();
+        let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+        let mut source = reader(2);
+        match scenario {
+            "changed" => {
+                let mut evidence = snapshot(2).evidence;
+                if let EvidenceSource::CompletedInteraction { user_text, .. } =
+                    &mut evidence[0].source
+                {
+                    *user_text = "旧摘要引用的正文已被改写".into();
+                }
+                source.fixed = Some(evidence);
+            }
+            "missing" => {
+                let mut evidence = snapshot(2).evidence;
+                evidence[0].id = "different-original-evidence".into();
+                source.fixed = Some(evidence);
+            }
+            "late_page" => source.fail_after = Some(2),
+            "revoked" => {
+                source = reader(3);
+                source.summary.revision = 5;
+                let mut evidence = snapshot(3).evidence;
+                evidence[2].revision = 4;
+                source.fixed = Some(evidence);
+                source.summary.preferences = vec![Preference {
+                    id: "p".into(),
+                    text: "旧偏好".into(),
+                    status: PreferenceStatus::Revoked,
+                    revision: 2,
+                    history: vec![
+                        PreferenceVersion {
+                            revision: 1,
+                            evidence_id: "e-1".into(),
+                            at_ms: 2,
+                            text: "旧偏好".into(),
+                            status: PreferenceStatus::Confirmed,
+                        },
+                        PreferenceVersion {
+                            revision: 2,
+                            evidence_id: "e-3".into(),
+                            at_ms: 5,
+                            text: "旧偏好".into(),
+                            status: PreferenceStatus::Revoked,
+                        },
+                    ],
+                }];
+            }
+            _ => unreachable!(),
+        }
+        let result = admin.reserve_repair_reader(&scope, &source, 70_000, "v2", options());
+        match scenario {
+            "revoked" => {
+                let repair = result.unwrap().unwrap();
+                assert!(repair.previous.is_empty());
+                assert_eq!(repair.consumed_ids, failed.consumed_ids);
+                assert_eq!(repair.sources.len(), 1);
+                assert_eq!(repair.sources[0].evidence_id, "e-2");
+            }
+            "late_page" => assert_eq!(result, Err(MemoryError::Storage)),
+            _ => assert!(result.unwrap().is_none()),
+        }
+        if scenario != "revoked" {
+            assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+        }
+        assert_eq!(
+            source.reads.load(Ordering::SeqCst),
+            source.summary.evidence_count as usize
+        );
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn repair_context_verifies_unreferenced_latest_sources_without_injecting_them() {
+    for scenario in ["valid", "changed", "missing"] {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path());
+        let (kernel, admin) = open(store.clone()).await;
+        let scope = snapshot(0).scope;
+        let first = admin
+            .reserve_reader(
+                &scope,
+                &reader(2),
+                1,
+                "v1",
+                SummaryOptions {
+                    max_new_evidence: 2,
+                    ..options()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.sources.len(), 2);
+        admin.finish(&first, 2, Ok(vec![point("e-1")])).unwrap();
+        let failed = admin
+            .reserve_reader(&scope, &reader(3), 3, "v1", options())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.consumed_ids, vec!["e-3"]);
+        assert!(
+            failed
+                .sources
+                .iter()
+                .all(|source| source.evidence_id != "e-2")
+        );
+        admin
+            .finish(&failed, 4, Err(SummaryFailure::Timeout))
+            .unwrap();
+        let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+        let mut source = reader(3);
+        let mut evidence = snapshot(3).evidence;
+        match scenario {
+            "valid" => {}
+            "changed" => {
+                if let EvidenceSource::CompletedInteraction { user_text, .. } =
+                    &mut evidence[1].source
+                {
+                    *user_text = "未被要点引用的原文也已改写".into();
+                }
+            }
+            "missing" => evidence[1].id = "different-original-evidence".into(),
+            _ => unreachable!(),
+        }
+        source.fixed = Some(evidence);
+        let repair = admin
+            .reserve_repair_reader(&scope, &source, 70_000, "v2", options())
+            .unwrap();
+        if scenario == "valid" {
+            let repair = repair.unwrap();
+            assert_eq!(repair.previous, vec![point("e-1")]);
+            assert_eq!(repair.consumed_ids, failed.consumed_ids);
+            assert_eq!(
+                repair
+                    .sources
+                    .iter()
+                    .map(|source| source.evidence_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["e-1", "e-3"]
+            );
+        } else {
+            assert!(repair.is_none(), "{scenario}");
+            assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+        }
+        assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn oversized_repair_preserves_previous_context_and_original_failure_without_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let mut evidence = snapshot(2).evidence;
+    for item in &mut evidence {
+        if let EvidenceSource::CompletedInteraction { user_text, .. } = &mut item.source {
+            user_text.extend(std::iter::repeat_n('x', MAX_TEXT_BYTES - user_text.len()));
+        }
+    }
+    let mut initial = reader(1);
+    initial.fixed = Some(evidence[..1].to_vec());
+    let scope = initial.summary.scope.clone();
+    let first = admin
+        .reserve_reader(&scope, &initial, 1, "v1", options())
+        .unwrap()
+        .unwrap();
+    admin.finish(&first, 2, Ok(vec![point("e-1")])).unwrap();
+    let mut source = reader(2);
+    source.fixed = Some(evidence);
+    let failed = admin
+        .reserve_reader(&scope, &source, 3, "v1", options())
+        .unwrap()
+        .unwrap();
+    assert!(failed.previous.is_empty());
+    admin
+        .finish(&failed, 4, Err(SummaryFailure::Timeout))
+        .unwrap();
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    assert_eq!(
+        admin.reserve_repair_reader(&scope, &source, 70_000, "v2", options()),
+        Err(MemoryError::LimitReached)
+    );
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    assert_eq!(
+        admin.latest_completed(&scope).unwrap().unwrap().points,
+        vec![point("e-1")]
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn repaired_history_accepts_legacy_empty_context_and_rejects_untrusted_previous_sources() {
+    for scenario in [
+        "legacy_empty",
+        "forged_point",
+        "extra_source",
+        "newer_context",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path());
+        let (kernel, admin) = open(store.clone()).await;
+        let scope = snapshot(0).scope;
+        let source = reader(3);
+        let first = admin
+            .reserve_reader(&scope, &source, 1, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&first, 2, Ok(vec![point("e-1")])).unwrap();
+        let failed = admin
+            .reserve_reader(&scope, &source, 3, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin
+            .finish(&failed, 4, Err(SummaryFailure::Timeout))
+            .unwrap();
+        let mut current = point("e-1");
+        if scenario == "newer_context" {
+            let newer = admin
+                .reserve_reader(&scope, &source, 5, "v1", options())
+                .unwrap()
+                .unwrap();
+            current = point("e-3");
+            admin.finish(&newer, 6, Ok(vec![current.clone()])).unwrap();
+        }
+        let repair = admin
+            .reserve_repair_reader(&scope, &source, 70_000, "v2", options())
+            .unwrap()
+            .unwrap();
+        if scenario == "newer_context" {
+            assert!(repair.previous.is_empty());
+        }
+        admin
+            .finish(&repair, 70_001, Ok(vec![point("e-2")]))
+            .unwrap();
+        kernel.stop_all().await.unwrap();
+        let mut document = saved_summary(&store);
+        let job = document["jobs"].as_array_mut().unwrap().last_mut().unwrap();
+        match scenario {
+            "legacy_empty" => {
+                job["batch"]["previous"] = serde_json::json!([]);
+                job["batch"]["sources"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|source| source["evidence_id"] == "e-2");
+            }
+            "forged_point" => {
+                job["batch"]["previous"][0]["text"] = serde_json::json!("并非当前摘要的观点");
+            }
+            "extra_source" | "newer_context" => {
+                job["batch"]["sources"].as_array_mut().unwrap().push(
+                    serde_json::to_value(SummarySource {
+                        evidence_id: "e-3".into(),
+                        revision: 3,
+                        at_ms: 3,
+                        user_text: match generated(3).source {
+                            EvidenceSource::CompletedInteraction { user_text, .. } => user_text,
+                            _ => unreachable!(),
+                        },
+                    })
+                    .unwrap(),
+                );
+                if scenario == "newer_context" {
+                    job["batch"]["previous"] = serde_json::json!([current]);
+                }
+            }
+            _ => unreachable!(),
+        }
+        let bytes = serde_json::to_vec(&document).unwrap();
+        store
+            .set(&owner(), SUMMARY_STATE_KEY.into(), bytes.clone())
+            .unwrap();
+        let reopened = Kernel::with_services(KernelServices {
+            state: store.clone(),
+            ..KernelServices::default()
+        });
+        let plugin = ConversationSummaryPlugin::new().unwrap();
+        let controller = plugin.controller();
+        reopened.register(Box::new(plugin)).unwrap();
+        if scenario == "legacy_empty" {
+            reopened.start(&owner()).await.unwrap();
+            let latest = controller.latest_completed(&scope).unwrap().unwrap();
+            assert!(latest.batch.previous.is_empty());
+            assert_eq!(latest.batch.sequence, repair.sequence);
+            reopened.stop_all().await.unwrap();
+        } else {
+            assert!(reopened.start(&owner()).await.is_err(), "{scenario}");
+            assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), Some(bytes));
+        }
+    }
+}
+
+#[tokio::test]
 async fn legacy_summary_migration_and_uncertain_root_commit_keep_both_recoverable_histories() {
     for failure in [1, 2] {
         let root = tempfile::tempdir().unwrap();
