@@ -16,6 +16,9 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_runtime_contract as contract
 
+STARTUP_CHECKPOINT_PROTOCOL = 1
+STARTUP_CHECKPOINT_ENV = 'EVE_STARTUP_CHECKPOINT_REQUEST'
+
 
 def identity(pid):
     try:
@@ -112,6 +115,8 @@ class Bridge:
         self.state = Path(contract.argument(options.command, '--state-dir'))
         self.stopping = threading.Event()
         self.child = None
+        self.startup_checkpoint_pending = STARTUP_CHECKPOINT_ENV in os.environ
+        self.startup_checkpoint_spawned = False
         self.known = {}
         self.nonce = None
         self.child_identity = None
@@ -336,6 +341,8 @@ class Bridge:
                                            failed_at_ms=int(time.time() * 1000), error=error))
 
     def start(self, record):
+        if self.startup_checkpoint_pending and self.startup_checkpoint_spawned:
+            raise ValueError('host_startup_checkpoint_not_ready')
         self.validate(record)
         self.nonce = secrets.token_hex(32)
         launch = self.root / 'host-launch.json'
@@ -356,6 +363,9 @@ class Bridge:
         command.extend(['--', *record['descriptor']['command']])
         try:
             self.child = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True, close_fds=True, pass_fds=(read_fd,))
+            # 一次性发布请求继续交给刚创建的监督器，后续自动重启不再次继承。
+            self.startup_checkpoint_spawned = True
+            os.environ.pop(STARTUP_CHECKPOINT_ENV, None)
             os.close(read_fd)
             read_fd = None
             self.child_identity = identity(self.child.pid)
@@ -386,6 +396,7 @@ class Bridge:
                     self.validate(record)
                     if self.child.poll() is not None:
                         raise ValueError('host_supervisor_not_stable')
+                    self.startup_checkpoint_pending = False
                     return
             else:
                 stable = None
@@ -481,6 +492,8 @@ class Bridge:
             self.rollback(previous, next_record, error)
 
     def rollback(self, previous, failed, error):
+        if self.startup_checkpoint_pending:
+            raise ValueError('host_startup_checkpoint_not_ready')
         code = safe_error(error)
         self.journal('rolling_back', previous, failed, code)
         self.close()
@@ -503,6 +516,8 @@ class Bridge:
         self.publish('running', result='rolled_back_runtime_state_preserved', error=code)
 
     def recover(self):
+        if self.startup_checkpoint_pending:
+            raise ValueError('host_startup_checkpoint_not_ready')
         self.close()
         now = int(time.time() * 1000)
         self.recovery['crashes'] = [n for n in self.recovery['crashes'] if now - n <= self.options.restart_window_seconds * 1000]
@@ -528,6 +543,10 @@ class Bridge:
                     if self.stopping.is_set():
                         return 0
                     self.close()
+                    # 首次恢复未验明时禁止无检查点的自动重启或回退。
+                    # 发布端保留失败证据，用新请求发起显式恢复。
+                    if self.startup_checkpoint_pending:
+                        raise ValueError('host_startup_checkpoint_not_ready') from None
                     if self.child and self.child.returncode == contract.RUNTIME_FAILED and self.previous is not None:
                         self.rollback(self.previous, self.record, ValueError('host_managed_runtime_failed'))
                         break

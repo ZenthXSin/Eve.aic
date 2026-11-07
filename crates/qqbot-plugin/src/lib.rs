@@ -45,6 +45,13 @@ pub use participants::QqParticipantObserver;
 pub use state::{ImageAttachment, Message, valid_message_id};
 pub use trusted_review::QqRestrictionObserver;
 
+/// 宿主在回执和原文归档恢复完成后、创建桥接任务前取得一次静默检查点。
+/// 回调只供可信组合层使用；错误会使启动失败，不开放通道，也不报告 ready。
+/// 宿主负责让其它入站与后台在本回调成功后才开始工作。
+pub trait QqBeforeIngress: Send + Sync {
+    fn before_ingress(&self) -> PluginFuture<'_, ()>;
+}
+
 /// 慢步骤进度的时间阈值：本轮某一步（等待模型或一批工具）持续超过它仍未结束时，
 /// 通道补发宿主可确认的活动。实时路径不调用措辞模型、不抄内部 final；
 /// 返回 None 表示关闭；每次检查时读取，可热修改。
@@ -258,6 +265,7 @@ pub struct QqBotPlugin {
     group_whitelist: Option<Arc<dyn QqGroupWhitelist>>,
     owner_directory: Option<Arc<dyn QqOwnerDirectory>>,
     group_access: Option<Arc<dyn QqGroupAccess>>,
+    before_ingress: Option<Arc<dyn QqBeforeIngress>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -306,6 +314,7 @@ impl QqBotPlugin {
             group_whitelist: None,
             owner_directory: None,
             group_access: None,
+            before_ingress: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -488,6 +497,10 @@ impl QqBotPlugin {
     }
 }
 impl QqBotPlugin {
+    pub fn with_before_ingress(mut self, boundary: Arc<dyn QqBeforeIngress>) -> Self {
+        self.before_ingress = Some(boundary);
+        self
+    }
     pub fn with_admission(mut self, admission: Arc<dyn QqAdmission>) -> Self {
         self.admission = Some(admission);
         self
@@ -596,6 +609,18 @@ impl Plugin for QqBotPlugin {
                 .ok_or_else(|| PluginError::State("QQBot 消息服务缺失".into()))?
                 .0
                 .clone();
+            bridge::restore_saved_receipts(
+                &self.config.app_id,
+                &ctx,
+                &ledger,
+                &self.conversations,
+                self.speech.as_ref(),
+                training.as_ref(),
+            )?;
+            ledger.archive_if_needed(&ctx)?;
+            if let Some(boundary) = &self.before_ingress {
+                boundary.before_ingress().await?;
+            }
             let (status, receiver) = watch::channel(QqBotStatus::default());
             let (stop, stop_receiver) = watch::channel(false);
             ctx.provide_service(

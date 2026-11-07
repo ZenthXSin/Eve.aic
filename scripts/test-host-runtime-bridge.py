@@ -106,6 +106,7 @@ def main():
                       child_pid=child.pid if child else None,
                       child_pgid=os.getpgid(child.pid) if child else None,
                       candidate=identity,
+                      startup_checkpoint=os.environ.get('EVE_STARTUP_CHECKPOINT_REQUEST'),
                       dependencies=[build_resources.MARKER, source_update.MARKER])
         with events.open('a', encoding='utf8') as stream:
             stream.write(json.dumps(record, sort_keys=True) + '\n')
@@ -900,6 +901,37 @@ class HostRuntimeBridgeTests(unittest.TestCase):
         self.process.terminate()
         self.assert_terminal(code=0)
         self.assertFalse(alive(business['pid']))
+
+    def test_startup_checkpoint_request_is_not_inherited_by_restarted_supervisor(self):
+        self.env['EVE_STARTUP_CHECKPOINT_REQUEST'] = '/owned/request.json'
+        self.start_initial()
+        self.trigger(action='crash')
+        self.wait_for(lambda: len([e for e in self.event_list() if e['phase'] == 'boot']) >= 2)
+        booted = [e for e in self.event_list() if e['phase'] == 'boot']
+        self.assertEqual([e['startup_checkpoint'] for e in booted[:2]], ['/owned/request.json', None])
+
+    def test_startup_checkpoint_failure_blocks_without_an_unchecked_second_supervisor(self):
+        for name, contents in self.runtime_files('A', mode='startup_failure').items():
+            (self.trusted / Path(name).name).write_bytes(contents)
+        self.env['EVE_STARTUP_CHECKPOINT_REQUEST'] = '/owned/request.json'
+        self.launch()
+        self.assert_terminal()
+        booted = [event for event in self.event_list() if event['phase'] == 'boot']
+        self.assertEqual(len(booted), 1)
+        self.assertEqual(booted[0]['startup_checkpoint'], '/owned/request.json')
+        status = read_json(self.control / 'host-status.json')
+        self.assertEqual(status['phase'], 'blocked')
+        self.assertEqual(status['error'], 'host_startup_checkpoint_not_ready')
+        self.assertEqual(read_json(self.state / 'sentinel.json')['visits'], ['A'])
+
+    def test_startup_checkpoint_health_failure_blocks_without_fallback(self):
+        for name, contents in self.runtime_files('A', mode='ready_failure').items():
+            (self.trusted / Path(name).name).write_bytes(contents)
+        self.env['EVE_STARTUP_CHECKPOINT_REQUEST'] = '/owned/request.json'
+        self.launch()
+        self.assert_terminal()
+        self.assertEqual([event['tag'] for event in self.event_list() if event['phase'] == 'boot'], ['A'])
+        self.assertEqual(read_json(self.control / 'host-status.json')['error'], 'host_startup_checkpoint_not_ready')
 
     def test_stale_nonce_cannot_authorize_a_candidate(self):
         request, command = self.candidate()

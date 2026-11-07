@@ -1289,6 +1289,60 @@ fn access_reply(
     }
 }
 
+/// 完成旧回执的本地恢复，再允许组合层捕获持久检查点；不启动桥或模型。
+pub(crate) fn restore_saved_receipts(
+    app: &str,
+    ctx: &PluginContext,
+    ledger: &Ledger,
+    conversations: &crate::QqConversations,
+    speech: Option<&Arc<dyn crate::QqSpeech>>,
+    training: Option<&Arc<dyn TrainingService>>,
+) -> PluginResult<()> {
+    // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
+    for entry in ledger.entries.iter().filter(|entry| entry.app_id == app) {
+        conversations.record_message(app, &entry.message)?;
+        if let Some(speaker) = speech {
+            for (part, progress) in entry.progress.iter().enumerate() {
+                let result = match progress.state {
+                    PartState::Sent => QqOutreachResult::Sent {
+                        platform_message_id: progress.platform_message_id.clone(),
+                    },
+                    PartState::Unknown | PartState::Sending => QqOutreachResult::Unknown,
+                    PartState::Failed => QqOutreachResult::Failed {
+                        http_status: None,
+                        biz_code: None,
+                    },
+                    _ => continue,
+                };
+                expression_receipt(speaker, app, entry, part, result)?;
+            }
+        }
+    }
+    // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
+    if let Some(training) = training {
+        for entry in &ledger.entries {
+            if entry.app_id != app {
+                continue;
+            }
+            let session = entry.message.session_key(app)?;
+            let scope = eve_llm_api::ContextScope {
+                session_id: session.session_id,
+                user_id: session.user_id,
+            };
+            if training
+                .observe_user_message(&scope, &entry.message.id, &entry.message.text)
+                .is_err()
+            {
+                // 与在线观察一致：学习容量或单条来源冲突不能阻止通道启动。
+                // 原表达状态和平台回执保留，不重放工具或发送；错误不能冒充已学习。
+                warn(ctx, "expression_history_observation_failed");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn run(
     config: Arc<QqBotConfig>,
     ctx: PluginContext,
@@ -1328,52 +1382,6 @@ pub(crate) async fn run(
         group_access,
         admission,
     } = services;
-    // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
-    for entry in ledger
-        .entries
-        .iter()
-        .filter(|entry| entry.app_id == config.app_id)
-    {
-        conversations.record_message(&config.app_id, &entry.message)?;
-        if let Some(speaker) = &speech {
-            for (part, progress) in entry.progress.iter().enumerate() {
-                let result = match progress.state {
-                    PartState::Sent => QqOutreachResult::Sent {
-                        platform_message_id: progress.platform_message_id.clone(),
-                    },
-                    PartState::Unknown | PartState::Sending => QqOutreachResult::Unknown,
-                    PartState::Failed => QqOutreachResult::Failed {
-                        http_status: None,
-                        biz_code: None,
-                    },
-                    _ => continue,
-                };
-                expression_receipt(speaker, &config.app_id, entry, part, result)?;
-            }
-        }
-    }
-    // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
-    if let Some(training) = &training {
-        for entry in &ledger.entries {
-            if entry.app_id != config.app_id {
-                continue;
-            }
-            let session = entry.message.session_key(&config.app_id)?;
-            let scope = eve_llm_api::ContextScope {
-                session_id: session.session_id,
-                user_id: session.user_id,
-            };
-            if training
-                .observe_user_message(&scope, &entry.message.id, &entry.message.text)
-                .is_err()
-            {
-                // 与在线观察一致：学习容量或单条来源冲突不能阻止通道启动。
-                // 原表达状态和平台回执保留，不重放工具或发送；错误不能冒充已学习。
-                warn(&ctx, "expression_history_observation_failed");
-                break;
-            }
-        }
-    }
     let (closed, receiver) = watch::channel(false);
     let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let (steps_tx, mut steps_rx) = mpsc::channel::<ControlEvent>(256);
