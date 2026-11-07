@@ -1973,13 +1973,14 @@ fn dispatch_focus(
     focus: SubjectFocus,
     now: u64,
 ) -> SubjectResult<SubjectDispatch> {
-    dispatch_focus_live(subject, tasks, authorization, None, focus, now)
+    dispatch_focus_live(subject, tasks, authorization, None, None, focus, now)
 }
 fn dispatch_focus_live(
     subject: &Arc<dyn SubjectAdmin>,
     tasks: &Arc<dyn TaskAdmin>,
     authorization: &Arc<dyn AutonomyOwner>,
     sessions: Option<&Arc<dyn eve_session_api::SessionService>>,
+    notes: Option<&crate::context_notes::NotesTool>,
     mut focus: SubjectFocus,
     now: u64,
 ) -> SubjectResult<SubjectDispatch> {
@@ -2130,11 +2131,17 @@ fn dispatch_focus_live(
             subject.upsert_focus(focus, now)?;
             return Ok(SubjectDispatch::Cancelled);
         }
+        // 找回已有任务和过时草稿处理均在此前完成；这里只为新会话读一次便笺。
+        let note_view = notes
+            .map(|notes| notes.snapshot(&identity(&focus.scope)))
+            .transpose()
+            .map_err(|_| SubjectError::Unavailable)?;
         let context = crate::qq_exploration::context(
             &input,
             crate::qq_exploration::recent_evidence(subject, &focus.scope, 3)?,
             owner.clone(),
             &crate::idle_loop::current_mind(subject, &snapshot, &focus.scope)?,
+            note_view.as_ref(),
         )?;
         let created = tasks.create_exploration(
             &owner,
@@ -2430,7 +2437,7 @@ fn tick(
     authorization: &Arc<dyn AutonomyOwner>,
     now: u64,
 ) -> Result<(), crate::AppError> {
-    tick_live(subject, tasks, authorization, None, None, now)
+    tick_live(subject, tasks, authorization, None, None, None, now)
 }
 fn tick_live(
     subject: &Arc<dyn SubjectAdmin>,
@@ -2438,6 +2445,7 @@ fn tick_live(
     authorization: &Arc<dyn AutonomyOwner>,
     sessions: Option<&Arc<dyn eve_session_api::SessionService>>,
     control: Option<&Arc<dyn eve_control_api::ControlService>>,
+    notes: Option<&crate::context_notes::NotesTool>,
     now: u64,
 ) -> Result<(), crate::AppError> {
     let _mutation = MUTATIONS
@@ -2505,7 +2513,7 @@ fn tick_live(
             };
             focus = next;
         }
-        dispatch_focus_live(subject, tasks, authorization, sessions, focus, now)
+        dispatch_focus_live(subject, tasks, authorization, sessions, notes, focus, now)
     })?;
     Ok(())
 }
@@ -2522,7 +2530,7 @@ impl Background {
         tasks: Arc<dyn TaskAdmin>,
         authorization: Arc<dyn AutonomyOwner>,
     ) -> Self {
-        Self::start_with_services(subject, tasks, authorization, None, None)
+        Self::start_with_services(subject, tasks, authorization, None, None, None)
     }
     pub(crate) fn start_with_services(
         subject: Arc<dyn SubjectAdmin>,
@@ -2530,12 +2538,13 @@ impl Background {
         authorization: Arc<dyn AutonomyOwner>,
         sessions: Option<Arc<dyn eve_session_api::SessionService>>,
         control: Option<Arc<dyn eve_control_api::ControlService>>,
+        notes: Option<Arc<crate::context_notes::NotesTool>>,
     ) -> Self {
         let (stop, mut stopping) = watch::channel(false);
         let (activate, mut activated) = watch::channel(false);
         let (done_tx, done) = watch::channel(false);
         let job = tokio::spawn(async move {
-            let result=async{loop{tokio::select!{_=stopping.changed()=>break,_=activated.changed()=>{},_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{if *activated.borrow(){tick_live(&subject,&tasks,&authorization,sessions.as_ref(),control.as_ref(),crate::qq_tasks::now_ms())?;}}}}Ok(())}.await;
+            let result=async{loop{tokio::select!{_=stopping.changed()=>break,_=activated.changed()=>{},_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{if *activated.borrow(){tick_live(&subject,&tasks,&authorization,sessions.as_ref(),control.as_ref(),notes.as_deref(),crate::qq_tasks::now_ms())?;}}}}Ok(())}.await;
             let _ = done_tx.send(true);
             result
         });
@@ -4616,7 +4625,8 @@ mod tests {
         let before_tasks = serde_json::to_vec(&f.tasks.snapshot().unwrap().tasks).unwrap();
         let before_grant = grant_for(&subject, &s).unwrap().unwrap().1;
         assert!(matches!(
-            dispatch_focus_live(&subject, &tasks, &authorization, None, focus, at + 4).unwrap(),
+            dispatch_focus_live(&subject, &tasks, &authorization, None, None, focus, at + 4)
+                .unwrap(),
             SubjectDispatch::Completed { .. }
         ));
         let recovered = subject
@@ -4645,7 +4655,16 @@ mod tests {
             grant_for(&subject, &s).unwrap().unwrap().1.issued,
             before_grant.issued
         );
-        dispatch_focus_live(&subject, &tasks, &authorization, None, recovered, at + 5).unwrap();
+        dispatch_focus_live(
+            &subject,
+            &tasks,
+            &authorization,
+            None,
+            None,
+            recovered,
+            at + 5,
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_vec(&f.tasks.snapshot().unwrap().tasks).unwrap(),
             before_tasks

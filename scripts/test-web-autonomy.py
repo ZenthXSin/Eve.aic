@@ -117,7 +117,7 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
         required = {
             "dispatch_background_task", "list_background_tasks", "cancel_background_task",
             "run_subagent", "create_subagent", "list_subagents", "delete_subagent",
-            "manage_subject_focus", "configure_subject_autonomy", "task_progress", "sleep",
+            "manage_subject_focus", "configure_subject_autonomy", "read_exploration", "task_progress", "sleep",
             "set_wakeup_trigger", "list_wakeup_triggers", "cancel_wakeup_trigger",
             "save_workflow_tool", "list_workflow_tools", "run_workflow_tool",
             "manage_business_permissions", "list_skills", "manage_skill",

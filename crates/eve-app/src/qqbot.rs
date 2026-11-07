@@ -2197,9 +2197,14 @@ async fn run_qqbot_composed(
                 authorization: qq_admin.clone(),
             }));
         }
-        bootstrap.tools.push(Arc::new(crate::context_notes::NotesTool {
+        let exploration_notes = Arc::new(crate::context_notes::NotesTool {
             admin: context_notes.clone(),
             binding: crate::context_notes::NoteBinding::Qq(conversations.clone()),
+        });
+        bootstrap.tools.push(exploration_notes.clone());
+        bootstrap.tools.push(Arc::new(crate::qq_exploration_history::ReadExploration {
+            subject: subject.clone(),
+            binding: exploration_notes.binding.clone(),
         }));
         let developer_backend = crate::developer::install_with_member_runtime_backend_profile(
             &mut bootstrap,
@@ -2703,7 +2708,7 @@ async fn run_qqbot_composed(
             eprintln!("EVE_HOST_AUTONOMY installed=false background_tasks_enabled=false existing_grant_preserved=true");
         }
         if let Some(tasks) = &tasks {
-            subject_background = Some(crate::qq_subject::Background::start_with_services(subject.clone(), Arc::new(tasks.clone()), qq_admin.clone(), Some(registry.get(&ServiceId::new(eve_session_api::SESSION_SERVICE_ID)?)?.ok_or("空闲回顾会话服务缺失")?.value.downcast::<eve_session_api::SessionServiceHandle>().map_err(|_|"空闲回顾会话服务类型错误")?.0.clone()), Some(control.clone())));
+            subject_background = Some(crate::qq_subject::Background::start_with_services(subject.clone(), Arc::new(tasks.clone()), qq_admin.clone(), Some(registry.get(&ServiceId::new(eve_session_api::SESSION_SERVICE_ID)?)?.ok_or("空闲回顾会话服务缺失")?.value.downcast::<eve_session_api::SessionServiceHandle>().map_err(|_|"空闲回顾会话服务类型错误")?.0.clone()), Some(control.clone()), Some(exploration_notes.clone())));
         }
         let failure_recovery = if let Some(tasks) = &tasks {
             let recovery = Arc::new(crate::qq_failure_recovery::Recovery {

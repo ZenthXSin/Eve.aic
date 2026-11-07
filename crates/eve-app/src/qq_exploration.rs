@@ -279,12 +279,13 @@ pub(crate) fn recent_evidence(
         .collect()
 }
 
-/// 仅首次创建会话时冻结同范围的当前认知；恢复必须继续使用原任务上下文。
+/// 仅首次创建会话时冻结同范围的当前认知与便笺；恢复必须继续使用原任务上下文。
 pub(crate) fn context(
     input: &ExplorationInput,
     evidence: Vec<IdleEvidence>,
     owner: TaskOwner,
     mind: &IdleMind,
+    notes: Option<&eve_context_api::ContextView>,
 ) -> SubjectResult<eve_task_api::DelegatedContext> {
     input.validate()?;
     if input.superseded_by_input.is_some()
@@ -305,6 +306,23 @@ pub(crate) fn context(
     if mind.revision > 0 && (validate_id(&mind.last_task).is_err() || mind.next_at_ms == 0) {
         return Err(SubjectError::InvalidInput);
     }
+    let notes = notes
+        .map(|view| {
+            if view.owner.channel != input.scope.channel
+                || view.owner.session_id != input.scope.conversation_id
+                || view.owner.user_id != input.scope.principal_id
+            {
+                return Err(SubjectError::CorruptState);
+            }
+            Ok(serde_json::json!({
+                "kind":"eve.exploration.notes.v1",
+                "owner":view.owner,
+                "revision":view.revision,
+                "rendered":view.rendered().map_err(invalid)?,
+                "read_with":"context_notes read_range，固定此 revision 并按 next_offset 分页"
+            }))
+        })
+        .transpose()?;
     Ok(eve_task_api::DelegatedContext {
         owner,
         messages_json: serde_json::to_string(&vec![ChatMessage::text(ChatRole::Assistant,
@@ -318,8 +336,9 @@ pub(crate) fn context(
                     "complete_history":false,
                     "self_interests_limit":MAX_SELF_INTERESTS
                 },
+                "notes_context":notes,
                 "recent_experiences":evidence,
-                "notice":"current_mind 是本次会话创建时冻结的同范围当前认知，snapshot.revision 与 last_task 标明来源版本；兴趣最多展示8项，未展示不表示不存在，可用 manage_subject_focus 查询完整兴趣和变化。thought、reason、judgments 与 self_interests 是自己的想法和可修正看法，不是已证实事实、当前指令或新授权。可以接着自己的兴趣，也可以转向、暂缓或放下；没有兴趣和判断也可以探索，不要求形成兴趣或完成目标。真实工具片段与主观感想分开，不要把旧调用当作本轮待执行操作。"
+                "notice":"current_mind 是本次会话创建时冻结的同范围当前认知，snapshot.revision 与 last_task 标明来源版本；兴趣最多展示8项，未展示不表示不存在，可用 manage_subject_focus 查询完整兴趣和变化。thought、reason、judgments 与 self_interests 是自己的想法和可修正看法，不是已证实事实、当前指令或新授权。可以接着自己的兴趣，也可以转向、暂缓或放下；没有兴趣和判断也可以探索，不要求形成兴趣或完成目标。notes_context 是本次创建时冻结的同范围工作便笺预览与 revision；可以用 context_notes 自由维护资料、未解问题和探索 ID 的索引，也可以不记或暂时放下。需要旧笔记时固定该 revision 回查，修改前 inspect 当前 revision。read_exploration 可按 ID 或分页回看同范围更早经历。笔记不是原话、执行回执或授权，不要求形成目标或整理报告。真实工具片段与主观感想分开，不要把旧调用当作本轮待执行操作。"
             }).to_string()
         )]).map_err(invalid)?,
     })
@@ -443,6 +462,7 @@ mod tests {
                     user_id: scope().principal_id,
                 },
                 &IdleMind::default(),
+                None,
             )
             .is_err()
         );
@@ -484,6 +504,7 @@ mod tests {
                     user_id: scope().principal_id,
                 },
                 &IdleMind::default(),
+                None,
             )
             .is_err()
         );
@@ -519,6 +540,7 @@ mod tests {
                     user_id: scope().principal_id,
                 },
                 mind,
+                None,
             )
         };
         let mut mind = IdleMind {
@@ -568,6 +590,101 @@ mod tests {
         }
         assert!(serde_json::to_vec(&mind).unwrap().len() > MAX_PAYLOAD_BYTES);
         assert!(matches!(make(&mind), Err(SubjectError::LimitReached)));
+    }
+
+    #[tokio::test]
+    async fn notes_preview_freezes_revision_and_utf8_prefix_without_changing_history_or_scope() {
+        use eve_context_api::{ContextAdmin, ContextOwner, ContextView, MAX_NOTE_PAGE_BYTES};
+        let root = tempfile::tempdir().unwrap();
+        let kernel = eve_kernel::Kernel::new();
+        let plugin = eve_context_plugin::ContextPlugin::new(std::sync::Arc::new(
+            eve_context_plugin::FileContextArchive::open(root.path()).unwrap(),
+        ))
+        .unwrap();
+        let admin = plugin.controller();
+        kernel.register(Box::new(plugin)).unwrap();
+        kernel.start_all().await.unwrap();
+        let input = ExplorationInput {
+            scope: scope(),
+            reflection_id: "reflection".into(),
+            thought: String::new(),
+            exploration: None,
+            superseded_by_input: None,
+        };
+        let owner = ContextOwner {
+            channel: input.scope.channel.clone(),
+            session_id: input.scope.conversation_id.clone(),
+            user_id: input.scope.principal_id.clone(),
+        };
+        let freeze = |view: &ContextView| {
+            context(
+                &input,
+                vec![],
+                TaskOwner {
+                    session_id: owner.session_id.clone(),
+                    user_id: owner.user_id.clone(),
+                },
+                &IdleMind::default(),
+                Some(view),
+            )
+        };
+        let data = |saved: &eve_task_api::DelegatedContext| {
+            let messages: Vec<ChatMessage> = serde_json::from_str(&saved.messages_json).unwrap();
+            serde_json::from_str::<serde_json::Value>(messages[0].text.as_deref().unwrap()).unwrap()
+        };
+        let empty = freeze(&admin.inspect(&owner).unwrap()).unwrap();
+        assert_eq!(data(&empty)["notes_context"]["revision"], 0);
+        assert!(data(&empty)["notes_context"]["rendered"].is_null());
+        let text = format!(
+            "资料: materials.txt；未解: 为什么会变化？\n{}",
+            "文".repeat(MAX_NOTE_PAGE_BYTES)
+        );
+        let first = admin.update(&owner, 0, &text).unwrap();
+        let saved = freeze(&first).unwrap();
+        let first_bytes = saved.messages_json.clone();
+        let preview = data(&saved);
+        let notes = &preview["notes_context"];
+        assert_eq!(notes["owner"], json!(owner));
+        assert_eq!(notes["revision"], 1);
+        let rendered = notes["rendered"].as_str().unwrap();
+        let prefix: serde_json::Value =
+            serde_json::from_str(rendered.lines().last().unwrap()).unwrap();
+        assert_eq!(prefix["revision"], 1);
+        assert_eq!(prefix["total_bytes"], text.len());
+        assert_eq!(prefix["truncated"], true);
+        let prefix_text = prefix["text_prefix"].as_str().unwrap();
+        assert!(text.starts_with(prefix_text));
+        assert!(
+            prefix_text.len() <= MAX_NOTE_PAGE_BYTES && prefix_text.len() > MAX_NOTE_PAGE_BYTES - 4
+        );
+        let second = admin
+            .update(&owner, 1, "先把材料放下，记得还有一个问题")
+            .unwrap();
+        assert_eq!(
+            data(&freeze(&second).unwrap())["notes_context"]["revision"],
+            2
+        );
+        assert_eq!(saved.messages_json, first_bytes);
+        assert_eq!(admin.read_version(&owner, 1).unwrap(), first);
+        for foreign in [
+            ContextOwner {
+                channel: "web".into(),
+                ..owner.clone()
+            },
+            ContextOwner {
+                session_id: "other-session".into(),
+                ..owner.clone()
+            },
+            ContextOwner {
+                user_id: "other-user".into(),
+                ..owner.clone()
+            },
+        ] {
+            let foreign = admin.update(&foreign, 0, "其他会话的私有笔记").unwrap();
+            assert!(matches!(freeze(&foreign), Err(SubjectError::CorruptState)));
+        }
+        assert!(!first_bytes.contains("其他会话的私有笔记"));
+        kernel.stop_all().await.unwrap();
     }
 
     #[test]
