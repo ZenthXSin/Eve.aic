@@ -30,7 +30,7 @@ fn new_facts_preserve_rules_pinned_and_history_before_dynamic_speech_context() {
     };
     let history = json!({"turns":[{"internal_final":"旧轮次收尾不是本次输出"}]});
     let deliveries = vec![json!({"delivery_status":"unknown","event_id":"earlier"})];
-    let first_event = event("first");
+    let first_event = event("host-reply:input-1");
     let first = decision_messages(
         "同一个 Eve".into(),
         context.clone(),
@@ -68,7 +68,8 @@ fn new_facts_preserve_rules_pinned_and_history_before_dynamic_speech_context() {
     assert_eq!(
         data(&first[4]),
         json!({
-            "profile":"原有交流画像", "memories":["原有记忆"], "recent_deliveries":deliveries
+            "profile":"原有交流画像", "memories":["原有记忆"], "recent_deliveries":deliveries,
+            "latest_user_message":{"id":first_event.anchor,"text":"用户当前完整原话\n第二行"}
         })
     );
     assert_eq!(first[5].text.as_deref(), Some(FORMAT_GUARD));
@@ -81,6 +82,71 @@ fn new_facts_preserve_rules_pinned_and_history_before_dynamic_speech_context() {
             "id":first_event.anchor, "text":"用户当前完整原话\n第二行"
         })
     );
+    assert_eq!(input["trigger"], "user_input");
+    let next_input: Value = serde_json::from_str(next[6].text.as_deref().unwrap()).unwrap();
+    assert_eq!(next_input["trigger"], "background_event");
+    assert!(next_input.get("current_user_message").is_none());
+    assert!(next_input.get("latest_user_message").is_none());
+    assert_eq!(data(&next[4])["latest_user_message"]["text"], "另一句原话");
+}
+
+#[test]
+fn delayed_background_and_rebound_command_never_reopen_the_last_user_message() {
+    for id in [
+        "outreach:health-42",
+        "outreach:wake-1",
+        "host-reply:older",
+        "unknown-source",
+    ] {
+        let messages = decision_messages(
+            "Eve".into(),
+            ContextSnapshot::default(),
+            json!({}),
+            vec![],
+            &event(id),
+            "晚安喵，你慢慢来".into(),
+            1000,
+        );
+        let input: Value =
+            serde_json::from_str(messages.last().unwrap().text.as_deref().unwrap()).unwrap();
+        assert_eq!(input["trigger"], "background_event");
+        assert!(input.get("current_user_message").is_none());
+        assert!(input.get("latest_user_message").is_none());
+        assert!(input.get("current_message_id").is_none());
+        assert_eq!(input["event_id"], id);
+        assert!(
+            !messages
+                .last()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .contains("晚安喵，你慢慢来")
+        );
+        let context: Value = serde_json::from_str(
+            messages[4]
+                .text
+                .as_deref()
+                .unwrap()
+                .split_once('：')
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert_eq!(context["latest_user_message"]["text"], "晚安喵，你慢慢来");
+    }
+    let messages = decision_messages(
+        "Eve".into(),
+        ContextSnapshot::default(),
+        json!({}),
+        vec![],
+        &event("foreground-input:live"),
+        "晚安喵，你慢慢来".into(),
+        1000,
+    );
+    let input: Value =
+        serde_json::from_str(messages.last().unwrap().text.as_deref().unwrap()).unwrap();
+    assert_eq!(input["trigger"], "user_input");
 }
 
 fn ready(store: &Store, event: &QqSpeechEvent) {
@@ -538,7 +604,8 @@ impl eve_llm_api::LlmProvider for DecisionProvider {
             let input: Value =
                 serde_json::from_str(request.messages.last().unwrap().text.as_deref().unwrap())
                     .unwrap();
-            assert_eq!(input["current_user_message"]["text"], "/help");
+            assert_eq!(input["trigger"], "background_event");
+            assert!(input.get("current_user_message").is_none());
             let answer = *self.answer.lock().unwrap();
             match answer {
                 ModelAnswer::Pending => std::future::pending().await,
