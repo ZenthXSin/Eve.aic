@@ -35,7 +35,7 @@ impl LlmProvider for Model {
                     calls: vec![ToolCall {
                         id: "learn".into(),
                         name: "experience_memory".into(),
-                        arguments: json!({"action":"save","id":"atlas","text":"atlas产物校验值nonce-837"}),
+                        arguments: json!({"action":"save","text":"atlas产物校验值nonce-837"}),
                     }],
                 });
             }
@@ -224,7 +224,7 @@ async fn run(
         .unwrap();
 }
 #[tokio::test]
-async fn actual_host_learns_shares_restarts_and_verifies_artifact_without_scope_leak() {
+async fn actual_host_saves_without_id_shares_restarts_and_verifies_artifact_without_scope_leak() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("artifact"), "nonce-837").unwrap();
     let (kernel, admin, registry, permissions) = world(root.path()).await;
