@@ -90,6 +90,11 @@ jobs:
         env:
           EVE_QQBOT_BINARY: target/debug/eve-qqbot
         run: python3 connectors/qqbot/test/free_exploration_test.py
+      - name: 实际恢复检查点、入站屏障与完整最小组合验收
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        env:
+          EVE_QQBOT_BINARY: target/debug/eve-qqbot
+        run: python3 -B connectors/qqbot/test/startup_checkpoint_test.py
       - name: 实际独立 Web 适配器切换、会话与身份验收
         if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
