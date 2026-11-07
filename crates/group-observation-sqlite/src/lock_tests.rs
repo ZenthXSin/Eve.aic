@@ -31,7 +31,10 @@ fn owner_drop_releases_lock_while_duplicate_descriptor_remains_open() {
 
     drop(store);
     let reopened = SqliteGroupObservations::open(&path).unwrap();
-    assert_eq!(reopened.recent("group-1", 10).unwrap(), [original.clone()]);
+    assert_eq!(
+        reopened.recent("group-1", 10).unwrap().as_slice(),
+        std::slice::from_ref(&original)
+    );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(
         SqliteGroupObservations::open(&path).err().as_deref(),
