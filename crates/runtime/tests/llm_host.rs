@@ -31,6 +31,212 @@ fn deferred_policy(retries: u32) -> eve_llm_api::DeferredReplyPolicy {
     }
 }
 
+fn full_window_policy() -> eve_llm_api::DeferredReplyPolicy {
+    eve_llm_api::DeferredReplyPolicy {
+        max_retries: 0,
+        initial_delay: Duration::from_secs(5),
+        max_delay: Duration::from_secs(30),
+        recovery_window: Duration::from_secs(600),
+    }
+}
+
+fn unavailable() -> LlmError {
+    LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(503).unwrap())
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_reply_window_recovers_after_five_failures_in_the_original_session_turn() {
+    let mut script = vec![Err(unavailable()); 5];
+    script.push(final_response("恢复后完整回答"));
+    let provider = RecordingProvider::scripted(script);
+    let (host, context, _, kernel) = make_host_with_registry(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            deferred_reply: Some(full_window_policy()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    kernel
+        .register(Box::new(eve_session_plugin::SessionPlugin::new().unwrap()))
+        .unwrap();
+    kernel
+        .start(&PluginId::new(eve_session_api::SESSION_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    let result = eve_runtime::SessionLlmHost::new(host, eve_runtime::SessionBinding::builtin())
+        .run_turn(eve_session_api::SessionInput {
+            key: eve_session_api::SessionKey::new("recovery", "user").unwrap(),
+            text: "等模型恢复后继续回答".into(),
+        })
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_secs(95) && elapsed < Duration::from_secs(96));
+    assert_eq!(result.output.text, "恢复后完整回答");
+    assert_eq!(result.output.diagnostics.provider_requests, 6);
+    assert_eq!(context.snapshots.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        result
+            .output
+            .transcript
+            .iter()
+            .filter(|message| message.role == ChatRole::User)
+            .count(),
+        1
+    );
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests.iter().all(|request| request == &requests[0]));
+        let expected = ModelSession::scoped(
+            "main",
+            &eve_llm_api::ContextScope {
+                session_id: "recovery".into(),
+                user_id: "user".into(),
+            },
+        )
+        .unwrap()
+        .with_turn(&result.turn_id.to_string())
+        .unwrap()
+        .for_request(1);
+        assert_eq!(requests[0].session, Some(expected));
+    }
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_reply_continuous_failure_waits_to_the_original_six_hundred_second_deadline() {
+    let provider = RecordingProvider::scripted(vec![Err(unavailable()); 64]);
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            deferred_reply: Some(full_window_policy()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    let failure = host.run_turn(turn()).await.unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_secs(600) && elapsed < Duration::from_secs(601));
+    assert_eq!(failure.error, unavailable());
+    let attempts = provider.requests.lock().unwrap().len();
+    assert!(attempts > 3 && attempts < 30, "退避保持有界请求频率");
+    assert_eq!(failure.diagnostics.provider_requests, attempts);
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(provider.requests.lock().unwrap().len(), attempts);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_reply_window_is_not_renewed_after_a_successful_tool_batch() {
+    let provider = RecordingProvider::scripted(vec![
+        Err(unavailable()),
+        tool_response(vec![call("once", "echo", json!({}))]),
+        Err(unavailable()),
+        final_response("不得重新开始恢复窗口"),
+    ]);
+    let mut tool = TestTool::new("echo", None, ToolMode::Echo);
+    tool.delay = Duration::from_secs(600);
+    let tool = Arc::new(tool);
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig {
+            deferred_reply: Some(full_window_policy()),
+            tool_timeout: Duration::from_secs(900),
+            ..Default::default()
+        },
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    let failure = host.run_turn(turn()).await.unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_secs(605) && elapsed < Duration::from_secs(606));
+    assert_eq!(failure.error, unavailable());
+    assert_eq!(failure.diagnostics.provider_requests, 3);
+    assert_eq!(failure.diagnostics.tool_results.len(), 1);
+    assert_eq!(tool.starts.lock().unwrap().len(), 1);
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_reply_window_deadline_drops_an_inflight_model_request() {
+    struct PendingRequest(Arc<AtomicBool>);
+    impl Drop for PendingRequest {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct PendingProvider {
+        requests: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+    }
+    impl LlmProvider for PendingProvider {
+        fn complete(&self, _: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+            if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async { Err(unavailable()) });
+            }
+            let guard = PendingRequest(self.dropped.clone());
+            Box::pin(async move {
+                let _guard = guard;
+                std::future::pending().await
+            })
+        }
+    }
+    let provider = Arc::new(PendingProvider {
+        requests: AtomicUsize::new(0),
+        dropped: Arc::new(AtomicBool::new(false)),
+    });
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            provider_timeout: Duration::from_secs(900),
+            deferred_reply: Some(full_window_policy()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    let failure = host.run_turn(turn()).await.unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_secs(600) && elapsed < Duration::from_secs(601));
+    assert_eq!(failure.error, LlmError::ProviderTimeout);
+    assert_eq!(failure.diagnostics.provider_requests, 2);
+    assert!(provider.dropped.load(Ordering::SeqCst));
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_reply_capped_backoff_allows_more_than_thirty_two_retries_without_overflow() {
+    let mut script = vec![Err(unavailable()); 64];
+    script.push(final_response("短退避仍可恢复"));
+    let provider = RecordingProvider::scripted(script);
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            deferred_reply: Some(eve_llm_api::DeferredReplyPolicy {
+                max_retries: 0,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                recovery_window: Duration::from_secs(1),
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    let output = host.run_turn(turn()).await.unwrap();
+    assert_eq!(output.text, "短退避仍可恢复");
+    assert_eq!(provider.requests.lock().unwrap().len(), 65);
+}
+
 #[tokio::test]
 async fn deferred_reply_keeps_tool_receipts_and_retries_only_the_failed_model_request() {
     let provider = RecordingProvider::scripted(vec![
@@ -211,7 +417,7 @@ async fn deferred_reply_cancellation_stops_backoff_without_another_model_request
         Err(LlmError::ProviderTimeout),
         final_response("不应请求"),
     ]);
-    let mut policy = deferred_policy(3);
+    let mut policy = deferred_policy(0);
     policy.initial_delay = Duration::from_millis(500);
     policy.max_delay = policy.initial_delay;
     let (host, _, _) = make_host(
@@ -1487,7 +1693,7 @@ impl Plugin for EmptyPlugin {
 }
 
 async fn make_host(
-    provider: Arc<RecordingProvider>,
+    provider: Arc<dyn LlmProvider>,
     tools: Vec<Arc<TestTool>>,
     config: LlmHostConfig,
 ) -> (LlmHost, Arc<CountingContext>, Vec<Arc<TestTool>>) {
@@ -1496,7 +1702,7 @@ async fn make_host(
 }
 
 async fn make_host_with_registry(
-    provider: Arc<RecordingProvider>,
+    provider: Arc<dyn LlmProvider>,
     tools: Vec<Arc<TestTool>>,
     mut config: LlmHostConfig,
     registry_override: Option<Arc<dyn ServiceRegistry>>,

@@ -37,7 +37,7 @@ pub(crate) fn schema() -> ConfigSchema {
             ),
             (
                 "max_retries".into(),
-                integer(3, 1, 8, "EVE_DEFERRED_REPLY_MAX_RETRIES"),
+                integer(0, 0, 8, "EVE_DEFERRED_REPLY_MAX_RETRIES"),
             ),
             (
                 "initial_delay_ms".into(),

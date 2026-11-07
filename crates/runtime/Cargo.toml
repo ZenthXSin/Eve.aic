@@ -29,6 +29,6 @@ eve-llm-openai = { path = "../llm-openai" }
 eve-session-plugin = { path = "../session-plugin" }
 eve-control-plugin = { path = "../control-plugin" }
 eve-message-plugin = { path = "../message-plugin" }
-tokio = { workspace = true, features = ["net", "io-util", "io-std"] }
+tokio = { workspace = true, features = ["net", "io-util", "io-std", "test-util"] }
 eve-cognition-plugin = { path = "../cognition-plugin" }
 eve-cognition-loop-plugin = { path = "../cognition-loop-plugin" }
