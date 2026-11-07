@@ -83,7 +83,7 @@ impl QqReceiptArchive for Archive {
             let outcome = gate.outcome.lock().unwrap();
             let (outcome, waited) = gate
                 .changed
-                .wait_timeout_while(outcome, Duration::from_secs(3), |(ready, _)| !ready)
+                .wait_timeout_while(outcome, Duration::from_secs(3), |(ready, _)| !*ready)
                 .unwrap();
             if waited.timed_out() || !outcome.0 || !outcome.1 {
                 return Err(PluginError::State("领取后的确定性收尾闸门失败".into()));
