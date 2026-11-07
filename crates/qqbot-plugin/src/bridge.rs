@@ -1060,6 +1060,10 @@ fn failure_reason(failure: ProviderFailure) -> String {
 fn explicit(text: &str) -> bool {
     text.lines().any(|line| line.trim_start().starts_with('/'))
 }
+/// 在线准入和旧回执恢复共用消息形态筛选；正文规则、启停与去重仍由训练服务处理。
+fn expression_input(message: &Message) -> bool {
+    message.attachments.is_empty() && !explicit(&message.text)
+}
 /// 只抢占无需模型判断且参数完整的任务改动；未知、冲突、缺少可信引用的
 /// /answer 等交给公开路由器处理，不让一段看似命令的文字取消在途判断。
 fn preempts_natural(text: &str, training: bool) -> bool {
@@ -1335,7 +1339,7 @@ pub(crate) fn restore_saved_receipts(
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = training {
         for entry in &ledger.entries {
-            if entry.app_id != app {
+            if entry.app_id != app || !expression_input(&entry.message) {
                 continue;
             }
             let session = entry.message.session_key(app)?;
@@ -3288,7 +3292,7 @@ pub(crate) async fn run(
                                 } else {
                                     // 按普通输入准入时的持久开关采集，不能延后到模型执行。
                                     // 启停/重置可先于排队任务执行；旧输入必须已有去重凭据。
-                                    if message.attachments.is_empty() && let Some(training) = &training {
+                                    if expression_input(&message) && let Some(training) = &training {
                                         let session = message.session_key(&config.app_id)?;
                                         let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
                                         if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
@@ -3471,6 +3475,10 @@ pub(crate) async fn run(
 #[cfg(test)]
 #[path = "authored_tests.rs"]
 mod authored_tests;
+
+#[cfg(test)]
+#[path = "expression_intake_tests.rs"]
+mod expression_intake_tests;
 
 #[cfg(test)]
 mod tests {
