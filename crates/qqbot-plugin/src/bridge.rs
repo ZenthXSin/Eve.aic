@@ -2435,10 +2435,8 @@ pub(crate) async fn run(
                     if let Some(window)=foreground_windows.get_mut(&ready.event.anchor) {window.remaining-=1;}
                     // 领取后主轮可以消费输入并恢复工作，不能据此撤销已经交接的即时交流。
                     // 取消或新的原话仍使尚未写出的操作失效。
-                    let cancelled=!control.snapshot(&claimed_key.session).is_ok_and(|snapshot|snapshot.is_some_and(|s|
-                        s.key==claimed_key && s.turn_id==Some(claimed_turn) && !s.cancel_requested && !s.events_retired
-                        && !matches!(s.phase,ControlPhase::Cancelling|ControlPhase::Finished|ControlPhase::Blocked)))
-                        || !conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false);
+                    let cancelled=!conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false)
+                        || !foreground_speech::claimed_reply_is_current(control.as_ref(),&claimed_key,claimed_turn);
                     if cancelled {
                         speaker.delivered(&ready.event,QqOutreachResult::NotSent)?;
                         claim.complete(eve_llm_api::InputReplyDelivery::NotSent)?;

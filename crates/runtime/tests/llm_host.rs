@@ -669,12 +669,16 @@ async fn verified_legacy_gap_can_query_only_host_selected_tools_without_fabricat
 struct MemoryJournal {
     frame: Mutex<Option<eve_llm_api::TurnCheckpoint>>,
     fail_before_tools: AtomicBool,
+    loads: AtomicUsize,
+    saves: AtomicUsize,
 }
 impl eve_llm_api::TurnJournal for MemoryJournal {
     fn load(&self) -> Result<Option<eve_llm_api::TurnCheckpoint>, LlmError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
         Ok(self.frame.lock().unwrap().clone())
     }
     fn save(&self, frame: &eve_llm_api::TurnCheckpoint) -> Result<(), LlmError> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
         if !frame.pending_calls.is_empty() && self.fail_before_tools.load(Ordering::SeqCst) {
             return Err(LlmError::Context("检查点写入失败".into()));
         }
@@ -3142,6 +3146,7 @@ async fn input_handoff_keeps_original_work_and_terminal_receipts_only_reach_natu
     assert_eq!(output.text, "源码检查完成");
     assert_eq!(output.diagnostics.started_tools, 1);
     assert_eq!(output.diagnostics.tool_results[0].call_id, "current");
+    assert_eq!(output.diagnostics.input_replies, vec![sent.clone()]);
     assert_eq!(
         *recorded.lock().unwrap(),
         [vec!["检查源码".to_string(), sending.input_text.clone()]]
@@ -3239,7 +3244,7 @@ async fn terminal_handoff_alone_never_reopens_a_finished_turn() {
                 },
                 SteeringUpdate {
                     batch: SteeringBatch::default(),
-                    input_replies: vec![input_handoff(delivery)],
+                    input_replies: vec![input_handoff(delivery.clone())],
                 },
             ]));
         let output = eve_runtime::SessionLlmHost::new(host, eve_runtime::SessionBinding::builtin())
@@ -3256,9 +3261,143 @@ async fn terminal_handoff_alone_never_reopens_a_finished_turn() {
         assert_eq!(output.text, "本轮自然结束");
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
         assert_eq!(output.diagnostics.started_tools, 0);
+        assert_eq!(
+            output.diagnostics.input_replies,
+            vec![input_handoff(delivery)]
+        );
         assert!(output.transcript.iter().all(|m| m.role != ChatRole::System));
         kernel.stop_all().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn input_handoff_survives_original_source_failure_after_atomic_consumption() {
+    struct BrokenOriginals;
+    impl eve_llm_api::ReviewUserMessageSource for BrokenOriginals {
+        fn read(&self, _: &eve_llm_api::ContextScope) -> Result<Option<Vec<String>>, LlmError> {
+            Ok(Some(vec!["继续工作".into()]))
+        }
+        fn read_at(
+            &self,
+            _: &eve_llm_api::ContextScope,
+            _: &str,
+        ) -> Result<Option<Vec<String>>, LlmError> {
+            Err(LlmError::Context("原文存储读取失败".into()))
+        }
+    }
+    let provider = RecordingProvider::scripted(vec![final_response("不应请求")]);
+    let (host, _, _, kernel) =
+        make_host_with_registry(provider.clone(), vec![], LlmHostConfig::default(), None).await;
+    kernel
+        .register(Box::new(eve_session_plugin::SessionPlugin::new().unwrap()))
+        .unwrap();
+    kernel
+        .start(&PluginId::new(eve_session_api::SESSION_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let handoff = input_handoff(eve_llm_api::InputReplyDelivery::Sending);
+    let host = host
+        .with_review_user_message_source(Arc::new(BrokenOriginals))
+        .with_steering(handoff_steering(vec![eve_llm_api::SteeringUpdate {
+            batch: eve_llm_api::SteeringBatch {
+                messages: vec![handoff.input_text.clone()],
+                review_anchor: Some(handoff.input_message_id.clone()),
+            },
+            input_replies: vec![handoff.clone()],
+        }]));
+    let result = eve_runtime::SessionLlmHost::new(host, eve_runtime::SessionBinding::builtin())
+        .run_turn(eve_session_api::SessionInput {
+            key: eve_session_api::SessionKey::new("s", "u").unwrap(),
+            text: "继续工作".into(),
+        })
+        .await;
+    let eve_runtime::SessionRunError::Turn(failure) = result.unwrap_err() else {
+        panic!("应保存真实上下文失败");
+    };
+    assert_eq!(failure.error, LlmError::Context("原文存储读取失败".into()));
+    assert_eq!(failure.diagnostics.input_replies, vec![handoff]);
+    assert_eq!(
+        failure.diagnostics.review_user_messages,
+        Some(vec!["继续工作".into()])
+    );
+    assert!(provider.requests.lock().unwrap().is_empty());
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn journal_with_input_handoff_rejects_a_session_before_loading_but_allows_independent_work() {
+    struct UnopenedSteering;
+    impl eve_llm_api::TurnSteeringSource for UnopenedSteering {
+        fn open(
+            &self,
+            _: &eve_llm_api::ContextScope,
+            _: u64,
+        ) -> Result<Arc<dyn eve_llm_api::TurnSteering>, LlmError> {
+            panic!("不支持的组合不能消费实时输入；独立任务没有 turn_id")
+        }
+    }
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("once", "echo", json!({}))]),
+        final_response("独立任务正常完成"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, context, _, kernel) = make_host_with_registry(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig::default(),
+        None,
+    )
+    .await;
+    kernel
+        .register(Box::new(eve_session_plugin::SessionPlugin::new().unwrap()))
+        .unwrap();
+    kernel
+        .start(&PluginId::new(eve_session_api::SESSION_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let journal = Arc::new(MemoryJournal::default());
+    let host = host
+        .with_turn_journal(journal.clone())
+        .with_steering(Arc::new(UnopenedSteering));
+    host.run_scoped_turn_with_events(
+        turn(),
+        Some(eve_llm_api::ContextScope {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        }),
+        &ProgressRecorder::default(),
+    )
+    .await
+    .unwrap();
+    let before = serde_json::to_vec(&*journal.frame.lock().unwrap()).unwrap();
+    let loads = journal.loads.load(Ordering::SeqCst);
+    let saves = journal.saves.load(Ordering::SeqCst);
+    let result = eve_runtime::SessionLlmHost::new(host, eve_runtime::SessionBinding::builtin())
+        .run_turn(eve_session_api::SessionInput {
+            key: eve_session_api::SessionKey::new("s", "u").unwrap(),
+            text: "不支持的组合".into(),
+        })
+        .await;
+    let eve_runtime::SessionRunError::Turn(failure) = result.unwrap_err() else {
+        panic!("应在执行前报告配置错误");
+    };
+    assert!(matches!(failure.error, LlmError::Configuration(_)));
+    assert_eq!(failure.diagnostics.provider_requests, 0);
+    assert_eq!(failure.diagnostics.started_tools, 0);
+    assert_eq!(journal.loads.load(Ordering::SeqCst), loads);
+    assert_eq!(journal.saves.load(Ordering::SeqCst), saves);
+    assert_eq!(
+        serde_json::to_vec(&*journal.frame.lock().unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(tool.starts.lock().unwrap().len(), 1);
+    assert_eq!(context.snapshots.load(Ordering::SeqCst), 1);
+    kernel.stop_all().await.unwrap();
 }
 
 #[tokio::test]

@@ -177,6 +177,26 @@ impl ForegroundInput {
     }
 }
 
+/// 已持久领取后，业务自然结束不会撤销即时交流；真实取消、退役和换代仍撤销。
+pub(super) fn claimed_reply_is_current(
+    control: &dyn ControlService,
+    key: &GenerationKey,
+    turn_id: u64,
+) -> bool {
+    control.snapshot(&key.session).is_ok_and(|snapshot| {
+        snapshot.is_some_and(|state| {
+            state.key == *key
+                && state.turn_id == Some(turn_id)
+                && !state.cancel_requested
+                && !state.events_retired
+                && !matches!(
+                    state.phase,
+                    ControlPhase::Cancelling | ControlPhase::Blocked
+                )
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
