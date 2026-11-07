@@ -130,12 +130,11 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         kernel
             .start(&PluginId::new(eve_context_api::CONTEXT_PLUGIN_ID)?)
             .await?;
-        bootstrap
-            .tools
-            .push(Arc::new(crate::context_notes::NotesTool {
-                admin: notes.clone(),
-                binding: crate::context_notes::NoteBinding::Web,
-            }));
+        let exploration_notes = Arc::new(crate::context_notes::NotesTool {
+            admin: notes.clone(),
+            binding: crate::context_notes::NoteBinding::Web,
+        });
+        bootstrap.tools.push(exploration_notes.clone());
         bootstrap.context = Some(Arc::new(crate::context_notes::NotesContext {
             channel: "web",
             inner: bootstrap
@@ -153,6 +152,7 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
             &mut bootstrap,
             &options.state_directory,
             health.clone(),
+            exploration_notes,
         )
         .await?;
         stage.complete();

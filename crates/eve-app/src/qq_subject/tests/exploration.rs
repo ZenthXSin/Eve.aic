@@ -667,7 +667,27 @@ async fn old_half_committed_context_survives_restart_and_later_mind_changes_byte
     drop(f);
 
     let f = open(root.path()).await;
-    dispatch(&f, focus(&f, &scope, &draft.id), at + 3).unwrap();
+    // 故意提供已停用的便笺句柄；找回半提交任务不能尝试读取当前便笺。
+    let notes_plugin = eve_context_plugin::ContextPlugin::new(Arc::new(
+        eve_context_plugin::FileContextArchive::open(root.path().join("unused-notes")).unwrap(),
+    ))
+    .unwrap();
+    let unavailable_notes = crate::context_notes::NotesTool {
+        admin: Arc::new(notes_plugin.controller()),
+        binding: crate::context_notes::NoteBinding::Qq(Default::default()),
+    };
+    let restore = |at| {
+        dispatch_focus_live(
+            &(f.subject.clone() as Arc<dyn SubjectAdmin>),
+            &(f.tasks.clone() as Arc<dyn TaskAdmin>),
+            &(Arc::new(Owner) as Arc<dyn AutonomyOwner>),
+            None,
+            Some(&unavailable_notes),
+            focus(&f, &scope, &draft.id),
+            at,
+        )
+    };
+    restore(at + 3).unwrap();
     assert_eq!(
         focus(&f, &scope, &draft.id).task_id.as_deref(),
         Some(task.id.as_str())
@@ -677,7 +697,7 @@ async fn old_half_committed_context_survives_restart_and_later_mind_changes_byte
         Some(task.clone())
     );
     // 已补关联的第二次扫描也不能用新兴趣重新生成原 spec。
-    dispatch(&f, focus(&f, &scope, &draft.id), at + 4).unwrap();
+    restore(at + 4).unwrap();
     assert_eq!(
         f.tasks.get_owned(&task.owner, &task.id).unwrap(),
         Some(task)

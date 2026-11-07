@@ -35,6 +35,7 @@ fn public_tool(name: &str) -> bool {
             | "wait_for_input"
             | "clear_context"
             | "context_notes"
+            | "read_exploration"
             | "save_preference"
             | "read_attachment"
             | "describe_image"
