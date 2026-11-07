@@ -2083,6 +2083,7 @@ fn dispatch_focus_live(
             &input,
             crate::qq_exploration::recent_evidence(subject, &focus.scope, 3)?,
             owner.clone(),
+            &crate::idle_loop::current_mind(subject, &snapshot, &focus.scope)?,
         )?;
         let created = tasks.create_exploration(
             &owner,
