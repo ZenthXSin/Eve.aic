@@ -7,6 +7,7 @@ use tokio::time::Instant;
 pub(crate) struct DeferredReply {
     used: u32,
     deadline: Option<Instant>,
+    last_delay: Option<Duration>,
 }
 
 impl DeferredReply {
@@ -20,19 +21,22 @@ impl DeferredReply {
                 failure.kind == ProviderFailureKind::Network
                     || matches!(failure.http_status, Some(408 | 429 | 500 | 502 | 503 | 504))
             });
-        if !transient || self.used >= policy.max_retries {
+        if !transient || (policy.max_retries != 0 && self.used >= policy.max_retries) {
             return None;
         }
         let now = Instant::now();
         let deadline = *self.deadline.get_or_insert(now + policy.recovery_window);
-        let delay = policy
-            .initial_delay
-            .saturating_mul(1 << self.used)
-            .min(policy.max_delay);
-        if deadline.saturating_duration_since(now) <= delay {
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
             return None;
         }
-        self.used += 1;
-        Some((self.used, delay, deadline))
+        let delay = self
+            .last_delay
+            .map_or(policy.initial_delay, |delay| delay.saturating_mul(2))
+            .min(policy.max_delay);
+        self.last_delay = Some(delay);
+        self.used = self.used.saturating_add(1);
+        // 最后一段等待仍保留原轮次到截止，宿主到点结束，不能再发出模型请求。
+        Some((self.used, delay.min(remaining), deadline))
     }
 }
