@@ -23,14 +23,23 @@ const bridge = createBridge(bot, frame => {
   process.stdout.write(JSON.stringify(frame) + "\n");
 });
 handlers.get("ready")();
-handlers.get("message")({}, {
+const incoming = {
   kind: "c2c", messageId: "failed-input", senderId: "alice", content: "核对错误后通知",
   replyTarget: {scope: "c2c", targetId: "alice", msgId: "failed-input"},
-});
+};
+handlers.get("message")({}, incoming);
+let repeated = false;
 const input = readline.createInterface({input: process.stdin});
 for await (const line of input) {
   const frame = JSON.parse(line);
   record({direction: "host", ...frame});
   await bridge.command(frame);
+  if (frame.type === "finish" && outcome === "silent") {
+    record({type: "finished", id: frame.id});
+    if (!repeated) {
+      repeated = true;
+      handlers.get("message")({}, incoming);
+    }
+  }
   if (frame.type === "stop") break;
 }

@@ -68,6 +68,10 @@ pub trait QqSlowProgress: Send + Sync {
     fn tool_milestones(&self) -> bool {
         false
     }
+    /// 实时模式是否直接投递固定故障通知；默认关闭，不影响失败保存与后台恢复。
+    fn failure_notices(&self) -> bool {
+        false
+    }
 }
 
 /// 连发消息的等待窗口：同一会话里同一人连发的纯文字，在窗口内到达的合成一轮回复。

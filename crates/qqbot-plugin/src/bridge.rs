@@ -2900,6 +2900,12 @@ pub(crate) async fn run(
                                 }
                             }
                         });
+                        if live_dialogue.is_some() && !slow_progress.as_ref().is_some_and(|policy| policy.failure_notices()) {
+                            // 关闭的只是固定话术；保留原 Control 结果及独立发言回执，再释放输入。
+                            mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
+                            finish(&mut stdin, &current.message.id).await?;
+                            continue;
+                        }
                         replies.push_back(Reply { message: current.message,
                             text: format!("系统通知：{}", failed_turn_notice(&report, recovery.as_deref())), guard: ReplyGuard::Failure(report.key),
                             interaction: None, invite: None });

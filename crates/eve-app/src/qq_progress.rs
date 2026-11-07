@@ -22,6 +22,8 @@ pub(crate) fn schema() -> ConfigSchema {
     milestones.environment = Some("EVE_PROGRESS_TOOL_MILESTONES".into());
     let mut stages = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
     stages.environment = Some("EVE_PROGRESS_STAGE_UPDATES".into());
+    let mut failures = ConfigField::new(ConfigKind::Boolean, Some(json!(false)));
+    failures.environment = Some("EVE_PROGRESS_FAILURE_NOTICES".into());
     let mut interval = ConfigField::new(
         ConfigKind::Integer {
             minimum: Some(1000),
@@ -37,6 +39,7 @@ pub(crate) fn schema() -> ConfigSchema {
             ("slow_after_ms".into(), field),
             ("tool_milestones".into(), milestones),
             ("stage_updates".into(), stages),
+            ("failure_notices".into(), failures),
             ("min_interval_ms".into(), interval),
         ]),
     }
@@ -71,6 +74,14 @@ impl eve_qqbot_plugin::QqSlowProgress for SlowProgress {
             .get()
             .and_then(|settings| settings.snapshot(NAMESPACE, 1).ok())
             .and_then(|snapshot| snapshot.get("tool_milestones").ok())
+            .unwrap_or(false)
+    }
+
+    fn failure_notices(&self) -> bool {
+        self.settings
+            .get()
+            .and_then(|settings| settings.snapshot(NAMESPACE, 1).ok())
+            .and_then(|snapshot| snapshot.get("failure_notices").ok())
             .unwrap_or(false)
     }
 
