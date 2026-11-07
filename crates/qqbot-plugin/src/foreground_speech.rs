@@ -143,6 +143,25 @@ impl ForegroundInput {
         activity: &ForegroundActivity,
         control: &dyn ControlService,
     ) -> bool {
+        self.activity_is_current(activity, control)
+            && live
+                .pending_anchor(
+                    &ContextScope {
+                        session_id: self.key.session.session_id.clone(),
+                        user_id: self.key.session.user_id.clone(),
+                    },
+                    self.turn_id,
+                )
+                .as_deref()
+                == Some(&self.event.anchor)
+    }
+
+    /// 领取输入的临界区已经持有 LiveDialogue 的输入锁，不能再递归读取 pending_anchor。
+    pub(super) fn activity_is_current(
+        &self,
+        activity: &ForegroundActivity,
+        control: &dyn ControlService,
+    ) -> bool {
         activity
             .current(&self.key, self.turn_id)
             .is_some_and(|batch| batch.version == self.batch)
@@ -155,16 +174,6 @@ impl ForegroundInput {
                         && !s.events_retired
                 })
             })
-            && live
-                .pending_anchor(
-                    &ContextScope {
-                        session_id: self.key.session.session_id.clone(),
-                        user_id: self.key.session.user_id.clone(),
-                    },
-                    self.turn_id,
-                )
-                .as_deref()
-                == Some(&self.event.anchor)
     }
 }
 

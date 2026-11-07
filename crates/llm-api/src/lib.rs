@@ -47,7 +47,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-pub use steering::{SteeringBatch, TurnSteering, TurnSteeringSource};
+pub use steering::{
+    InputReplyDelivery, InputReplyHandoff, SteeringBatch, SteeringUpdate, TurnSteering,
+    TurnSteeringSource,
+};
 pub use usage::{ModelUsage, ModelUsageObserver, PrefixReuse};
 
 pub type LlmFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LlmError>> + Send + 'a>>;

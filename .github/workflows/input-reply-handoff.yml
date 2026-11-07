@@ -1,0 +1,42 @@
+name: 同一输入交流交接回归
+
+on:
+  push:
+    branches: [codex/live-speech-receipt-context-20261107]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: input-reply-handoff-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  handoff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.0'
+      - name: 安装检查组件
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: 检查格式与受影响契约
+        run: |
+          cargo +stable fmt -- --check
+          cargo +stable clippy -p eve-llm-api -p eve-runtime -p eve-qqbot-plugin --all-targets --locked -- -D warnings
+      - name: 验证输入原子交接与自然模型请求
+        run: |
+          cargo +stable test -p eve-llm-api --lib steering::tests --locked -- --nocapture
+          cargo +stable test -p eve-qqbot-plugin --lib live::tests --locked -- --nocapture
+          cargo +stable test -p eve-runtime --test llm_host handoff --locked -- --nocapture
+      - name: 验证真实通道与长工具进程竞争
+        run: cargo +stable test -p eve-qqbot-plugin --test live_foreground_speech --locked -- --nocapture
