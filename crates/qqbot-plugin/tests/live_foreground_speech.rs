@@ -40,6 +40,7 @@ struct ClaimGate {
     directory: PathBuf,
     claimed: AtomicBool,
     crossed: AtomicBool,
+    completed_before_check: AtomicBool,
     changed: std::sync::Condvar,
     outcome: Mutex<(bool, bool)>,
 }
@@ -78,14 +79,20 @@ impl QqReceiptArchive for Archive {
             && gate.claimed.load(Ordering::SeqCst)
             && !gate.crossed.swap(true, Ordering::SeqCst)
         {
-            // 主轮只能在领取锁释放后消费；最后的原话核对让另一执行线程完成精确竞态。
-            std::fs::write(gate.directory.join("release-tool"), b"release").unwrap();
-            let outcome = gate.outcome.lock().unwrap();
-            let (outcome, waited) = gate
-                .changed
-                .wait_timeout_while(outcome, Duration::from_secs(3), |(ready, _)| !*ready)
-                .unwrap();
-            if waited.timed_out() || !outcome.0 || !outcome.1 {
+            // 这是同步存档接口；先让出 Tokio 核心，子进程回收和控制任务才能继续。
+            // 主轮只能在领取锁释放后消费；最后的原话核对前必须完成指定控制转移。
+            let completed = tokio::task::block_in_place(|| {
+                std::fs::write(gate.directory.join("release-tool"), b"release").unwrap();
+                let outcome = gate.outcome.lock().unwrap();
+                let (outcome, waited) = gate
+                    .changed
+                    .wait_timeout_while(outcome, Duration::from_secs(3), |(ready, _)| !*ready)
+                    .unwrap();
+                !waited.timed_out() && outcome.0 && outcome.1
+            });
+            gate.completed_before_check
+                .store(completed, Ordering::SeqCst);
+            if !completed {
                 return Err(PluginError::State("领取后的确定性收尾闸门失败".into()));
             }
         }
@@ -449,6 +456,7 @@ async fn scenario(mode: Scenario) {
             directory: directory.path().into(),
             claimed: AtomicBool::new(false),
             crossed: AtomicBool::new(false),
+            completed_before_check: AtomicBool::new(false),
             changed: std::sync::Condvar::new(),
             outcome: Mutex::new((false, false)),
         })
@@ -711,6 +719,12 @@ async fn scenario(mode: Scenario) {
     }
     if let Some(race) = race {
         race.await.unwrap();
+    }
+    if let Some(gate) = &gate {
+        assert!(
+            gate.completed_before_check.load(Ordering::SeqCst),
+            "闸门必须在桥最终核对前完成，超时不能伪装成正常撤销"
+        );
     }
     assert_eq!(observed.runs.load(Ordering::SeqCst), 1);
     assert_eq!(
