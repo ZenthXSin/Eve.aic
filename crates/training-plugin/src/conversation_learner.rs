@@ -40,6 +40,13 @@ impl ConversationLearner for ModelConversationLearner {
             if data.len() > MAX_CONVERSATION_PROMPT_BYTES {
                 return Err(LlmError::Context("交流学习批次超过容量；不裁剪依据".into()));
             }
+            let prompt = if batch.id.starts_with("conversation-revisit-v2-") {
+                format!(
+                    "{PROMPT}\n本批是用户明确要求的历史重访。messages 按可证来源顺序排列，metadata.sequence 仍是原持久序号，不按它重新排序；ordering_uncertain=true或缺少同源可比时间表示只知部分先后关系，不把数组相邻当成真人对Eve的纠正/反例，也不补全未知顺序。旧证据可以用于重新理解并修正已有原则，优先填写已有 lesson_id，不把重读旧话当新支持。没有不同认识仍返回空列表。"
+                )
+            } else {
+                PROMPT.to_owned()
+            };
             let selection = self.resolver.resolve()?;
             let response = tokio::time::timeout(
                 selection.provider_timeout,
@@ -50,7 +57,7 @@ impl ConversationLearner for ModelConversationLearner {
                             .for_request(u64::from(batch.attempt)),
                     ),
                     messages: vec![
-                        ChatMessage::text(ChatRole::System, PROMPT),
+                        ChatMessage::text(ChatRole::System, prompt),
                         ChatMessage::text(ChatRole::User, data),
                     ],
                     tools: vec![],

@@ -38,6 +38,7 @@ SUITES = (
     ("live-dialogue", QQ + "live_dialogue_test.py"),
     ("natural-progress", QQ + "natural_progress_test.py"),
     ("conversation-learning", QQ + "conversation_learning_test.py"),
+    ("conversation-history-maintenance", QQ + "conversation_history_maintenance_test.py"),
     ("message-learning-flow", QQ + "message_learning_flow_test.py"),
     ("speech-event-context", QQ + "speech_event_context_test.py"),
     ("health-watch", QQ + "health_watch_test.py"),

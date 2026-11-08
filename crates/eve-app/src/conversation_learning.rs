@@ -1,5 +1,6 @@
 //! QQ/Web 共用的交流学习组合；只在后台做无工具分析，前台读取持久经验。
 use crate::AppError;
+mod maintenance;
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
 };
@@ -147,6 +148,17 @@ impl Background {
         learner: Arc<dyn ConversationLearner>,
         gate: crate::qq_budget::Gate,
     ) -> Self {
+        Self::start_with_maintenance(training, learner, gate, None, None)
+    }
+    pub(crate) fn start_with_maintenance(
+        training: Arc<dyn TrainingService>,
+        learner: Arc<dyn ConversationLearner>,
+        gate: crate::qq_budget::Gate,
+        directory: Option<std::path::PathBuf>,
+        maintenance_learner: Option<Arc<dyn ConversationLearner>>,
+    ) -> Self {
+        let mut maintenance = directory.map(maintenance::Maintenance::new);
+        let mut maintenance_error: Option<String> = None;
         let (active, mut activation) = watch::channel(false);
         let (stop, mut stopped) = watch::channel(false);
         let (done, finished) = watch::channel(false);
@@ -157,8 +169,26 @@ impl Background {
                 }
                 loop {
                     if *stopped.borrow() { return Ok(()); }
-                    if gate.admits_category(crate::qq_budget::CONVERSATION_LEARNING, 1)?
-                        && let Some(batch) = training.take_conversation_batch(crate::qq_tasks::now_ms())? {
+                    if let Some(maintenance) = &mut maintenance {
+                        if let Err(error) = maintenance.tick(training.as_ref(), &stopped).await {
+                            let error = error.to_string();
+                            if maintenance_error.as_ref() != Some(&error) {
+                                eprintln!("EVE_CONVERSATION_MAINTENANCE {}", serde_json::json!({"outcome":"unavailable","reason":error}));
+                                maintenance_error = Some(error);
+                            }
+                        } else { maintenance_error = None; }
+                    }
+                    if *stopped.borrow() { return Ok(()); }
+                    let maintenance_batch = if maintenance_learner.is_some() && maintenance.as_ref().is_some_and(|m| m.ready()) {
+                        training.take_conversation_maintenance_batch(crate::qq_tasks::now_ms(), 4096)?
+                    } else { None };
+                    let is_maintenance = maintenance_batch.is_some();
+                    let batch = if is_maintenance { maintenance_batch }
+                        else if gate.admits_category(crate::qq_budget::CONVERSATION_LEARNING, 1)? {
+                            training.take_conversation_batch(crate::qq_tasks::now_ms())?
+                        } else { None };
+                    if let Some(batch) = batch {
+                        let learner = if is_maintenance { maintenance_learner.as_ref().expect("maintenance learner") } else { &learner };
                         // 批次号只在当前范围递增；沿用学习请求的稳定匿名会话键，避免跨范围同号误判为重放。
                         let scope_hash = eve_llm_api::ModelSession::scoped("conversation-learning", &batch.scope)?
                             .session_id().to_owned();

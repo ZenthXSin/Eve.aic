@@ -1,4 +1,5 @@
 """真实 Eve 进程：长工具期间自主决定说话；只使用本地模型、QQ 与临时工作区。"""
+import hashlib
 import json
 import sys
 import time
@@ -121,25 +122,30 @@ class NaturalProgressAcceptance(live.LiveToolAcceptance):
                 if delegated and not leaf:
                     return self.choose('run_subagent', {
                         'agent_id': 'coding', 'include_context': True, 'max_steps': 4,
-                        'task': '在当前临时工作区运行 gated-check.py，等待真实完成并核验退出状态。',
+                        'task': '在当前临时工作区运行 gated-check.py，等待真实完成，再读取 completed-once.txt 核验产物。',
                         'verification': {'kind': 'receipts', 'contract': {'checks': [{
-                            'tool': 'run_command', 'arguments': self.command,
-                            'output_pointer': '/exit_code', 'expected': 0,
+                            'tool': 'read_file', 'arguments': {'path': 'completed-once.txt'},
+                            'output_pointer': '/sha256',
+                            'expected': hashlib.sha256(b'x').hexdigest(),
                         }], 'require_final_batch': True}},
                     })
                 return self.choose('run_command', self.command)
             if leaf:
                 self.assertEqual(body['model'], 'local-coding-fixture')
-                self.assertTrue(results[-1]['success'], results[-1])
-                self.assertIn('ACTUAL_ISOLATED_CHECK_PASSED', results[-1]['stdout'])
+                if len(results) == 1:
+                    self.assertTrue(results[-1]['success'], results[-1])
+                    self.assertIn('ACTUAL_ISOLATED_CHECK_PASSED', results[-1]['stdout'])
+                    return self.choose('read_file', {'path': 'completed-once.txt'})
+                self.assertEqual(results[-1]['content'], 'x')
+                self.assertEqual(results[-1]['sha256'], hashlib.sha256(b'x').hexdigest())
                 return dialogue.text_response('隔离检查已实际执行通过。')
-            self.assertEqual(self.executions.read_text(), 'x')
             if delegated:
                 self.assertTrue(results[-1]['completed'], results[-1])
                 self.assertEqual(results[-1]['usage']['agent_id'], 'coding')
-                self.assertEqual(results[-1]['usage']['steps_used'], 1)
+                self.assertEqual(results[-1]['usage']['steps_used'], 2)
             else:
                 self.assertTrue(results[-1]['success'], results[-1])
+            self.assertEqual(self.executions.read_text(), 'x')
             if expected_delivery:
                 handoff = self.handoffs(body)
                 self.assertTrue(handoff, '主轮继续时必须收到自然发言的真实投递状态')
@@ -177,7 +183,7 @@ class NaturalProgressAcceptance(live.LiveToolAcceptance):
         ], checkpoints={'delivered-while-running': delivered_while_running})
         self.assertIsNotNone(self.completed_main)
         self.assertEqual(len(self.main_requests), 2)
-        self.assertEqual(len(self.child_requests), 2)
+        self.assertEqual(len(self.child_requests), 3)
         self.assertEqual([event['text'] for event in self.outbound_progress()], [PROGRESS_TEXT])
         self.assertEqual(len(self.progress_rows()), 1)
         self.assertEqual(len(self.speech_requests), 1, '同一批工具不得不断触发发言判断')
