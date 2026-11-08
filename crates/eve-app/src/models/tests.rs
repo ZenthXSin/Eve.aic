@@ -353,6 +353,11 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         ])
         .await;
         let h = Harness::start(root.path(), &server.url, protocol).await;
+        // 显式设置首轮强度，验证工具往返冻结该值，下一轮才采用在途中保存的 omit。
+        h.update(
+            &[(config::OPENAI_NAMESPACE, "reasoning_effort", json!("low"))],
+            ApplyMode::Immediate,
+        );
         let gate = Arc::new(ToolGate::default());
         let first = h.submit("first", gate.clone());
         let request = server.next().await;
