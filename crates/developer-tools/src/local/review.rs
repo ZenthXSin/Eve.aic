@@ -142,7 +142,7 @@ impl LocalDeveloper {
         Ok(())
     }
 
-    /// 仅具体系统危险触发模型审查；身份、路径、回执与候选完整性仍由宿主核对。
+    /// 仅非主人的具体系统危险触发模型审查；身份、路径、回执与候选完整性仍由宿主核对。
     pub(super) async fn review_operation(
         &self,
         operation_id: u64,
@@ -272,6 +272,18 @@ impl LocalDeveloper {
         let Some((mut action, reason)) = action else {
             return Ok(ReviewedFiles(vec![], vec![], None, None));
         };
+        // 只读取宿主当前身份；委派与后台沿用原始可信 scope，不接受模型传来的确认。
+        // 命令禁止规则、凭据检查和升级候选核对已执行，之后仍复核权限和文件边界。
+        if context.scope().is_some_and(|scope| {
+            self.authorization
+                .as_ref()
+                .is_some_and(|authorization| authorization.is_owner(scope))
+        }) {
+            self.authorize_selected_backend(operation, context)?;
+            let files = ReviewedFiles(vec![], artifacts, baseline, None);
+            files.recheck(self)?;
+            return Ok(files);
+        }
         let mut observed = Vec::new();
         if !paths.is_empty() {
             paths.sort();

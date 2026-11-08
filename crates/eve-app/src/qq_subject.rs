@@ -755,7 +755,7 @@ impl Tool for FocusTool {
 pub(crate) trait AutonomyOwner: DeveloperAuthorization {
     fn is_owner(&self, scope: &ContextScope) -> bool;
     fn allows_autonomy(&self, scope: &ContextScope) -> bool {
-        self.is_owner(scope) && self.is_operator(scope)
+        AutonomyOwner::is_owner(self, scope) && self.is_operator(scope)
     }
     fn business_grant_evidence(&self, _scope: &ContextScope) -> Option<Vec<String>> {
         None
@@ -3920,7 +3920,7 @@ mod tests {
         }
         fn allows_autonomy(&self, scope: &ContextScope) -> bool {
             self.is_operator(scope)
-                && (self.is_owner(scope) || self.explicit.load(Ordering::SeqCst))
+                && (AutonomyOwner::is_owner(self, scope) || self.explicit.load(Ordering::SeqCst))
         }
     }
     #[tokio::test]

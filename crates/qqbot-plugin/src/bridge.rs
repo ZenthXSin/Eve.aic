@@ -1595,6 +1595,33 @@ pub(crate) async fn run(
                 if ready_foreground.as_ref().is_some_and(|c|c.event.id==input.event.id) {ready_foreground=None;}
                 write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor})).await?;
             }
+            // 没有追加用户消息时，真正的慢工具也可获得一次自然交流机会。
+            // 只沿当前原消息的私聊窗口发送；短工具、已排队表达和近期主动说话让步。
+            let mut open_progress_windows = Vec::new();
+            if let (Some(speaker), Some(live)) = (&speech, &live_dialogue) {
+                for current in active.iter().filter(|current| current.message.scope == "c2c") {
+                    if current.started.elapsed() >= Duration::from_secs(225)
+                        || foreground_inputs.get(&current.message.id).is_some_and(|input| !input.resolved)
+                        || live.has_outgoing(&current.key.session)
+                        || last_progress.get(&current.message.id).is_some_and(|last| last.elapsed() < Duration::from_secs(60))
+                        || conversations.latest_message_id(&current.key.session)?.as_deref() != Some(&current.message.id) {
+                        continue;
+                    }
+                    let Some(snapshot) = control.snapshot(&current.key.session).ok().flatten() else { continue };
+                    let Some(turn_id) = snapshot.turn_id else { continue };
+                    let scope = eve_llm_api::ContextScope { session_id: current.key.session.session_id.clone(), user_id: current.key.session.user_id.clone() };
+                    if snapshot.key != current.key || snapshot.phase != ControlPhase::Tools || snapshot.cancel_requested
+                        || snapshot.events_retired || !live.progress_is_current(&scope, turn_id) { continue; }
+                    let Some(batch) = foreground_activity.progress_candidate(&current.key, turn_id) else { continue };
+                    let input = ForegroundInput::progress(batch, current.message.id.clone());
+                    // 开窗期间子工具仍可能推进，首次判断前才冻结并持久化事实。
+                    if let Some(previous) = foreground_inputs.insert(current.message.id.clone(), input) { speaker.retire(&previous.event)?; }
+                    open_progress_windows.push(current.message.id.clone());
+                }
+            }
+            for id in open_progress_windows {
+                write(&mut stdin, json!({"type":"open_foreground","version":1,"id":id})).await?;
+            }
             let stages = slow_progress.as_ref().is_some_and(|p| p.stage_updates());
             let min_interval = slow_progress.as_ref().map_or(Duration::from_secs(15), |p| p.min_interval());
             let slow_after = if live_dialogue.is_none() { slow_progress.as_ref().and_then(|policy| policy.after()) } else { None };
@@ -2458,7 +2485,9 @@ pub(crate) async fn run(
                     let window=foreground_windows.get(&ready.event.anchor).is_some_and(|window|
                         window.remaining>0 && window.session==ready.event.session && tokio::time::Instant::now()<window.deadline);
                     let scope=eve_llm_api::ContextScope {session_id:ready.event.session.session_id.clone(),user_id:ready.event.session.user_id.clone()};
-                    if !current || !window || !valid_outreach_text(&ready.text)
+                    let recent_expression = ready.event.id.starts_with("foreground-progress:")
+                        && last_progress.get(&ready.event.anchor).is_some_and(|last| last.elapsed() < Duration::from_secs(60));
+                    if !current || !window || recent_expression || live.has_outgoing(&ready.event.session) || !valid_outreach_text(&ready.text)
                         || !conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false) {
                         speaker.retire(&ready.event)?;
                         if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
@@ -2469,14 +2498,24 @@ pub(crate) async fn run(
                     if route.scope!="c2c" || route.session_key(&config.app_id)?!=ready.event.session {
                         return Err(failure("前台交流身份不匹配"));
                     }
-                    let id=format!("speech-{}",ready.event.id.strip_prefix("foreground-input:").expect("前台事实编号"));
+                    let id=format!("speech-{}",ready.event.id.split_once(':').expect("前台事实编号").1);
                     let input=foreground_inputs.get(&ready.event.anchor).expect("当前前台输入");
-                    let Some(claim)=live.claim_input_reply(&scope,input.turn_id,&ready.event.anchor,&ready.event.id,&ready.text,
-                        || {
-                            if !input.activity_is_current(&foreground_activity,control.as_ref()) {return Ok(false);}
-                            speaker.dispatched(&ready.event)?;
-                            Ok(true)
-                        })? else {
+                    let persist = || {
+                        if !input.activity_is_current(&foreground_activity,control.as_ref()) {return Ok(false);}
+                        speaker.dispatched(&ready.event)?;
+                        Ok(true)
+                    };
+                    let claim = if input.progress {
+                        live.claim_progress_reply(&scope, input.turn_id, eve_llm_api::InputReplyHandoff {
+                            kind: eve_llm_api::InputReplyKind::Progress,
+                            input_message_id: ready.event.anchor.clone(), input_text: route.turn_text(),
+                            event_id: ready.event.id.clone(), reply_text: ready.text.clone(),
+                            delivery: eve_llm_api::InputReplyDelivery::Sending,
+                        }, persist)?
+                    } else {
+                        live.claim_input_reply(&scope,input.turn_id,&ready.event.anchor,&ready.event.id,&ready.text,persist)?
+                    };
+                    let Some(claim) = claim else {
                         // 主轮已经消费了同一输入，交流职责没有交给前台；该支路零发送。
                         speaker.retire(&ready.event)?;
                         if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
@@ -2521,6 +2560,10 @@ pub(crate) async fn run(
                         if !speech_retries.eligible(&event,now) {continue;}
                         let Some(input)=foreground_inputs.get_mut(&event.anchor) else {continue};
                         if !input.current(live,&foreground_activity,control.as_ref()) {continue;}
+                        if input.progress && (live.has_outgoing(&event.session)
+                            || last_progress.get(&event.anchor).is_some_and(|last| last.elapsed() < Duration::from_secs(60))) {continue;}
+                        input.prepare_decision(&foreground_activity);
+                        let event = input.event.clone();
                         input.next=now+Duration::from_secs(2);
                         speech_retries.started(&event);
                         let service=speaker.clone();let value=event.clone();
@@ -2610,7 +2653,7 @@ pub(crate) async fn run(
                     }}
                     for mut event in speech_retries.order(speaker.pending()?) {
                         // 前台事实仅由内存中仍有效的工具/输入组合提供；重启不重放。
-                        if event.id.starts_with("foreground-input:") {
+                        if event.id.starts_with("foreground-input:") || event.id.starts_with("foreground-progress:") {
                             if !foreground_inputs.values().any(|input|!input.resolved && input.event==event) {speaker.retire(&event)?;}
                             continue;
                         }
@@ -2729,8 +2772,14 @@ pub(crate) async fn run(
                         Ok(Some(crate::QqSpeechDecision::Silence{}))=>{
                             if let Some(input)=foreground_inputs.get_mut(&pending.event.anchor) {input.resolved=true;}
                         },
+                        Ok(Some(crate::QqSpeechDecision::Wait {..})) if pending.event.id.starts_with("foreground-progress:") => {
+                            if let Some(input)=foreground_inputs.get_mut(&pending.event.anchor) {input.resolved=true;}
+                        },
                         Ok(_)=>{},
                         Err(error)=>{
+                            // 同批活动只判断一次；错误保存证据，下一批真实进展才再给交流机会。
+                            if pending.event.id.starts_with("foreground-progress:")
+                                && let Some(input)=foreground_inputs.get_mut(&pending.event.anchor) {input.resolved=true;}
                             let retry=speech_retries.failed(&pending.event,tokio::time::Instant::now());
                             let postponed=speech.as_ref().is_some_and(|speaker|speaker.postpone(&pending.event,retry.as_millis() as u64).is_ok());
                             let _=ctx.log(speech_retry::failure_log(&pending.event,&error,pending.started.elapsed(),retry,postponed));
@@ -3013,7 +3062,8 @@ pub(crate) async fn run(
                             let Some(slots)=frame.get("remaining").and_then(Value::as_u64).filter(|n|(1..=4).contains(n)) else {continue};
                             let Some(index)=ledger.find(&config.app_id,id) else {continue};
                             let entry=&ledger.entries[index];
-                            if entry.state!=ReceiptState::Merged || entry.message.scope!="c2c"
+                            let expected_state = if input.progress {ReceiptState::Processing} else {ReceiptState::Merged};
+                            if entry.state!=expected_state || entry.message.scope!="c2c"
                                 || entry.message.session_key(&config.app_id)?!=input.key.session
                                 || conversations.latest_message_id(&input.key.session)?.as_deref()!=Some(id) {continue;}
                             foreground_windows.insert(id.into(),PassiveWindow {

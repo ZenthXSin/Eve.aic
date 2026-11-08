@@ -386,6 +386,7 @@ async fn ordinary_and_custom_coding_named_roles_and_background_keep_task_model()
             steps: 5,
             timeout: None,
             stop: stopped,
+            progress: None,
             journal: None,
             shared_steps: None,
             profile: None,

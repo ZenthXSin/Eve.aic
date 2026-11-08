@@ -831,7 +831,10 @@ impl QqSpeech for Speech {
                     self.store
                         .save(&event, state, Some(&decision), now().saturating_add(delay))
                         .map_err(context_error)?;
-                    Ok((delay == 0).then_some(decision))
+                    // 进展事实每批只判断一次；wait 等新的实际活动，不定时重新问同一问题。
+                    let progress_wait = event.id.starts_with("foreground-progress:")
+                        && matches!(decision, QqSpeechDecision::Wait { .. });
+                    Ok((delay == 0 || progress_wait).then_some(decision))
                 }
                 Err(error) => {
                     self.store

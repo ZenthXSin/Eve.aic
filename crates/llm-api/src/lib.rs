@@ -19,6 +19,7 @@ mod failure;
 mod history;
 mod image;
 mod journal;
+mod progress;
 mod protocol;
 mod request_fingerprint;
 mod session;
@@ -35,6 +36,7 @@ pub use image::{
     ImageInput, MAX_IMAGE_BYTES, MAX_TURN_IMAGES, TurnImageSource, TurnImages, sniff_image,
 };
 pub use journal::{MAX_CHECKPOINT_BYTES, TurnCheckpoint, TurnJournal};
+pub use progress::{DelegatedProgressObserver, DelegatedToolProgress};
 pub use protocol::ProtocolFailureKind;
 pub use request_fingerprint::ModelRequestFingerprint;
 use serde::{Deserialize, Serialize};
@@ -48,8 +50,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub use steering::{
-    InputReplyDelivery, InputReplyHandoff, MAX_INPUT_REPLY_HANDOFF_BYTES, MAX_INPUT_REPLY_HANDOFFS,
-    SteeringBatch, SteeringUpdate, TurnSteering, TurnSteeringSource, validate_input_reply_handoffs,
+    InputReplyDelivery, InputReplyHandoff, InputReplyKind, MAX_INPUT_REPLY_HANDOFF_BYTES,
+    MAX_INPUT_REPLY_HANDOFFS, SteeringBatch, SteeringUpdate, TurnSteering, TurnSteeringSource,
+    validate_input_reply_handoffs,
 };
 pub use usage::{ModelUsage, ModelUsageObserver, PrefixReuse};
 
@@ -695,6 +698,11 @@ pub enum TurnEventKind {
         failed_calls: usize,
         tool_names: Vec<String>,
     },
+    /// 父调用仍在运行时的子执行事实；身份取自宿主，不能替代父工具回执。
+    DelegatedToolProgress {
+        parent_call_id: String,
+        progress: DelegatedToolProgress,
+    },
     TurnCompleted {
         text: String,
     },
@@ -842,6 +850,7 @@ pub struct ToolExecutionContext {
     shared_steps: Option<SharedToolSteps>,
     deadline: Option<std::time::Instant>,
     delegated: bool,
+    delegated_progress: Option<Arc<dyn DelegatedProgressObserver>>,
 }
 /// 单轮内共享的任务状态。只影响本轮收尾，不授予权限、不持久化或重放工具。
 #[derive(Clone, Default)]
@@ -883,6 +892,7 @@ impl ToolExecutionContext {
             shared_steps: None,
             deadline: None,
             delegated: false,
+            delegated_progress: None,
         }
     }
     /// 绑定本轮的可信会话范围；由宿主依据通道身份设置，模型参数不能改变它。
@@ -1006,6 +1016,13 @@ impl ToolExecutionContext {
     pub fn is_delegated(&self) -> bool {
         self.delegated
     }
+    pub fn with_delegated_progress(mut self, observer: Arc<dyn DelegatedProgressObserver>) -> Self {
+        self.delegated_progress = Some(observer);
+        self
+    }
+    pub fn delegated_progress(&self) -> Option<&Arc<dyn DelegatedProgressObserver>> {
+        self.delegated_progress.as_ref()
+    }
     pub fn shared_steps(&self) -> Option<&SharedToolSteps> {
         self.shared_steps.as_ref()
     }
@@ -1033,6 +1050,9 @@ pub struct ToolCancellation(Arc<AtomicBool>);
 impl ToolCancellation {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancel_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 

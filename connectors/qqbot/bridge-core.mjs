@@ -278,6 +278,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   }
   function forgetPending(id) {
     clearLiveReplies(id);
+    if (passiveWindows.get(id)?.parent && passiveWindows.get(id).parent === pending.get(id)) passiveWindows.delete(id);
     pending.delete(id);
   }
   const replyMention = item => group.mention !== false && item.target.scope === "group" ? item.senderId : undefined;
@@ -365,17 +366,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_INBOUND_FRAME) {
       warn("frame_limit"); return;
     }
-    // 所有验证过的真实输入都使旧决定过期，包括无需唤醒的群消息。
-    const inputKey=routeKey(msg.kind,target.targetId,msg.senderId);
-    latestInput.delete(inputKey);
-    latestInput.set(inputKey,msg.messageId);
-    for (const [id, item] of passiveWindows) {
-      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS || routeKey(item.target.scope,item.target.targetId,item.senderId) === inputKey) passiveWindows.delete(id);
-    }
-    for (const [parentId, window] of liveReplies) {
-      const item = window.item;
-      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS || routeKey(item.target.scope,item.target.targetId,item.senderId) === inputKey) liveReplies.delete(parentId);
-    }
+    // 群插话面向全群最新事实，旁观消息也会使尚未发送的插话过期。
     if (msg.kind === "group") {
       const groupKey=routeKey("group",target.targetId,"*");
       latestInput.delete(groupKey);
@@ -397,6 +388,19 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     }
     // 仅前缀模式仍记录群原话；艾特、引用和附件本身都不能绕过前缀唤醒。
     if (msg.kind === "group" && group.prefixOnly && !/^eve/i.test(text.trimStart())) return;
+    // 主轮只消费通过唤醒规则的输入。未进入主轮的群旁观不能撤销其
+    // 回复或已合入窗口；新唤醒输入仍先使旧决定过期，再由宿主交接。
+    const inputKey=routeKey(msg.kind,target.targetId,msg.senderId);
+    latestInput.delete(inputKey);
+    latestInput.set(inputKey,msg.messageId);
+    while(latestInput.size>8192) latestInput.delete(latestInput.keys().next().value);
+    for (const [id, item] of passiveWindows) {
+      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS || routeKey(item.target.scope,item.target.targetId,item.senderId) === inputKey) passiveWindows.delete(id);
+    }
+    for (const [parentId, window] of liveReplies) {
+      const item = window.item;
+      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS || routeKey(item.target.scope,item.target.targetId,item.senderId) === inputKey) liveReplies.delete(parentId);
+    }
     // 不在 SDK 猜测业务句意。Rust 核对真实身份、白名单和完整原话后只允许缩权，
     // 此帧没有 SDK pending 路由，不启动模型任务，也不能获得被动回复额度。
     if (restrictionOnly) { send(frame); return; }
@@ -417,6 +421,9 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     const target = item.proactive
       ? { scope: item.target.scope, targetId: item.target.targetId } : item.target;
     const meta = { delivery_mode: item.proactive ? "proactive" : "passive", elapsed_ms: elapsed };
+    if (!item.proactive && (item.passiveProgress ?? item.progress ?? 0) >= passiveLimit(item.target.scope)) {
+      return {ok:false,...meta,failure_kind:"passive_quota_exhausted"};
+    }
     try {
       const mention=replyMention(item);
       const result = await sendText(target, text, mention);
@@ -537,7 +544,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     }
     const hostActivity = frame.host_activity === true;
     const index = item.progress ?? 0;
-    if (item.sending || item.next !== undefined || frame.index !== index || index >= 64 || (frame.proactive !== true && (item.passiveProgress ?? index) >= 3)) {
+    if (item.sending || item.next !== undefined || frame.index !== index || index >= 64) {
       warn("invalid_progress"); return;
     }
     if (!validText(frame.text) || Buffer.byteLength(frame.text) > (frame.explicit === true ? 32768 : 1024)) {
@@ -554,6 +561,15 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     }
     const proactive = frame.proactive === true;
     const elapsed = Math.max(0, Math.floor(now() - item.receivedAt));
+    // 自然发言不占父轮 progress 序号，但共用平台被动额度；最后一格
+    // 留给主轮的明确 send_message，它在实时模式下也使用 progress 帧。
+    const passiveQuota = frame.explicit === true && item.target.scope === "c2c" ? passiveLimit("c2c") : 3;
+    if (!proactive && (item.passiveProgress ?? index) >= passiveQuota) {
+      item.progress = index + 1;
+      send({type:"delivery",id:frame.id,progress:true,index,ok:false,delivery_mode:"passive",
+        elapsed_ms:elapsed,failure_kind:"passive_quota_exhausted"});
+      return;
+    }
     if (proactive && item.lastProgress !== undefined && now() - item.lastProgress < 1000) {
       send({ type: "delivery", id: frame.id, progress: true, index, ok: false, failure_kind: "progress_rate_limit" });
       item.progress = index + 1;
@@ -674,29 +690,44 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       pushing.delete(frame.id);
     }
   }
-  // 实时对话收尾后仍只使用原消息的被动额度；没有窗口时绝不回退主动消息。
+  // 活跃主轮和收尾后的补充都只使用原消息额度；没有窗口时不退回主动消息。
   async function passivePush(frame) {
     if (!validMessageId(frame.id)) {warn("invalid_command");return;}
     const reject = kind => send({type:"delivery",id:frame.id,push:true,ok:false,failure_kind:kind});
     const item = passiveWindows.get(frame.based_on_message_id);
     if (!item) {reject("passive_window_missing");return;}
+    const parent = item.parent;
     if ((frame.foreground === true) !== (item.foreground === true)) {reject("passive_window_missing");return;}
     if (frame.scope !== "c2c" || item.target.scope !== frame.scope || item.target.targetId !== frame.target_id || item.senderId !== frame.sender_id ||
         latestInput.get(routeKey(frame.scope,frame.target_id,frame.sender_id)) !== frame.based_on_message_id) {reject("stale_decision");return;}
     if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS) {passiveWindows.delete(frame.based_on_message_id);reject("passive_window_elapsed");return;}
-    if (item.sending || item.attempts.has(frame.id)) {warn("duplicate_reply");return;}
-    if (item.remaining <= 0) {reject("passive_quota_exhausted");return;}
+    if (parent && (pending.get(frame.based_on_message_id) !== parent || parent.finished || parent.next !== undefined)) {reject("stale_decision");return;}
+    if (item.sending || parent?.sending || item.attempts.has(frame.id)) {warn("duplicate_reply");return;}
+    // 活跃主轮保留最后一个被动名额；额度取父对象实时值，不能被重复开窗恢复。
+    const remaining = parent ? passiveLimit(parent.target.scope) - 1 - (parent.passiveProgress ?? parent.progress ?? 0) : item.remaining;
+    if (remaining <= 0) {reject("passive_quota_exhausted");return;}
     if (!validText(frame.text) || Buffer.byteLength(frame.text) > MAX_PUSH_BYTES) {reject("reply_limit");return;}
     item.attempts.add(frame.id);
-    item.remaining--; // 失败或未知也占额度，桥接层不重发。
+    if (parent) {
+      parent.passiveProgress = (parent.passiveProgress ?? parent.progress ?? 0) + 1;
+      parent.sending = true;
+    } else item.remaining--;
+    // 失败或未知也占额度，桥接层不重发。
     item.sending = true;
     try {
       const guard = () => !closed && passiveWindows.get(frame.based_on_message_id) === item && now() - item.receivedAt < PASSIVE_REPLY_WINDOW_MS &&
+        (!parent || (pending.get(frame.based_on_message_id) === parent && !parent.finished && parent.next === undefined)) &&
         latestInput.get(routeKey(frame.scope,frame.target_id,frame.sender_id)) === frame.based_on_message_id;
       const result = await sendText(item.target,frame.text,undefined,SEND_TIMEOUT_MS,guard);
       send({type:"delivery",id:frame.id,push:true,ok:true,delivery_mode:"passive",message_id:result.id});
     } catch (err) {send({type:"delivery",id:frame.id,push:true,ok:false,...diagnostic(err)});}
-    finally {item.sending=false;}
+    finally {
+      item.sending=false;
+      if (parent) {
+        parent.sending=false;
+        if (parent.finished) forgetPending(frame.based_on_message_id);
+      }
+    }
   }
   return {
     stop,
@@ -710,6 +741,23 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         if (passiveWindows.get(frame.id)?.foreground === true) passiveWindows.delete(frame.id);
         return;
       }
+      if (frame.type === "open_foreground") {
+        if (!validMessageId(frame.id)) {warn("invalid_command");return;}
+        const item = pending.get(frame.id);
+        if (!item || item.target.scope !== "c2c" || item.finished || item.sending || item.next !== undefined ||
+            latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) !== frame.id) return;
+        const remaining = passiveLimit(item.target.scope) - 1 - (item.passiveProgress ?? item.progress ?? 0);
+        const remainingMs = Math.floor(PASSIVE_REPLY_WINDOW_MS - Math.max(0, now() - item.receivedAt));
+        if (remaining <= 0 || remainingMs <= 0) return;
+        const window = passiveWindows.get(frame.id);
+        if (window && (window.parent !== item || window.foreground !== true)) return;
+        for (const [id, saved] of passiveWindows) if (now() - saved.receivedAt >= PASSIVE_REPLY_WINDOW_MS) passiveWindows.delete(id);
+        if (!window && passiveWindows.size >= limit) return;
+        item.foregroundAttempts ??= new Set();
+        if (!window) passiveWindows.set(frame.id,{...item,parent:item,attempts:item.foregroundAttempts,foreground:true});
+        send({type:"foreground_window",id:frame.id,remaining_ms:remainingMs,remaining});
+        return;
+      }
       // 只恢复宿主持久接收的锚点；绝不覆盖本进程已经看见的新消息。
       if (frame.type === "restore_anchor") {
         if (!["c2c","group"].includes(frame.scope) || !validId(frame.target_id) || !validId(frame.sender_id) || !validMessageId(frame.message_id)) {warn("invalid_command");return;}
@@ -721,6 +769,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if (frame.type === "push") { await push(frame); return; }
       if (frame.type === "file") { await pushFile(frame); return; }
       if (frame.type === "finish") {
+        if (passiveWindows.get(frame.id)?.parent) passiveWindows.delete(frame.id);
         const parentId = retiredLiveInputs.get(frame.id);
         if (parentId !== undefined) {
           if (frame.keep_live_reply !== true && liveReplies.get(parentId)?.anchor === frame.id) liveReplies.delete(parentId);

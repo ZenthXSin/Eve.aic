@@ -76,7 +76,7 @@ fn install_seed(
     let identity = identity(&seed.scope);
     if scope(&identity) != seed.scope
         || !owner.allows_autonomy(&identity)
-        || !owner.is_owner(&identity)
+        || !AutonomyOwner::is_owner(owner.as_ref(), &identity)
     {
         return Err(SubjectError::InvalidInput);
     }

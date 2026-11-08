@@ -193,6 +193,9 @@ class DualModelEffortAcceptance(WireAcceptance):
             self.assertIn("编程分工：", policy)
             self.assertIn("agent_id=coding", policy)
             self.assertIn("include_context=true", policy)
+            self.assertIn("中等及以上", policy)
+            self.assertIn("默认在同一工具批次并行调用多个 run_subagent", policy)
+            self.assertIn("不让多个执行者同时修改同一文件", policy)
 
     def assert_coding_wire(self, captured):
         self.assert_wire_identity(captured, CODING_MODEL, CODING_KEY, CODING_OUTPUT, self.coding_effort)
@@ -280,6 +283,77 @@ class DualModelEffortAcceptance(WireAcceptance):
         self.assertEqual(len(self.coding_requests), 6, "已完成编程调用不在重投或重启后重放")
         self.assertEqual(journal.read_bytes(), before)
         self.assert_same_session(self.foreground())
+
+    def test_same_scope_independent_coding_tasks_overlap_in_one_batch_and_keep_separate_sessions(self):
+        configuration = json.loads(self.developer_config.read_text())
+        configuration["max_tool_rounds"] = 8
+        self.developer_config.write_text(json.dumps(configuration), encoding="utf8")
+        tasks = {
+            "parallel-left.py": 'side = "left"\n',
+            "parallel-right.py": 'side = "right"\n',
+        }
+        turn = "并行实现两个独立文件，各自读取核验后交回结果"
+        condition = threading.Condition()
+        entered = set()
+        active = peak = 0
+
+        def coding(captured):
+            nonlocal active, peak
+            body = captured["body"]
+            [path] = [path for path in tasks if path in latest_user(body)]
+            results = current_results(body)
+            if not results:
+                with condition:
+                    self.assertNotIn(path, entered, "同一委派不能重复启动")
+                    entered.add(path)
+                    active += 1
+                    peak = max(peak, active)
+                    condition.notify_all()
+                    try:
+                        self.assertTrue(condition.wait_for(lambda: len(entered) == 2, timeout=10),
+                                        "同范围的两个 coding 请求未实际重叠")
+                    finally:
+                        active -= 1
+                return Reply(calls=[("parallel-write-" + path, "write_file", {
+                    "path": path, "content": tasks[path], "expected_sha256": ""})])
+            if len(results) == 1:
+                self.assertTrue(results[0]["success"])
+                return Reply(calls=[("parallel-read-" + path, "read_file", {"path": path})])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[-1]["content"], tasks[path])
+            return Reply(text="独立文件已核验：" + path)
+
+        def main(captured):
+            body = captured["body"]
+            self.assertEqual(latest_user(body), turn)
+            results = current_results(body)
+            if not results:
+                return Reply(calls=[("parallel-delegate-" + path, "run_subagent", {
+                    "agent_id": "coding", "task": "只实现并核验 " + path + "，保留另一个执行者的文件",
+                    "include_context": True, "verification": receipt_contract(path, content),
+                }) for path, content in tasks.items()])
+            self.assertEqual(len(results), 2)
+            for result, path in zip(results, tasks):
+                self.assertTrue(result["completed"], result)
+                self.assertTrue(result["include_context"])
+                self.assertEqual(result["usage"]["agent_id"], "coding")
+                self.assertEqual(result["usage"]["steps_used"], 2)
+                self.assertIn(path, result["result"], "并行结果保持父调用顺序")
+                self.assertEqual((self.source / path).read_text(), tasks[path])
+            self.assertEqual(max(result["usage"]["shared_steps_used"] for result in results), 6,
+                             "两项委派和四个叶子工具共用原父工具预算")
+            return Reply(text="两项独立编程结果已核验整合")
+
+        self.coding_callback, self.callback = coding, main
+        self.enabled(self.send(self.message("coding-parallel", turn, expected="两项独立编程结果已核验整合")),
+                     env_extra={"EVE_MODELS_AUXILIARY_SMALL_MAX_CONCURRENT_REQUESTS": "3"})
+        self.assertEqual(entered, set(tasks))
+        self.assertEqual(peak, 2, "模型端实际同时接收两个同范围 coding 请求")
+        groups = [[request for request in self.coding_requests if path in latest_user(request["body"])]
+                  for path in tasks]
+        self.assertEqual([len(group) for group in groups], [3, 3])
+        self.assertEqual(len(self.foreground()), 2, "主线程只做同批交接和结果整合")
+        self.assert_isolated([self.foreground(), *groups])
 
     def test_chat_general_task_and_distillation_keep_primary_route_and_separate_sessions(self):
         def main(captured):

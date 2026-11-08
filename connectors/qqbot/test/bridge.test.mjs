@@ -152,12 +152,14 @@ test("重启锚点只恢复缺失路由，不能覆盖新到内容",async()=>{
 });
 
 test("未唤醒的群友消息也会作废尚未发送的插话",async()=>{
-  const f=fixture({group:{observe:true}});f.message("group");
-  const pending=f.bridge.command({version:1,type:"push",id:"chime-decided",scope:"group",target_id:"group-1",sender_id:"user-1",text:"先前的话",based_on_message_id:"in-1",group_chime:true});
-  f.handlers.get("message")({}, {kind:"group",rawEventType:"GROUP_MESSAGE_CREATE",messageId:"other-input",senderId:"member-2",content:"补充一下",groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:"other-input"}});
-  await pending;
-  assert.deepEqual(f.sent,[]);
-  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  for (const senderId of ["user-1","member-2"]) {
+    const f=fixture({group:{observe:true}});f.message("group");
+    const pending=f.bridge.command({version:1,type:"push",id:"chime-decided",scope:"group",target_id:"group-1",sender_id:"user-1",text:"先前的话",based_on_message_id:"in-1",group_chime:true});
+    f.handlers.get("message")({}, {kind:"group",rawEventType:"GROUP_MESSAGE_CREATE",messageId:"other-input",senderId,content:"补充一下",groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:"other-input"}});
+    await pending;
+    assert.deepEqual(f.sent,[],senderId);
+    assert.equal(f.frames.at(-1).failure_kind,"stale_decision",senderId);
+  }
 });
 
 test("表情包作为明确表达独立发送，并使用同一个新鲜度检查",async()=>{
@@ -1357,6 +1359,139 @@ test("前台窗口新输入和重启失效，未知投递不重试或变成主�
   assert.equal(restarted.sent.length,0);
 });
 
+const openForeground = {version:1,type:"open_foreground",id:"in-1"};
+const foregroundPush = id => ({...passiveFrame(id),foreground:true});
+
+test("原消息慢工具发言开窗保留主轮，共享已消费额度和原接收年龄",async()=>{
+  let now=0;const f=fixture({now:()=>now});f.message();
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"我开始看了",explicit:true,based_on_message_id:"in-1"});
+  now=8000;await f.bridge.command(openForeground);
+  assert.deepEqual(f.frames.at(-1),{version:1,type:"foreground_window",id:"in-1",remaining_ms:232000,remaining:2});
+  await f.bridge.command(foregroundPush("tool-observation-1"));
+  assert.equal(f.frames.at(-1).ok,true);
+  now=11000;await f.bridge.command(openForeground);
+  assert.equal(f.frames.at(-1).remaining,1);
+  assert.equal(f.frames.at(-1).remaining_ms,229000);
+  await f.bridge.command({version:1,type:"close_foreground",id:"in-1"});
+  await f.bridge.command(openForeground);
+  await f.bridge.command(foregroundPush("tool-observation-1"));
+  assert.equal(f.sent.length,2,"同一发言在关窗重开后也不重复");
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:1,text:"已找到相关日志",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.frames.at(-1).ok,true,"开窗没有结束父轮或消费其progress序号");
+  await f.bridge.command(foregroundPush("tool-observation-2"));
+  assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+  await f.bridge.command({version:1,type:"reply",id:"in-1",text:"核对完成"});
+  assert.deepEqual(f.sent.map(x=>x.target.msgId),["in-1","in-1","in-1","in-1"]);
+  await f.bridge.command(foregroundPush("after-final"));
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+});
+
+test("原消息慢工具发言只能打开有效原锚点，不恢复过期、取消或缺失路由",async()=>{
+  for (const mode of ["expired","new-input","finished","missing","group"]) {
+    let now=0;const f=fixture({now:()=>now});
+    if (mode!=="missing") f.message(mode==="group"?"group":"c2c");
+    if (mode==="expired") now=PASSIVE_REPLY_WINDOW_MS;
+    if (mode==="new-input") f.message("c2c","new-input");
+    if (mode==="finished") await f.bridge.command({version:1,type:"finish",id:"in-1"});
+    await f.bridge.command({version:1,type:"restore_anchor",scope:"c2c",target_id:"user-1",sender_id:"user-1",message_id:"in-1"});
+    await f.bridge.command(openForeground);
+    assert.equal(f.frames.some(x=>x.type==="foreground_window"),false,mode);
+    await f.bridge.command(foregroundPush("invalid-window"));
+    assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing",mode);
+    assert.deepEqual(f.sent,[],mode);
+  }
+});
+
+test("原消息慢工具发言与父轮发送互斥，取消在 SDK 前撤销已经排队的发言",async()=>{
+  for (const close of ["finish","close_foreground"]) {
+    const f=fixture();f.message();await f.bridge.command(openForeground);
+    const sending=f.bridge.command(foregroundPush("queued-progress"));
+    await f.bridge.command({version:1,type:close,id:"in-1"});
+    await sending;
+    assert.deepEqual(f.sent,[]);
+    assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  }
+  const held=deferred();
+  const f=fixture({hold:held.promise});f.message();await f.bridge.command(openForeground);
+  const sending=f.bridge.command(foregroundPush("slow-progress"));
+  await new Promise(setImmediate);
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"不能并发写出",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.sent.length,1);
+  held.resolve();await sending;
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"主轮继续",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.sent.length,2);
+  assert.equal(f.frames.at(-1).ok,true);
+});
+
+test("原消息慢工具发言失败和未知也消费共享额度且不会重发",async()=>{
+  for (const textResult of [{}, {id:"valid-result"}]) {
+    const f=fixture({textResult,fail:!!textResult.id});f.message();await f.bridge.command(openForeground);
+    await f.bridge.command(foregroundPush("failed-progress"));
+    assert.equal(f.frames.at(-1).ok,false);
+    await f.bridge.command({version:1,type:"close_foreground",id:"in-1"});
+    await f.bridge.command(openForeground);
+    assert.equal(f.frames.at(-1).remaining,2);
+    await f.bridge.command(foregroundPush("failed-progress"));
+    assert.equal(f.sent.length,1);
+  }
+});
+
+test("三次自然进度后实时 send_message 使用最后被动名额，超额确定拒发且序号不漂移",async()=>{
+  let now=0;const f=fixture({now:()=>now});f.message();await f.bridge.command(openForeground);
+  for (let index=0;index<3;index++) {
+    await f.bridge.command(foregroundPush(`natural-${index}`));
+    assert.equal(f.frames.at(-1).ok,true);
+  }
+  const final={version:1,type:"progress",id:"in-1",index:0,text:"已经核验完了",explicit:true,
+    proactive:false,based_on_message_id:"in-1"};
+  await f.bridge.command(final);
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.equal(f.frames.at(-1).index,0,"自然发言不伪造主轮工具的 progress 序号");
+  assert.deepEqual(f.sent.map(x=>x.target.msgId),["in-1","in-1","in-1","in-1"]);
+  await f.bridge.command({...final,index:1,text:"窗口内已没有第五个名额"});
+  assert.equal(f.sent.length,4);
+  assert.deepEqual(f.frames.at(-1),{version:1,type:"delivery",id:"in-1",progress:true,index:1,ok:false,
+    delivery_mode:"passive",elapsed_ms:0,failure_kind:"passive_quota_exhausted"});
+  const receipts=f.frames.filter(x=>x.type==="delivery"&&x.progress).length;
+  await f.bridge.command({...final,index:1,text:"拒绝过的序号不能重放"});
+  assert.equal(f.frames.filter(x=>x.type==="delivery"&&x.progress).length,receipts);
+  assert.equal(f.sent.length,4);
+  now=2000;
+  await f.bridge.command({...final,index:2,text:"新决定沿宿主给出的主动路由",proactive:true});
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.equal(f.frames.at(-1).index,2);
+  assert.equal(f.sent.at(-1).target.msgId,undefined);
+});
+
+test("自然发言未知或失败也占额度，最后明确消息可发送而自动进度不能抢占",async()=>{
+  for (const fail of [true,false]) {
+    const f=fixture({fail:n=>fail&&n===1,textResult:fail?{id:"out-1"}:{}});
+    f.message();await f.bridge.command(openForeground);
+    for (let index=0;index<3;index++) await f.bridge.command(foregroundPush(`attempt-${index}`));
+    await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"自动进度不能占结尾名额"});
+    assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+    assert.equal(f.sent.length,3);
+    await f.bridge.command({version:1,type:"progress",id:"in-1",index:1,text:"主轮明确表达",explicit:true,based_on_message_id:"in-1"});
+    assert.equal(f.sent.length,4);
+    assert.equal(f.frames.at(-1).index,1);
+    assert.equal(f.frames.at(-1).ok,fail,"缺少平台消息编号仍如实记为未知");
+    await f.bridge.command({version:1,type:"progress",id:"in-1",index:2,text:"不能再使用被动窗口",explicit:true,based_on_message_id:"in-1"});
+    assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+    assert.equal(f.sent.length,4);
+  }
+});
+
+test("明确发言用完第四个被动名额后旧式 reply 也不能再发送第五条",async()=>{
+  const f=fixture();f.message();await f.bridge.command(openForeground);
+  for (let index=0;index<3;index++) await f.bridge.command(foregroundPush(`natural-${index}`));
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"已明确发送结论",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.frames.at(-1).ok,true);
+  await f.bridge.command({version:1,type:"reply",id:"in-1",text:"不能再占被动额度"});
+  assert.equal(f.sent.length,4);
+  assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+  assert.equal(f.frames.at(-1).delivery_mode,"passive");
+});
+
 const liveReplyFrame = (index = 0, anchor = "live-child", text = "已经看过你的补充") => ({
   version:1,type:"progress",id:"in-1",index,text,explicit:true,based_on_message_id:anchor,
 });
@@ -1368,6 +1503,63 @@ function groupInput(f, id, user = "user-1", target = "group-1") {
     rawEventType:"GROUP_AT_MESSAGE_CREATE",groupOpenid:target,
     replyTarget:{scope:"group",targetId:target,msgId:id}});
 }
+function groupObservation(f, id, content = "好了", rawEventType = "GROUP_MESSAGE_CREATE") {
+  f.handlers.get("message")({}, {kind:"group",messageId:id,senderId:"user-1",content,
+    rawEventType,groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:id}});
+}
+
+test("同用户非唤醒群消息继续旁观学习，不作废主轮已决定的回复",async()=>{
+  for (const duringSend of [false,true]) {
+    const f=fixture({group:{observe:true}});
+    groupObservation(f,"in-1","eve的astra子代理");
+    let sending;
+    if (duringSend) sending=f.bridge.command(liveReplyFrame(0,"in-1","已经核对编码子代理"));
+    groupObservation(f,"ambient-after","好了");
+    if (!duringSend) sending=f.bridge.command(liveReplyFrame(0,"in-1","已经核对编码子代理"));
+    await sending;
+    assert.deepEqual(f.frames.filter(x=>x.type==="message").map(x=>x.id),["in-1"]);
+    assert.deepEqual(f.frames.filter(x=>x.type==="group_observation").map(x=>x.message.id),["in-1","ambient-after"]);
+    assert.deepEqual(f.sent.map(x=>x.target.msgId),["in-1"]);
+    assert.equal(f.frames.at(-1).ok,true);
+    // 旁观消息没有获得主轮的被动窗口或可消费输入资格。
+    await f.bridge.command(keepLiveReply("ambient-after"));
+    assert.equal(f.frames.at(-1).code,"unknown_reply");
+  }
+});
+
+test("仅前缀模式下被过滤的艾特不作废主轮，真正唤醒及取消仍撤销发送",async()=>{
+  for (const cancel of [false,true]) {
+    const f=fixture({group:{observe:true,prefixOnly:true}});
+    groupObservation(f,"in-1","eve检查一下");
+    groupObservation(f,"at-without-prefix","<@1904159860> 好了","GROUP_AT_MESSAGE_CREATE");
+    await f.bridge.command(liveReplyFrame(0,"in-1","已读到当前请求"));
+    assert.deepEqual(f.sent.map(x=>x.target.msgId),["in-1"]);
+    assert.deepEqual(f.frames.filter(x=>x.type==="message").map(x=>x.id),["in-1"]);
+    const sending=f.bridge.command(liveReplyFrame(1,"in-1","仍未写出的旧决定"));
+    if (cancel) await f.bridge.command({version:1,type:"finish",id:"in-1"});
+    else groupObservation(f,"new-wake","eve先停一下");
+    await sending;
+    assert.equal(f.sent.length,1);
+    assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  }
+});
+
+test("同用户群旁观不破坏已消费输入的窗口交接，也不刷新额度和年龄",async()=>{
+  let now=0;const f=fixture({now:()=>now,group:{observe:true}});f.message("group");
+  now=1000;groupInput(f,"live-child");
+  now=2000;groupObservation(f,"ambient-before-handoff");
+  await f.bridge.command(keepLiveReply());
+  now=3000;
+  const first=f.bridge.command(liveReplyFrame());
+  groupObservation(f,"ambient-during-send");
+  await first;
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.equal(f.frames.at(-1).elapsed_ms,2000);
+  for (let index=1;index<3;index++) await f.bridge.command(liveReplyFrame(index));
+  await f.bridge.command(liveReplyFrame(3));
+  assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+  assert.deepEqual(f.sent.map(x=>x.target.msgId),["live-child","live-child","live-child"]);
+});
 
 test("群长轮旧窗口失效后，合入的新输入提供自己的原窗口和三次进展额度",async()=>{
   let now=0;const f=fixture({now:()=>now});f.message("group");

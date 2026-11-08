@@ -3283,6 +3283,7 @@ fn handoff_steering(updates: Vec<eve_llm_api::SteeringUpdate>) -> Arc<HandoffSte
 }
 fn input_handoff(delivery: eve_llm_api::InputReplyDelivery) -> eve_llm_api::InputReplyHandoff {
     eve_llm_api::InputReplyHandoff {
+        kind: eve_llm_api::InputReplyKind::UserInput,
         input_message_id: "later-input".into(),
         input_text: "你还在吗？继续检查源码".into(),
         event_id: "foreground-input:event-1".into(),

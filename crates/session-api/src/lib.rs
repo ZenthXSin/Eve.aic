@@ -511,6 +511,7 @@ mod enumeration_compatibility {
         .into_iter()
         .enumerate()
         .map(|(index, delivery)| InputReplyHandoff {
+            kind: eve_llm_api::InputReplyKind::UserInput,
             input_message_id: format!("input-{index}"),
             input_text: "继续处理 {{NAME_ab12cd34}}".into(),
             event_id: format!("event-{index}"),

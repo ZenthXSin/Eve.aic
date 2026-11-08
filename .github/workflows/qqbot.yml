@@ -140,6 +140,7 @@ jobs:
           python3 connectors/qqbot/test/eve_e2e.py
           python3 connectors/qqbot/test/message_judge_test.py
           python3 connectors/qqbot/test/live_dialogue_test.py
+          python3 connectors/qqbot/test/natural_progress_test.py
           python3 connectors/qqbot/test/speech_history_test.py
           python3 connectors/qqbot/test/speech_event_context_test.py
           python3 connectors/qqbot/test/live_reminder_test.py

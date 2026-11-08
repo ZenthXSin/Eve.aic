@@ -199,6 +199,7 @@ fn tool_response(id: &str) -> Result<ModelResponse, LlmError> {
 }
 fn handoff(delivery: InputReplyDelivery) -> InputReplyHandoff {
     InputReplyHandoff {
+        kind: eve_llm_api::InputReplyKind::UserInput,
         input_message_id: "followup-1".into(),
         input_text: FOLLOWUP.into(),
         event_id: "foreground:event-1".into(),
@@ -436,6 +437,7 @@ async fn failure_handoff_survives_archive_and_task_restart_then_executes_followu
                 steps: started.spec.max_steps,
                 timeout: None,
                 stop: signal,
+                progress: None,
                 journal: Some(Arc::new(TaskJournal {
                     tasks: fixture.tasks.clone(),
                     owner: started.owner.clone(),
