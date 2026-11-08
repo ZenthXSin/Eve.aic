@@ -483,24 +483,15 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
         self.send_and_finish("当前会话尝试执行写入", 5)
         self.assertFalse((self.source / "revoked-scope.txt").exists())
 
-    def test_unlock_review_uses_exact_six_user_bodies_including_host_like_prefix(self):
+    def test_owner_unlock_skips_review_and_keeps_exact_six_user_bodies_including_host_like_prefix(self):
         originals = [
             WAKE + "这是用户自己输入的普通正文，不能按系统事件丢弃。",
             "用户背景一\n换行原样保留",
             "完整长正文开始\n" + "授权证据仍是用户原话。" * 700 + "\n完整长正文结束",
             "用户背景三",
             "用户背景四",
-            "现在解锁当前会话全部业务权限，继续保留敏感操作审核。",
+            "现在解锁当前会话全部业务权限。",
         ]
-        reviews = []
-
-        def review(request):
-            reviews.append(request)
-            self.assertEqual(request["user_messages"], originals)
-            self.assertFalse(request["delegated"])
-            self.assertIn("解锁", request["action"])
-            return {"risk": "medium", "authorization": "high", "outcome": "allow",
-                    "rationale": "主人明确要求解锁当前会话业务权限，安全审核保留"}
 
         def respond(body):
             text = self.current_text(body)
@@ -510,31 +501,52 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
             if not self.results(body):
                 return tool_response([("manage_business_permissions", {"action": "unlock"})])
             self.assertTrue(self.results(body)[0]["business_permitted"], self.results(body))
-            self.assertTrue(self.results(body)[0]["safety_review_required"])
-            return text_response("当前会话业务权限已解锁，审核仍保留")
+            self.assertFalse(self.results(body)[0]["safety_review_required"])
+            return text_response("当前会话业务权限已解锁")
 
         self.callback = respond
-        self.review_reply = review
+        self.review_reply = lambda request: self.fail("可信主人解锁不能调用审核模型")
         self.start_web()
         self.send_and_finish("撤销当前会话全部业务权限", 1)
-        for number, text in enumerate(originals, 2):
+        self.assertEqual(self.kind("chat"), [], "可信入口缩权不调用模型")
+        for number, text in enumerate(originals[:-1], 2):
             self.send_and_finish(text, number)
-        self.assertEqual(len(reviews), 1)
-        self.assertEqual(len(self.kind("review")), 1)
+        before = len(self.kind("chat"))
+        self.send_and_finish(originals[-1], 7)
+        self.assertEqual(len(self.kind("chat")), before + 2,
+                         "解锁只需要正常工具调用与回执后的回复，不额外审核")
+        self.assertEqual(self.kind("review"), [])
         [grant] = self.business_ledger()["grants"].values()
         self.assertEqual(grant["state"], "unlocked")
         self.assertEqual(grant["user_messages"], originals)
         self.assertEqual(self.business_ledger()["audit"][-1]["user_messages"], originals)
+        self.assertIsNone(self.business_ledger()["audit"][-1]["verdict"])
 
-    def test_raw_emergency_stop_preempts_pending_review_and_keeps_six_complete_user_bodies(self):
+    def test_raw_emergency_stop_cancels_running_tool_and_keeps_six_complete_user_bodies(self):
+        # Web 入口始终绑定主人，不能伪造非主人身份来制造审核。
+        # 非主人管理员的在途审核抢占由 business_restriction_ingress_test.py 验证。
         retained = self.source / "retained"
         retained.mkdir()
         (retained / "keep.txt").write_text("keep", encoding="utf8")
         retained.chmod(0o700)
         originals = ["背景正文 " + str(i) for i in range(5)]
         originals[2] += "\n" + "完整原话不能裁剪。" * 700 + "\n正文末尾标记"
-        action = "检查 retained 目录权限变更"
+        action = "启动受控慢工具，等我释放后再变更 retained 目录权限"
         stop = "立即急停当前会话并取消既有任务"
+        started_tool = self.source / "tool-started.txt"
+        released_tool = self.source / "tool-release"
+        completed_tool = self.source / "tool-completed.txt"
+        command = (
+            "from pathlib import Path\nimport time\n"
+            "marker = Path('tool-started.txt')\n"
+            "marker.write_text((marker.read_text() if marker.exists() else '') + 'x')\n"
+            "deadline = time.monotonic() + 20\n"
+            "while not Path('tool-release').exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(.02)\n"
+            "if Path('tool-release').exists():\n"
+            "    Path('retained').chmod(0o777)\n"
+            "    Path('tool-completed.txt').write_text('completed')\n"
+        )
 
         def respond(body):
             text = self.current_text(body)
@@ -542,30 +554,32 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
                 return text_response("背景已收到")
             self.assertEqual(text, action)
             if not self.results(body):
-                return tool_response([("run_command", {"program": "chmod", "args": ["777", "retained"]})])
+                return tool_response([("run_command", {
+                    "program": sys.executable, "args": ["-c", command]})])
             self.assertFalse(self.results(body)[0].get("success", False), self.results(body))
             return text_response("急停后未改变权限")
 
         self.callback = respond
-        self.response_gates[("review", 1)] = "review-held"
+        self.review_reply = lambda request: self.fail("可信主人慢工具不能调用审核模型")
         self.start_web()
         for number, text in enumerate(originals, 1):
             self.send_and_finish(text, number)
         pending = self.request(action, request=format(6, "032x"))
         self.assertEqual(self.web("/api/chat/send", pending)[0], 202)
-        self.wait_until(lambda: len(self.kind("review")) == 1, "危险命令未进入实际审核请求")
-        pending_review = json.loads(self.kind("review")[0]["body"]["messages"][-1]["content"])
-        self.assertEqual(pending_review["user_messages"], [], "系统危险审查不重复发送用户历史")
+        self.wait_until(started_tool.exists, "慢工具没有实际开始执行")
+        self.assertEqual(started_tool.read_text(), "x")
+        self.assertFalse(completed_tool.exists())
+        self.assertFalse(released_tool.exists())
         baseline = len(self.kind("chat"))
         stop_request = self.request(stop, request=format(7, "032x"))
         started = time.monotonic()
         status, state = self.web("/api/chat/send", stop_request)
         self.assertEqual((status, state["status"]), (202, "completed"), state)
-        self.assertLess(time.monotonic() - started, 3, "急停等待了在途模型审核")
+        self.assertLess(time.monotonic() - started, 3, "急停等待了在途慢工具")
         self.assertIsNone(state["generation"])
-        self.assertFalse(self.gate("review-held").exists())
+        self.assertFalse(released_tool.exists())
         self.assertEqual(len(self.kind("chat")), baseline)
-        self.assertEqual(len(self.kind("review")), 1)
+        self.assertEqual(self.kind("review"), [])
         ledger = self.business_ledger()
         [grant] = ledger["grants"].values()
         self.assertEqual(grant["state"], "emergency_stopped")
@@ -576,8 +590,12 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
         self.assertEqual(grant["user_messages"], originals[-4:] + [action, stop])
         self.assertEqual((retained / "keep.txt").read_text(), "keep")
         self.assertEqual(retained.stat().st_mode & 0o777, 0o700)
-        self.gate("review-held").touch()
-        self.assertEqual(self.finish_web(pending)["status"], "failed")
+        cancelled = self.finish_web(pending)
+        self.assertEqual(cancelled["status"], "failed", cancelled)
+        self.assertEqual(cancelled["started_tools"], 1)
+        released_tool.touch()
+        self.assert_quiet(workers=0, wakes=0)
+        self.assertFalse(completed_tool.exists(), "已取消的真实工具不能在放行后继续执行")
         self.assertEqual((retained / "keep.txt").read_text(), "keep")
         self.assertEqual(retained.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.web("/api/chat/send", stop_request)[1]["status"], "completed")
@@ -589,6 +607,10 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
                               if e["action"] == "emergency_stop" and e["outcome"] == "committed"]), 1)
         self.assertEqual((retained / "keep.txt").read_text(), "keep")
         self.assertEqual(retained.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(completed_tool.exists(), "重启不能重放已取消的工具")
+        self.assertEqual(started_tool.read_text(), "x")
+        self.assertEqual(len(self.kind("chat")), baseline)
+        self.assertEqual(self.kind("review"), [])
 
 
 if __name__ == "__main__":
