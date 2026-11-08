@@ -349,7 +349,7 @@ class MemoryAcceptance(unittest.TestCase):
         self.assertEqual([item["text"] for item in first[0]["preferences"]], [PREFERENCE])
         self.assertEqual([item["text"] for item in corrected[0]["preferences"]], [CORRECTION])
         self.assertEqual(revoked, [])
-        self.assertTrue(any("从交互中学习表达" in (message.get("content") or "")
+        self.assertTrue(any("从真实交互中学习说话内容与表达方式" in (message.get("content") or "")
                             for message in self.requests[0]["body"]["messages"]))
         preference = self.only_snapshot()["preferences"][0]
         self.assertEqual([version["status"] for version in preference["history"]],
@@ -552,7 +552,7 @@ class MemoryAcceptance(unittest.TestCase):
         self.assertFalse(request["body"].get("tools"))
         encoded = json.dumps(request["body"], ensure_ascii=False)
         self.assertNotIn(PREFERENCE, encoded)
-        self.assertNotIn("当前会话允许从交互中学习表达", encoded)
+        self.assertNotIn("当前会话允许从真实交互中学习说话内容与表达方式", encoded)
         self.assertEqual(self.memory(), before)
 
     @unittest.skipUnless(os.name == "posix", "SIGTERM uses the Unix child process interface")

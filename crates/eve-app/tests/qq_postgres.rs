@@ -304,7 +304,7 @@ fn has_training(request: &Value) -> bool {
         m["role"] == "system"
             && m["content"]
                 .as_str()
-                .is_some_and(|text| text.contains("当前会话允许从交互中学习表达"))
+                .is_some_and(|text| text.contains("当前会话允许从真实交互中学习说话内容与表达方式"))
     })
 }
 

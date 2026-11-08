@@ -432,7 +432,7 @@ def validate_receipt_entries(receipts, inherited=frozenset()):
         passive = {}
         for part in progress:
             authored = version >= 9 and isinstance(part, dict) and part.get('decision_id') is not None
-            allowed_fields = {'text', 'state', 'proactive', 'necessary', 'reply_anchor'}
+            allowed_fields = {'text', 'state', 'proactive', 'necessary', 'reply_anchor', 'conversation'}
             if version >= 9:
                 allowed_fields |= {'decision_id', 'platform_message_id', 'image_path'}
             if (not isinstance(part, dict) or not {'text', 'state'} <= set(part)
@@ -460,6 +460,7 @@ def validate_receipt_entries(receipts, inherited=frozenset()):
             if anchor is not None and (not platform_id(anchor) or anchor == receipt['message']['id']
                     or receipt['message']['scope'] != 'group' or part.get('proactive', False) or not authored):
                 raise ValueError('invalid_reply_anchor')
+            validate_progress_conversation(part, receipt, authored)
             if version == 10 and not part.get('proactive', False):
                 effective = anchor if anchor is not None else receipt['message']['id']
                 passive[effective] = passive.get(effective, 0) + 1
@@ -474,6 +475,44 @@ def validate_receipt_entries(receipts, inherited=frozenset()):
                 raise ValueError('invalid_passive_progress_budget')
     validate_merged_receipts(receipts)
     return settled
+
+def validate_progress_conversation(part, receipt, authored):
+    """镜像 QQ Progress 的公开交流契约；未知投递不能拥有送达观察时间。"""
+    metadata = part.get('conversation')
+    if metadata is None:
+        return
+    fields = {'observed_at_ms', 'source_at_ms', 'reply_to', 'turn_id', 'activity',
+              'sequence', 'source_kind', 'context', 'fragment'}
+    def control(character):
+        return ord(character) < 32 or 127 <= ord(character) <= 159
+    def identifier(value, limit):
+        return (isinstance(value, str) and 0 < len(value.encode()) <= limit
+                and value.strip() == value and not any(control(c) for c in value))
+    def optional_u64(value):
+        return value is None or type(value) is int and 0 <= value <= 2 ** 64 - 1
+    if (not authored or part.get('image_path') is not None
+            or not isinstance(metadata, dict) or not set(metadata) <= fields
+            or any(metadata.get(key) is not None
+                   for key in ('sequence', 'fragment', 'source_at_ms', 'context'))
+            or metadata.get('source_kind') != 'qq_sent'
+            or not optional_u64(metadata.get('turn_id')) or metadata.get('turn_id') == 0
+            or not optional_u64(metadata.get('observed_at_ms'))
+            or metadata.get('observed_at_ms') is not None
+               and (metadata['observed_at_ms'] == 0 or part['state'] != 'Sent')
+            or not identifier(metadata.get('reply_to'), 256)
+            or any(control(c) and c not in '\n\r\t' for c in part['text'])):
+        raise ValueError('invalid_progress_conversation')
+    anchor = part.get('reply_anchor') or receipt['message']['id']
+    expected = 'qq-human:' + hashlib.sha256(anchor.encode()).hexdigest()
+    if metadata['reply_to'] != expected:
+        raise ValueError('invalid_progress_conversation')
+    activity = metadata.get('activity')
+    if activity is not None and (not isinstance(activity, dict)
+            or not {'phase'} <= set(activity) <= {'phase', 'elapsed_ms', 'tool_name'}
+            or not identifier(activity['phase'], 80)
+            or not optional_u64(activity.get('elapsed_ms'))
+            or activity.get('tool_name') is not None and not identifier(activity['tool_name'], 256)):
+        raise ValueError('invalid_progress_conversation')
 
 def platform_id(value):
     return (isinstance(value, str) and 0 < len(value.encode()) <= 253 and value.strip() == value

@@ -613,11 +613,7 @@ impl PersistentConversations {
         }
         for revision in history {
             let sequence = revision.sequence;
-            if batch
-                .lessons
-                .iter()
-                .any(|lesson| *lesson == revision.lesson)
-            {
+            if batch.lessons.contains(&revision.lesson) {
                 checkpoint.history_cursor = sequence;
                 continue;
             }

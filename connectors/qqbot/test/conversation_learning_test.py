@@ -91,6 +91,24 @@ class WebConversationLearning(web_fixture.WebAutonomyAcceptance):
             return json.dumps({"lessons": [lesson(decoded, "correction", [1, 2])]}, ensure_ascii=False)
         return super().reply(kind, decoded, latest)
 
+    def provider_response(self, body, kind, fallback):
+        messages = body["messages"]
+        if messages[0]["role"] == "system" and messages[0]["content"].startswith("你是对话历史压缩器"):
+            self.assertEqual([message["role"] for message in messages], ["system", "user", "user"])
+            self.assertFalse(body.get("tools"))
+            self.assertEqual(body.get("response_format"), {"type": "json_object"})
+            request = json.loads(messages[1]["content"])
+            self.assertEqual(set(request), {"previous_turns", "previous", "turns"})
+            self.assertTrue(request["turns"])
+            covered = request["previous_turns"] + len(request["turns"])
+            self.assertEqual([turn["number"] for turn in request["turns"]],
+                             list(range(request["previous_turns"] + 1, covered + 1)))
+            # 长会话仍运行真实历史压缩；带来源的合成摘要不进入前台接话回调。
+            points = [*request["previous"], *({"text": " ".join(turn["user"].splitlines())[:120],
+                                             "turns": [turn["number"]]} for turn in request["turns"])]
+            return text_response(json.dumps({"points": points[-12:]}, ensure_ascii=False))
+        return super().provider_response(body, kind, fallback)
+
     def test_correction_learns_without_commands_applies_to_new_topic_and_survives_restart(self):
         replies = {"今天跑了一整天，有点累": "建议你列个休息计划，要我帮你安排吗？",
                    "不用帮我安排，就陪我吐槽两句，别每次都提建议": "这一天够折腾的，先歇会儿"}

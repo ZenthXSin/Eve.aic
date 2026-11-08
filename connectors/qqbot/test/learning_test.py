@@ -780,7 +780,7 @@ class LearningAcceptance(unittest.TestCase):
         self.assertNotIn(preference, encoded)
         self.assertNotIn(description, encoded)
         self.assertNotIn(ARTIFACT["summary"], encoded)
-        self.assertNotIn("当前会话允许从交互中学习表达", encoded)
+        self.assertNotIn("当前会话允许从真实交互中学习说话内容与表达方式", encoded)
         self.assertEqual(self.memory(), before)
         self.assertEqual(sum(request["kind"] == "reflection" for request in self.requests), 1)
 
