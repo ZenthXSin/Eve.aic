@@ -1,6 +1,8 @@
 """真实进程：后台事件有自己的触发原因，旧入站只作语境；不使用正文去重。"""
 import hashlib
 import json
+import sqlite3
+import time
 import unittest
 
 import dialogue_tools_test as dialogue
@@ -121,6 +123,52 @@ class SpeechEventContextAcceptance(live.LiveToolAcceptance):
                          ['这件事我想告诉你。'] * 3)
         self.assertEqual(len({json.loads(r['messages'][-1]['content'])['event_id']
                               for r in self.speech_requests}), 3)
+
+    def test_group_observation_does_not_replace_background_progress_reply_anchor(self):
+        parent = self.message('group-task', '后台核对这个任务', scope='group', target='group-1')
+        self.callback = lambda body: (self.choose('send_message', {'text': '任务已经接下。'})
+            if not self.all_results(body) else dialogue.text_response('{"action":"silence"}'))
+        self.run_live(self.send(parent))
+        session = self.receipt(parent['id'])['message']
+        principal = 'qq:' + hashlib.sha256(json.dumps(
+            ['1904159860', 'group', session['target_id'], session['user_id']],
+            separators=(',', ':')).encode()).hexdigest()
+        event = {'id': 'test-background-progress',
+                 'session': {'session_id': principal, 'user_id': principal},
+                 'anchor': parent['id'], 'facts': {'kind': 'background_task_observation',
+                     'status': 'Running', 'result': '已有步骤的核对结果'}}
+        event_key = hashlib.sha256(json.dumps([event['session'], event['id']],
+            separators=(',', ':')).encode()).hexdigest()
+        # 隔离宿主停止后放入待审视事实；正文仍必须从真实原始入站库读取。
+        with sqlite3.connect(self.work / 'state/speech.sqlite3') as db:
+            due = int(time.time() * 1000) + 4000
+            db.execute('INSERT INTO speech(id,event,state,due,updated) VALUES(?,?,?,?,?)',
+                       (event_key, json.dumps(event), 'pending', due, due))
+        ambient = {'type': 'group_observation', 'id': 'observe-ambient',
+                   'message': {'id': 'ambient', 'scope': 'group', 'target_id': 'group-1',
+                               'user_id': 'user-1', 'text': '我在和另一位群友聊画画'},
+                   'original_text': '我在和另一位群友聊画画', 'mentions_me': False}
+
+        def decide(facts):
+            self.assertEqual(facts['trigger'], 'background_event')
+            current = json.loads(self.speech_requests[-1]['messages'][4]['content'].split('：', 1)[1])
+            self.assertEqual(current['latest_user_message'],
+                             {'id': parent['id'], 'text': parent['text']})
+            return {'action': 'speak', 'text': '刚才任务已有新的核对结果。', 'after_ms': 0}
+
+        self.speech_callback = decide
+
+        def delivered():
+            self.wait_until(lambda: any(e['id'] == event['id'] and state == 'sent'
+                for e, state, _ in self.speech_rows()), '群旁观抢走后台进展的真实回复锚点')
+
+        self.run_live([{'send': ambient}, *self.checkpoint('delivered')],
+                      checkpoints={'delivered': delivered})
+        [push] = [e for e in self.events if e.get('type') == 'push']
+        self.assertEqual(push['based_on_message_id'], parent['id'])
+        self.assertEqual(push['text'], '刚才任务已有新的核对结果。')
+        self.assertEqual(len(self.speech_requests), 1)
+        self.assertEqual(self.receipt(parent['id'])['state'], 'Handled')
 
 
 if __name__ == '__main__':

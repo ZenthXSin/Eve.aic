@@ -3264,7 +3264,12 @@ pub(crate) async fn run(
                             let at_ms = observed.metadata().observed_at_ms.unwrap_or(1);
                             // 全量群旁观也先持久采集真实正文，再交插话/表达筛选。
                             if learning.push(&ctx, observed).is_err() { warn(&ctx, "conversation_observer_input_failed"); }
-                            conversations.record_message(&config.app_id, &message)?;
+                            // 群旁观有自己的插话与学习锚点，不是新的主对话输入。
+                            // 这里只更新可信身份和路由；推进 latest_messages 会使后台
+                            // 发言去读取没有进入主对话原文库的消息，并永久等待其原文。
+                            conversations.record(&session, &message.scope);
+                            conversations.record_group_identity(&config.app_id, session,
+                                &message.target_id, &message.user_id, message.conversation_key(&config.app_id)?)?;
                             if let Some(observer) = &group_observer
                                 && observer.observe(&message, frame["sender_name"].as_str(), frame["mentions_me"].as_bool().unwrap_or(false), at_ms).is_err() {
                                 warn(&ctx,"group_observation_failed");

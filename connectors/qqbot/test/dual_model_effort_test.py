@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from model_adapter_fixture import (
     CHAT_PATH, RESPONSES_PATH, MODEL, MODEL_KEY, MAX_OUTPUT, Reply, WireAcceptance,
-    content_text, current_results, items, latest_user, tool_definitions,
+    content_text, current_results, delegated_messages, items, latest_user, tool_definitions,
 )
 
 CODING_MODEL = "coding-process-fixture"
@@ -443,17 +443,7 @@ class DualModelEffortAcceptance(WireAcceptance):
             body = captured["body"]
             self.assertIn(child_task, latest_user(body))
             self.assertNotIn("seed-history-", json.dumps(current_results(body)))
-            data = []
-            for message in items(body):
-                text = content_text(message)
-                if message.get("role") != "user" or "eve.delegated_context" not in text:
-                    continue
-                try:
-                    record = json.loads(text[text.index("{"):])
-                except (ValueError, TypeError):
-                    continue
-                if record.get("kind") == "eve.delegated_context":
-                    data.append(record["message"])
+            data = delegated_messages(body)
             self.assertEqual(json.dumps(data, ensure_ascii=False).count(historical), 5,
                              "coding 请求须收到完整冻结资料，不能只保留 include_context 成功标记")
             self.assertFalse(any(message.get("tool_calls") for message in items(body)

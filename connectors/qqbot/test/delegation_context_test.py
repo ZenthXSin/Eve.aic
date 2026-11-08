@@ -5,6 +5,7 @@ import unittest
 import developer_tools_test as developer
 from background_task_test import WORKER, calls
 from dialogue_tools_test import text_response
+from model_adapter_fixture import delegated_messages
 
 
 class DelegationContextAcceptance(developer.DeveloperAcceptance):
@@ -32,17 +33,20 @@ class DelegationContextAcceptance(developer.DeveloperAcceptance):
         leaf="你是 Eve 的子代理" in body["messages"][0]["content"]
         self.assertFalse(names & ({"dispatch_background_task", "set_wakeup_trigger", "create_subagent"} | ({"run_subagent"} if leaf else set())))
         text = self.text(body)
-        self.assertEqual("eve.delegated_context" in text, include)
+        self.assertIn("核查背景并交付结论", text)
+        messages = delegated_messages(body)
+        self.assertEqual(bool(messages), include)
+        request = json.dumps(body, ensure_ascii=False)
+        self.assertNotIn("OTHER_USER_PRIVATE_928", request)
         if include:
-            data = json.loads(text[text.index('{"kind":"eve.delegated_context"'):])
-            encoded = json.dumps(data, ensure_ascii=False)
+            encoded = json.dumps(messages, ensure_ascii=False)
             self.assertIn("PARENT_FACT_735", encoded)
             self.assertIn("开始委派", encoded)
             self.assertNotIn("OTHER_USER_PRIVATE_928", encoded)
             self.assertFalse(any(c["name"] in {"run_subagent", "dispatch_background_task"}
-                                 for m in data["messages"] for c in m["tool_calls"]))
+                                 for m in messages for c in m.get("tool_calls", [])))
         else:
-            self.assertNotIn("PARENT_FACT_735", text)
+            self.assertNotIn("PARENT_FACT_735", request)
         return text_response("委派核查完成")
 
     def exercise(self, tool, include):

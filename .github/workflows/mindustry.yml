@@ -79,8 +79,12 @@ jobs:
           node-version: "22"
       - name: 下载并校验 Mindustry 服务端
         run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
-            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
+          if ! curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
+            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"; then
+            curl --fail --location --retry 3 -H 'Accept: application/octet-stream' \
+              -o "$RUNNER_TEMP/server-release.jar" \
+              "https://api.github.com/repos/Anuken/Mindustry/releases/assets/620209090"
+          fi
           echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
           java -version
       - name: 安装 Rust
@@ -136,8 +140,12 @@ jobs:
           persist-credentials: false
       - name: 下载并校验 Gradle 与 Mindustry 服务端
         run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
-            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
+          if ! curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
+            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"; then
+            curl --fail --location --retry 3 -H 'Accept: application/octet-stream' \
+              -o "$RUNNER_TEMP/server-release.jar" \
+              "https://api.github.com/repos/Anuken/Mindustry/releases/assets/620209090"
+          fi
           echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/gradle.zip" \
             "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"

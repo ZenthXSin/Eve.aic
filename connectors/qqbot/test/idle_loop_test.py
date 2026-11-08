@@ -13,6 +13,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import developer_tools_test as developer
 from dialogue_tools_test import text_response, tool_response
+from model_adapter_fixture import delegated_messages
 
 PREFIX='eve.idle.observation.v1\n'
 PLAN_PREFIX='eve.subject.plan.v1\n'
@@ -119,12 +120,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             self.assertFalse(body.get('tools'),'回顾轮次无外部操作工具')
             self.review_capabilities.append(self.action_capabilities(body))
             self.assertNotIn('invented-hint',json.dumps(body),'非法小模型ID不能注入主模型')
-            messages=[]
-            for m in body['messages']:
-                text=m.get('content') or ''
-                if '"kind":"eve.delegated_context"' in text:
-                    packet=json.JSONDecoder().raw_decode(text[text.index('{"kind":"eve.delegated_context"'):])[0]
-                    messages.extend(packet['messages'])
+            messages=delegated_messages(body)
             observation=json.loads(next(m['text'][len(PREFIX):] for m in messages if (m.get('text') or '').startswith(PREFIX)))
             self.observations.append(observation)
             self.reflections+=1
