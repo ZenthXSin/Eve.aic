@@ -4,11 +4,11 @@
 //! 服务仍通过 `plugin-api` 的公开注册表访问，业务插件不依赖本模块。
 use eve_kernel::{Kernel, RuntimeAdmissionGuard};
 use eve_llm_api::{
-    ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture,
-    LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode,
-    SystemPromptMetadata, SystemPromptSnapshot, SystemPromptSource, Tool, ToolBinding, ToolCall,
-    ToolCancellation, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode,
-    ToolResult, ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
+    ChatMessage, ChatRole, ContextAssembler, ContextScope, ContextService, ContextSnapshot,
+    LlmError, LlmFuture, LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelTextSink,
+    ResponseMode, SystemPromptMetadata, SystemPromptSnapshot, SystemPromptSource, Tool,
+    ToolBinding, ToolCall, ToolCancellation, ToolConcurrency, ToolDefinition, ToolExecutionContext,
+    ToolFailureCode, ToolResult, ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
 };
 use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
@@ -1962,6 +1962,27 @@ impl LlmHost {
             )
             .await
             .map_err(|error| fail(error, diagnostics.clone()))?;
+            let delegated_conversation =
+                Arc::new(if let Some((_, original)) = &self.delegated_context {
+                    match &checkpoint {
+                        Some(frame) => {
+                            let mut current = frame.messages.clone();
+                            remove_legacy_delegated_suffix(&mut current, original)
+                                .map_err(|error| fail(error, diagnostics.clone()))?;
+                            current
+                        }
+                        None => compaction.as_ref().map_or_else(
+                            || {
+                                let mut current = messages.clone();
+                                current.drain(2..2 + original.len());
+                                current
+                            },
+                            |state| state.without_history(&messages),
+                        ),
+                    }
+                } else {
+                    messages.clone()
+                });
             let results = match self
                 .execute_calls_ordered(
                     &prepared.tools,
@@ -1976,31 +1997,7 @@ impl LlmHost {
                             .as_ref()
                             .map(|session| session.for_request(request_ordinal)),
                         continuation: continuation.clone(),
-                        conversation: Arc::new(if self.delegated_context.is_some() {
-                            match &checkpoint {
-                                Some(frame) => {
-                                    let mut current = frame.messages.clone();
-                                    remove_legacy_delegated_suffix(
-                                        &mut current,
-                                        &self.delegated_context.as_ref().unwrap().1,
-                                    )
-                                    .map_err(|error| fail(error, diagnostics.clone()))?;
-                                    current
-                                }
-                                None => compaction.as_ref().map_or_else(
-                                    || {
-                                        let mut current = messages.clone();
-                                        current.drain(
-                                            2..2 + self.delegated_context.as_ref().unwrap().1.len(),
-                                        );
-                                        current
-                                    },
-                                    |state| state.without_history(&messages),
-                                ),
-                            }
-                        } else {
-                            messages.clone()
-                        }),
+                        conversation: delegated_conversation,
                         review_user_messages: review_user_messages.clone(),
                         require_current_anchor: !chat_without_tools
                             && review_user_messages.is_none(),

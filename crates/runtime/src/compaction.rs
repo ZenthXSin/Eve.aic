@@ -486,15 +486,23 @@ mod tests {
             );
         }
         let mut count = JsonCharacters {
+            bytes: 0,
             ascii: usize::MAX,
             non_ascii: 0,
         };
         assert!(count.write_all(b"x").is_err());
         let mut count = JsonCharacters {
+            bytes: 0,
             ascii: 0,
             non_ascii: usize::MAX,
         };
         assert!(count.write_all("猫".as_bytes()).is_err());
+        let mut count = JsonCharacters {
+            bytes: usize::MAX,
+            ascii: 0,
+            non_ascii: 0,
+        };
+        assert!(count.write_all(b"x").is_err());
     }
     struct Digests(AtomicUsize);
 
