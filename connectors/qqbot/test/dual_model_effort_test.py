@@ -443,6 +443,22 @@ class DualModelEffortAcceptance(WireAcceptance):
             body = captured["body"]
             self.assertIn(child_task, latest_user(body))
             self.assertNotIn("seed-history-", json.dumps(current_results(body)))
+            data = []
+            for message in items(body):
+                text = content_text(message)
+                if message.get("role") != "user" or "eve.delegated_context" not in text:
+                    continue
+                try:
+                    record = json.loads(text[text.index("{"):])
+                except (ValueError, TypeError):
+                    continue
+                if record.get("kind") == "eve.delegated_context":
+                    data.append(record["message"])
+            self.assertEqual(json.dumps(data, ensure_ascii=False).count(historical), 5,
+                             "coding 请求须收到完整冻结资料，不能只保留 include_context 成功标记")
+            self.assertFalse(any(message.get("tool_calls") for message in items(body)
+                                 if message.get("role") == "user"),
+                             "历史工具只能作为资料，不能成为实际调用")
             if not current_results(body):
                 return Reply(calls=[("long-coding-read", "read_file", {"path": "README.md"})])
             self.assertEqual(current_results(body)[-1]["content"], "真实源码测试")
