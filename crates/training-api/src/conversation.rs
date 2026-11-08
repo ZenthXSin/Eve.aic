@@ -230,16 +230,37 @@ pub struct ConversationHistoryRecord {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConversationSweepMessageCounts {
+    /// 已消费完整原消息中，至少一片最终失败且没有未知片段的数量。
+    pub failed: u64,
+    /// 已消费完整原消息中，至少一片结果未知的数量；优先于失败。
+    pub unknown: u64,
+    /// 旧检查点没有逐片结果，不能证明成功或失败的已消费消息。
+    pub unclassified: u64,
+    /// 迁移前记录的 processed，仅供核对，不能与新成功数相加。
+    pub legacy_processed: u64,
+    /// 以下三个数都是 remaining 的子集，原消息越界后才计入终态。
+    pub partial: u64,
+    pub partial_failed: u64,
+    pub partial_unknown: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConversationSweepStatus {
     pub id: String,
     pub scopes: u64,
     pub total: u64,
+    /// message_counts 存在时，仅统计全部分片已确认成功的原消息。
     pub processed: u64,
     pub remaining: u64,
     pub updated: u64,
     pub failed_batches: u64,
     pub interrupted_batches: u64,
     pub model_requests: u64,
+    /// 旧状态文件缺失此字段时保持未知，不能把旧 processed 当作全片成功。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_counts: Option<ConversationSweepMessageCounts>,
+    /// 表示冻结队列已消费完，不代表每条消息均成功。
     pub completed: bool,
 }
 
@@ -285,6 +306,7 @@ pub struct ConversationLegacyScope {
 pub struct ConversationBatchArchive {
     pub batch: ConversationBatch,
     /// completed / failed / paused / reset / interrupted；不是外部动作回执。
+    /// budget_exhausted 仅结算已明确失败、但维护总额度不再允许重试的原批次，不代表新请求。
     pub outcome: String,
     pub recorded_at_ms: Option<u64>,
 }

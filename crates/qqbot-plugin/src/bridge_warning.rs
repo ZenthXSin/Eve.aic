@@ -46,9 +46,13 @@ pub(super) fn entry(frame: &Value) -> Option<LogEntry> {
         Some("frame_limit") => "bridge_frame_limit",
         Some("protocol_version") => "bridge_protocol_version",
         Some("sdk_error") => "bridge_sdk_error",
+        Some("send_failure") => "bridge_send_failure",
         _ => "bridge_warning",
     };
     let mut entry = LogEntry::new(LogLevel::Warn, "eve.qqbot", code).ok()?;
+    if code == "bridge_send_failure" {
+        return Some(outbound_entry(entry, frame));
+    }
     if code != "bridge_invalid_route_or_text" {
         return Some(entry);
     }
@@ -155,6 +159,64 @@ pub(super) fn entry(frame: &Value) -> Option<LogEntry> {
         }
     }
     Some(entry)
+}
+
+fn outbound_entry(mut entry: LogEntry, frame: &Value) -> LogEntry {
+    let Some(outbound) = frame.get("outbound") else {
+        return entry;
+    };
+    if outbound.get("version").and_then(Value::as_u64) != Some(1) {
+        return entry;
+    }
+    let Some(stage) = outbound
+        .get("stage")
+        .and_then(Value::as_str)
+        .filter(|stage| {
+            matches!(
+                *stage,
+                "sdk_message_request" | "sdk_token" | "receipt_validation" | "sdk_operation"
+            )
+        })
+    else {
+        return entry;
+    };
+    let Some(kind) = outbound
+        .get("failure_kind")
+        .and_then(Value::as_str)
+        .filter(|kind| {
+            matches!(
+                *kind,
+                "transport_unknown"
+                    | "timeout"
+                    | "connection"
+                    | "dns"
+                    | "tls"
+                    | "http"
+                    | "platform_message_id_unknown"
+            )
+        })
+    else {
+        return entry;
+    };
+    entry = entry
+        .with_field("outbound_version", "1")
+        .with_field("outbound_stage", stage)
+        .with_field("outbound_failure_kind", kind);
+    if let Some(value) = outbound
+        .get("elapsed_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_SAFE_INTEGER)
+    {
+        entry = entry.with_field("outbound_elapsed_ms", value.to_string());
+    }
+    if let Some(value) = outbound
+        .get("http_status")
+        .and_then(Value::as_u64)
+        .filter(|value| (100..=599).contains(value))
+    {
+        entry = entry.with_field("outbound_http_status", value.to_string());
+    }
+    entry
 }
 
 #[cfg(test)]
@@ -273,5 +335,102 @@ mod tests {
             assert!(entry.fields.is_empty());
             assert!(!format!("{entry:?}").contains("PRIVATE"));
         }
+    }
+
+    #[test]
+    fn send_failure_keeps_only_fixed_stages_kinds_and_bounded_values() {
+        for (stage, kind) in [
+            ("sdk_message_request", "transport_unknown"),
+            ("sdk_token", "timeout"),
+            ("receipt_validation", "platform_message_id_unknown"),
+            ("receipt_validation", "transport_unknown"),
+            ("sdk_operation", "connection"),
+            ("sdk_operation", "dns"),
+            ("sdk_operation", "tls"),
+            ("sdk_message_request", "http"),
+        ] {
+            let frame = json!({"code":"send_failure", "text":"PRIVATE_TEXT", "outbound": {
+                "version":1, "stage":stage, "failure_kind":kind,
+                "elapsed_ms":10_674, "http_status":200, "biz_code":"PRIVATE_CODE",
+                "message":"PRIVATE_ERROR", "stack":"PRIVATE_STACK", "cause":{"code":"PRIVATE"},
+                "target_id":"PRIVATE_ID", "path":"https://PRIVATE_HOST/PRIVATE_TOKEN"
+            }});
+            let entry = entry(&frame).unwrap();
+            assert_eq!(entry.message, "bridge_send_failure");
+            assert_eq!(entry.fields.len(), 5);
+            assert_eq!(entry.fields["outbound_version"], "1");
+            assert_eq!(entry.fields["outbound_stage"], stage);
+            assert_eq!(entry.fields["outbound_failure_kind"], kind);
+            assert_eq!(entry.fields["outbound_elapsed_ms"], "10674");
+            assert_eq!(entry.fields["outbound_http_status"], "200");
+            assert!(!format!("{entry:?}").contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn send_failure_rejects_malformed_or_unknown_metadata_without_echoing_it() {
+        for outbound in [
+            json!(null),
+            json!("PRIVATE"),
+            json!({"version":2, "stage":"sdk_operation", "failure_kind":"timeout"}),
+            json!({"version":1, "stage":"PRIVATE", "failure_kind":"timeout"}),
+            json!({"version":1, "stage":"sdk_operation", "failure_kind":"PRIVATE"}),
+        ] {
+            let frame = json!({"code":"send_failure", "outbound":outbound});
+            let entry = entry(&frame).unwrap();
+            assert_eq!(entry.message, "bridge_send_failure");
+            assert!(entry.fields.is_empty());
+            assert!(!format!("{entry:?}").contains("PRIVATE"));
+        }
+        assert!(
+            entry(&json!({"code":"send_failure"}))
+                .unwrap()
+                .fields
+                .is_empty()
+        );
+        for (elapsed, status) in [
+            (json!(-1), json!(99)),
+            (json!(9_007_199_254_740_992_u64), json!(600)),
+            (json!(1.5), json!(200.5)),
+            (json!("PRIVATE"), json!("PRIVATE")),
+            (json!(null), json!(null)),
+            (json!(true), json!(false)),
+        ] {
+            let frame = json!({"code":"send_failure", "outbound": {
+                "version":1, "stage":"sdk_operation", "failure_kind":"transport_unknown",
+                "elapsed_ms":elapsed, "http_status":status
+            }});
+            let entry = entry(&frame).unwrap();
+            assert_eq!(entry.fields.len(), 3);
+            assert!(!format!("{entry:?}").contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn successful_http_without_a_receipt_preserves_the_unknown_delivery_mapping() {
+        for status in [200, 201, 204, 299] {
+            let frame = json!({
+                "version":1, "type":"delivery", "ok":false,
+                "failure_kind":"transport_unknown", "http_status":status
+            });
+            assert!(super::super::delivery_unknown(&frame));
+            assert_eq!(
+                super::super::file_result(&frame, false),
+                crate::QqFileResult::Unknown
+            );
+            assert_eq!(
+                super::super::outreach_result(&frame, false),
+                crate::QqOutreachResult::Unknown
+            );
+        }
+        let rejected = json!({"ok":false, "failure_kind":"http", "http_status":403});
+        assert!(!super::super::delivery_unknown(&rejected));
+        assert!(matches!(
+            super::super::file_result(&rejected, false),
+            crate::QqFileResult::Failed {
+                http_status: Some(403),
+                ..
+            }
+        ));
     }
 }

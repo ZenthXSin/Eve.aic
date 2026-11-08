@@ -78,7 +78,7 @@ fn archive_valid(scope: &ContextScope, archive: &ConversationBatchArchive) -> bo
         && batch.lesson_history.iter().all(revision_valid)
         && matches!(
             archive.outcome.as_str(),
-            "completed" | "failed" | "paused" | "reset" | "interrupted"
+            "completed" | "failed" | "paused" | "reset" | "interrupted" | "budget_exhausted"
         )
 }
 fn insert_archive(

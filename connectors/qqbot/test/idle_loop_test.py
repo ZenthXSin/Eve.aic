@@ -210,11 +210,18 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
                         (json.dumps(mind,ensure_ascii=False),scope))
 
     def wait_revision(self,n):self.wait_for(lambda:self.mind() and self.mind()['revision']>=n,'回顾结果未保存',15)
+
+    def wait_notifications_delivered(self):
+        # Completed 只证明行动完成；桥在 checkpoint 放行后立即退出，须先等真实通知回执。
+        self.wait_for(lambda:all(t['notice'] is None or t['notice']['status']=='Delivered'
+            for t in self.tasks()),'重启快照前已完成任务通知尚未送达',15)
+
     def test_idle_action_and_changed_judgment_across_processes_without_new_user_message(self):
         self.initialize();self.due()
         def completed():
             self.wait_for(lambda:(self.source/'experiment.txt').exists(),'自主行动没有执行',15)
             self.wait_for(lambda:any(t['spec']['title']=='隔离验证空闲想法' and t['status']=='Completed' for t in self.tasks()),'行动未完成',15)
+            self.wait_notifications_delivered()
         self.run_idle(self.checkpoint('action'),checkpoints={'action':completed})
         self.assertEqual(self.reflections,1)
         self.assertEqual((self.source/'experiment.txt').read_text(),EXPERIMENT)
@@ -270,6 +277,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         def completed():
             self.wait_for(lambda:any(t['spec']['title']=='隔离验证空闲想法' and t['status']=='Completed'
                 for t in self.tasks()),'兴趣驱动的实际行动未完成',15)
+            self.wait_notifications_delivered()
         self.run_idle(self.checkpoint('own-action'),checkpoints={'own-action':completed})
         first_judgment_evidence=self.mind()['judgments'][0]['evidence']
         first=self.mind()['self_interests'][0]
@@ -331,8 +339,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         def completed_and_delivered():
             self.wait_for(lambda:any(t['source'].startswith('subject-focus:') and t['status']=='Completed'
                 for t in self.tasks()),'旧行动没有完成规划、冻结和真实验收',15)
-            self.wait_for(lambda:all(t['notice'] is None or t['notice']['status']=='Delivered'
-                for t in self.tasks()),'重启快照前已完成任务通知尚未送达',15)
+            self.wait_notifications_delivered()
         self.run_idle(self.checkpoint('legacy-action'),checkpoints={'legacy-action':completed_and_delivered})
         self.assertEqual(self.reflections,1)
         self.assertEqual(self.plans,1)
