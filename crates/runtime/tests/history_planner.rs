@@ -402,6 +402,127 @@ async fn selected_history_compression_is_ephemeral_and_does_not_reuse_original_p
     );
 }
 
+struct FullPlan;
+impl HistoryContextPlanner for FullPlan {
+    fn plan<'a>(
+        &'a self,
+        _: Option<&'a ContextScope>,
+        _: &'a TurnInput,
+        history: &'a [ChatMessage],
+    ) -> LlmFuture<'a, Option<HistoryContextPlan>> {
+        Box::pin(async move {
+            Ok(Some(HistoryContextPlan {
+                retained_turns: (0..history_turns(history).len()).collect(),
+                working_set: vec!["保留完整历史，工作集不改变原文".into()],
+            }))
+        })
+    }
+}
+
+#[derive(Default)]
+struct PrefixDigest {
+    saved: Mutex<Option<(ContextScope, Vec<ChatMessage>, HistoryDigest)>>,
+    compactions: std::sync::atomic::AtomicUsize,
+}
+impl HistoryDigests for PrefixDigest {
+    fn digest(
+        &self,
+        _: Option<&ContextScope>,
+        _: &[ChatMessage],
+    ) -> Result<Option<HistoryDigest>, LlmError> {
+        panic!("full plan omits no prefix")
+    }
+    fn cached(
+        &self,
+        scope: Option<&ContextScope>,
+        history: &[ChatMessage],
+    ) -> Result<Option<HistoryDigest>, LlmError> {
+        let saved = self.saved.lock().unwrap();
+        Ok(saved
+            .as_ref()
+            .filter(|(owner, original, _)| Some(owner) == scope && history.starts_with(original))
+            .map(|(_, _, digest)| digest.clone()))
+    }
+    fn compact<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        history: &'a [ChatMessage],
+    ) -> LlmFuture<'a, Option<HistoryDigest>> {
+        Box::pin(async move {
+            let scope = scope.expect("unchanged full history must retain its scope");
+            self.compactions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let digest = HistoryDigest {
+                covered_turns: history_turns(history).len(),
+                text: "旧工具已完成，原文保留，不重放。".into(),
+            };
+            *self.saved.lock().unwrap() = Some((scope.clone(), history.to_vec(), digest.clone()));
+            Ok(Some(digest))
+        })
+    }
+}
+
+#[tokio::test]
+async fn full_history_plan_reuses_scoped_prefix_digest_across_turns_and_keeps_new_messages() {
+    let provider = Provider::new(vec![
+        Step::new(final_response("first")),
+        Step::new(final_response("second")),
+    ]);
+    let original = history(2);
+    let (rig, host, _) = setup(provider.clone(), original.clone(), Arc::new(FullPlan)).await;
+    let digests = Arc::new(PrefixDigest::default());
+    let host = host
+        .with_history_resolver(Arc::new(SmallPolicy))
+        .with_history_digests(digests.clone());
+    let scope = ContextScope {
+        session_id: "session".into(),
+        user_id: "owner".into(),
+    };
+    host.run_scoped_turn_with_events(turn(), Some(scope.clone()), &DiscardTurnEvents)
+        .await
+        .unwrap();
+    assert_eq!(*rig.context.history.lock().unwrap(), original);
+    let mut updated = original.clone();
+    updated.extend([
+        ChatMessage::text(ChatRole::User, "新增的完整原话"),
+        ChatMessage::text(ChatRole::Assistant, "新增的回复"),
+    ]);
+    *rig.context.history.lock().unwrap() = updated.clone();
+    host.run_scoped_turn_with_events(turn(), Some(scope), &DiscardTurnEvents)
+        .await
+        .unwrap();
+    assert_eq!(
+        digests
+            .compactions
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "unchanged original prefix must not be distilled again"
+    );
+    assert_eq!(*rig.context.history.lock().unwrap(), updated);
+    let requests = provider.requests.lock().unwrap();
+    let second = &requests[1];
+    second.validate().unwrap();
+    assert!(second.messages.iter().any(|message| {
+        message.role == ChatRole::User && message.text.as_deref() == Some("新增的完整原话")
+    }));
+    assert!(
+        !second
+            .messages
+            .iter()
+            .any(|message| !message.tool_calls.is_empty())
+    );
+    assert!(second.messages.iter().any(|message| {
+        message
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("旧工具已完成"))
+    }));
+    assert_eq!(
+        second.messages.last().unwrap().text.as_deref(),
+        Some(turn().text.as_str())
+    );
+}
+
 #[tokio::test]
 async fn layered_plan_still_counts_fixed_prefix_in_the_total_200k_limit() {
     let provider = Provider::new(vec![]);

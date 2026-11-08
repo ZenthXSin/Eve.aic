@@ -29,6 +29,12 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
                     "自适应上下文上限至少为 10000".into(),
                 ));
             }
+            let coding: usize = history.get("coding_limit_tokens")?;
+            if !(10000..=1000000).contains(&coding) {
+                return Err(ConfigError::InvalidValue(
+                    "编程子代理上下文上限必须为 10000 至 1000000 token".into(),
+                ));
+            }
             let trigger: usize = history.get("compact_at_tokens")?;
             let target: usize = history.get("compact_to_tokens")?;
             if adaptive == 0 && trigger != 0 && target >= trigger {
@@ -248,6 +254,10 @@ pub(crate) fn history_schema() -> ConfigSchema {
             (
                 "adaptive_limit_tokens".into(),
                 field(275000, 0, 1000000, "EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS"),
+            ),
+            (
+                "coding_limit_tokens".into(),
+                field(450000, 10000, 1000000, "EVE_CONTEXT_CODING_LIMIT_TOKENS"),
             ),
             (
                 "compact_at_tokens".into(),

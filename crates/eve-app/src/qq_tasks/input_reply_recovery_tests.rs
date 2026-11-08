@@ -428,6 +428,7 @@ async fn failure_handoff_survives_archive_and_task_restart_then_executes_followu
                     &started.owner,
                 )
                 .unwrap(),
+                delegated_context: started.spec.context.clone(),
                 scope: Some(ContextScope {
                     session_id: started.owner.session_id.clone(),
                     user_id: started.owner.user_id.clone(),

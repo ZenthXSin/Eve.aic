@@ -1108,6 +1108,89 @@ async fn coding_use_routes_independent_endpoint_credentials_and_limits_without_c
 }
 
 #[tokio::test]
+async fn coding_context_token_limit_is_independent_validated_and_persists_across_restart() {
+    use eve_llm_api::HistoryWindowResolver;
+    let root = tempfile::tempdir().unwrap();
+    let server = Server::start(vec![]).await;
+    let h = Harness::start_with_validator(root.path(), &server.url, "chat", true).await;
+    let primary = crate::history::ConfiguredHistory(h.settings.clone());
+    let coding = crate::history::ConfiguredCodingHistory(h.settings.clone());
+    assert_eq!(primary.adaptive_limit().unwrap(), Some(275000));
+    assert_eq!(coding.adaptive_limit().unwrap(), Some(450000));
+    assert_eq!(coding.resolve().unwrap(), primary.resolve().unwrap());
+    assert!(coding.compaction().unwrap().is_none());
+    assert!(coding.casual_compaction().unwrap().is_none());
+    h.update(
+        &[
+            (
+                crate::history::NAMESPACE,
+                "adaptive_limit_tokens",
+                json!(100000),
+            ),
+            (crate::history::NAMESPACE, "compact_at_tokens", json!(80000)),
+            (crate::history::NAMESPACE, "compact_to_tokens", json!(40000)),
+            (
+                crate::history::NAMESPACE,
+                "casual_compact_at_tokens",
+                json!(20000),
+            ),
+            (
+                crate::history::NAMESPACE,
+                "casual_compact_to_tokens",
+                json!(10000),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    assert_eq!(primary.adaptive_limit().unwrap(), Some(100000));
+    assert_eq!(coding.adaptive_limit().unwrap(), Some(450000));
+    assert!(coding.compaction().unwrap().is_none());
+    assert!(coding.casual_compaction().unwrap().is_none());
+    h.update(
+        &[(
+            crate::history::NAMESPACE,
+            "coding_limit_tokens",
+            json!(500000),
+        )],
+        ApplyMode::Immediate,
+    );
+    assert_eq!(coding.adaptive_limit().unwrap(), Some(500000));
+    assert_eq!(primary.adaptive_limit().unwrap(), Some(100000));
+    for invalid in [0, 9999, 1000001] {
+        let revision = h.admin.current().unwrap().revision;
+        assert!(
+            h.try_update(
+                &[(
+                    crate::history::NAMESPACE,
+                    "coding_limit_tokens",
+                    json!(invalid)
+                )],
+                ApplyMode::Immediate,
+            )
+            .is_err()
+        );
+        assert_eq!(h.admin.current().unwrap().revision, revision);
+        assert_eq!(coding.adaptive_limit().unwrap(), Some(500000));
+    }
+    h.stop().await;
+    let reopened = Harness::start_with_validator(root.path(), &server.url, "chat", true).await;
+    assert_eq!(
+        crate::history::ConfiguredCodingHistory(reopened.settings.clone())
+            .adaptive_limit()
+            .unwrap(),
+        Some(500000)
+    );
+    assert_eq!(
+        crate::history::ConfiguredHistory(reopened.settings.clone())
+            .adaptive_limit()
+            .unwrap(),
+        Some(100000)
+    );
+    assert!(server.requests.is_empty(), "配置读取与恢复不产生模型调用");
+    reopened.stop().await;
+}
+
+#[tokio::test]
 async fn auxiliary_use_routes_real_requests_keeps_old_selections_and_isolates_credential_rotation()
 {
     use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};

@@ -10,24 +10,40 @@ const CURRENT: &str = "[宿主上下文压缩摘要：本轮已执行工具]";
 /// 无 Grok 官方本地分词器时的保守估算：ASCII 每四字节一 token，其他字符每字两 token。
 /// 序列化整个消息与工具定义，包含协议开销；不是厂商计费 token 数。
 pub(crate) fn estimate<T: serde::Serialize + ?Sized>(value: &T) -> Result<usize, LlmError> {
+    measure(value).map(|size| size.estimated_tokens)
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct SizeMetrics {
+    pub(crate) serialized_bytes: usize,
+    pub(crate) estimated_tokens: usize,
+}
+
+/// 同一次流式计数同时取得序列化字节和保守 token 估计，不构造正文副本。
+pub(crate) fn measure<T: serde::Serialize + ?Sized>(value: &T) -> Result<SizeMetrics, LlmError> {
     let mut count = JsonCharacters::default();
     serde_json::to_writer(&mut count, value)
         .map_err(|_| LlmError::Context("上下文大小无法估算".into()))?;
-    Ok(count
-        .ascii
-        .div_ceil(4)
-        .saturating_add(count.non_ascii.saturating_mul(2)))
+    Ok(SizeMetrics {
+        serialized_bytes: count.bytes,
+        estimated_tokens: count
+            .ascii
+            .div_ceil(4)
+            .saturating_add(count.non_ascii.saturating_mul(2)),
+    })
 }
 
 /// JSON 序列化器输出合法 UTF-8；每个非 ASCII 字符恰有一个首字节，不受 write 分片边界影响。
 #[derive(Default)]
 struct JsonCharacters {
+    bytes: usize,
     ascii: usize,
     non_ascii: usize,
 }
 impl std::io::Write for JsonCharacters {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let overflow = || std::io::Error::other("上下文字符计数溢出");
+        let total_bytes = self.bytes.checked_add(bytes.len()).ok_or_else(overflow)?;
         let ascii = self
             .ascii
             .checked_add(bytes.iter().filter(|byte| byte.is_ascii()).count())
@@ -38,6 +54,7 @@ impl std::io::Write for JsonCharacters {
             .ok_or_else(overflow)?;
         self.ascii = ascii;
         self.non_ascii = non_ascii;
+        self.bytes = total_bytes;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -129,6 +146,23 @@ impl State {
             cached: cached.map(|d| d.text),
             current: None,
         }
+    }
+
+    /// 下层委派另走原始资料槽；不再捕获本次压缩的 JSON 投影或它的摘要。
+    pub(crate) fn without_history(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .enumerate()
+            .filter(|(index, message)| {
+                !((2..2 + self.remaining).contains(index)
+                    || (message.role == ChatRole::System
+                        && message
+                            .text
+                            .as_deref()
+                            .is_some_and(|text| text.starts_with(HISTORY))))
+            })
+            .map(|(_, message)| message.clone())
+            .collect()
     }
 
     pub(crate) fn inject(&self, messages: &mut Vec<ChatMessage>) {
@@ -378,6 +412,12 @@ mod tests {
             serde_json::json!({"系统":[{"tool":"echo","arguments":{"text":"猫😀\"\\\n".repeat(100_000)}}],"value":1e100}),
         ] {
             assert_eq!(estimate(&value).unwrap(), original_estimate(&value));
+            let size = measure(&value).unwrap();
+            assert_eq!(size.estimated_tokens, original_estimate(&value));
+            assert_eq!(
+                size.serialized_bytes,
+                serde_json::to_vec(&value).unwrap().len()
+            );
         }
         struct Reject;
         impl serde::Serialize for Reject {
