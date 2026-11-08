@@ -137,13 +137,17 @@ class SpeechEventContextAcceptance(live.LiveToolAcceptance):
                  'session': {'session_id': principal, 'user_id': principal},
                  'anchor': parent['id'], 'facts': {'kind': 'background_task_observation',
                      'status': 'Running', 'result': '已有步骤的核对结果'}}
+        # Store 用规范 JSON 文本匹配同一事实版本；结构字段保持声明顺序，
+        # serde_json::Value 的 facts 对象按键排序，不能写成带空格的 Python JSON。
+        event['facts'] = dict(sorted(event['facts'].items()))
+        encoded_event = json.dumps(event, ensure_ascii=False, separators=(',', ':'))
         event_key = hashlib.sha256(json.dumps([event['session'], event['id']],
             separators=(',', ':')).encode()).hexdigest()
         # 隔离宿主停止后放入待审视事实；正文仍必须从真实原始入站库读取。
         with sqlite3.connect(self.work / 'state/speech.sqlite3') as db:
             due = int(time.time() * 1000) + 4000
             db.execute('INSERT INTO speech(id,event,state,due,updated) VALUES(?,?,?,?,?)',
-                       (event_key, json.dumps(event), 'pending', due, due))
+                       (event_key, encoded_event, 'pending', due, due))
         ambient = {'type': 'group_observation', 'id': 'observe-ambient',
                    'message': {'id': 'ambient', 'scope': 'group', 'target_id': 'group-1',
                                'user_id': 'user-1', 'text': '我在和另一位群友聊画画'},
