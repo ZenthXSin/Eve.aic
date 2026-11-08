@@ -39,11 +39,34 @@ impl Cursor {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Claim {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sweep: bool,
     batch: ConversationBatch,
     after: Cursor,
     /// 只有宿主已经明确记录失败，才可重新请求这次无工具学习。
     retryable: bool,
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Sweep {
+    id: String,
+    sequences: Vec<u64>,
+    cursor: Cursor,
+    processed: u64,
+    updated: u64,
+    failed_batches: u64,
+    interrupted_batches: u64,
+    #[serde(default)]
+    model_requests: u64,
+    #[serde(default)]
+    covered: Vec<u64>,
+}
+impl Sweep {
+    fn pending(&self) -> bool {
+        self.cursor.sequence <= self.sequences.len() as u64
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Checkpoint {
@@ -61,6 +84,12 @@ struct Checkpoint {
     history_cursor: u64,
     #[serde(default)]
     history_from: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sweep: Option<Sweep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sweep_requests: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sweep_archive: Vec<Sweep>,
 }
 impl Default for Checkpoint {
     fn default() -> Self {
@@ -78,6 +107,9 @@ impl Default for Checkpoint {
             lesson_cursor: 0,
             history_cursor: 0,
             history_from: 0,
+            sweep: None,
+            sweep_requests: vec![],
+            sweep_archive: vec![],
         }
     }
 }
@@ -120,7 +152,12 @@ impl Checkpoint {
                     || !(1..=3).contains(&claim.batch.attempt)
                     || claim.retryable && claim.batch.attempt >= 3
                     || claim.batch.messages.is_empty()
-                    || claim.batch.messages.len() > MAX_CONVERSATION_MESSAGES
+                    || claim.batch.messages.len()
+                        > if claim.sweep {
+                            MAX_CONVERSATION_REVISIT_MESSAGES
+                        } else {
+                            MAX_CONVERSATION_MESSAGES
+                        }
                     || claim
                         .batch
                         .messages
@@ -134,11 +171,12 @@ impl Checkpoint {
                         .collect::<BTreeSet<_>>()
                         .len()
                         != claim.batch.messages.len()
-                    || claim.after.sequence < value.cursor.sequence
-                    || claim.after.sequence > row.next_sequence
+                    || !claim.sweep && claim.after.sequence < value.cursor.sequence
+                    || !claim.sweep && claim.after.sequence > row.next_sequence
                     || claim.after.text_offset > MAX_CONVERSATION_BODY_BYTES
                     || claim.after.context_offset > MAX_CONVERSATION_CONTEXT_BYTES
-                    || (claim.after.sequence == row.next_sequence
+                    || (!claim.sweep
+                        && claim.after.sequence == row.next_sequence
                         && (claim.after.text_offset != 0 || claim.after.context_offset != 0))
                     || claim.batch.lessons.len() > MAX_CONVERSATION_LESSONS
                     || claim.batch.lessons.iter().any(|l| !lesson_valid(l))
@@ -240,9 +278,61 @@ fn validate_checkpoint(
             return Err(state("交流当前经验与已保存版本不一致；保留原记录"));
         }
     }
+    if let Some(sweep) = &checkpoint.sweep
+        && (!super::identifier(&sweep.id)
+            || sweep.sequences.len() > 250_000
+            || sweep.cursor.sequence == 0
+            || sweep.cursor.sequence > sweep.sequences.len() as u64 + 1
+            || sweep
+                .sequences
+                .iter()
+                .any(|s| *s == 0 || *s >= row.next_sequence)
+            || sweep.sequences.iter().collect::<BTreeSet<_>>().len() != sweep.sequences.len()
+            || sweep.processed > sweep.sequences.len() as u64)
+    {
+        return Err(state("交流重访检查点无效"));
+    }
     let Some(claim) = &checkpoint.inflight else {
         return Ok(());
     };
+    if claim.sweep {
+        let sweep = checkpoint
+            .sweep
+            .as_ref()
+            .ok_or_else(|| state("交流重访批次缺少请求"))?;
+        let mut expected = sweep.cursor.clone();
+        for message in &claim.batch.messages {
+            let sequence = *sweep
+                .sequences
+                .get(expected.sequence as usize - 1)
+                .ok_or_else(|| state("交流重访批次越过冻结来源"))?;
+            let event = original_event(store, &row.scope, sequence)?;
+            let mut offset = expected.clone();
+            offset.sequence = sequence;
+            let total = event.message.text.len() + context_text(&event.message).len();
+            let end = message
+                .metadata
+                .as_ref()
+                .and_then(|m| m.fragment.as_ref())
+                .map_or(total, |f| f.text_end + f.context_end);
+            if project(&event, &offset, end)? != *message {
+                return Err(state("交流重访批次原文不一致"));
+            }
+            expected = if end == total {
+                Cursor::at(expected.sequence + 1)
+            } else {
+                Cursor {
+                    sequence: expected.sequence,
+                    text_offset: end.min(event.message.text.len()),
+                    context_offset: end.saturating_sub(event.message.text.len()),
+                }
+            };
+        }
+        if expected != claim.after || !fits(&claim.batch)? {
+            return Err(state("交流重访批次进度不一致"));
+        }
+        return validate_claim_lessons(store, row, checkpoint, claim);
+    }
     let mut expected = checkpoint.cursor.clone();
     let mut previous_sequence = 0;
     let mut progressed = false;
@@ -308,6 +398,14 @@ fn validate_checkpoint(
         return Err(state("交流固定批次消费结尾或字节预算不一致"));
     }
     validate_cursor(store, row, &claim.after)?;
+    validate_claim_lessons(store, row, checkpoint, claim)
+}
+fn validate_claim_lessons(
+    store: &dyn ConversationStore,
+    row: &ConversationStoredScope,
+    checkpoint: &Checkpoint,
+    claim: &Claim,
+) -> PluginResult<()> {
     for lesson in &claim.batch.lessons {
         if !checkpoint.lessons.contains(lesson) {
             return Err(state("交流固定批次的当前经验版本不一致"));
@@ -352,7 +450,7 @@ impl PersistentConversations {
                 if checkpoint.inflight.as_ref().is_some_and(|c| !c.retryable) {
                     let claim = checkpoint.inflight.take().expect("checked claim");
                     // 可能已经请求过模型，不能凭进程重启自动重放。原批次完整保留供核查。
-                    checkpoint.cursor = claim.after;
+                    advance(&mut checkpoint, &claim, "interrupted", 0)?;
                     checkpoint.pending_since_ms = None;
                     checkpoint.ready_at = 0;
                     value.save(
@@ -435,19 +533,29 @@ impl PersistentConversations {
         &self,
         now: u64,
         enabled: impl Fn(&ContextScope) -> bool,
+        maintenance: bool,
     ) -> PluginResult<Option<ConversationBatch>> {
         self.run(|| {
             let mut candidates = self
                 .store
                 .scopes()?
                 .into_iter()
-                .filter(|row| enabled(&row.scope))
                 .map(|row| {
                     Checkpoint::load(&row, self.store.as_ref()).map(|checkpoint| (row, checkpoint))
                 })
                 .collect::<PluginResult<Vec<_>>>()?;
             candidates.sort_by_key(|(_, c)| (c.last_claimed_at, c.ready_at));
             for (row, mut checkpoint) in candidates {
+                let wants_maintenance = checkpoint.inflight.as_ref().map_or_else(
+                    || checkpoint.sweep.as_ref().is_some_and(Sweep::pending),
+                    |claim| claim.sweep,
+                );
+                if maintenance != wants_maintenance {
+                    continue;
+                }
+                if !enabled(&row.scope) && !checkpoint.sweep.as_ref().is_some_and(Sweep::pending) {
+                    continue;
+                }
                 if now < checkpoint.ready_at {
                     continue;
                 }
@@ -459,11 +567,35 @@ impl PersistentConversations {
                         return Err(state("交流失败重试检查点无效"));
                     }
                     claim.batch.attempt += 1;
+                    if claim.sweep {
+                        checkpoint
+                            .sweep
+                            .as_mut()
+                            .expect("validated sweep")
+                            .model_requests += 1;
+                    }
                     claim.retryable = false;
                     let batch = claim.batch.clone();
                     checkpoint.last_claimed_at = now;
                     self.save(&row, &checkpoint, vec![], None)?;
                     return Ok(Some(batch));
+                }
+                if checkpoint.sweep.as_ref().is_some_and(Sweep::pending) {
+                    let batch = self.take_sweep(&row, &mut checkpoint, now)?;
+                    return Ok(Some(batch));
+                }
+                if let Some(sweep) = &checkpoint.sweep
+                    && !sweep.pending()
+                {
+                    let covered: BTreeSet<_> = sweep.covered.iter().copied().collect();
+                    let before = checkpoint.cursor.clone();
+                    while covered.contains(&checkpoint.cursor.sequence) {
+                        checkpoint.cursor = Cursor::at(checkpoint.cursor.sequence + 1);
+                    }
+                    if checkpoint.cursor != before {
+                        self.save(&row, &checkpoint, vec![], None)?;
+                        return Ok(None);
+                    }
                 }
                 if checkpoint.cursor.sequence >= row.next_sequence {
                     continue;
@@ -514,6 +646,13 @@ impl PersistentConversations {
                 let start = checkpoint.cursor.clone();
                 let mut after = start.clone();
                 for event in &events {
+                    if checkpoint
+                        .sweep
+                        .as_ref()
+                        .is_some_and(|s| !s.pending() && s.covered.contains(&event.sequence))
+                    {
+                        break;
+                    }
                     if event.sequence != after.sequence {
                         break;
                     }
@@ -573,6 +712,7 @@ impl PersistentConversations {
                 checkpoint.pending_since_ms = None;
                 checkpoint.last_claimed_at = now;
                 checkpoint.inflight = Some(Claim {
+                    sweep: false,
                     batch: batch.clone(),
                     after,
                     retryable: false,
@@ -582,6 +722,210 @@ impl PersistentConversations {
             }
             Ok(None)
         })
+    }
+    pub(crate) fn take_maintenance(
+        &self,
+        now: u64,
+        max_requests: u64,
+    ) -> PluginResult<Option<ConversationBatch>> {
+        if max_requests == 0 || max_requests > 4096 {
+            return Err(rejected("交流维护请求额度无效"));
+        }
+        let used = self.run(|| {
+            let mut requests = std::collections::BTreeMap::<String, (u64, bool)>::new();
+            for row in self.store.scopes()? {
+                let checkpoint = Checkpoint::load(&row, self.store.as_ref())?;
+                for sweep in checkpoint.sweep.into_iter().chain(checkpoint.sweep_archive) {
+                    let entry = requests.entry(sweep.id.clone()).or_default();
+                    entry.0 += sweep.model_requests;
+                    entry.1 |= sweep.pending();
+                }
+            }
+            Ok(requests
+                .into_values()
+                .filter(|(_, pending)| *pending)
+                .map(|(used, _)| used)
+                .max()
+                .unwrap_or(0))
+        })?;
+        if used >= max_requests {
+            return Ok(None);
+        }
+        self.take(now, |_| true, true)
+    }
+    pub(crate) fn import_history(
+        &self,
+        record: &ConversationHistoryRecord,
+    ) -> PluginResult<ConversationAppend> {
+        self.run(|| {
+            self.store
+                .import_history(&record.scope, &record.event.message)
+        })
+    }
+    pub(crate) fn request_sweep(
+        &self,
+        id: &str,
+        scope: &ContextScope,
+        sequences: &[u64],
+    ) -> PluginResult<()> {
+        self.run(|| {
+            if !super::identifier(id)
+                || sequences.is_empty()
+                || sequences.len() > 250_000
+                || sequences.iter().collect::<BTreeSet<_>>().len() != sequences.len()
+            {
+                return Err(rejected("交流重访请求无效"));
+            }
+            let row = self
+                .store
+                .scope(scope)?
+                .ok_or_else(|| rejected("交流重访范围不存在"))?;
+            let mut checkpoint = Checkpoint::load(&row, self.store.as_ref())?;
+            let request_digest =
+                hash(&serde_json::to_vec(sequences).map_err(|_| state("交流重访来源编码失败"))?);
+            if let Some((_, previous)) = checkpoint
+                .sweep_requests
+                .iter()
+                .find(|(request, _)| request == id)
+            {
+                return if previous == &request_digest {
+                    Ok(())
+                } else {
+                    Err(rejected("交流重访请求ID内容冲突"))
+                };
+            }
+            if checkpoint.sweep_requests.len() >= 256 {
+                return Err(rejected("交流重访请求历史已满；旧记录保留"));
+            }
+            if let Some(previous) = &checkpoint.sweep {
+                if previous.id == id {
+                    return if previous.sequences == sequences {
+                        Ok(())
+                    } else {
+                        Err(rejected("交流重访请求ID内容冲突"))
+                    };
+                }
+                if previous.pending() {
+                    return Err(rejected("已有交流重访未完成"));
+                }
+            }
+            if sequences.iter().any(|s| *s == 0 || *s >= row.next_sequence) {
+                return Err(rejected("交流重访来源未完整导入"));
+            }
+            if let Some(previous) = checkpoint.sweep.take() {
+                checkpoint.sweep_archive.push(previous);
+            }
+            checkpoint.sweep_requests.push((id.into(), request_digest));
+            checkpoint.sweep = Some(Sweep {
+                id: id.into(),
+                sequences: sequences.to_vec(),
+                cursor: Cursor::at(1),
+                processed: 0,
+                updated: 0,
+                failed_batches: 0,
+                interrupted_batches: 0,
+                model_requests: 0,
+                covered: vec![],
+            });
+            self.save(&row, &checkpoint, vec![], None)
+        })
+    }
+    pub(crate) fn sweep_status(&self, id: &str) -> PluginResult<ConversationSweepStatus> {
+        self.run(|| {
+            let mut status = ConversationSweepStatus {
+                id: id.into(),
+                ..Default::default()
+            };
+            for row in self.store.scopes()? {
+                let checkpoint = Checkpoint::load(&row, self.store.as_ref())?;
+                if let Some(sweep) = checkpoint
+                    .sweep
+                    .into_iter()
+                    .chain(checkpoint.sweep_archive)
+                    .find(|s| s.id == id)
+                {
+                    status.scopes += 1;
+                    status.total += sweep.sequences.len() as u64;
+                    status.processed += sweep.processed;
+                    status.remaining +=
+                        (sweep.sequences.len() as u64 + 1).saturating_sub(sweep.cursor.sequence);
+                    status.updated += sweep.updated;
+                    status.failed_batches += sweep.failed_batches;
+                    status.interrupted_batches += sweep.interrupted_batches;
+                    status.model_requests += sweep.model_requests;
+                }
+            }
+            status.completed = status.scopes > 0 && status.remaining == 0;
+            Ok(status)
+        })
+    }
+    fn take_sweep(
+        &self,
+        row: &ConversationStoredScope,
+        checkpoint: &mut Checkpoint,
+        now: u64,
+    ) -> PluginResult<ConversationBatch> {
+        let mut batch = ConversationBatch {
+            id: checkpoint.next_name("conversation-revisit")?,
+            scope: row.scope.clone(),
+            messages: vec![],
+            lessons: vec![],
+            lesson_history: vec![],
+            attempt: 1,
+        };
+        self.lesson_page(&row.scope, checkpoint, &mut batch)?;
+        let sweep = checkpoint
+            .sweep
+            .as_ref()
+            .ok_or_else(|| state("交流重访请求缺失"))?;
+        let mut after = sweep.cursor.clone();
+        while let Some(sequence) = sweep.sequences.get(after.sequence as usize - 1) {
+            let event = original_event(self.store.as_ref(), &row.scope, *sequence)?;
+            let mut offset = after.clone();
+            offset.sequence = *sequence;
+            let total = event.message.text.len() + context_text(&event.message).len();
+            batch.messages.push(project(&event, &offset, total)?);
+            if fits(&batch)? {
+                after = Cursor::at(after.sequence + 1);
+            } else {
+                batch.messages.pop();
+                if !batch.messages.is_empty() {
+                    break;
+                }
+                let (message, cursor) = fitting_fragment(&event, &offset, &mut batch)?;
+                batch.messages.push(message);
+                after = if cursor.sequence > *sequence {
+                    Cursor::at(after.sequence + 1)
+                } else {
+                    Cursor {
+                        sequence: after.sequence,
+                        text_offset: cursor.text_offset,
+                        context_offset: cursor.context_offset,
+                    }
+                };
+                break;
+            }
+            if batch.messages.len() >= MAX_CONVERSATION_REVISIT_MESSAGES {
+                break;
+            }
+        }
+        if batch.messages.is_empty() || after == sweep.cursor {
+            return Err(state("交流重访批次没有推进"));
+        }
+        checkpoint.last_claimed_at = now;
+        checkpoint
+            .sweep
+            .as_mut()
+            .expect("validated sweep")
+            .model_requests += 1;
+        checkpoint.inflight = Some(Claim {
+            sweep: true,
+            batch: batch.clone(),
+            after,
+            retryable: false,
+        });
+        self.save(row, checkpoint, vec![], None)?;
+        Ok(batch)
     }
     fn lesson_page(
         &self,
@@ -653,7 +997,7 @@ impl PersistentConversations {
                 now,
                 &mut revisions,
             )?;
-            checkpoint.cursor = claim.after;
+            advance(&mut checkpoint, &claim, "completed", changed as u64)?;
             checkpoint.inflight = None;
             checkpoint.ready_at = now;
             checkpoint.pending_since_ms = None;
@@ -684,13 +1028,17 @@ impl PersistentConversations {
                 return Ok(());
             };
             let final_attempt = batch.attempt >= 3;
-            let after = claim.after.clone();
+            let claim = claim.clone();
             if final_attempt {
-                checkpoint.cursor = after;
+                advance(&mut checkpoint, &claim, "failed", 0)?;
                 checkpoint.inflight = None;
                 checkpoint.pending_since_ms = None;
             } else {
-                claim.retryable = true;
+                checkpoint
+                    .inflight
+                    .as_mut()
+                    .expect("checked claim")
+                    .retryable = true;
             }
             checkpoint.ready_at =
                 now.saturating_add(RETRY_MS.saturating_mul(u64::from(batch.attempt)));
@@ -714,7 +1062,7 @@ impl PersistentConversations {
             let mut checkpoint = Checkpoint::load(&row, self.store.as_ref())?;
             let archive = checkpoint.inflight.take().map(|claim| {
                 if !claim.retryable {
-                    checkpoint.cursor = claim.after;
+                    advance(&mut checkpoint, &claim, "interrupted", 0).expect("validated progress");
                 }
                 ConversationBatchArchive {
                     batch: claim.batch,
@@ -766,6 +1114,7 @@ impl PersistentConversations {
                     recorded_at_ms: None,
                 })
                 .collect();
+            checkpoint.sweep = None;
             checkpoint.cursor = Cursor::at(row.next_sequence);
             checkpoint.context_from = row.next_sequence;
             checkpoint.generation = checkpoint
@@ -782,6 +1131,49 @@ impl PersistentConversations {
             self.save(&row, &checkpoint, revisions, archive)
         })
     }
+}
+
+fn advance(
+    checkpoint: &mut Checkpoint,
+    claim: &Claim,
+    outcome: &str,
+    updated: u64,
+) -> PluginResult<()> {
+    if claim.sweep {
+        let sweep = checkpoint
+            .sweep
+            .as_mut()
+            .ok_or_else(|| state("交流重访完成缺少请求"))?;
+        let consumed = claim.after.sequence.saturating_sub(sweep.cursor.sequence);
+        if outcome == "completed" {
+            sweep.processed += consumed;
+            for index in sweep.cursor.sequence..claim.after.sequence {
+                sweep.covered.push(sweep.sequences[index as usize - 1]);
+            }
+        }
+        if outcome == "failed" {
+            sweep.failed_batches += 1;
+        }
+        if outcome == "interrupted" {
+            sweep.interrupted_batches += 1;
+        }
+        if outcome != "completed" {
+            for index in sweep.cursor.sequence..claim.after.sequence {
+                sweep.covered.push(sweep.sequences[index as usize - 1]);
+            }
+        }
+        sweep.updated += updated;
+        sweep.cursor = claim.after.clone();
+        if !sweep.pending() {
+            let covered: BTreeSet<_> = sweep.covered.iter().copied().collect();
+            while covered.contains(&checkpoint.cursor.sequence) {
+                checkpoint.cursor = Cursor::at(checkpoint.cursor.sequence + 1);
+            }
+        }
+    } else {
+        checkpoint.cursor = claim.after.clone();
+    }
+    Ok(())
 }
 
 fn context_text(message: &ConversationMessage) -> &str {
@@ -949,7 +1341,22 @@ fn apply_drafts(
             batch.messages[..*i]
                 .iter()
                 .rposition(|m| m.role == ConversationRole::Eve)
-                .is_some_and(|j| indices.contains(&j))
+                .is_some_and(|j| {
+                    indices.contains(&j)
+                        && !batch.messages[j]
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|m| m.ordering_uncertain)
+                        && !batch.messages[*i]
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|m| m.ordering_uncertain)
+                        && (!checkpoint.inflight.as_ref().is_some_and(|c| c.sweep)
+                            || conversation_feedback_order_known(
+                                &batch.messages[j],
+                                &batch.messages[*i],
+                            ))
+                })
         });
         if humans.is_empty()
             || (draft.assessment == ConversationAssessment::Observation && humans.len() < 2)
@@ -1005,11 +1412,35 @@ fn apply_drafts(
                 evidence: vec![],
                 evaluated_message_ids: vec![],
             });
-        if humans.iter().all(|i| {
-            lesson
-                .evaluated_message_ids
-                .contains(&batch.messages[*i].id)
-        }) {
+        let revisiting = checkpoint.inflight.as_ref().is_some_and(|c| c.sweep);
+        let mut evaluated: BTreeSet<String> =
+            lesson.evaluated_message_ids.iter().cloned().collect();
+        if !lesson.id.is_empty() {
+            let mut after = checkpoint.history_from;
+            loop {
+                let history = store.revisions(&batch.scope, after, 256)?;
+                for revision in &history {
+                    if revision.lesson.id == lesson.id {
+                        evaluated.extend(revision.lesson.evaluated_message_ids.iter().cloned());
+                    }
+                }
+                let Some(last) = history.last() else {
+                    break;
+                };
+                after = last.sequence;
+            }
+        }
+        let previously_evaluated = humans
+            .iter()
+            .all(|i| evaluated.contains(&batch.messages[*i].id));
+        if previously_evaluated && !revisiting {
+            continue;
+        }
+        if previously_evaluated
+            && (lesson.situation == draft.situation
+                && lesson.response == draft.response
+                && lesson.avoid == draft.avoid)
+        {
             continue;
         }
         if lesson.id.is_empty() {
@@ -1018,20 +1449,22 @@ fn apply_drafts(
         if !lesson.evidence.is_empty() {
             revisions.push(archive(lesson.clone(), "before_update", batch, now));
         }
-        match draft.assessment {
-            ConversationAssessment::Observation => {
-                lesson.observations = lesson.observations.saturating_add(1)
-            }
-            ConversationAssessment::Correction => {
-                lesson.corrections = lesson.corrections.saturating_add(1);
-                lesson.counterexamples = 0;
-            }
-            ConversationAssessment::Counterexample => {
-                lesson.counterexamples = lesson.counterexamples.saturating_add(1)
+        if !previously_evaluated {
+            match draft.assessment {
+                ConversationAssessment::Observation => {
+                    lesson.observations = lesson.observations.saturating_add(1)
+                }
+                ConversationAssessment::Correction => {
+                    lesson.corrections = lesson.corrections.saturating_add(1);
+                    lesson.counterexamples = 0;
+                }
+                ConversationAssessment::Counterexample => {
+                    lesson.counterexamples = lesson.counterexamples.saturating_add(1)
+                }
             }
         }
         // 新独立观察也能修正原则；只有直接纠正可以解除既存反例。
-        if draft.assessment != ConversationAssessment::Counterexample {
+        if draft.assessment != ConversationAssessment::Counterexample || previously_evaluated {
             lesson.situation = draft.situation.clone();
             lesson.response = draft.response.clone();
             lesson.avoid = draft.avoid.clone();

@@ -160,6 +160,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/live_dialogue_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 connectors/qqbot/test/natural_progress_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/live_reminder_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/task_progress_test.py

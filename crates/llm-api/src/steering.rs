@@ -19,12 +19,28 @@ pub struct SteeringBatch {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputReplyHandoff {
+    /// 默认仍是原输入交接；progress 只是原轮发言事实，不生成或消费用户输入。
+    #[serde(default, skip_serializing_if = "InputReplyKind::is_user_input")]
+    pub kind: InputReplyKind,
     pub input_message_id: String,
     /// 从入站队列取出的原正文，只用于把多条输入分别关联到交接事实。
     pub input_text: String,
     pub event_id: String,
     pub reply_text: String,
     pub delivery: InputReplyDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputReplyKind {
+    #[default]
+    UserInput,
+    Progress,
+}
+impl InputReplyKind {
+    fn is_user_input(&self) -> bool {
+        *self == Self::UserInput
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -94,7 +110,9 @@ pub fn validate_input_reply_handoffs(handoffs: &[InputReplyHandoff]) -> Result<(
     let mut events = std::collections::BTreeSet::new();
     for handoff in handoffs {
         handoff.validate()?;
-        if !inputs.insert(&handoff.input_message_id) || !events.insert(&handoff.event_id) {
+        if (handoff.kind == InputReplyKind::UserInput && !inputs.insert(&handoff.input_message_id))
+            || !events.insert(&handoff.event_id)
+        {
             return Err(LlmError::Context("输入交流交接身份重复".into()));
         }
     }
@@ -175,6 +193,7 @@ mod tests {
     #[test]
     fn input_reply_delivery_requires_a_platform_id_to_claim_confirmed_delivery() {
         let mut handoff = InputReplyHandoff {
+            kind: InputReplyKind::UserInput,
             input_message_id: "input-1".into(),
             input_text: "继续".into(),
             event_id: "event-1".into(),
@@ -204,6 +223,35 @@ mod tests {
         );
         handoff.input_message_id = "input\nother".into();
         assert!(handoff.validate().is_err());
+    }
+
+    #[test]
+    fn progress_events_share_real_anchor_without_changing_old_user_input_encoding() {
+        let original = serde_json::json!({"input_message_id":"original","input_text":"继续查", "event_id":"input-event", "reply_text":"我在查", "delivery":{"state":"sending"}});
+        let handoff: InputReplyHandoff = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(handoff.kind, InputReplyKind::UserInput);
+        assert_eq!(serde_json::to_value(&handoff).unwrap(), original);
+        let first = InputReplyHandoff {
+            kind: InputReplyKind::Progress,
+            event_id: "progress-1".into(),
+            ..handoff.clone()
+        };
+        let second = InputReplyHandoff {
+            event_id: "progress-2".into(),
+            ..first.clone()
+        };
+        validate_input_reply_handoffs(&[handoff.clone(), first.clone(), second]).unwrap();
+        assert!(validate_input_reply_handoffs(&[first.clone(), first]).is_err());
+        assert!(
+            validate_input_reply_handoffs(&[
+                handoff.clone(),
+                InputReplyHandoff {
+                    event_id: "other-input-event".into(),
+                    ..handoff
+                }
+            ])
+            .is_err()
+        );
     }
 
     #[test]

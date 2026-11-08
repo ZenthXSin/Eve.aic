@@ -49,6 +49,12 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
     def bind_owner(self):
         self.bind(owner_accounts=owner.account("user-1"))
 
+    def use_group_administrator(self):
+        # 只有真实管理员走模型审查；主人现已按宿主身份自动免审。
+        config = json.loads(self.developer_config.read_text())
+        config["operators"].append(self.scope_id)
+        self.developer_config.write_text(json.dumps(config), encoding="utf8")
+
     def incoming(self, message_id, body, raw=None, **options):
         return {**self.message(message_id, body, **self.route, **options),
                 "original_text": body if raw is None else raw}
@@ -84,7 +90,8 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         return {"risk": "medium", "authorization": "high", "outcome": "allow",
                 "rationale": "临时工作区权限变更的旧安全结论，返回时仍须核对最新取消状态"}
 
-    def test_owner_group_stop_commits_while_review_waits_and_restart_keeps_it(self):
+    def test_administrator_group_stop_commits_while_review_waits_and_restart_keeps_it(self):
+        self.use_group_administrator()
         command_text = "检查 chmod 777 keep 权限变更，只涉及临时工作区 keep 目录"
         command_raw = "<@!1904159860> " + command_text
         stop_text = "立即急停当前会话并取消既有任务"
@@ -106,7 +113,8 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             if not results:
                 return tool_response([("manage_business_permissions", {"action": "status"})])
             status = results[-1]
-            self.assertTrue(status["owner"])
+            self.assertFalse(status["owner"])
+            self.assertTrue(status["administrator"])
             self.assertFalse(status["business_permitted"])
             self.assertEqual(status["explicit_grant"]["state"], "emergency_stopped")
             return text_response("已核对急停状态，业务权限保持关闭")
@@ -141,7 +149,6 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             self.assert_retained()
 
         self.run_restriction([
-            *self.owner_checkpoint(),
             {"send": self.incoming("old-command", command_text, command_raw,
                                    expected="目录保留，旧命令未执行")},
             {"wait_file": str(self.arrived("review", 1))},
@@ -152,8 +159,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             {"touch": str(self.gate("old-review-release"))},
             self.wait_reply("old-command"), self.wait_receipt("old-command"),
             self.wait_reply("stop-during-review"), self.wait_receipt("stop-during-review"),
-        ], panel=True, checkpoints={"bind-owner": self.bind_owner,
-                                   "review-held": before_stop,
+        ], panel=True, checkpoints={"review-held": before_stop,
                                    "stopped-before-review": stopped_before_review})
         self.assertEqual(len(self.reviews), 1)
         self.assertEqual(len(self.command_results), 1)
@@ -247,6 +253,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         self.assert_retained()
 
     def test_live_group_stop_steers_existing_turn_before_old_review_returns(self):
+        self.use_group_administrator()
         command = "检查 chmod 777 keep 权限变更，只涉及临时工作区 keep 目录"
         stop = "立即急停当前会话并取消既有任务"
         originals = ["<@!1904159860> " + text for text in [command, stop]]
@@ -272,7 +279,8 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             results = self.results(body)
             if not results:
                 return tool_response([("manage_business_permissions", {"action": "status"})])
-            self.assertTrue(results[-1]["owner"])
+            self.assertFalse(results[-1]["owner"])
+            self.assertTrue(results[-1]["administrator"])
             self.assertFalse(results[-1]["business_permitted"])
             self.assertEqual(results[-1]["explicit_grant"]["state"], "emergency_stopped")
             return text_response("实时急停在重启后仍有效")
@@ -304,7 +312,6 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         stop_message = self.incoming("live-stop", stop, originals[-1])
         stop_message["expected_type"] = "finish"
         self.run_restriction([
-            *self.owner_checkpoint(),
             {"send": self.incoming("live-command", command, originals[0]) | {'expected_type':'finish'}},
             {"wait_file": str(self.arrived("review", 1))},
             {"send": stop_message},
@@ -315,8 +322,7 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
             {"wait_command":{"id":"live-command","type":"finish"}},
             self.wait_receipt("live-command", state="Handled"),
         ], panel=True, env_extra=environment,
-            checkpoints={"bind-owner": self.bind_owner,
-                         "live-stopped-before-review": check_while_held})
+            checkpoints={"live-stopped-before-review": check_while_held})
         self.assertEqual(len(self.command_results), 1)
         self.assertEqual(len(self.reviews), 1)
         self.assertEqual(self.chat_rounds, 2)

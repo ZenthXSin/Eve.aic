@@ -2673,8 +2673,10 @@ async fn run_qqbot_composed(
                 queue: profile_queue.clone(),
             },
         ));
-        conversation_background = Some(crate::conversation_learning::Background::start(
+        conversation_background = Some(crate::conversation_learning::Background::start_with_maintenance(
             training.0.clone(), Arc::new(eve_training_plugin::ModelConversationLearner::new(budget_gate.wrap(observed_capped("conversation_learning", Some(59))?, crate::qq_budget::CONVERSATION_LEARNING)?)), budget_gate.clone(),
+            Some(options.state_directory.join("conversation-maintenance")),
+            Some(Arc::new(eve_training_plugin::ModelConversationLearner::new(observed_capped("conversation_learning", Some(59))?))),
         ));
         // 说法学习：训练中的会话攒够一批原话后学习一次；用途 phrase 单独记健康与输出上限。
         let _ = phrase_policy

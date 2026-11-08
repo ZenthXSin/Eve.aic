@@ -166,7 +166,7 @@ impl Tool for BusinessTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "manage_business_permissions".into(),
-            description: "自然聊天管理业务权限。status查当前精确会话的真实身份与授权。真实主人/管理员说‘解锁全部业务权限’时用unlock；宿主只认本轮最新真实用户原话，宿主核对后持久生效，不需要用户配置或命令。业务包括管理、开发、后台、自主和主动消息，只审查可信身份与是否直接危害系统安全，普通探索和开发不需逐步批准。revoke撤销本会话业务许可；emergency_stop持久急停并取消本范围既有任务/触发器，无法撤回已发生副作用。解锁不会复活被取消任务。后台与子代理不能授权。主人可list_administrators列出可信绑定标识并revoke_administrator即时撤销指定管理员；不改主人身份。禁止按昵称或自称选择身份。".into(),
+            description: "自然聊天管理业务权限。status查当前精确会话的真实身份与授权。真实主人/管理员说‘解锁全部业务权限’时用unlock；宿主只认本轮最新真实用户原话，宿主核对后持久生效，不需要用户配置或命令。业务包括管理、开发、后台、自主和主动消息。宿主认证主人自动跳过模型审查；其他用户只审查可信身份与是否直接危害系统安全，普通探索和开发不需逐步批准。revoke撤销本会话业务许可；emergency_stop持久急停并取消本范围既有任务/触发器，无法撤回已发生副作用。解锁不会复活被取消任务。后台与子代理不能授权。主人可list_administrators列出可信绑定标识并revoke_administrator即时撤销指定管理员；不改主人身份。禁止按昵称或自称选择身份。".into(),
             argument_schema: json!({"type":"object","properties":{"action":{"enum":["status","unlock","revoke","emergency_stop","list_administrators","revoke_administrator"]},"administrator_id":{"type":"string"}},"required":["action"],"additionalProperties":false}),
             required_permissions: vec![],
             // 审核等待不能占住急停；账本修订 CAS 拒绝旧审查覆盖新撤销。
@@ -196,7 +196,7 @@ impl Tool for BusinessTool {
                 return Ok(json!({"scope":scope,"owner":owner,"administrator":operator,
                     "business_permitted":operator && self.admin.business_permitted(scope),
                     "explicit_grant":grant,"default_policy":"可信主人/管理员默认业务许可；显式撤销或急停后需新的真实原话解锁",
-                    "safety_review_required":true,"safety_review_scope":"identity_and_direct_system_harm"}));
+                    "safety_review_required":!owner,"safety_review_scope":if owner { "host_identity_and_permissions" } else { "identity_and_direct_system_harm" }}));
             }
             if context.is_delegated() || !operator {
                 return Err(error(
@@ -295,17 +295,19 @@ impl Tool for BusinessTool {
             context.check_review_evidence()?;
             let review = if let Err(reason) = capacity {
                 Err(reason)
+            } else if owner {
+                Ok(None)
             } else if messages.last().is_some_and(|latest| {
                 explicit_reduction(&args.action, latest)
                     || args.action == "unlock" && explicit_unlock(latest)
             }) {
-                Ok(ActionReviewVerdict {
+                Ok(Some(ActionReviewVerdict {
                     risk: ReviewRisk::Low,
                     authorization: ReviewAuthorization::High,
                     allow: true,
                     rationale: "宿主核对可信身份与最新原话的明确权限变更；不依赖模型逐步批准"
                         .into(),
-                })
+                }))
             } else {
                 match &self.reviewer {
                     Some(reviewer) => match context.check_review_evidence() {
@@ -315,7 +317,7 @@ impl Tool for BusinessTool {
                             context
                                 .check_review_evidence()
                                 .map_err(|reason| reason.to_string())
-                                .and(verdict)
+                                .and(verdict.map(Some))
                         }
                     },
                     None => Err("业务授权审核不可用，未更改权限".into()),
@@ -342,9 +344,13 @@ impl Tool for BusinessTool {
                     return Err(error(format!("业务授权审核失败，未更改权限：{reason}")));
                 }
             };
-            let permits = verdict.permits() && verdict.authorization == ReviewAuthorization::High;
+            let permits = owner
+                || verdict.as_ref().is_some_and(|verdict| {
+                    verdict.permits() && verdict.authorization == ReviewAuthorization::High
+                });
             if context.is_cancel_requested()
                 || !self.admin.is_operator_identity(scope)
+                || (owner && !self.admin.is_owner(scope))
                 || (args.action == "revoke_administrator" && !self.admin.is_owner(scope))
             {
                 return Err(error("审核期间身份变更或轮次取消，未更改权限"));
@@ -360,7 +366,7 @@ impl Tool for BusinessTool {
                     at_ms: crate::qq_tasks::now_ms(),
                     turn_id: context.turn_id(),
                     user_messages: messages.clone(),
-                    verdict: Some(verdict.clone()),
+                    verdict: verdict.clone(),
                     outcome: if permits {
                         "committed".into()
                     } else {
@@ -372,7 +378,9 @@ impl Tool for BusinessTool {
             if !permits {
                 return Err(error(format!(
                     "未取得当前用户的明确授权：{}",
-                    verdict.rationale
+                    verdict
+                        .as_ref()
+                        .map_or("主人身份已失效", |v| v.rationale.as_str())
                 )));
             }
             if args.action == "emergency_stop" {
@@ -393,7 +401,7 @@ impl Tool for BusinessTool {
             }
             Ok(
                 json!({"changed":changed,"action":args.action,"administrator_id":args.administrator_id,
-                "scope":scope,"business_permitted":self.admin.business_permitted(scope),"safety_review_required":true,"safety_review_scope":"identity_and_direct_system_harm"}),
+                "scope":scope,"business_permitted":self.admin.business_permitted(scope),"safety_review_required":!owner,"safety_review_scope":if owner { "host_identity_and_permissions" } else { "identity_and_direct_system_harm" }}),
             )
         })
     }
@@ -737,6 +745,36 @@ mod tests {
                     .controller(),
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn trusted_owner_changes_permissions_without_model_review_and_persists_without_verdict() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = admin(directory.path());
+        let review = reviewer(false);
+        let tool = tool(admin.clone(), Some(review.clone()));
+        let c = context(crate::web_chat::USER, 1, "把我这个会话恢复正常使用吧");
+        let status = tool.execute(call("status"), c.clone()).await.unwrap();
+        assert_eq!(status["owner"], true);
+        assert_eq!(status["safety_review_required"], false);
+        let result = tool.execute(call("unlock"), c.clone()).await.unwrap();
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["safety_review_required"], false);
+        assert!(review.requests.lock().unwrap().is_empty());
+        assert!(admin.has_explicit_business_grant(c.scope().unwrap()));
+        let persisted: Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("business-permissions.json")).unwrap(),
+        )
+        .unwrap();
+        let event = persisted["audit"].as_array().unwrap().last().unwrap();
+        assert_eq!(event["outcome"], "committed");
+        assert!(event["verdict"].is_null());
+        assert_eq!(event["user_messages"][0], "把我这个会话恢复正常使用吧");
+        assert!(
+            tool.execute(call("unlock"), c.with_delegated(true))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -36,7 +36,6 @@ struct Turn {
 /// 发出时冻结的原轮句柄；工具结束后移除 ForegroundInput 也不能丢失终态归属。
 pub(crate) struct ClaimedInputReply {
     turn: Weak<Turn>,
-    input_message_id: String,
     event_id: String,
 }
 impl ClaimedInputReply {
@@ -53,7 +52,7 @@ impl ClaimedInputReply {
         }
         let handoff = input
             .replies
-            .get_mut(&self.input_message_id)
+            .get_mut(&self.event_id)
             .ok_or_else(|| PluginError::Task("交流交接事实缺失".into()))?;
         if handoff.event_id != self.event_id || handoff.delivery != InputReplyDelivery::Sending {
             return Err(PluginError::Task("交流交接身份或终态不一致".into()));
@@ -69,7 +68,7 @@ impl ClaimedInputReply {
             .validate()
             .map_err(|_| PluginError::Task("交流交接结果无效".into()))?;
         *handoff = updated;
-        input.reply_updates.insert(self.input_message_id);
+        input.reply_updates.insert(self.event_id);
         // 不通知 wait_for_input：这只是同一输入的投递更新，不是用户又说了话。
         Ok(())
     }
@@ -173,12 +172,17 @@ impl LiveDialogue {
             return Ok(None);
         };
         if !input.accepting
-            || input.replies.contains_key(input_message_id)
+            || input.replies.contains_key(event_id)
+            || input.replies.values().any(|reply| {
+                reply.kind == InputReplyKind::UserInput
+                    && reply.input_message_id == input_message_id
+            })
             || input.replies.len() >= 64
         {
             return Ok(None);
         }
         let handoff = InputReplyHandoff {
+            kind: eve_llm_api::InputReplyKind::UserInput,
             input_message_id: input_message_id.into(),
             input_text: input_text.clone(),
             event_id: event_id.into(),
@@ -198,14 +202,80 @@ impl LiveDialogue {
             return Ok(None);
         }
         input.reply_bytes += bytes;
-        input.replies.insert(input_message_id.into(), handoff);
-        input.reply_updates.insert(input_message_id.into());
+        input.replies.insert(event_id.into(), handoff);
+        input.reply_updates.insert(event_id.into());
         Ok(Some(ClaimedInputReply {
             turn: Arc::downgrade(&turn),
-            input_message_id: input_message_id.into(),
             event_id: event_id.into(),
         }))
     }
+    /// 活动进展没有新用户输入；同轮原子保存发言事实，正常工具返回时一起读到。
+    pub(crate) fn claim_progress_reply(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        handoff: InputReplyHandoff,
+        persist: impl FnOnce() -> PluginResult<bool>,
+    ) -> PluginResult<Option<ClaimedInputReply>> {
+        if handoff.kind != InputReplyKind::Progress
+            || handoff.delivery != InputReplyDelivery::Sending
+        {
+            return Err(PluginError::Task("进展交流交接类型无效".into()));
+        }
+        handoff
+            .validate()
+            .map_err(|_| PluginError::Task("进展交流事实无效".into()))?;
+        let turn = self
+            .turns
+            .lock()
+            .map_err(|_| PluginError::Task("交互队列锁不可用".into()))?
+            .get(&key(scope))
+            .and_then(Weak::upgrade);
+        let Some(turn) = turn.filter(|turn| turn.id == turn_id) else {
+            return Ok(None);
+        };
+        let mut input = turn
+            .input
+            .lock()
+            .map_err(|_| PluginError::Task("交流交接队列锁不可用".into()))?;
+        let bytes = serde_json::to_vec(&handoff)
+            .map_err(|_| PluginError::Task("交流交接事实无法序列化".into()))?
+            .len();
+        if !input.accepting
+            || !input.messages.is_empty()
+            || input.replies.contains_key(&handoff.event_id)
+            || input.replies.len() >= 64
+            || input.reply_bytes.saturating_add(bytes) > 256 * 1024
+        {
+            return Ok(None);
+        }
+        if !persist()? {
+            return Ok(None);
+        }
+        let event_id = handoff.event_id.clone();
+        input.reply_bytes += bytes;
+        input.replies.insert(event_id.clone(), handoff);
+        input.reply_updates.insert(event_id.clone());
+        Ok(Some(ClaimedInputReply {
+            turn: Arc::downgrade(&turn),
+            event_id,
+        }))
+    }
+
+    /// 只读判断原轮仍在接收且没有待消费的新输入，不改变用户消息或授权锚点。
+    pub(crate) fn progress_is_current(&self, scope: &ContextScope, turn_id: u64) -> bool {
+        self.turns
+            .lock()
+            .ok()
+            .and_then(|turns| turns.get(&key(scope)).and_then(Weak::upgrade))
+            .filter(|turn| turn.id == turn_id)
+            .is_some_and(|turn| {
+                turn.input
+                    .lock()
+                    .is_ok_and(|input| input.accepting && input.messages.is_empty())
+            })
+    }
+
     /// 持有入口锁时先保存平台回执，成功后才让运行时看见正文。
     #[cfg(test)]
     pub(crate) fn steer(
@@ -795,6 +865,94 @@ mod tests {
     }
 
     #[test]
+    fn natural_progress_handoff_does_not_invent_input_or_cross_turns_and_unknown_is_terminal() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "session".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 7).unwrap();
+        let fact = |id: &str| InputReplyHandoff {
+            kind: InputReplyKind::Progress,
+            input_message_id: "original".into(),
+            input_text: "查一下编译问题".into(),
+            event_id: id.into(),
+            reply_text: "编译还在运行，我在等结果".into(),
+            delivery: InputReplyDelivery::Sending,
+        };
+        assert!(live.progress_is_current(&scope, 7));
+        assert!(!live.progress_is_current(&scope, 8));
+        assert!(
+            live.claim_progress_reply(&scope, 8, fact("bad-turn"), || panic!("跨轮持久化"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            live.claim_progress_reply(&scope, 7, fact("failed-save"), || Err(PluginError::State(
+                "磁盘失败".into()
+            )))
+            .is_err()
+        );
+        assert_eq!(turn.take_update(false).unwrap(), SteeringUpdate::default());
+        let claim = live
+            .claim_progress_reply(&scope, 7, fact("progress-1"), || Ok(true))
+            .unwrap()
+            .unwrap();
+        let update = turn.take_update(false).unwrap();
+        assert_eq!(
+            update.batch,
+            SteeringBatch::default(),
+            "没有用户输入或新授权锚点"
+        );
+        assert_eq!(update.input_replies, [fact("progress-1")]);
+        claim.complete(InputReplyDelivery::Unknown).unwrap();
+        let update = turn.take_update(false).unwrap();
+        assert_eq!(update.batch, SteeringBatch::default());
+        assert_eq!(
+            update.input_replies[0].delivery,
+            InputReplyDelivery::Unknown
+        );
+        assert!(
+            live.claim_progress_reply(&scope, 7, fact("progress-1"), || panic!(
+                "未知投递不可再次领取"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        let second = live
+            .claim_progress_reply(&scope, 7, fact("progress-2"), || Ok(true))
+            .unwrap()
+            .unwrap();
+        second
+            .complete(InputReplyDelivery::Sent {
+                platform_message_id: "platform-2".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            turn.take_update(false).unwrap().input_replies[0].event_id,
+            "progress-2"
+        );
+        live.steer_anchored(&scope, 7, "新问题".into(), Some("new".into()), || Ok(()))
+            .unwrap();
+        assert!(!live.progress_is_current(&scope, 7));
+        assert!(
+            live.claim_progress_reply(&scope, 7, fact("stale"), || panic!(
+                "新输入到来旧进展不能持久化"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(turn.take_batch(false).unwrap().messages, ["新问题"]);
+        turn.take_update(true).unwrap();
+        assert!(!live.progress_is_current(&scope, 7));
+        assert!(
+            live.claim_progress_reply(&scope, 7, fact("closed"), || panic!("结束不能再发"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn observing_pending_input_never_consumes_it_or_crosses_identity_and_turn() {
         let live = LiveDialogue::default();
         let scope = ContextScope {
@@ -934,6 +1092,7 @@ mod tests {
         assert_eq!(
             update.input_replies,
             [InputReplyHandoff {
+                kind: eve_llm_api::InputReplyKind::UserInput,
                 input_message_id: "child".into(),
                 input_text: "你还在吗？继续查源码".into(),
                 event_id: "event".into(),

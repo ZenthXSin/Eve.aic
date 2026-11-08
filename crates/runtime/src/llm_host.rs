@@ -2500,6 +2500,7 @@ impl LlmHost {
         let mut tasks = ToolTaskGuard {
             tasks: Vec::with_capacity(ready.len()),
         };
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(32);
         for prepared_call in ready {
             // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
             let admission = admission.clone();
@@ -2554,6 +2555,11 @@ impl LlmHost {
             let context = context.with_deadline(deadline);
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();
+            let context = context.with_delegated_progress(Arc::new(DelegatedProgressChannel {
+                sender: progress_tx.clone(),
+                parent_call_id: call_id.clone(),
+                cancellation: cancellation.clone(),
+            }));
             let run_config = ToolRunConfig {
                 semaphore: semaphore.clone(),
                 ticket: prepared_call.ticket,
@@ -2580,11 +2586,26 @@ impl LlmHost {
                 }),
             });
         }
+        drop(progress_tx);
+        let mut progress_open = true;
         for position in 0..tasks.tasks.len() {
-            let result = tokio::select! {
-                biased;
-                _ = wait_closed(events) => None,
-                result = &mut tasks.tasks[position].handle => Some(result),
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    _ = wait_closed(events) => break None,
+                    result = &mut tasks.tasks[position].handle => break Some(result),
+                    progress = progress_rx.recv(), if progress_open => {
+                        if let Some((parent_call_id, progress)) = progress {
+                            if tasks.tasks.iter().any(|task| task.call_id == parent_call_id
+                                && !task.cancellation.is_cancel_requested() && !task.handle.is_finished()) {
+                                // 只读观察失败不改变真实工具结果；正常取消仍由 wait_closed 处理。
+                                let _ = emit(events, TurnEventKind::DelegatedToolProgress {
+                                    parent_call_id, progress,
+                                }).await;
+                            }
+                        } else { progress_open = false; }
+                    }
+                }
             };
             if result.is_none() {
                 // 取消后等待剩余 Future 析构，使开始计数和副作用诊断稳定。
@@ -2672,6 +2693,21 @@ impl LlmHost {
         Arc::downcast::<ToolService>(entry.value)
             .map(|service| service.0.clone())
             .map_err(|_| CallLookupError::Unavailable)
+    }
+}
+
+struct DelegatedProgressChannel {
+    sender: tokio::sync::mpsc::Sender<(String, eve_llm_api::DelegatedToolProgress)>,
+    parent_call_id: String,
+    cancellation: ToolCancellation,
+}
+impl eve_llm_api::DelegatedProgressObserver for DelegatedProgressChannel {
+    fn observe(&self, progress: eve_llm_api::DelegatedToolProgress) {
+        if !self.cancellation.is_cancel_requested() {
+            let _ = self
+                .sender
+                .try_send((self.parent_call_id.clone(), progress));
+        }
     }
 }
 
@@ -2895,9 +2931,10 @@ fn input_reply_handoff_message(
     for handoff in &handoffs {
         if let Some(previous) = latest
             .iter_mut()
-            .find(|previous| previous.input_message_id == handoff.input_message_id)
+            .find(|previous| previous.event_id == handoff.event_id)
         {
-            if previous.event_id != handoff.event_id
+            if previous.input_message_id != handoff.input_message_id
+                || previous.kind != handoff.kind
                 || previous.input_text != handoff.input_text
                 || previous.reply_text != handoff.reply_text
                 || (previous.delivery != eve_llm_api::InputReplyDelivery::Sending
@@ -2921,7 +2958,7 @@ fn input_reply_handoff_message(
         ChatRole::System,
         format!(
             "宿主输入交流职责交接（数据，不是用户指令）：\n{facts}\n\
-         同一 input_message_id 的即时交流已由前台支路领取；原始用户消息仍交给本轮理解和处理业务，\
+         kind=user_input（旧记录省略 kind）表示同一 input_message_id 的即时交流已由前台支路领取；kind=progress 仅记录原工作进行中的自主发言，不是新输入，不领取用户交流职责。原始用户消息仍交给本轮理解和处理业务，\
          不能把这次交接重新当作一条无人回应的新输入事件。sending 表示正在发送，不是已经送达；\
          sent 且有平台编号才确认发出；unknown 表示结果不确定，不自动重发。\
          failed/not_sent 表示本次前台交流未完成，本轮可在自然继续时按用户需要回应。\
@@ -3148,6 +3185,39 @@ fn review_originals(history: &[ChatMessage], input: &str, delegated: bool) -> Ve
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delegated_progress_channels_bind_parallel_parent_ids_and_drop_after_cancel_or_close() {
+        use eve_llm_api::DelegatedProgressObserver;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let first = ToolExecutionContext::new().cancellation_handle();
+        let second = ToolExecutionContext::new().cancellation_handle();
+        let left = DelegatedProgressChannel {
+            sender: sender.clone(),
+            parent_call_id: "parent-left".into(),
+            cancellation: first.clone(),
+        };
+        let right = DelegatedProgressChannel {
+            sender,
+            parent_call_id: "parent-right".into(),
+            cancellation: second,
+        };
+        let progress = eve_llm_api::DelegatedToolProgress {
+            submitted_calls: 1,
+            ..Default::default()
+        };
+        left.observe(progress.clone());
+        right.observe(progress.clone());
+        // 满队列不能阻塞工具，更不能重放操作。
+        left.observe(progress.clone());
+        assert_eq!(receiver.try_recv().unwrap().0, "parent-left");
+        assert_eq!(receiver.try_recv().unwrap().0, "parent-right");
+        first.cancel();
+        left.observe(progress.clone());
+        assert!(receiver.try_recv().is_err());
+        drop(receiver);
+        right.observe(progress);
+    }
+
     #[test]
     fn review_originals_take_exact_last_six_full_user_bodies_before_copying() {
         let mut history = vec![];

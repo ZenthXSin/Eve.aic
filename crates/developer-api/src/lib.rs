@@ -251,6 +251,11 @@ pub trait ActionReviewer: Send + Sync {
 
 /// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
 pub trait DeveloperAuthorization: Send + Sync {
+    /// 宿主当前核验的主人身份，用于跳过模型审查；管理员和模型自称不等同于主人。
+    /// 旧授权后端默认不提供该身份，不能从 is_operator 或用户名推断。
+    fn is_owner(&self, _scope: &eve_llm_api::ContextScope) -> bool {
+        false
+    }
     /// 宿主业务急停；所有公开、成员及管理操作执行前都必须复核。默认兼容既有授权后端。
     fn permits_business(&self, _scope: &eve_llm_api::ContextScope) -> bool {
         true

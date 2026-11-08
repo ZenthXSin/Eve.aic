@@ -862,3 +862,249 @@ async fn oversized_legacy_claim_is_archived_whole_without_becoming_a_new_request
     assert_eq!(batch_outcomes(&path), ["interrupted"]);
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn full_history_sweep_preserves_lessons_order_live_input_and_request_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let state = Arc::new(MemoryStateStore::default());
+    let (_kernel, training) = open(state.clone(), sql.clone()).await;
+    observe(training.as_ref(), 0, 4);
+    let first = training.take_conversation_batch(100000).unwrap().unwrap();
+    training
+        .finish_conversation_batch(
+            &first,
+            vec![draft(
+                &first,
+                [1, 2],
+                None,
+                ConversationAssessment::Correction,
+                "先说明正在查",
+            )],
+            100001,
+        )
+        .unwrap();
+    let old = training.conversation_lessons(&scope()).unwrap()[0].clone();
+    let append = training
+        .import_conversation_history(&ConversationHistoryRecord {
+            scope: scope(),
+            event: ConversationEvent {
+                sequence: 5,
+                message: event(4),
+            },
+        })
+        .unwrap();
+    assert!(append.inserted);
+    observe(training.as_ref(), 5, 1); // 真实新输入位于两条历史导入之间。
+    training
+        .import_conversation_history(&ConversationHistoryRecord {
+            scope: scope(),
+            event: ConversationEvent {
+                sequence: 6,
+                message: event(6),
+            },
+        })
+        .unwrap();
+    let sources = [1, 2, 3, 4, 5, 7];
+    training
+        .request_conversation_sweep("full-a", &scope(), &sources)
+        .unwrap();
+    training
+        .request_conversation_sweep("full-a", &scope(), &sources)
+        .unwrap();
+    let batch = training
+        .take_conversation_maintenance_batch(200000, 4096)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        batch
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-0", "m-1", "m-2", "m-3", "m-4", "m-6"]
+    );
+    assert_eq!(batch.lessons.as_slice(), std::slice::from_ref(&old));
+    let revised = draft(
+        &batch,
+        [1, 2],
+        Some(old.id.clone()),
+        ConversationAssessment::Correction,
+        "有实际发现再说明进展",
+    );
+    training
+        .finish_conversation_batch(&batch, vec![revised], 200001)
+        .unwrap();
+    let learned = training.conversation_lessons(&scope()).unwrap();
+    assert_eq!(learned[0].corrections, old.corrections);
+    assert_eq!(learned[0].response, "有实际发现再说明进展");
+    let status = training.conversation_sweep_status("full-a").unwrap();
+    assert!(status.completed);
+    assert_eq!((status.total, status.processed, status.updated), (6, 6, 1));
+    let live = training.take_conversation_batch(300000).unwrap().unwrap();
+    assert_eq!(live.messages.last().unwrap().id, "m-5");
+    assert!(!live.messages.iter().any(|m| m.id == "m-6"));
+    training
+        .finish_conversation_batch(&live, vec![], 300001)
+        .unwrap();
+    assert!(training.take_conversation_batch(400000).unwrap().is_none());
+    assert_eq!(checkpoint(sql.as_ref())["cursor"]["sequence"], 8);
+    training
+        .request_conversation_sweep("full-b", &scope(), &sources)
+        .unwrap();
+    let second = training
+        .take_conversation_maintenance_batch(500000, 4096)
+        .unwrap()
+        .unwrap();
+    training
+        .finish_conversation_batch(&second, vec![], 500001)
+        .unwrap();
+    training
+        .request_conversation_sweep("full-a", &scope(), &sources)
+        .unwrap();
+    assert!(training.take_conversation_batch(600000).unwrap().is_none());
+    assert!(
+        training
+            .request_conversation_sweep("full-a", &scope(), &[1])
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn full_history_import_restores_disabled_original_without_changing_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let (_kernel, training) = open(Arc::new(MemoryStateStore::default()), sql.clone()).await;
+    training.set_enabled(&scope(), false).unwrap();
+    training.observe_conversation(&scope(), event(0)).unwrap();
+    let record = ConversationHistoryRecord {
+        scope: scope(),
+        event: ConversationEvent {
+            sequence: 1,
+            message: event(0),
+        },
+    };
+    let added = training.import_conversation_history(&record).unwrap();
+    assert!(added.inserted);
+    assert_eq!(added.sequence, Some(1));
+    assert!(
+        !training
+            .import_conversation_history(&record)
+            .unwrap()
+            .inserted
+    );
+    training
+        .request_conversation_sweep("explicit-full", &scope(), &[1])
+        .unwrap();
+    let batch = training
+        .take_conversation_maintenance_batch(100000, 4096)
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.messages[0].id, "m-0");
+    training
+        .finish_conversation_batch(&batch, vec![], 100001)
+        .unwrap();
+    assert!(
+        training
+            .conversation_sweep_status("explicit-full")
+            .unwrap()
+            .completed
+    );
+    assert!(!training.enabled(&scope()).unwrap());
+    let mut conflicting = record;
+    conflicting.event.message.text.push_str("changed");
+    assert!(training.import_conversation_history(&conflicting).is_err());
+}
+
+#[tokio::test]
+async fn full_history_budget_and_restart_keep_unknown_terminal_and_later_events_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, training) = open(state.clone(), sql.clone()).await;
+    observe(training.as_ref(), 0, 140);
+    training
+        .request_conversation_sweep("full-unknown", &scope(), &(1..=140).collect::<Vec<_>>())
+        .unwrap();
+    let claimed = training
+        .take_conversation_maintenance_batch(100000, 1)
+        .unwrap()
+        .unwrap();
+    assert!(claimed.messages.len() > MAX_CONVERSATION_MESSAGES);
+    assert!(claimed.messages.len() <= MAX_CONVERSATION_REVISIT_MESSAGES);
+    assert!(conversation_prompt_json(&claimed).unwrap().len() <= MAX_CONVERSATION_PROMPT_BYTES);
+    assert!(
+        training
+            .take_conversation_maintenance_batch(100001, 1)
+            .unwrap()
+            .is_none()
+    );
+    kernel
+        .stop(&PluginId::new(TRAINING_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let (_kernel, reopened) = open(state, sql).await;
+    let progress = reopened.conversation_sweep_status("full-unknown").unwrap();
+    assert_eq!(progress.interrupted_batches, 1);
+    assert_eq!(progress.model_requests, 1);
+    assert_eq!(progress.processed, 0);
+    let next = reopened
+        .take_conversation_maintenance_batch(200000, 4096)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !next
+            .messages
+            .iter()
+            .any(|m| claimed.messages.iter().any(|old| old.id == m.id))
+    );
+    reopened
+        .finish_conversation_batch(&next, vec![], 200001)
+        .unwrap();
+    assert!(
+        reopened
+            .conversation_sweep_status("full-unknown")
+            .unwrap()
+            .completed
+    );
+}
+
+#[tokio::test]
+async fn full_history_unknown_order_is_not_a_human_feedback_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let (_kernel, training) = open(Arc::new(MemoryStateStore::default()), sql).await;
+    for index in 0..4 {
+        let mut message = event(index);
+        message.metadata.as_mut().unwrap().ordering_uncertain = true;
+        training.observe_conversation(&scope(), message).unwrap();
+    }
+    training
+        .request_conversation_sweep("full-uncertain", &scope(), &[1, 2, 3, 4])
+        .unwrap();
+    let batch = training
+        .take_conversation_maintenance_batch(100000, 4096)
+        .unwrap()
+        .unwrap();
+    let prompt: serde_json::Value =
+        serde_json::from_str(&conversation_prompt_json(&batch).unwrap()).unwrap();
+    assert_eq!(prompt["feedback_pairs"], serde_json::json!([]));
+    assert!(
+        training
+            .finish_conversation_batch(
+                &batch,
+                vec![draft(
+                    &batch,
+                    [1, 2],
+                    None,
+                    ConversationAssessment::Correction,
+                    "不能猜测原话时序"
+                )],
+                100001
+            )
+            .is_err()
+    );
+    training
+        .finish_conversation_batch(&batch, vec![], 100002)
+        .unwrap();
+}

@@ -50,6 +50,7 @@ if (scenario.script) {
   let stopped = false;
   // 主动私聊的平台结果：默认成功；脚本可改为拒绝（带错误码）或暂不回执。
   let pushMode = { ok: true };
+  const foregroundWindows = new Set();
   const until = async predicate => {
     const deadline = Date.now() + (scenario.wait_timeout_ms ?? 15000);
     while (!predicate()) {
@@ -142,7 +143,31 @@ if (scenario.script) {
       record({ direction: "out", ...cmd, ...(cmd.type === "segment" ? { at: Date.now() } : {}) });
       if (cmd.type === "stop") { stopped = true; return; }
       // 锚点恢复与窗口关闭是控制帧，不应被当成另一条聊天回复。
-      if (cmd.type === "restore_anchor" || cmd.type === "close_foreground") { commands.push(cmd);continue; }
+      if (cmd.type === "restore_anchor" || cmd.type === "close_foreground") {
+        if (cmd.type === "close_foreground") foregroundWindows.delete(cmd.id);
+        commands.push(cmd);continue;
+      }
+      if (cmd.type === "open_foreground") {
+        const anchor = pending.get(cmd.id);
+        if (!anchor || anchor.scope !== "c2c") throw new Error("invalid_foreground_anchor");
+        commands.push(cmd);
+        foregroundWindows.add(cmd.id);
+        send({type:"foreground_window",id:cmd.id,remaining_ms:240000,remaining:4});
+        continue;
+      }
+      if (cmd.type === "passive_push" && cmd.foreground === true) {
+        const anchor = pending.get(cmd.based_on_message_id);
+        if (!foregroundWindows.has(cmd.based_on_message_id) || !anchor || anchor.scope !== "c2c" ||
+            cmd.target_id !== anchor.target_id || cmd.sender_id !== anchor.user_id || typeof cmd.text !== "string") {
+          throw new Error("invalid_foreground_push");
+        }
+        commands.push(cmd);
+        if (pushMode.hold) continue;
+        const { ok, ...diagnostic } = pushMode;
+        send(ok ? {type:"delivery",id:cmd.id,push:true,ok:true,message_id:"push-"+cmd.id}
+                : {type:"delivery",id:cmd.id,push:true,ok:false,...diagnostic});
+        continue;
+      }
       if (cmd.type === "file") {
         if (typeof cmd.path !== "string" || !fs.statSync(cmd.path).isFile()) throw new Error("invalid_file_path");
         commands.push(cmd);
@@ -192,6 +217,10 @@ if (scenario.script) {
         throw new Error("unexpected_command");
       } else if (message.expected_type === "reply" && !message.allow_finish && !message.accept_any) {
         throw new Error("expected_reply_was_finished");
+      }
+      if (cmd.type === "finish" && cmd.keep_foreground === true) {
+        foregroundWindows.add(cmd.id);
+        send({type:"foreground_window",id:cmd.id,remaining_ms:240000,remaining:4});
       }
       commands.push(cmd);
     }

@@ -59,7 +59,12 @@ fn archive_valid(scope: &ContextScope, archive: &ConversationBatchArchive) -> bo
         && identifier(&batch.id)
         && (1..=3).contains(&batch.attempt)
         && !batch.messages.is_empty()
-        && batch.messages.len() <= MAX_CONVERSATION_MESSAGES
+        && batch.messages.len()
+            <= if batch.id.starts_with("conversation-revisit-v2-") {
+                MAX_CONVERSATION_REVISIT_MESSAGES
+            } else {
+                MAX_CONVERSATION_MESSAGES
+            }
         && batch.messages.iter().all(conversation_message_valid)
         && batch
             .messages
@@ -256,6 +261,44 @@ fn insert_seen(
 }
 
 impl ConversationStore for SqliteExpressions {
+    fn import_history(
+        &self,
+        scope: &ContextScope,
+        message: &ConversationMessage,
+    ) -> PluginResult<ConversationAppend> {
+        if !scope_valid(scope)
+            || !conversation_message_valid(message)
+            || message
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.fragment.is_some())
+        {
+            return Err(invalid());
+        }
+        let id = hash(message.id.as_bytes());
+        let body = core_hash(message)?;
+        self.run(|db| {
+            let tx = db.transaction().map_err(|_| failed())?;
+            ensure_scope(&tx, scope)?;
+            insert_seen(&tx, scope, &ConversationSeen { id, body })?;
+            let existing: Option<u64> = tx.query_row(
+                "SELECT sequence FROM conversation_events WHERE session_id=?1 AND user_id=?2 AND message_id=?3",
+                params![scope.session_id, scope.user_id, message.id], |row| row.get(0),
+            ).optional().map_err(|_| failed())?;
+            if let Some(sequence) = existing {
+                return Ok(ConversationAppend { inserted: false, sequence: Some(sequence) });
+            }
+            let sequence = stored_scope(&tx, scope)?.ok_or_else(failed)?.next_sequence;
+            let next = sequence.checked_add(1).ok_or_else(failed)?;
+            let mut message = message.clone();
+            message.metadata.get_or_insert_with(Default::default).sequence = Some(sequence);
+            insert_event(&tx, scope, &ConversationEvent { sequence, message })?;
+            tx.execute("UPDATE conversation_scopes SET next_sequence=?3 WHERE session_id=?1 AND user_id=?2",
+                params![scope.session_id, scope.user_id, next]).map_err(|_| failed())?;
+            tx.commit().map_err(|_| failed())?;
+            Ok(ConversationAppend { inserted: true, sequence: Some(sequence) })
+        })
+    }
     fn import_legacy(&self, digest: &str, scopes: &[ConversationLegacyScope]) -> PluginResult<()> {
         if !digest_valid(digest)
             || scopes.iter().any(|s| {

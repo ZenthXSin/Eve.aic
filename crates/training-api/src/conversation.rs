@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 pub const CONVERSATION_BATCH_MESSAGES: usize = 4;
 pub const MAX_CONVERSATION_MESSAGES: usize = 16;
+/// 显式历史重访按相同字节预算合并更多短消息，普通实时批次不变。
+pub const MAX_CONVERSATION_REVISIT_MESSAGES: usize = 128;
 pub const MAX_CONVERSATION_BODY_BYTES: usize = 32_768;
 pub const MAX_CONVERSATION_CONTEXT_BYTES: usize = 8_192;
 pub const MAX_CONVERSATION_PROMPT_BYTES: usize = 65_536;
@@ -34,6 +36,9 @@ pub struct ConversationMessage {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConversationMetadata {
+    /// 历史来源只提供偏序，不能据数组相邻顺序推断真人反馈。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ordering_uncertain: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +221,28 @@ pub struct ConversationEvent {
     pub message: ConversationMessage,
 }
 
+/// 运维受理的真实历史来源；原身份和原消息编号不改变。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationHistoryRecord {
+    pub scope: ContextScope,
+    pub event: ConversationEvent,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConversationSweepStatus {
+    pub id: String,
+    pub scopes: u64,
+    pub total: u64,
+    pub processed: u64,
+    pub remaining: u64,
+    pub updated: u64,
+    pub failed_batches: u64,
+    pub interrupted_batches: u64,
+    pub model_requests: u64,
+    pub completed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConversationSeen {
@@ -273,6 +300,14 @@ pub struct ConversationCommit {
 /// 可替换的交流日志存储。append 和 commit 各自原子；提交失败或未知不得退回空状态。
 /// 去重使用范围、消息 id 与 speaker/role/text 的稳定摘要；元数据采用首次已保存版本。
 pub trait ConversationStore: Send + Sync {
+    /// 明确授权的历史导入补全已见但未保留正文的事件；原摘要冲突必须拒绝。
+    fn import_history(
+        &self,
+        _scope: &ContextScope,
+        _message: &ConversationMessage,
+    ) -> PluginResult<ConversationAppend> {
+        Err(PluginError::Task("当前存储不支持历史交流导入".into()))
+    }
     /// 一次性导入旧 JSON 的可用材料。相同摘要幂等，来源变化必须拒绝；旧文件不改写。
     fn import_legacy(&self, digest: &str, scopes: &[ConversationLegacyScope]) -> PluginResult<()>;
     fn append(
@@ -359,6 +394,26 @@ struct PromptBatch<'a> {
     attempt: u8,
 }
 
+/// 历史重访只有已有顺序事实才允许把后一句当作对前一句的反馈。
+pub fn conversation_feedback_order_known(
+    eve: &ConversationMessage,
+    human: &ConversationMessage,
+) -> bool {
+    let (Some(eve), Some(human)) = (&eve.metadata, &human.metadata) else {
+        return false;
+    };
+    if eve.ordering_uncertain || human.ordering_uncertain {
+        return false;
+    }
+    match (eve.observed_at_ms, human.observed_at_ms) {
+        (Some(first), Some(later)) => first <= later,
+        _ => match (eve.source_at_ms, human.source_at_ms) {
+            (Some(first), Some(later)) => first <= later,
+            _ => false,
+        },
+    }
+}
+
 /// 队列与模型学习器共用的精确序列化；不传内部支持计数去重表，不裁剪原文。
 pub fn conversation_prompt_json(batch: &ConversationBatch) -> PluginResult<String> {
     let feedback_pairs = batch
@@ -371,6 +426,18 @@ pub fn conversation_prompt_json(batch: &ConversationBatch) -> PluginResult<Strin
                 .iter()
                 .rev()
                 .find(|previous| previous.role == ConversationRole::Eve)
+                .filter(|previous| {
+                    !previous
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|m| m.ordering_uncertain)
+                        && !message
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|m| m.ordering_uncertain)
+                        && (!batch.id.starts_with("conversation-revisit-v2-")
+                            || conversation_feedback_order_known(previous, message))
+                })
                 .map(|previous| FeedbackPair {
                     eve_message_id: &previous.id,
                     later_human_message_id: &message.id,

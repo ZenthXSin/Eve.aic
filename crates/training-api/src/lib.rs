@@ -179,6 +179,37 @@ pub trait PhraseLearner: Send + Sync {
 }
 
 pub trait TrainingService: Send + Sync {
+    fn take_conversation_maintenance_batch(
+        &self,
+        _now_ms: u64,
+        _max_requests: u64,
+    ) -> PluginResult<Option<ConversationBatch>> {
+        Ok(None)
+    }
+    fn import_conversation_history(
+        &self,
+        _record: &ConversationHistoryRecord,
+    ) -> PluginResult<ConversationAppend> {
+        Err(eve_plugin_api::PluginError::Task(
+            "当前训练服务不支持历史交流导入".into(),
+        ))
+    }
+    /// 同一请求 ID 重投幂等；顺序来自已核实的原事件，不是新用户输入。
+    fn request_conversation_sweep(
+        &self,
+        _id: &str,
+        _scope: &ContextScope,
+        _sequences: &[u64],
+    ) -> PluginResult<()> {
+        Err(eve_plugin_api::PluginError::Task(
+            "当前训练服务不支持交流重访".into(),
+        ))
+    }
+    fn conversation_sweep_status(&self, _id: &str) -> PluginResult<ConversationSweepStatus> {
+        Err(eve_plugin_api::PluginError::Task(
+            "当前训练服务不支持交流重访".into(),
+        ))
+    }
     /// 只采集当前可信范围内实际发生的交流，不接受模型编造的示范对话。
     fn observe_conversation(
         &self,

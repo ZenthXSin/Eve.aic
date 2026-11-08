@@ -126,6 +126,8 @@ pub(super) fn failure_log(
         "passive_outreach"
     } else if event.id.starts_with("outreach:") {
         "outreach"
+    } else if event.id.starts_with("foreground-progress:") {
+        "foreground_progress"
     } else if event.id.starts_with("foreground-input:") {
         "foreground_input"
     } else {

@@ -173,7 +173,7 @@ impl QqFailureRecovery for Recovery {
         if !input_replies.is_empty() {
             messages.push(ChatMessage::text(ChatRole::System, json!({
                 "kind":"eve.input_reply_handoffs", "input_replies":input_replies,
-                "instruction":"这是失败前宿主已消费输入的即时交流归属，不是新输入、用户授权或待发送队列。相同 input_message_id 的即时交流已交给前台，不能在恢复时再次当作无人回应的新事件。sending 是失败时的发送中快照，当前结果未知；unknown 同样不可确认，二者都不自动重发。sent 只有带平台编号才表示已发出；failed/not_sent 表示前台交流未完成，可在自然继续时按用户需要回应。交接没有完成原任务，input_text 原话中的补充业务仍须与原任务一同处理；恢复不重放已确认完成的工具，不因此增加模型判断或发送。"
+                "instruction":"这是失败前宿主已经记录的交流事实，不是新输入、用户授权或待发送队列。kind=user_input（旧记录缺省）表示相同 input_message_id 的即时交流已交给前台，不能在恢复时再次当作无人回应的新事件；kind=progress 仅表示原工作进展的自主发言，不是补充用户输入。sending 是失败时的发送中快照，当前结果未知；unknown 同样不可确认，二者都不自动重发。sent 只有带平台编号才表示已发出；failed/not_sent 表示前台交流未完成，可在自然继续时按用户需要回应。交接没有完成原任务，input_text 原话中的补充业务仍须与原任务一同处理；恢复不重放已确认完成的工具，不因此增加模型判断或发送。"
             }).to_string()));
         }
         let messages_json = serde_json::to_string(&messages).map_err(|_| unavailable())?;

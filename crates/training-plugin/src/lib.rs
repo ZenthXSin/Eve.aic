@@ -190,6 +190,63 @@ impl TrainingService for StoredModes {
         inner.snapshot = next;
         Ok(())
     }
+    fn take_conversation_maintenance_batch(
+        &self,
+        now_ms: u64,
+        max_requests: u64,
+    ) -> PluginResult<Option<ConversationBatch>> {
+        let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_conversations_writable()?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
+        inner
+            .persistent_conversations
+            .as_ref()
+            .ok_or_else(|| error("交流重访需要持久日志"))?
+            .take_maintenance(now_ms, max_requests)
+    }
+    fn import_conversation_history(
+        &self,
+        record: &ConversationHistoryRecord,
+    ) -> PluginResult<ConversationAppend> {
+        let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_conversations_writable()?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
+        inner
+            .persistent_conversations
+            .as_ref()
+            .ok_or_else(|| error("历史交流导入需要持久日志"))?
+            .import_history(record)
+    }
+    fn request_conversation_sweep(
+        &self,
+        id: &str,
+        scope: &ContextScope,
+        sequences: &[u64],
+    ) -> PluginResult<()> {
+        let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_conversations_writable()?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
+        inner
+            .persistent_conversations
+            .as_ref()
+            .ok_or_else(|| error("交流重访需要持久日志"))?
+            .request_sweep(id, scope, sequences)
+    }
+    fn conversation_sweep_status(&self, id: &str) -> PluginResult<ConversationSweepStatus> {
+        let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_conversations_writable()?;
+        inner
+            .persistent_conversations
+            .as_ref()
+            .ok_or_else(|| error("交流重访需要持久日志"))?
+            .sweep_status(id)
+    }
     fn observe_conversation(
         &self,
         scope: &ContextScope,
@@ -220,7 +277,11 @@ impl TrainingService for StoredModes {
             return Err(error("训练服务已停止"));
         }
         if let Some(conversations) = &inner.persistent_conversations {
-            return conversations.take(now_ms, |scope| inner.enabled(scope, self.default_enabled));
+            return conversations.take(
+                now_ms,
+                |scope| inner.enabled(scope, self.default_enabled),
+                false,
+            );
         }
         // 空闲扫描只读计数与期限，避免每秒克隆并编码整个持久经验库。
         if !inner
@@ -246,11 +307,16 @@ impl TrainingService for StoredModes {
         if inner.context.is_none() {
             return Err(error("训练服务已停止"));
         }
+        if let Some(conversations) = &inner.persistent_conversations {
+            if !inner.enabled(&batch.scope, self.default_enabled)
+                && !batch.id.starts_with("conversation-revisit-v2-")
+            {
+                return Err(PluginError::Task("交流学习已停止；迟到结果不采用".into()));
+            }
+            return conversations.finish(batch, &drafts, now_ms);
+        }
         if !inner.enabled(&batch.scope, self.default_enabled) {
             return Err(PluginError::Task("交流学习已停止；迟到结果不采用".into()));
-        }
-        if let Some(conversations) = &inner.persistent_conversations {
-            return conversations.finish(batch, &drafts, now_ms);
         }
         let mut next = inner.conversations.clone();
         let changed = next

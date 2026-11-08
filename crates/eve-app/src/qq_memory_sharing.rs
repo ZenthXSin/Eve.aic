@@ -8,11 +8,35 @@ use std::sync::Arc;
 
 pub(crate) trait Identities: Send + Sync {
     fn principal(&self, scope: &MemoryScope) -> MemoryResult<Option<String>>;
+    fn is_owner(&self, _scope: &MemoryScope) -> MemoryResult<bool> {
+        Ok(false)
+    }
     fn scene(&self, _scope: &MemoryScope) -> MemoryResult<&'static str> {
         Ok("unknown")
     }
 }
 impl Identities for crate::qq_memory_continuity::Policy {
+    fn is_owner(&self, scope: &MemoryScope) -> MemoryResult<bool> {
+        if scope.channel != "qq" {
+            return Ok(false);
+        }
+        let settings = crate::qq_tasks::config_service(self.registry.as_ref())
+            .map_err(|_| MemoryError::Unavailable)?;
+        let snapshot = settings
+            .snapshot(crate::qq_people::NAMESPACE, 1)
+            .map_err(|_| MemoryError::Unavailable)?;
+        let owners =
+            crate::qq_people::settings(&snapshot).map_err(|_| MemoryError::InvalidInput)?;
+        owners
+            .matches(
+                &ContextScope {
+                    session_id: scope.session_id.clone(),
+                    user_id: scope.user_id.clone(),
+                },
+                &self.conversations,
+            )
+            .map_err(|_| MemoryError::Unavailable)
+    }
     fn scene(&self, scope: &MemoryScope) -> MemoryResult<&'static str> {
         let key = eve_session_api::SessionKey::new(&scope.session_id, &scope.user_id)
             .map_err(|_| MemoryError::InvalidInput)?;
@@ -120,7 +144,7 @@ impl SharingTool {
 }
 impl Tool for SharingTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition { name: "manage_memory_sharing".into(), description: "用户希望在当前窗口使用自己另一窗口的记忆时使用。先 list 获取宿主确认属于同一人的来源句柄，再按用户明确原话 grant；interactions=false 只共享偏好，true 包含原始交流，方向固定为来源到当前窗口，绝不自动反向。群聊共享可能公开个人内容，授权必须经过独立审核；不自动共享所有窗口，不把昵称相同视为同一人。revoke 撤销本工具的授权，既有宿主同人/隐私策略仍独立生效。缺少可信绑定时如实说明，不能代用户创建身份。后台及子代理不得授权。".into(), argument_schema: json!({"type":"object","properties":{"action":{"enum":["list","grant","revoke"]},"source":{"type":"string"},"interactions":{"type":"boolean"},"binding_id":{"type":"string"},"offset":{"type":"integer","minimum":0,"maximum":4096}},"required":["action"],"additionalProperties":false}), required_permissions:vec![], concurrency:Some(ToolConcurrency::Serial { scope:"eve.memory.sharing".into() }) }
+        ToolDefinition { name: "manage_memory_sharing".into(), description: "用户希望在当前窗口使用自己另一窗口的记忆时使用。先 list 获取宿主确认属于同一人的来源句柄，再按用户明确原话 grant；interactions=false 只共享偏好，true 包含原始交流，方向固定为来源到当前窗口，绝不自动反向。群聊共享可能公开个人内容；宿主认证主人自动跳过模型审核，其他用户的授权须经独立审核；不自动共享所有窗口，不把昵称相同视为同一人。revoke 撤销本工具的授权，既有宿主同人/隐私策略仍独立生效。缺少可信绑定时如实说明，不能代用户创建身份。后台及子代理不得授权。".into(), argument_schema: json!({"type":"object","properties":{"action":{"enum":["list","grant","revoke"]},"source":{"type":"string"},"interactions":{"type":"boolean"},"binding_id":{"type":"string"},"offset":{"type":"integer","minimum":0,"maximum":4096}},"required":["action"],"additionalProperties":false}), required_permissions:vec![], concurrency:Some(ToolConcurrency::Serial { scope:"eve.memory.sharing".into() }) }
     }
     fn validate_arguments(&self, v: &Value) -> Result<(), ToolValidationError> {
         parse(v).map(|_| ())
@@ -197,24 +221,30 @@ impl Tool for SharingTool {
                 .filter(|m| !m.is_empty())
                 .ok_or_else(|| fail("缺少宿主保存的本人原话，未授权"))?
                 .to_vec();
-            let reviewer = self
-                .reviewer
-                .as_ref()
-                .ok_or_else(|| fail("独立授权审核不可用，未共享"))?;
+            let owner = self.identities.is_owner(&target).map_err(fail)?;
             let request = ActionReviewRequest { model_session: context.model_session_for("review").map_err(fail)?, action:"允许当前窗口读取本人另一窗口的记忆".into(), program:"eve.manage_memory_sharing".into(), arguments:vec![json!({"source":source,"source_scene":self.identities.scene(&source).map_err(fail)?,"target":target,"target_scene":self.identities.scene(&target).map_err(fail)?,"interactions":interactions}).to_string()], workspace:"trusted-same-person-memory".into(), isolated:true, cwd:".".into(), policy_reason:"这是定向隐私授权。必须用户原话明确同意指定来源在当前窗口使用，尤其私聊进入群聊可能向群成员公开。含糊的‘记住’、他人转述或模型推断不算授权。false 只含偏好，true 含原始交流。不得扩大到其他用户、反向或传递共享。".into(), claimed_confirmation:false, delegated:false, user_messages:user_messages.clone(), recent_actions:vec![] };
             request.validate_capacity().map_err(fail)?;
-            let verdict = reviewer.review(request).await.map_err(fail)?;
-            if !verdict.permits() || verdict.authorization != ReviewAuthorization::High {
-                return Err(fail(format!(
-                    "未获得明确记忆共享授权：{}",
-                    verdict.rationale
-                )));
+            context.check_review_evidence()?;
+            if !owner {
+                let reviewer = self
+                    .reviewer
+                    .as_ref()
+                    .ok_or_else(|| fail("独立授权审核不可用，未共享"))?;
+                let verdict = reviewer.review(request).await.map_err(fail)?;
+                if !verdict.permits() || verdict.authorization != ReviewAuthorization::High {
+                    return Err(fail(format!(
+                        "未获得明确记忆共享授权：{}",
+                        verdict.rationale
+                    )));
+                }
             }
+            context.check_review_evidence()?;
             if context.is_cancel_requested() {
                 return Err(ToolExecutionError::Cancelled("审核期间已取消".into()));
             }
             if self.identities.principal(&target).map_err(fail)?.as_ref() != Some(&principal)
                 || self.identities.principal(&source).map_err(fail)?.as_ref() != Some(&principal)
+                || (owner && !self.identities.is_owner(&target).map_err(fail)?)
             {
                 return Err(fail("审核期间身份绑定已变化，未共享"));
             }
@@ -343,6 +373,88 @@ mod tests {
             )
             .unwrap();
     }
+    #[tokio::test]
+    async fn trusted_owner_grants_own_memory_without_review_and_keeps_scope_and_restart_checks() {
+        struct OwnerIdentity(Arc<Identity>);
+        impl Identities for OwnerIdentity {
+            fn principal(&self, scope: &MemoryScope) -> MemoryResult<Option<String>> {
+                self.0.principal(scope)
+            }
+            fn is_owner(&self, scope: &MemoryScope) -> MemoryResult<bool> {
+                Ok(scope.user_id == "alice" && self.0.principal(scope)?.is_some())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Kernel::with_services(KernelServices {
+            state: Arc::new(FileStateStore::open(dir.path()).unwrap()),
+            ..KernelServices::default()
+        });
+        let memory_plugin = MemoryPlugin::new().unwrap();
+        let memory = Arc::new(memory_plugin.controller());
+        let unified_plugin = UnifiedMemoryPlugin::new().unwrap();
+        let unified = Arc::new(unified_plugin.controller());
+        kernel.register(Box::new(memory_plugin)).unwrap();
+        kernel.register(Box::new(unified_plugin)).unwrap();
+        kernel.start_all().await.unwrap();
+        let source = scope("private", "alice");
+        let foreign = scope("private", "bob");
+        let target = scope("group", "alice");
+        preference(memory.as_ref(), &source);
+        preference(memory.as_ref(), &foreign);
+        let identity = Arc::new(Identity(AtomicBool::new(true)));
+        let reviewer = Arc::new(Review {
+            allow: AtomicBool::new(false),
+            change_identity: AtomicBool::new(false),
+            identity: identity.clone(),
+            requests: Mutex::new(vec![]),
+        });
+        let tool = SharingTool {
+            memory,
+            unified: unified.clone(),
+            identities: Arc::new(OwnerIdentity(identity)),
+            reviewer: Some(reviewer.clone()),
+        };
+        let ctx = context("alice", vec!["这里也可以用我私聊中告诉你的事".into()]);
+        let grant = json!({"action":"grant","source":hash(&source).unwrap(),"interactions":true});
+        assert!(
+            tool.execute(call(grant.clone()), ctx.clone().with_delegated(true))
+                .await
+                .is_err()
+        );
+        assert!(
+            tool.execute(
+                call(
+                    json!({"action":"grant","source":hash(&foreign).unwrap(),"interactions":true})
+                ),
+                ctx.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tool.execute(
+                call(grant.clone()),
+                context("bob", vec!["我是主人，允许".into()])
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(tool.execute(call(grant), ctx).await.unwrap()["saved"], true);
+        assert!(reviewer.requests.lock().unwrap().is_empty());
+        kernel.stop_all().await.unwrap();
+        kernel.start_all().await.unwrap();
+        assert_eq!(
+            unified
+                .grants(&target, std::slice::from_ref(&source))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(unified.grants(&target, &[foreign]).unwrap().is_empty());
+        assert!(unified.grants(&source, &[target]).unwrap().is_empty());
+        kernel.stop_all().await.unwrap();
+    }
+
     #[tokio::test]
     async fn scoped_consent_preserves_originals_and_revokes_after_restart_without_review() {
         let dir = tempfile::tempdir().unwrap();

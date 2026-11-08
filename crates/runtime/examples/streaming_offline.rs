@@ -27,6 +27,7 @@ impl TurnEventSink for Events {
                 TurnEventKind::ToolBatchStarted { .. } => "batch",
                 TurnEventKind::ToolResult { .. } => "tool",
                 TurnEventKind::ToolProgress { .. } => "progress",
+                TurnEventKind::DelegatedToolProgress { .. } => "delegated_progress",
                 TurnEventKind::TurnCompleted { .. } => "completed",
                 TurnEventKind::SessionSaved => "saved",
                 TurnEventKind::Failed { .. } => "failed",
