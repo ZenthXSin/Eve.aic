@@ -3,6 +3,7 @@
 模型与 QQ 都是本地替身；真实平台的全量事件权限及主动发送配额另行观察。
 """
 from fixture_auth import configure_fixture_progress, bootstrap_fixture_group_ids
+import hashlib
 import json
 from contextlib import closing
 import sqlite3
@@ -78,9 +79,21 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
     def wait_outbound(self, status='sent'):
         self.wait_for(lambda:any(row['status']==status for row in self.rows('outbound')), '群插话没有收到最终回执', 20)
 
+    def conversation_events(self):
+        path = self.work/'state/training-expressions.sqlite3'
+        if not path.exists(): return []
+        with closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)) as db:
+            return [dict(json.loads(message), session_id=session, user_id=user, stored_sequence=sequence)
+                    for session, user, sequence, message in db.execute(
+                        'SELECT session_id,user_id,sequence,message_json FROM conversation_events '
+                        'ORDER BY session_id,user_id,sequence')]
+
     def test_unmentioned_group_message_sends_one_model_decision_and_never_replays(self):
         first=self.observation('ambient-1','这个思路，Eve你怎么看',user='member-2')
-        self.run_eve([first,*self.checkpoint('sent')],memory=True,checkpoints={'sent':self.wait_outbound})
+        def sent():
+            self.wait_outbound()
+            self.wait_for(lambda:len(self.conversation_events())>=3, '群原话及真实 Sent 没有逐条保存', 20)
+        self.run_eve([first,*self.checkpoint('sent')],memory=True,checkpoints={'sent':sent})
         [push]=self.pushes()
         self.assertEqual((push['scope'],push['target_id'],push['sender_id']),('group','group-1','member-2'))
         self.assertEqual(push['based_on_message_id'],'ambient-1')
@@ -95,10 +108,30 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(self.definitions(self.kind('group_speech')[0]['body']), {'read_source'})
         self.assertFalse(any('eve.identity.v1' in m.get('content','') for m in self.kind('group_speech')[0]['body']['messages']))
         self.assertEqual(len(self.rows('observations')),2)
+        records=self.conversation_events()
+        self.assertEqual(len(records),3, '群原话在个人与群范围各一条，群发言只在群范围一条')
+        group=[event for event in records if event['user_id']=='eve-chime']
+        self.assertEqual([event['role'] for event in group],['human','eve'])
+        conversation='qq:'+hashlib.sha256(json.dumps(['1904159860','group','group-1'],separators=(',',':')).encode()).hexdigest()
+        self.assertEqual([event['session_id'] for event in group],[conversation]*2)
+        self.assertEqual([event['text'] for event in group],[first['send']['message']['text'],push['text']])
+        self.assertEqual([event['stored_sequence'] for event in group],[1,2])
+        self.assertEqual([event['metadata']['sequence'] for event in group],[1,2])
+        human_id='qq-human:'+hashlib.sha256(b'ambient-1').hexdigest()
+        self.assertEqual(group[0]['id'],human_id)
+        self.assertEqual(group[1]['id'],'qq-eve:'+hashlib.sha256(('push-'+push['id']).encode()).hexdigest())
+        self.assertEqual(group[1]['metadata']['reply_to'],human_id)
+        self.assertEqual(group[1]['metadata']['source_kind'],'qq_group_sent')
+        self.assertGreater(group[1]['metadata']['observed_at_ms'],0)
+        personal=[event for event in records if event['user_id']!='eve-chime']
+        self.assertEqual([(event['id'],event['role']) for event in personal],[(human_id,'human')])
+        personal_scope='qq:'+hashlib.sha256(json.dumps(['1904159860','group','group-1','member-2'],separators=(',',':')).encode()).hexdigest()
+        self.assertEqual((personal[0]['session_id'],personal[0]['user_id']),(personal_scope,personal_scope))
         before=len(self.requests)
         self.run_eve([first,*self.checkpoint('quiet')],checkpoints={'quiet':self.quiet})
         self.assertEqual(len(self.requests),before)
         self.assertEqual(len(self.pushes()),1)
+        self.assertEqual(self.conversation_events(),records, '重投不能重复采集或改写首次观察时间、序号')
 
     def test_unmentioned_messages_feed_phrase_distillation_without_creating_user_tasks(self):
         def learned():
@@ -118,10 +151,19 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
         first=self.observation('failed-1','聊一句，Eve')
         self.run_eve([{'push_mode':{'ok':False,'http_status':403}},first,*self.checkpoint('failed')],checkpoints={'failed':lambda:self.wait_outbound('failed')})
         self.assertEqual(len(self.pushes()),1)
+        records=self.conversation_events()
+        self.assertEqual(len(records),2, '发送失败仍保留个人与群范围的真实原话')
+        self.assertEqual([event['role'] for event in records],['human','human'])
+        self.assertEqual([event['text'] for event in records],[first['send']['message']['text']]*2)
+        self.assertEqual({event['id'] for event in records},{'qq-human:'+hashlib.sha256(b'failed-1').hexdigest()})
+        self.assertEqual(len([event for event in records if event['user_id']=='eve-chime']),1)
+        self.assertEqual(self.rows('exchanges'),[])
         before=len(self.requests)
         self.run_eve([first,*self.checkpoint('quiet')],checkpoints={'quiet':self.quiet})
         self.assertEqual(len(self.pushes()),1)
         self.assertEqual(len(self.requests),before)
+        self.assertEqual(self.conversation_events(),records, '失败发言与重投不能变成 Eve 交流证据')
+        self.assertEqual(self.rows('exchanges'),[])
 
     def test_observation_does_not_inherit_admin_tool_authority_and_commands_are_not_learned(self):
         self.speech_decision=lambda facts:{'action':'speak','text':'这个要求需要管理员处理','after_ms':0}

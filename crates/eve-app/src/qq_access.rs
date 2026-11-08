@@ -542,6 +542,7 @@ impl QqCommandHandler for GuardedCommands {
                     head,
                     "/budget"
                         | "/model"
+                        | "/effort"
                         | "/memories"
                         | "/recall"
                         | "/interests"

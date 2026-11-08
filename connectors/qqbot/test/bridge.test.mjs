@@ -1078,6 +1078,31 @@ test("全量群消息只进入观察，艾特消息同时保留普通任务入�
   f.handlers.get("message")({}, {...msg,senderIsBot:true});
   assert.equal(f.frames.filter(x=>x.type==="group_observation").length,2);
 });
+test("学习帧保留原文和明确平台时间，群旁观与普通入口使用同一来源", () => {
+  const f = fixture({ group: { observe: true, mention: true } });
+  const original = "  原始正文\n```rs\nlet x = 1;\n```\n> 引用文字  ";
+  const timestamp = "2026-11-08T08:09:10+08:00";
+  f.handlers.get("message")({}, {
+    kind: "group", messageId: "learning-group", senderId: "member-1", content: original,
+    timestamp, rawEventType: "GROUP_AT_MESSAGE_CREATE", groupOpenid: "group-1",
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "learning-group" },
+  });
+  const observed = f.frames.find(frame => frame.type === "group_observation");
+  const received = f.frames.find(frame => frame.type === "message");
+  for (const frame of [observed, received]) {
+    assert.equal(frame.original_text, original);
+    assert.equal(frame.source_at_ms, Date.parse(timestamp));
+  }
+  for (const [index, rawTime] of [undefined, 123, "not-a-date", "2026-11-08T08:09:10"].entries()) {
+    const id = "unknown-time-" + index;
+    f.handlers.get("message")({}, {
+      kind: "c2c", messageId: id, senderId: "user-1", content: "正文中的时间不充当平台时间",
+      raw: { timestamp: rawTime }, rawEventType: "C2C_MESSAGE_CREATE",
+      replyTarget: { scope: "c2c", targetId: "user-1", msgId: id },
+    });
+    assert.equal(f.frames.find(frame => frame.id === id).source_at_ms, undefined);
+  }
+});
 test("群回复每段艾特平台原发送者，私聊不增加艾特", async () => {
   const f=fixture({group:{observe:true,mention:true}}); f.message("group","g-at");
   await f.bridge.command({type:"segment",version:1,id:"g-at",index:0,count:2,text:"知道了"});

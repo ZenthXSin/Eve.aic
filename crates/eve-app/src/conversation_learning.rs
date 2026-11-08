@@ -10,23 +10,15 @@ use ring::digest::{SHA256, digest};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-pub(crate) fn observe(
+pub(crate) fn observe_with_metadata(
     training: &dyn TrainingService,
     scope: &ContextScope,
     id: &str,
     speaker: &str,
     role: ConversationRole,
     text: &str,
+    metadata: Option<eve_training_api::ConversationMetadata>,
 ) -> eve_plugin_api::PluginResult<()> {
-    // 长任务、引用块、代码与附件说明不伪装成日常表达；不截断后再声称完整依据。
-    if text.trim().is_empty()
-        || text.len() > eve_training_api::MAX_CONVERSATION_BODY_BYTES
-        || text.trim_start().starts_with('/')
-        || text.contains("```")
-        || text.lines().any(|line| line.trim_start().starts_with('>'))
-    {
-        return Ok(());
-    }
     let speaker: String = digest(&SHA256, speaker.as_bytes())
         .as_ref()
         .iter()
@@ -39,6 +31,7 @@ pub(crate) fn observe(
             speaker,
             role,
             text: text.into(),
+            metadata,
         },
     )
 }
@@ -174,6 +167,12 @@ impl Background {
                             Ok(drafts) => match training.finish_conversation_batch(&batch, drafts, crate::qq_tasks::now_ms()) {
                                 Ok(saved) => eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"batch":batch.id,"outcome":"learned","saved":saved})),
                                 Err(error) => {
+                                    // 持久提交失败或结果未知不是模型输出拒绝：不能再提交 fail，
+                                    // 更不能拿旧快照覆盖可能已经保存的经验和消费位置。
+                                    if !matches!(error, eve_plugin_api::PluginError::Task(_)) {
+                                        eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"batch":batch.id,"outcome":"storage_unconfirmed","reason":error.to_string()}));
+                                        return Err(error.into());
+                                    }
                                     eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"batch":batch.id,"outcome":"rejected","reason":error.to_string()}));
                                     // 重置或停止已经令批次失效，不恢复它；其他输出错误按同批有限重试。
                                     training.fail_conversation_batch(&batch, crate::qq_tasks::now_ms())?;

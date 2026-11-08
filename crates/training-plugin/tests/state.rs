@@ -100,7 +100,7 @@ async fn reset_rejects_inflight_learning_without_affecting_another_user() {
 }
 
 #[tokio::test]
-async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
+async fn storage_failure_preserves_mode_and_requires_reload_before_reusing_training() {
     let state = Arc::new(FallibleState {
         storage: MemoryStateStore::default(),
         fail: AtomicBool::new(false),
@@ -118,12 +118,24 @@ async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
     kernel.start(&id).await.unwrap();
     let old = service(&registry);
     let one = scope("group-1", "user-1");
+    old.set_enabled(&one, false).unwrap();
+    let stored = || {
+        ["modes.v1", "phrases.v1", "conversation.v1", "expression.v1"]
+            .map(|key| state.get(&id, key).unwrap())
+    };
+    let before = stored();
     state.fail.store(true, Ordering::SeqCst);
     assert!(old.set_enabled(&one, true).is_err());
-    assert!(!old.enabled(&one).unwrap());
+    assert!(old.enabled(&one).is_err());
+    assert!(old.phrases(&one).is_err());
+    assert!(old.conversation_lessons(&one).is_err());
+    assert_eq!(stored(), before);
     state.fail.store(false, Ordering::SeqCst);
-    old.set_enabled(&one, true).unwrap();
-    assert!(!old.enabled(&scope("group-1", "user-2")).unwrap());
+    assert!(old.set_enabled(&one, true).is_err());
+    assert!(
+        old.observe_user_message(&one, "unknown", "状态未重新加载")
+            .is_err()
+    );
     let context = TrainingContext(old.clone());
     assert!(
         context
@@ -136,7 +148,7 @@ async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
             .is_empty()
     );
     assert!(
-        !context
+        context
             .assemble_scoped(
                 TurnInput {
                     text: "答案".into()
@@ -144,10 +156,9 @@ async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
                 Some(one.clone())
             )
             .await
-            .unwrap()
-            .pinned
-            .is_empty()
+            .is_err()
     );
+    assert_eq!(stored(), before);
     kernel.stop(&id).await.unwrap();
     assert!(old.enabled(&one).is_err());
     assert!(
@@ -162,9 +173,39 @@ async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
             .is_err()
     );
     kernel.start(&id).await.unwrap();
-    assert!(service(&registry).enabled(&one).unwrap());
+    let restored = service(&registry);
+    assert!(!restored.enabled(&one).unwrap());
+    assert_eq!(stored(), before);
+    restored.set_enabled(&one, true).unwrap();
+    assert!(restored.enabled(&one).unwrap());
+    assert!(!restored.enabled(&scope("group-1", "user-2")).unwrap());
+    let restored_context = TrainingContext(restored.clone());
+    assert!(
+        restored_context
+            .assemble(TurnInput {
+                text: "/train start user-1".into()
+            })
+            .await
+            .unwrap()
+            .pinned
+            .is_empty()
+    );
+    assert!(
+        !restored_context
+            .assemble_scoped(
+                TurnInput {
+                    text: "答案".into()
+                },
+                Some(one.clone())
+            )
+            .await
+            .unwrap()
+            .pinned
+            .is_empty()
+    );
     assert!(old.set_enabled(&one, false).is_err());
     kernel.stop_all().await.unwrap();
+    assert!(restored.enabled(&one).is_err());
 }
 
 #[tokio::test]
@@ -327,7 +368,7 @@ async fn expression_features_exclude_commands_quoted_material_and_freeze_scoped_
         .assemble_scoped(input(), Some(one.clone()))
         .await
         .unwrap();
-    assert!(frozen.revision.starts_with("eve-training-5:"));
+    assert!(frozen.revision.starts_with("eve-training-6:"));
     assert!(frozen.profile.contains("当前可信会话"));
     assert!(!frozen.profile.contains("我想出去"));
     let fallback = context

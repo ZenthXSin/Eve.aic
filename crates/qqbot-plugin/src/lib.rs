@@ -8,8 +8,10 @@ mod live;
 mod trusted_review;
 pub use live::LiveDialogue;
 mod admission;
+mod conversation_observer;
 mod observer;
 pub use admission::{QqAdmission, QqAdmissionResult};
+pub use conversation_observer::{QqConversationMessage, QqConversationObserver};
 /// 组合层在启动任何可写服务前核验既有回执；复用正式加载器，绝不修复或重写原字节。
 pub fn validate_receipt_state(bytes: &[u8]) -> eve_plugin_api::PluginResult<()> {
     state::Ledger::decode(bytes).map(|_| ())
@@ -245,6 +247,7 @@ pub struct QqBotPlugin {
     command_handler: Option<Arc<dyn QqCommandHandler>>,
     training: bool,
     observer: Option<Arc<dyn QqInteractionObserver>>,
+    conversation_observer: Option<Arc<dyn QqConversationObserver>>,
     segmentation: Option<Arc<Segmentation>>,
     natural_message_judgement: bool,
     outreach: Option<Arc<bridge::OutreachHook>>,
@@ -294,6 +297,7 @@ impl QqBotPlugin {
             command_handler: None,
             training: false,
             observer: None,
+            conversation_observer: None,
             segmentation: None,
             natural_message_judgement: false,
             outreach: None,
@@ -485,6 +489,12 @@ impl QqBotPlugin {
         self.training = true;
         Ok(self)
     }
+    /// 逐条观察真实入站与平台确认的 Eve 正文；失败待写保留，不补发聊天。
+    pub fn with_conversation_observer(mut self, observer: Arc<dyn QqConversationObserver>) -> Self {
+        self.conversation_observer = Some(observer);
+        self
+    }
+
     /// 接收已提交且确认发送的普通交互；未接线时不读取 Session 或执行观察。
     pub fn with_interaction_observer(
         mut self,
@@ -637,6 +647,7 @@ impl Plugin for QqBotPlugin {
             let ledger = Arc::new(tokio::sync::Mutex::new(Some(ledger)));
             let config = self.config.clone();
             let command_handler = self.command_handler.clone();
+            let conversation_observer = self.conversation_observer.clone();
             let segmentation = self.segmentation.clone();
             let natural_message_judgement = self.natural_message_judgement;
             let outreach = self.outreach.clone();
@@ -676,6 +687,7 @@ impl Plugin for QqBotPlugin {
                     let observation = observation.clone();
                     let segmentation = segmentation.clone();
                     let outreach = outreach.clone();
+                    let conversation_observer = conversation_observer.clone();
                     let files = files.clone();
                     let attachment_observer = attachment_observer.clone();
                     let raw_observer = raw_observer.clone();
@@ -706,6 +718,7 @@ impl Plugin for QqBotPlugin {
                             ctx,
                             bridge::Services {
                                 control,
+                                conversation_observer,
                                 messages,
                                 command_handler,
                                 training,

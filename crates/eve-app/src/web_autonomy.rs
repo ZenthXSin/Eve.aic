@@ -41,12 +41,14 @@ impl WebAutonomy {
         health: Arc<eve_model_health::HealthBook>,
         exploration_notes: Arc<crate::context_notes::NotesTool>,
     ) -> Result<Self, AppError> {
+        let expression_store = Arc::new(eve_training_sqlite::SqliteExpressions::open(
+            &state.join("training-expressions.sqlite3"),
+        )?);
         kernel.register(Box::new(
             eve_training_plugin::TrainingPlugin::new(true)?
                 .with_phrase_learning()
-                .with_expression_store(Arc::new(eve_training_sqlite::SqliteExpressions::open(
-                    &state.join("training-expressions.sqlite3"),
-                )?)),
+                .with_expression_store(expression_store.clone())
+                .with_conversation_store(expression_store),
         ))?;
         kernel
             .start(&PluginId::new(eve_training_api::TRAINING_PLUGIN_ID)?)
@@ -610,7 +612,10 @@ impl WebAutonomy {
             permissions,
             &self.worker_tools,
             self.worker_config.clone(),
-            resolver(crate::qq_tasks::MODEL_USE),
+            crate::qq_tasks::WorkerModels {
+                task: resolver(crate::qq_tasks::MODEL_USE),
+                coding: resolver("coding"),
+            },
             self.digests.clone(),
         )
         .await?;

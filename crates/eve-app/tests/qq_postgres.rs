@@ -1,14 +1,14 @@
 //! 独立 QQ/终端进程使用同一公开 SQL 后端；仅本机专用测试库与 loopback 模型。
-#[path = "../../llm-openai/tests/support/mod.rs"]
-mod http_support;
+#[path = "support/qq_model_server.rs"]
+mod qq_model_server;
 #[path = "support/session_archive.rs"]
 mod session_archive;
 
 use eve_app::{ChatOptions, QqBotOptions};
 use eve_qqbot_plugin::QQBOT_PLUGIN_ID;
 use eve_state_postgres::ConnectionOptions;
-use http_support::{Reply, Server, final_response};
 use postgres::{Client, Config, NoTls};
+use qq_model_server::{Reply, Server, final_response};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -18,12 +18,6 @@ use std::{
     process::{Child, Command, Output, Stdio},
     thread,
     time::Duration,
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
 };
 
 const MODEL_KEY: &str = "postgres-qq-model-fixture";
@@ -304,7 +298,7 @@ fn has_training(request: &Value) -> bool {
         m["role"] == "system"
             && m["content"]
                 .as_str()
-                .is_some_and(|text| text.contains("当前会话允许从交互中学习表达"))
+                .is_some_and(|text| text.contains("当前会话允许从真实交互中学习说话内容与表达方式"))
     })
 }
 
@@ -355,12 +349,15 @@ async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) 
         "next_step": "请用户补充执行范围。",
         "needs_user_input": true
     });
-    let mut server = Server::start(vec![
-        Reply::json(final_response("SQL 确认偏好后的回复。")),
-        Reply::json(final_response(&artifact.to_string())),
-        Reply::json(final_response("SQL 修正偏好后的回复。")),
-        Reply::json(final_response("SQL 撤销偏好后的回复。")),
-    ])
+    let mut server = Server::start(
+        root,
+        vec![
+            Reply::json(final_response("SQL 确认偏好后的回复。")),
+            Reply::json(final_response(&artifact.to_string())),
+            Reply::json(final_response("SQL 修正偏好后的回复。")),
+            Reply::json(final_response("SQL 撤销偏好后的回复。")),
+        ],
+    )
     .await;
     let url = server.url.clone();
     let enabled = || {
@@ -368,7 +365,7 @@ async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) 
         command.args(["--memory", "--cognition", "--cognition-max-executions", "1"]);
         command
     };
-
+    let initial_requests = server.checkpoint();
     scenario(
         root,
         vec![containing_message(
@@ -395,7 +392,8 @@ async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) 
         snapshot["evidence"][0]["id"]
     );
     // 开启记忆没有补采本 suite 先前关闭记忆时产生的 SQL 聊天回执。
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_requests_since(initial_requests);
 
     scenario(
         root,
@@ -498,6 +496,7 @@ async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) 
     assert_eq!(child["feedback"]["verification_met"], true);
     assert_eq!(child["feedback"]["started_tools"], 0);
 
+    let recovery = server.recovery_checkpoint();
     scenario(
         root,
         vec![
@@ -510,7 +509,8 @@ async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) 
     assert_eq!(replay["received"], 0);
     assert_eq!(replay["sent"], 0);
     assert_eq!(rows(database), reflected);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
 
     for (command_id, change, confirmation, chat_id, input, reply, expected) in [
         (
@@ -572,88 +572,19 @@ async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) 
             assert!(!String::from_utf8_lossy(bytes).contains(secret));
         }
     }
+    let recovery = server.recovery_checkpoint();
     scenario(root, vec![]);
     successful(Process::run(enabled(), "", password).await, Entry::Qq);
     assert_eq!(rows(database), committed);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
 }
 
-/// 模型响应由测试在读取已提交的 SQL Running 后显式放行，不靠延时捕捉中间状态。
-struct LearningServer {
-    url: String,
-    requests: mpsc::UnboundedReceiver<(Value, oneshot::Sender<Value>)>,
-    task: JoinHandle<()>,
-}
-impl LearningServer {
-    async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
-        let (sender, requests) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    let mut bytes = vec![];
-                    let header_end = loop {
-                        let mut chunk = [0; 4096];
-                        let count = socket.read(&mut chunk).await.unwrap();
-                        assert!(count > 0);
-                        bytes.extend_from_slice(&chunk[..count]);
-                        assert!(bytes.len() < 1024 * 1024);
-                        if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break index + 4;
-                        }
-                    };
-                    let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-                    assert!(headers.starts_with("POST /v1/responses HTTP/1.1\r\n"));
-                    let length: usize = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|length| length.trim().parse().unwrap())
-                        })
-                        .unwrap();
-                    assert!(length < 1024 * 1024);
-                    while bytes.len() < header_end + length {
-                        let mut chunk = [0; 4096];
-                        let count = socket.read(&mut chunk).await.unwrap();
-                        assert!(count > 0);
-                        bytes.extend_from_slice(&chunk[..count]);
-                    }
-                    let request =
-                        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
-                    let (reply, response) = oneshot::channel::<Value>();
-                    assert!(sender.send((request, reply)).is_ok());
-                    let body = serde_json::to_vec(&final_response(
-                        &response.await.unwrap().to_string(),
-                    ))
-                    .unwrap();
-                    let header = format!(
-                        "HTTP/1.1 200 Fixture\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                        body.len()
-                    );
-                    socket.write_all(header.as_bytes()).await.unwrap();
-                    socket.write_all(&body).await.unwrap();
-                })
-                .await
-                .expect("SQL 提炼模型夹具未有界完成");
-            }
-        });
-        Self {
-            url,
-            requests,
-            task,
-        }
-    }
-}
-impl Drop for LearningServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn wait_sql(database: &Path, ready: impl Fn(&[StoredRow]) -> bool) -> Vec<StoredRow> {
+async fn wait_sql(
+    database: &Path,
+    checkpoint: &'static str,
+    ready: impl Fn(&[StoredRow]) -> bool,
+) -> Vec<StoredRow> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let saved = rows(database);
@@ -664,7 +595,7 @@ async fn wait_sql(database: &Path, ready: impl Fn(&[StoredRow]) -> bool) -> Vec<
         }
     })
     .await
-    .expect("SQL 状态未到达验收检查点")
+    .unwrap_or_else(|error| panic!("SQL 状态未到达验收检查点 {checkpoint}: {error}"))
 }
 
 fn learning_message(id: &str, text: &str, expected: &str) -> Value {
@@ -710,6 +641,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
 ) {
     const PREFERENCE: &str = "SQL_LEARNED_PREFERENCE：先给简短结论，再给必要依据。";
     let mut chat = Server::start(
+        root,
         (0..3)
             .map(|_| Reply::json(final_response("SQL 新作用域的普通回复。")))
             .collect(),
@@ -734,7 +666,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
     let mut seed = command(Entry::Qq, root, &chat.url, Some(database));
     seed.arg("--memory");
     let poll = async {
-        wait_sql(database, |saved| {
+        wait_sql(database, "learning_seed_completed_interactions", |saved| {
             let memory = document(saved, "eve.memory", "memory.v1");
             memory["scopes"].as_array().unwrap().iter().any(|scope| {
                 is_learning_scope(scope)
@@ -753,7 +685,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
         assert!(!has_training(&request));
         assert_preference_context(&request, None);
     }
-    assert!(chat.requests.try_recv().is_err());
+    chat.assert_no_unexpected();
     let before = rows(database);
     let memory = document(&before, "eve.memory", "memory.v1");
     let snapshot = learning_memory(&memory);
@@ -786,7 +718,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
 
     // 先前记忆测试的旧作用域也有三条经历；保留它并验证提炼不会跨作用域拼批。
     assert_eq!(memory["scopes"].as_array().unwrap().len(), 2);
-    let mut server = LearningServer::start().await;
+    let mut server = Server::learning(root).await;
     let url = server.url.clone();
     let enabled = || {
         let mut command = command(Entry::Qq, root, &url, Some(database));
@@ -798,11 +730,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
     let inspect = async {
         let mut seen = vec![];
         for _ in 0..2 {
-            let (request, reply) =
-                tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let (request, reply) = server.next_learning().await;
             let input = request["input"].as_array().unwrap();
             assert_eq!(input.len(), 2);
             assert_eq!(input[0]["role"], "system");
@@ -858,7 +786,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
                     .is_ok()
             );
         }
-        wait_sql(database, |saved| {
+        wait_sql(database, "learning_jobs_completed", |saved| {
             let learning = learning_document(root, saved);
             let jobs = learning["jobs"].as_array().unwrap();
             jobs.len() == 2
@@ -871,7 +799,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
     };
     let (output, ()) = tokio::join!(Process::run(enabled(), "", password), inspect);
     successful(output, Entry::Qq);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
     let extracted = rows(database);
     assert_eq!(document(&extracted, "eve.memory", "memory.v1"), memory);
     assert_eq!(
@@ -924,8 +852,10 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
         snapshot["evidence"][3]["id"]
     );
     assert_eq!(learning_document(root, &accepted), learning);
+    server.assert_no_unexpected();
 
     // 空消息重启保持桥接存活两轮扫描：旧批次不重请求，所有 SQL 原始行逐字节不变。
+    let recovery = server.recovery_checkpoint();
     let ready = root.join("sql-learning-idle-ready");
     let idle = root.join("sql-learning-idle-completed");
     script(
@@ -940,17 +870,16 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
         })
         .await
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(650), server.requests.recv())
-                .await
-                .is_err()
-        );
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        server.assert_no_replay_since(&recovery);
         std::fs::write(&idle, b"idle").unwrap();
     };
     let (output, ()) = tokio::join!(Process::run(enabled(), "", password), inspect);
     successful(output, Entry::Qq);
     assert_eq!(rows(database), accepted);
+    server.assert_no_replay_since(&recovery);
 
+    let recovery = server.recovery_checkpoint();
     scenario(
         root,
         vec![learning_message(
@@ -980,7 +909,8 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
         revoked_memory
     );
     assert_eq!(learning_document(root, &final_rows), learning);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
     assert!(!root.join("state/state.json").exists());
     for (_, _, bytes) in &final_rows {
         for secret in [MODEL_KEY, QQ_KEY, password] {
@@ -1004,7 +934,8 @@ async fn sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_rev
     database: &Path,
     password: &str,
 ) {
-    let mut server = Server::start(vec![]).await;
+    let mut server = Server::start(root, vec![]).await;
+    let recovery = server.recovery_checkpoint();
     let before = rows(database);
     let learning = learning_document(root, &before);
     let memory = document(&before, "eve.memory", "memory.v1");
@@ -1029,7 +960,7 @@ async fn sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_rev
     let mut automatic = command(Entry::Qq, root, &server.url, Some(database));
     automatic.arg("--self-learning");
     let inspect = async {
-        wait_sql(database, |saved| {
+        wait_sql(database, "autonomous_preference_confirmed", |saved| {
             let current = document(saved, "eve.memory", "memory.v1");
             current["scopes"].as_array().unwrap().iter().any(|s| {
                 s["snapshot"]["preferences"]
@@ -1040,15 +971,14 @@ async fn sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_rev
             })
         })
         .await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(650), server.requests.recv())
-                .await
-                .is_err()
-        );
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        server.assert_no_replay_since(&recovery);
         std::fs::write(&done, b"done").unwrap();
     };
     let (output, ()) = tokio::join!(Process::run(automatic, "", password), inspect);
     successful(output, Entry::Qq);
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
     let saved = rows(database);
     assert_eq!(learning_document(root, &saved), learning);
     let current = document(&saved, "eve.memory", "memory.v1");
@@ -1083,12 +1013,14 @@ async fn sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_rev
             .unwrap()
             .contains(&preference["history"][0]["evidence_id"])
     );
+    let recovery = server.recovery_checkpoint();
     script(root, vec![]);
     let mut restart = command(Entry::Qq, root, &server.url, Some(database));
     restart.arg("--self-learning");
     successful(Process::run(restart, "", password).await, Entry::Qq);
     assert_eq!(rows(database), saved);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
 }
 
 fn interaction_evidence(saved: &[StoredRow]) -> Vec<Value> {
@@ -1163,10 +1095,13 @@ async fn sql_segmented_delivery_imports_only_fully_sent_interactions(
         "最后补充下一步。",
     ];
     let text = parts.join("\n\n");
-    let mut server = Server::start(vec![
-        Reply::json(final_response(&text)),
-        Reply::json(final_response(&text)),
-    ])
+    let mut server = Server::start(
+        root,
+        vec![
+            Reply::json(final_response(&text)),
+            Reply::json(final_response(&text)),
+        ],
+    )
     .await;
     let url = server.url.clone();
     let enabled = || {
@@ -1207,7 +1142,7 @@ async fn sql_segmented_delivery_imports_only_fully_sent_interactions(
         assert_sql_parts(&entry, &text, &parts, &["Sent", "Sent", "Sending"]);
         assert_eq!(document(&pending, "eve.memory", "memory.v1"), memory_before);
         std::fs::write(&release, b"release").unwrap();
-        wait_sql(database, |saved| {
+        wait_sql(database, "segmented_reply_fully_imported", |saved| {
             receipt(saved, COMPLETE)["state"] == "Sent"
                 && interaction_evidence(saved)
                     .iter()
@@ -1267,7 +1202,7 @@ async fn sql_segmented_delivery_imports_only_fully_sent_interactions(
         ],
     );
     let inspect = async {
-        wait_sql(database, |saved| {
+        wait_sql(database, "failed_segment_receipt", |saved| {
             document(saved, QQBOT_PLUGIN_ID, "receipts.v1")["entries"]
                 .as_array()
                 .unwrap()
@@ -1288,7 +1223,7 @@ async fn sql_segmented_delivery_imports_only_fully_sent_interactions(
         assert_eq!(summary[name], expected);
     }
     assert!(!has_training(&server.next().await.body));
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
     let failed_rows = rows(database);
     let entry = receipt(&failed_rows, FAILED);
     assert_eq!(entry["state"], "Failed");
@@ -1307,6 +1242,7 @@ async fn sql_segmented_delivery_imports_only_fully_sent_interactions(
 
     // 空启动以及平台重复投递都不补发片段，不重新调用模型，也不改任何 SQL 字节。
     for repeat in [false, true] {
+        let recovery = server.recovery_checkpoint();
         let steps = if repeat {
             [COMPLETE, FAILED]
                 .into_iter()
@@ -1331,7 +1267,8 @@ async fn sql_segmented_delivery_imports_only_fully_sent_interactions(
         assert_eq!(events.len(), if repeat { 2 } else { 0 });
         assert!(events.iter().all(|event| event["type"] == "finish"));
         assert_eq!(rows(database), failed_rows);
-        assert!(server.requests.try_recv().is_err());
+        server.assert_no_unexpected();
+        server.assert_no_replay_since(&recovery);
     }
     for (namespace, key) in [
         ("eve.learning", "learning.v1"),
@@ -1386,7 +1323,7 @@ async fn sql_segment_case_with_memory(
         enabled.arg("--memory");
     }
     let inspect = async {
-        let saved = wait_sql(database, |saved| {
+        let saved = wait_sql(database, "last_segment_case_receipt_sent", |saved| {
             document(saved, QQBOT_PLUGIN_ID, "receipts.v1")["entries"]
                 .as_array()
                 .unwrap()
@@ -1412,12 +1349,15 @@ async fn sql_segment_preferences_persist_and_remain_scoped(
     let parts = ["在。", "有事说就行。", "我会按顺序回答。"];
     let text = parts.join("\n\n");
     let two_parts = ["好。", "我们继续。"];
-    let mut server = Server::start(vec![
-        Reply::json(final_response(&text)),
-        Reply::json(final_response(&text)),
-        Reply::json(final_response(&text)),
-        Reply::json(final_response(&two_parts.join("\n\n"))),
-    ])
+    let mut server = Server::start(
+        root,
+        vec![
+            Reply::json(final_response(&text)),
+            Reply::json(final_response(&text)),
+            Reply::json(final_response(&text)),
+            Reply::json(final_response(&two_parts.join("\n\n"))),
+        ],
+    )
     .await;
     let before = rows(database);
     let preferences =
@@ -1447,13 +1387,15 @@ async fn sql_segment_preferences_persist_and_remain_scoped(
     server.next().await;
 
     // 空重启不改任何 SQL 字节；真实新输入继续读取持久化的关闭设置。
+    let recovery = server.recovery_checkpoint();
     segment_script(root, vec![]);
     let mut restart = command(Entry::Qq, root, &server.url, Some(database));
     restart.arg("--segmented");
     successful(Process::run(restart, "", password).await, Entry::Qq);
     assert_eq!(rows(database), disabled);
     assert!(segment_events(root).is_empty());
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
     let restarted = sql_segment_case(
         root,
         database,
@@ -1509,7 +1451,7 @@ async fn sql_segment_preferences_persist_and_remain_scoped(
         &["Sent"; 2],
     );
     server.next().await;
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
     for (namespace, key) in [
         ("eve.memory", "memory.v1"),
         ("eve.learning", "learning.v1"),
@@ -1529,7 +1471,8 @@ async fn sql_rhythm_advice_uses_confirmed_sources_and_only_writes_settings(
     password: &str,
 ) {
     const TEXT: &str = "回复最多两段，段间停顿50%。";
-    let mut server = Server::start(vec![]).await;
+    let mut server = Server::start(root, vec![]).await;
+    let recovery = server.recovery_checkpoint();
     let remembered = sql_segment_case_with_memory(
         root,
         database,
@@ -1607,7 +1550,8 @@ async fn sql_rhythm_advice_uses_confirmed_sources_and_only_writes_settings(
     successful(Process::run(restart, "", password).await, Entry::Qq);
     assert_eq!(rows(database), adopted);
     assert!(segment_events(root).is_empty());
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
 }
 
 #[test]
@@ -1650,7 +1594,7 @@ async fn sql_context_notes_use_cold_files_and_restore_through_real_qq_tools() {
             "output":[{"type":"function_call","id":format!("item-{id}"),"call_id":id,"name":"context_notes","arguments":arguments.to_string(),"status":"completed"}]
         }))
     };
-    let mut server = Server::start(vec![
+    let mut server = Server::start(root.path(), vec![
         tool(
             "note-update",
             json!({"operation":"update","expected_revision":0,"text":note}),
@@ -1794,6 +1738,8 @@ async fn sql_context_notes_use_cold_files_and_restore_through_real_qq_tools() {
         note
     );
     // 冷文件缺失时启动拒绝；保留 SQL 索引与回执，不连接模型或补做旧工具。
+    server.assert_no_unexpected();
+    let requests_before_failure = server.checkpoint();
     std::fs::remove_file(body).unwrap();
     scenario(root.path(), vec![]);
     let output = Process::run(
@@ -1804,7 +1750,8 @@ async fn sql_context_notes_use_cold_files_and_restore_through_real_qq_tools() {
     .await;
     assert!(!output.status.success());
     assert_eq!(rows(&database), saved);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_requests_since(requests_before_failure);
     admin(&database, |client| {
         client
             .batch_execute("DROP SCHEMA eve_state CASCADE")
@@ -1830,13 +1777,16 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
             .unwrap();
     });
     let root = fixture();
-    let mut server = Server::start(vec![
-        Reply::json(final_response("记住了 SQL 偏好。")),
-        Reply::json(final_response("已经恢复普通聊天。")),
-        Reply::json(final_response("重启后记得 SQL 偏好。")),
-        Reply::json(final_response("终端第一轮已保存。")),
-        Reply::json(final_response("终端重启后仍记得。")),
-    ])
+    let mut server = Server::start(
+        root.path(),
+        vec![
+            Reply::json(final_response("记住了 SQL 偏好。")),
+            Reply::json(final_response("已经恢复普通聊天。")),
+            Reply::json(final_response("重启后记得 SQL 偏好。")),
+            Reply::json(final_response("终端第一轮已保存。")),
+            Reply::json(final_response("终端重启后仍记得。")),
+        ],
+    )
     .await;
     scenario(
         root.path(),
@@ -1933,6 +1883,7 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
     );
 
     // 空启动不重新学习、不调用模型、不补发；重复平台 ID 也只结束本次投递。
+    let recovery = server.recovery_checkpoint();
     scenario(root.path(), vec![]);
     let idle = successful(
         Process::run(
@@ -1960,7 +1911,8 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
         Entry::Qq,
     );
     assert_eq!(duplicate["sent"], 0);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
     assert_eq!(rows(&database), saved);
     let events = std::fs::read_to_string(root.path().join("events.jsonl")).unwrap();
     assert!(
@@ -2035,6 +1987,7 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
             assert!(!String::from_utf8_lossy(bytes).contains(secret));
         }
     }
+    let recovery = server.recovery_checkpoint();
     successful(
         Process::run(
             command(Entry::Console, root.path(), &server.url, Some(&database)),
@@ -2045,8 +1998,10 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
         Entry::Console,
     );
     assert_eq!(rows(&database), committed);
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_replay_since(&recovery);
 
+    let requests_before_rejection = server.checkpoint();
     let changed_path = root.path().join("changed.json");
     let mut changed: Value = serde_json::from_slice(&std::fs::read(&database).unwrap()).unwrap();
     changed["database"] = json!("different_qq_destination_test");
@@ -2115,7 +2070,8 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
         assert_eq!(std::fs::read(&file_path).unwrap(), original);
         assert!(!local.path().join("state/state.backend.json").exists());
     }
-    assert!(server.requests.try_recv().is_err());
+    server.assert_no_unexpected();
+    server.assert_no_requests_since(requests_before_rejection);
     assert_eq!(rows(&database), committed);
     sql_memory_and_cognition(root.path(), &database, &credentials.password).await;
     sql_learning_requires_confirmation_and_does_not_replay(
@@ -2263,7 +2219,7 @@ async fn sql_explicit_speech_and_silence_keep_platform_receipts_without_replay()
             .unwrap();
     });
     let root = fixture();
-    let mut server = Server::start(vec![
+    let mut server = Server::start(root.path(), vec![
         Reply::json(json!({"id":"speech-response","object":"response","status":"completed",
             "output":[{"type":"function_call","id":"speech-item","call_id":"explicit-sql-speech",
                 "name":"send_message","arguments":json!({"text":"这句话由 Eve 自己决定发出。"}).to_string(),"status":"completed"}]})),
@@ -2320,6 +2276,7 @@ async fn sql_explicit_speech_and_silence_keep_platform_receipts_without_replay()
     for _ in 0..3 {
         server.next().await;
     }
+    server.assert_no_unexpected();
     let mut replay = Vec::new();
     for mut message in messages {
         message["expected_type"] = json!("finish");

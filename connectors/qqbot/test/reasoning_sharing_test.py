@@ -24,7 +24,7 @@ class ReasoningSharingAcceptance(developer.DeveloperAcceptance):
             user = [m['content'] for m in body['messages'] if m['role'] == 'user'][-1]
             results = self.results(body)
             if 'REASONING_SET' in user:
-                self.assertEqual(body['reasoning_effort'], 'low', '当前轮的工具往返不能换档')
+                self.assertNotIn('reasoning_effort', body, '默认不传参数，当前轮的工具往返不能换档')
                 if not results:
                     return invoke('set_reasoning_effort', {'effort':'high'}, 'set-high')
                 self.assertTrue(results[-1]['saved'])

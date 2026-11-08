@@ -325,6 +325,7 @@ async fn background_wait_survives_restart_then_only_exact_claim_can_send_single_
     let group = make_group(&path, settings.clone(), training.clone());
     let input = platform("real-platform-input", "等我讲完这件事");
     group.observe(&input, None, false, now_ms()).unwrap();
+    let source = group.store.pending_speech(now_ms(), 1).unwrap().remove(0);
     let control = TestControl::new(&[r#"{"action":"wait","after_ms":1000}"#]);
     let background = Background::start(
         group.clone(),
@@ -343,7 +344,7 @@ async fn background_wait_survives_restart_then_only_exact_claim_can_send_single_
     let first_id = control.submitted.lock().unwrap()[0].input.task_id.clone();
     background.stop().await.unwrap();
     drop(group);
-    let group = make_group(&path, settings, training.clone());
+    let group = make_group(&path, settings.clone(), training.clone());
     let control = TestControl::new(&[
         r#"{"action":"speak","text":"我看完了。第二句仍是同一条。","after_ms":0}"#,
     ]);
@@ -379,10 +380,44 @@ async fn background_wait_survives_restart_then_only_exact_claim_can_send_single_
         )
         .unwrap();
     let conversation = input.conversation_key("app-1").unwrap();
-    assert_eq!(group.store.exchanges(&conversation).unwrap().len(), 1);
-    assert_eq!(training.0.load(Ordering::SeqCst), 1, "只学真实发出去的正文");
+    let exchanges = group.store.exchanges(&conversation).unwrap();
+    assert_eq!(exchanges.len(), 1);
+    let exchange = &exchanges[0];
+    assert!(exchange.valid(&conversation));
+    assert_eq!(exchange.source, source);
+    assert_eq!(exchange.source.text, input.text);
+    assert_eq!(exchange.source.speaker, input.user_id);
+    assert_eq!(exchange.reply.id, format!("{}:reply", push.message.id));
+    assert_eq!(exchange.reply.text, push.message.text);
+    assert_eq!(exchange.reply.speaker, USER);
+    assert!(exchange.reply.at_ms > exchange.source.at_ms);
+    state(&path, "sent").await;
+    assert!(
+        group
+            .delivered(
+                &push.message.id,
+                QqOutreachResult::Sent {
+                    platform_message_id: Some("actual-platform-receipt".into()),
+                },
+            )
+            .is_err(),
+        "已结算回执不能再次写入群交流"
+    );
+    assert_eq!(group.store.exchanges(&conversation).unwrap(), exchanges);
+    assert!(!group.claim_authored_push(&push).unwrap());
+    assert_eq!(
+        training.0.load(Ordering::SeqCst),
+        0,
+        "逐条学习由通道真实 Sent 观察器采集，Group.delivered 不重复采集"
+    );
     assert!(group.next_authored_push().unwrap().is_none());
     background.stop().await.unwrap();
+    drop(group);
+    let restored = make_group(&path, settings, training.clone());
+    assert_eq!(restored.store.exchanges(&conversation).unwrap(), exchanges);
+    assert!(restored.next_authored_push().unwrap().is_none());
+    assert!(!restored.claim_authored_push(&push).unwrap());
+    assert_eq!(training.0.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -503,48 +538,78 @@ async fn provider_budget_is_reserved_before_actual_request_and_error_does_not_au
 
 #[tokio::test]
 async fn missing_platform_receipt_is_unknown_and_never_learned_as_sent() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("group.sqlite3");
-    let settings = Arc::new(TestSettings(Mutex::new("model".into())));
-    let training = Arc::new(NoTraining::default());
-    let group = make_group(&path, settings, training.clone());
-    let input = platform("unknown", "事实");
-    group.observe(&input, None, false, now_ms()).unwrap();
-    let message = group.store.pending_speech(now_ms(), 1).unwrap().remove(0);
-    let review = group
-        .store
-        .begin_speech(&message, now_ms())
-        .unwrap()
-        .unwrap();
-    group
-        .store
-        .decide_speech(
-            &review,
-            Some(&ChimeSpeechDecision::Speak {
-                text: "待确认正文".into(),
-                after_ms: 0,
-            }),
-            now_ms(),
-        )
-        .unwrap();
-    let push = group.next_authored_push().unwrap().unwrap();
-    assert!(group.claim_authored_push(&push).unwrap());
-    group
-        .delivered(
-            &push.message.id,
+    for (result, expected) in [
+        (
             QqOutreachResult::Sent {
                 platform_message_id: None,
             },
-        )
-        .unwrap();
-    state(&path, "unknown").await;
-    assert!(group.next_authored_push().unwrap().is_none());
-    assert!(
+            "unknown",
+        ),
+        (
+            QqOutreachResult::Sent {
+                platform_message_id: Some("  ".into()),
+            },
+            "unknown",
+        ),
+        (QqOutreachResult::Unknown, "unknown"),
+        (
+            QqOutreachResult::Failed {
+                http_status: Some(403),
+                biz_code: None,
+            },
+            "failed",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.sqlite3");
+        let settings = Arc::new(TestSettings(Mutex::new("model".into())));
+        let training = Arc::new(NoTraining::default());
+        let group = make_group(&path, settings.clone(), training.clone());
+        let input = platform("unknown", "事实");
+        group.observe(&input, None, false, now_ms()).unwrap();
+        let message = group.store.pending_speech(now_ms(), 1).unwrap().remove(0);
+        let review = group
+            .store
+            .begin_speech(&message, now_ms())
+            .unwrap()
+            .unwrap();
         group
             .store
-            .exchanges(&input.conversation_key("app-1").unwrap())
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(training.0.load(Ordering::SeqCst), 0);
+            .decide_speech(
+                &review,
+                Some(&ChimeSpeechDecision::Speak {
+                    text: "待确认正文".into(),
+                    after_ms: 0,
+                }),
+                now_ms(),
+            )
+            .unwrap();
+        let push = group.next_authored_push().unwrap().unwrap();
+        assert!(group.claim_authored_push(&push).unwrap());
+        group.delivered(&push.message.id, result).unwrap();
+        state(&path, expected).await;
+        assert!(
+            group
+                .delivered(
+                    &push.message.id,
+                    QqOutreachResult::Sent {
+                        platform_message_id: Some("late-platform-receipt".into()),
+                    },
+                )
+                .is_err(),
+            "已结束的失败或未知投递不能由后来的重复回执变成已发送"
+        );
+        let conversation = input.conversation_key("app-1").unwrap();
+        assert!(group.store.exchanges(&conversation).unwrap().is_empty());
+        assert!(group.next_authored_push().unwrap().is_none());
+        assert!(!group.claim_authored_push(&push).unwrap());
+        assert_eq!(training.0.load(Ordering::SeqCst), 0);
+        drop(group);
+        let restored = make_group(&path, settings, training.clone());
+        state(&path, expected).await;
+        assert!(restored.store.exchanges(&conversation).unwrap().is_empty());
+        assert!(restored.next_authored_push().unwrap().is_none());
+        assert!(!restored.claim_authored_push(&push).unwrap());
+        assert_eq!(training.0.load(Ordering::SeqCst), 0);
+    }
 }

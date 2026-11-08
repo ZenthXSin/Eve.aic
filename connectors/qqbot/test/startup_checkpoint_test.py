@@ -251,10 +251,13 @@ class StartupCheckpointAcceptance(unittest.TestCase):
         self.assertEqual({name: value['version'] for name, value in checkpoint['ledgers'].items()},
                          {'tasks': 5, 'phrases': 2, 'receipts': 10})
         saved = self.state_path.read_bytes()
+        learning_db = self.state / 'training-expressions.sqlite3'
+        saved_learning = learning_db.read_bytes()
         requests = len(self.requests)
         for _ in range(12 if stability else 1):
             self.assert_closed_ingress(run)
             self.assertEqual(self.state_path.read_bytes(), saved, '等待证明期间不能由后台改写业务状态')
+            self.assertEqual(learning_db.read_bytes(), saved_learning, '等待证明期间不能改写表达或交流数据库')
             self.assertEqual(len(self.requests), requests, '等待证明期间不能执行模型请求')
             if stability:
                 time.sleep(.1)
@@ -337,8 +340,87 @@ class StartupCheckpointAcceptance(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as connection:
             connection.row_factory = sqlite3.Row
             return [dict(row) for row in connection.execute(
-                'SELECT session_id,user_id,id,body,chars,paragraphs,question,formal,casual,active '
+                'SELECT seq,session_id,user_id,id,body,chars,paragraphs,question,formal,casual,active '
                 'FROM expressions ORDER BY seq')]
+
+    def learning_records(self):
+        path = self.state / 'training-expressions.sqlite3'
+        self.assertTrue(path.is_file(), '恢复检查点必须已有真实学习数据库')
+        orders = {
+            'metadata': 'version,identity,legacy_sha',
+            'expressions': 'seq',
+            'conversation_metadata': 'version,legacy_sha',
+            'conversation_scopes': 'session_id,user_id',
+            'conversation_events': 'session_id,user_id,sequence',
+            'conversation_seen': 'session_id,user_id,id_sha',
+            'conversation_revisions': 'session_id,user_id,sequence',
+            'conversation_batches': 'sequence',
+            'sqlite_sequence': 'name',
+            'sqlite_master': 'type,name',
+        }
+        with contextlib.closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            return {table: [dict(row) for row in connection.execute(
+                f'SELECT * FROM {table} ORDER BY {order}')] for table, order in orders.items()}
+
+    def assert_help_observation(self, before, after, received_after_ms, stopped_at_ms):
+        changed = {'conversation_scopes', 'conversation_events', 'conversation_seen'}
+        for table in before.keys() - changed:
+            self.assertEqual(after[table], before[table], f'新 /help 不得改写 {table}')
+        self.assertEqual(after['conversation_revisions'], [], '新 /help 不能生成经验版本')
+        self.assertEqual(after['conversation_batches'], [], '新 /help 不能启动或归档学习批次')
+        scope = self.learning_scope()
+        events = after['conversation_events']
+        self.assertEqual(len(before['conversation_events']), self.runs - 1)
+        self.assertEqual(len(events), self.runs, '每次确认后只采集本轮一条 Human')
+        self.assertEqual(events[:-1], before['conversation_events'], '已有交流原文及元数据必须逐字节保留')
+        identifier = 'qq-human:' + digest(('checkpoint-' + str(self.runs)).encode())
+        core = {'id': identifier, 'speaker': digest(scope['user_id'].encode()),
+                'role': 'human', 'text': '/help'}
+        message = json.loads(events[-1]['message_json'])
+        metadata = message.pop('metadata')
+        self.assertEqual(message, core, '固定 /help 回执不能冒充 Eve 发言')
+        observed_at_ms = metadata['observed_at_ms']
+        self.assertIsInstance(observed_at_ms, int)
+        self.assertGreaterEqual(observed_at_ms, received_after_ms)
+        self.assertLessEqual(observed_at_ms, stopped_at_ms)
+        self.assertEqual(metadata, {'observed_at_ms': observed_at_ms, 'sequence': self.runs,
+                                   'source_kind': 'qq_original_input', 'activity': {'phase': 'received'}})
+        self.assertEqual(events[-1], {**scope, 'sequence': self.runs, 'message_id': identifier,
+                                     'message_json': events[-1]['message_json']})
+        seen = {**scope, 'id_sha': digest(identifier.encode()), 'body_sha': digest(encoded(core))}
+        self.assertEqual(after['conversation_seen'], sorted([*before['conversation_seen'], seen],
+                         key=lambda row: (row['session_id'], row['user_id'], row['id_sha'])))
+
+        previous = before['conversation_scopes']
+        self.assertEqual(len(previous), int(self.runs > 1))
+        if previous:
+            self.assertEqual(previous[0]['next_sequence'], self.runs)
+        previous_checkpoint = previous[0]['checkpoint'] if previous else None
+        revision = previous[0]['revision'] if previous else 0
+        self.assertEqual(len(after['conversation_scopes']), 1)
+        current = after['conversation_scopes'][0]
+        checkpoint = current['checkpoint']
+        if checkpoint != previous_checkpoint:
+            # 后台可首次记下等待凑批次的时刻；不能消费消息、创建经验或领取模型工作。
+            self.assertIsNone(previous_checkpoint)
+            self.assertIsNotNone(checkpoint)
+            decoded_checkpoint = json.loads(checkpoint)
+            pending_since = decoded_checkpoint['pending_since_ms']
+            first_observed = json.loads(events[0]['message_json'])['metadata']['observed_at_ms']
+            # 同一 tick 的后台时钟可略早于并发入站；只允许确认后到首次观察这一小段区间。
+            self.assertIsInstance(pending_since, int)
+            self.assertGreaterEqual(pending_since, min(received_after_ms, first_observed))
+            self.assertLessEqual(pending_since, first_observed)
+            self.assertEqual(decoded_checkpoint, {
+                'version': 2, 'generation': 1, 'next_id': 1,
+                'cursor': {'sequence': 1, 'text_offset': 0, 'context_offset': 0},
+                'context_from': 1, 'ready_at': 0, 'pending_since_ms': pending_since,
+                'last_claimed_at': 0, 'inflight': None, 'lessons': [],
+                'lesson_cursor': 0, 'history_cursor': 0, 'history_from': 0})
+            revision += 1
+        self.assertEqual(current, {**scope, 'revision': revision, 'next_sequence': self.runs + 1,
+                                   'checkpoint': checkpoint})
 
     def assert_no_history_replay(self, run, old_receipts):
         self.assertEqual(self.requests, [], '本地恢复不能请求模型或由模型重放工具')
@@ -425,14 +507,19 @@ class StartupCheckpointAcceptance(unittest.TestCase):
                 preserved_rows = restored
                 current_sha = digest((self.state / 'training-expressions.sqlite3').read_bytes())
                 if expression_sha is not None:
-                    self.assertEqual(current_sha, expression_sha, '重启不改写已有 SQLite 表达来源')
-                expression_sha = current_sha
+                    self.assertEqual(current_sha, expression_sha, '入站前恢复不改写已有 SQLite 表达和交流来源')
+                before_learning = self.learning_records()
                 self.assertEqual(json.loads(self.state_path.read_bytes())['entries']['eve.training'],
                                  original_training, '原去重、重置、待学、已学和重试失败字节不得改写')
+                received_after_ms = time.time_ns() // 1_000_000
                 self.acknowledge(run, checkpoint, payload)
                 self.ready_and_stop(run)
+                stopped_at_ms = time.time_ns() // 1_000_000
                 self.assert_no_history_replay(run, receipts)
-                self.assertEqual(digest((self.state / 'training-expressions.sqlite3').read_bytes()), expression_sha)
+                self.assert_help_observation(before_learning, self.learning_records(),
+                                             received_after_ms, stopped_at_ms)
+                self.assertEqual(self.expression_records(), preserved_rows)
+                expression_sha = digest((self.state / 'training-expressions.sqlite3').read_bytes())
                 self.assertEqual(json.loads(self.state_path.read_bytes())['entries']['eve.training'], original_training)
         self.assertEqual(self.documents()['eve.training']['phrases.v1'], phrases)
 

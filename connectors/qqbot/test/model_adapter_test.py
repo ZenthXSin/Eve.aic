@@ -6,6 +6,7 @@ from model_adapter_fixture import (
     CHAT_PATH, RESPONSES_PATH, MODEL, Reply, WireAcceptance,
     adapter_call, current_results, latest_user,
 )
+from dual_model_effort_test import DualModelEffortAcceptance
 
 
 class ModelAdapterAcceptance(WireAcceptance):
@@ -130,4 +131,4 @@ class ModelAdapterAcceptance(WireAcceptance):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

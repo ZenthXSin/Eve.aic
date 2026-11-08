@@ -28,6 +28,12 @@ NO_CURRENT = "当前会话没有可控制的任务，请先发送普通文字开
 SIDE_EFFECTS = "有工具操作的结果尚未确认，补充要求已保留。请先核对现有结果，再决定后续处理；不会自动重跑或撤销已发生的操作。"
 UNSUPPORTED = "尚未支持任务暂停恢复；请明确继续、取消或开始新任务。"
 
+
+def is_conversation_learning(request):
+    first = request["messages"][0]
+    return first["role"] == "system" and first["content"].startswith("你整理 Eve 从真实交流中学到的交往经验。")
+
+
 class Acceptance(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -58,19 +64,21 @@ class Acceptance(unittest.TestCase):
             def respond(self):
                 assert self.path == "/v1/chat/completions"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                learning = is_conversation_learning(body)
                 with outer.request_lock:
                     outer.requests.append(body)
-                    index = len(outer.requests)
+                    index = sum(not is_conversation_learning(request) for request in outer.requests)
                     outer.request_documents.append(outer.documents())
                 assert body["model"] == outer.expected_model
-                assert body["reasoning_effort"] == "low"
-                outer.request_arrived(index).touch()
+                assert "reasoning_effort" not in body
+                if not learning:
+                    outer.request_arrived(index).touch()
                 messages = body["messages"]
                 latest = messages[-1]
                 spoken_receipt = (outer.explicit_speech and latest["role"] == "tool"
                                   and "sent" in json.loads(latest["content"]))
                 reason = "stop"
-                step = outer.provider_steps.get(index, {})
+                step = {} if learning else outer.provider_steps.get(index, {})
                 if "wait" in step:
                     deadline = time.monotonic() + 15
                     while not outer.gate(step["wait"]).exists():
@@ -80,7 +88,20 @@ class Acceptance(unittest.TestCase):
                 if latest.get("content") == "wait":
                     outer.started.set()
                     outer.release.wait(timeout=20)
-                if spoken_receipt:
+                if learning:
+                    outer.assertEqual([message["role"] for message in messages], ["system", "user"])
+                    outer.assertFalse(body.get("tools"))
+                    outer.assertEqual(body.get("response_format"), {"type": "json_object"})
+                    batch = json.loads(latest["content"])
+                    outer.assertTrue({"id", "scope", "messages", "lessons", "attempt", "feedback_pairs"} <= set(batch))
+                    outer.assertEqual(set(batch["scope"]), {"session_id", "user_id"})
+                    outer.assertTrue(batch["messages"])
+                    outer.assertTrue(all(item["role"] in ("human", "eve") for item in batch["messages"]))
+                    outer.assertEqual(len({item["id"] for item in batch["messages"]}), len(batch["messages"]))
+                    outer.assertTrue(all(isinstance(item["text"], str) and item["speaker"]
+                                         and item["metadata"]["sequence"] > 0 for item in batch["messages"]))
+                    message = {"role": "assistant", "content": '{"lessons":[]}'}
+                elif spoken_receipt:
                     assert json.loads(latest["content"])["sent"]
                     message = {"role": "assistant", "content": "内部完成，不对外发送。"}
                 elif "text" in step:
@@ -109,7 +130,7 @@ class Acceptance(unittest.TestCase):
                 else:
                     message = {"role": "assistant", "content": latest["content"]}
                 observer = any(m.get("role") == "system" and "你是受限的兴趣观察器" in m.get("content", "") for m in messages)
-                if outer.explicit_speech and not observer and not spoken_receipt and reason == "stop":
+                if outer.explicit_speech and not learning and not observer and not spoken_receipt and reason == "stop":
                     # 测试模型明确选择发言，真实宿主只能转发工具中的正文。
                     reason = "tool_calls"
                     message = {"role": "assistant", "content": None, "tool_calls": [{
@@ -219,7 +240,26 @@ class Acceptance(unittest.TestCase):
         return {"version": 1, "rows": records}
 
     def has_training(self, request):
-        return any(m["role"] == "system" and "当前会话允许从交互中学习表达" in m.get("content", "") for m in request["messages"])
+        return any(m["role"] == "system" and "当前会话允许从真实交互中学习说话内容与表达方式" in m.get("content", "") for m in request["messages"])
+
+    def dialogue_requests(self):
+        return [request for request in self.requests if not is_conversation_learning(request)]
+
+    def assert_learning_not_replayed(self):
+        batches = [json.loads(request["messages"][-1]["content"])
+                   for request in self.requests if is_conversation_learning(request)]
+        identities = [(batch["scope"]["session_id"], batch["scope"]["user_id"], batch["id"])
+                      for batch in batches]
+        self.assertEqual(len(identities), len(set(identities)), '重启不能重放已请求过的学习批次')
+        path = self.work / "state/training-expressions.sqlite3"
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            for batch in batches:
+                for message in batch["messages"]:
+                    row = db.execute("SELECT message_json FROM conversation_events "
+                        "WHERE session_id=? AND user_id=? AND message_id=?", (
+                            batch["scope"]["session_id"], batch["scope"]["user_id"], message["id"])).fetchone()
+                    self.assertIsNotNone(row, '后台学习必须来自同范围真实持久消息')
+                    self.assertEqual(json.loads(row[0]), message, '后台学习不得伪造或改写短消息来源')
 
     def test_builtin_expression_learning_from_old_receipts_is_local_idempotent_and_resettable(self):
         # 旧版记录没有表达统计；启动新版仅在本地导入，不回放请求或投递。
@@ -239,15 +279,17 @@ class Acceptance(unittest.TestCase):
         self.assertNotIn("今天不错", json.dumps(learned, ensure_ascii=False))
         self.run_eve(training=True)
         self.assertEqual(self.expression_state(), learned)
+        self.assertEqual(len(self.requests), before, '没有新入站的再次恢复不能请求学习模型')
         self.run_eve([self.message("el-stats", "/train stats", "本会话已学习 8 条有效用户表达：字数中位数 4，短消息 100%，单段消息 100%。当前要求始终优先；这是本地表达统计。", scope="group"),
                       self.message("el-other", "/train stats", "本会话暂无有效表达样本；训练开启后会从普通交流中学习。", scope="group", user="user-2"),
                       self.message("el-task", "详细解释这个任务", scope="group")], training=True)
-        self.assertEqual(len(self.requests), before + 1)
-        self.assertTrue(any(m["role"] == "system" and "当前可信会话" in m.get("content", "") for m in self.requests[-1]["messages"]))
+        self.assertEqual(len(self.dialogue_requests()), before + 1)
+        self.assertTrue(any(m["role"] == "system" and "当前可信会话" in m.get("content", "") for m in self.dialogue_requests()[-1]["messages"]))
         self.run_eve([self.message("el-reset", "/train reset", "已重置本会话的表达统计和学到的说法，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。", scope="group")], training=True)
         self.run_eve(training=True)
         self.assertFalse(any(r["active"] for r in self.expression_state()["rows"]))
-        self.assertEqual(len(self.requests), before + 1)
+        self.assertEqual(len(self.dialogue_requests()), before + 1)
+        self.assert_learning_not_replayed()
         self.assertEqual(len(self.sessions()[0]["turns"]), 9)
 
     def test_training_questions_use_real_history_stop_persists_and_ordinary_chat_continues(self):
@@ -256,15 +298,17 @@ class Acceptance(unittest.TestCase):
                       self.message("train-2", "叫我小星", "收到。你希望回复更简短吗？"),
                       self.message("train-3", "/train stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。"),
                       self.message("train-4", "普通任务")])
-        self.assertEqual(len(self.requests), 3)
-        self.assertTrue(self.has_training(self.requests[0]))
-        self.assertTrue(self.has_training(self.requests[1]))
-        self.assertFalse(self.has_training(self.requests[2]))
-        self.assertIn({"role": "assistant", "content": "你喜欢我怎样称呼你？"}, self.requests[1]["messages"])
+        requests = self.dialogue_requests()
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(self.has_training(requests[0]))
+        self.assertTrue(self.has_training(requests[1]))
+        self.assertFalse(self.has_training(requests[2]))
+        self.assertIn({"role": "assistant", "content": "你喜欢我怎样称呼你？"}, requests[1]["messages"])
         self.assertEqual([t["input"] for t in self.sessions()[0]["turns"]], ["/train start", "叫我小星", "普通任务"])
         # 显式 stop 的持久开关覆盖下一进程的默认训练选项。
         self.run_eve([self.message("train-5", "重启后聊天")], training=True)
-        self.assertFalse(self.has_training(self.requests[-1]))
+        self.assertFalse(self.has_training(self.dialogue_requests()[-1]))
+        self.assert_learning_not_replayed()
 
     def test_training_start_does_not_learn_stopped_queued_input_after_restart(self):
         self.run_eve([self.message("queue-stop", "/train stop",
@@ -277,10 +321,12 @@ class Acceptance(unittest.TestCase):
             {"send": self.message("queue-start", "/train start")},
             self.wait_command("queue-off", "finish"), self.open_gate("queue-release"),
             self.wait_command("queue-busy"), self.wait_command("queue-start")])
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.dialogue_requests()), 2)
         before = self.expression_state()
+        requests_before_restart = len(self.requests)
         self.run_eve(training=True)
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.requests), requests_before_restart)
+        self.assert_learning_not_replayed()
         self.assertEqual(self.replies(), [])
         after = self.expression_state()
         row = next(r for r in after["rows"] if r["id"] == hashlib.sha256(b"queue-off").hexdigest())
@@ -300,21 +346,25 @@ class Acceptance(unittest.TestCase):
         before = self.expression_state()
         self.assertEqual(len(before["rows"]), 2)
         self.assertFalse(any(r["active"] for r in before["rows"]), "重置前已准入队列应包含在重置范围")
+        requests_before_restart = len(self.requests)
         self.run_eve(training=True)
         self.assertEqual(self.expression_state(), before)
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.requests), requests_before_restart)
+        self.assertEqual(len(self.dialogue_requests()), 2)
         self.run_eve([self.message("reset-new", "重置后新输入")], training=True)
         rows = self.expression_state()["rows"]
         self.assertEqual([r["id"] for r in rows if r["active"]], [hashlib.sha256(b"reset-new").hexdigest()])
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.dialogue_requests()), 3)
+        self.assert_learning_not_replayed()
 
     def test_training_group_scope_does_not_change_other_sender_or_group(self):
         self.run_eve([self.message("tg-1", "/train stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。", scope="group"),
                       self.message("tg-2", "同群另一人", scope="group", user="user-2"),
                       self.message("tg-3", "另一群", scope="group", target="group-2"),
                       self.message("tg-4", "原会话", scope="group")], training=True)
-        self.assertEqual([self.has_training(r) for r in self.requests], [True, True, False])
-        for request in self.requests:
+        self.assertEqual([self.has_training(r) for r in self.dialogue_requests()], [True, True, False])
+        self.assert_learning_not_replayed()
+        for request in self.dialogue_requests():
             self.assertFalse(any(m["role"] == "assistant" for m in request["messages"]))
 
     def test_training_stop_cancels_inflight_question_and_never_sends_it(self):

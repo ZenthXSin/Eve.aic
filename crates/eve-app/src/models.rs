@@ -98,7 +98,9 @@ impl CoreModelResolver {
         }
     }
 
-    /// 按用途读取 runtime.model_uses 中的单次输出上限；宿主须登记该命名空间，缺失时解析失败。
+    /// 按用途读取 runtime.model_uses 中的模型角色与单次输出上限；coding 使用相同
+    /// 的独立辅助端点、适配器和凭据契约，显式配置错误时不会回退到主模型。
+    /// 宿主须登记该命名空间，缺失时解析失败。
     pub(crate) fn with_use(mut self, name: &str) -> Self {
         self.use_name = Some(name.into());
         self

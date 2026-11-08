@@ -110,6 +110,13 @@ function rawMessage(msg) {
   if (Buffer.byteLength(text) > 24576) return { truncated: true, bytes: Buffer.byteLength(text) };
   return out;
 }
+// 只接平台事件的明确时间字段；不按接收时间补猜，不从正文或调试格式推断。
+function sourceTime(msg) {
+  const value = msg.timestamp ?? msg.raw?.timestamp;
+  if (typeof value !== "string" || !/^\d{4}-\d\d-\d\dT.*(?:Z|[+-]\d\d:\d\d)$/.test(value)) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
 // Only the envelope's own attachments belong to this message. msg_elements can
 // contain quoted images; never treat those as freshly uploaded pictures.
 const FILE_TYPES = new Set(["text/plain", "application/pdf", "application/zip",
@@ -349,6 +356,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       target_id: target.targetId, user_id: msg.senderId,
       text, original_text: msg.content, ...(attachments.length ? { attachments } : {}),
       ...(quoted ? { quoted } : {}), ...(validName ? { sender_name: senderName } : {}) };
+    const sourceAt = sourceTime(msg);
+    if (sourceAt !== undefined) frame.source_at_ms = sourceAt;
     // 调试用的原始事件，和规范化帧分开；只保留有界的结构字段，不进回执。
     const raw = rawMessage(msg);
     if (raw) frame.raw = raw;
@@ -379,6 +388,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         const message = { id:frame.id, scope:frame.scope,target_id:frame.target_id,user_id:frame.user_id,text:frame.text,
           ...(frame.attachments ? {attachments:frame.attachments}:{}), ...(frame.quoted ? {quoted:frame.quoted}:{}) };
         const observation={version:1,type:"group_observation",message,mentions_me:isGroupAt(msg,bot.appId),
+          original_text:frame.original_text, ...(sourceAt !== undefined ? {source_at_ms:sourceAt} : {}),
           ...(validName?{sender_name:senderName}:{})};
         if (Buffer.byteLength(JSON.stringify(observation)) <= MAX_INBOUND_FRAME) emit(observation);
         else { warn("frame_limit"); return; }

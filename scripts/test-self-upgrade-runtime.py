@@ -181,6 +181,96 @@ class ReplyAnchorReceiptTests(unittest.TestCase):
         self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
         self.assertEqual(self.path.read_bytes(), before)
 
+    def conversation(self, anchor='original', **extra):
+        return dict(source_kind='qq_sent', turn_id=1,
+                    reply_to='qq-human:' + hashlib.sha256(anchor.encode()).hexdigest(),
+                    activity=dict(phase='tool_running', elapsed_ms=0, tool_name='source_read'),
+                    **extra)
+
+    def test_sent_conversation_preserves_source_and_original_ledger_version(self):
+        for version, anchor in ((9, None), (10, None), (10, 'followup-1')):
+            with self.subTest(version=version, anchor=anchor):
+                self.ledger['version'] = version
+                self.parent['progress'] = [self.part(1, anchor, conversation=self.conversation(
+                    anchor or 'original', observed_at_ms=123))]
+                self.save()
+                before = self.path.read_bytes()
+                self.assertTrue(runtime.delivery_documents(self.path)[2])
+                self.assertTrue(runtime.delivery_gate(self.path, self.request))
+                self.assertTrue(runtime.runtime_idle_gate(self.path))
+                self.assertEqual(runtime.inherited_receipts(self.path), frozenset())
+                self.assertEqual(self.path.read_bytes(), before)
+                stored = runtime.read_json(self.path)['entries']['eve.channel.qqbot']['receipts.v1']
+                self.assertEqual(json.loads(bytes(stored))['version'], version)
+
+    def test_pending_and_unknown_conversation_have_no_confirmed_observation_time(self):
+        for state in ('Sending', 'Unknown', 'Failed', 'Sent'):
+            with self.subTest(state=state):
+                metadata = self.conversation(observed_at_ms=None)
+                metadata.update(sequence=None, fragment=None, source_at_ms=None, context=None)
+                self.parent['progress'] = [self.part(1, state=state, conversation=metadata)]
+                self.save()
+                before = self.path.read_bytes()
+                self.assertEqual(runtime.delivery_gate(self.path, self.request), state != 'Sending')
+                self.assertEqual(runtime.runtime_idle_gate(self.path), state != 'Sending')
+                inherited = runtime.inherited_receipts(self.path)
+                self.assertEqual(len(inherited), int(state == 'Sending'))
+                self.assertEqual(self.path.read_bytes(), before)
+                if state != 'Sent':
+                    metadata['observed_at_ms'] = 123
+                    self.assert_rejected_without_write('invalid_progress_conversation')
+        self.parent['progress'] = [self.part(1, conversation=None)]
+        self.save()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+
+    def test_conversation_metadata_rejects_fabricated_source_and_invalid_types(self):
+        baseline = self.conversation(observed_at_ms=123)
+        mutations = [
+            lambda m: m.update(source_kind='qq_received'),
+            lambda m: m.update(reply_to='qq-human:wrong'),
+            lambda m: m.update(reply_to=self.conversation('followup-1')['reply_to']),
+            lambda m: m.update(sequence=1),
+            lambda m: m.update(fragment={}),
+            lambda m: m.update(source_at_ms=123),
+            lambda m: m.update(context='unverified'),
+            lambda m: m.update(unknown='field'),
+            lambda m: m.update(activity={}),
+            lambda m: m.update(activity={'phase': 'tool_running', 'unknown': None}),
+            lambda m: m.update(activity={'phase': ' phase'}),
+            lambda m: m.update(activity={'phase': '界' * 27}),
+            lambda m: m.update(activity={'phase': 'tool_running', 'tool_name': 'x\x85'}),
+            lambda m: m.update(activity={'phase': 'tool_running', 'tool_name': '界' * 86}),
+        ]
+        for key in ('observed_at_ms', 'turn_id'):
+            for value in (0, -1, 2 ** 64, True, 1.0, '1', [], {}):
+                mutations.append(lambda m, k=key, v=value: m.update({k: v}))
+        for value in (-1, 2 ** 64, True, 1.0, '1', [], {}):
+            mutations.append(lambda m, v=value: m['activity'].update(elapsed_ms=v))
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                metadata = copy.deepcopy(baseline)
+                mutate(metadata)
+                self.parent['progress'] = [self.part(1, conversation=metadata)]
+                self.assert_rejected_without_write('invalid_progress_conversation')
+        for metadata in ('invalid', [], 1, False):
+            with self.subTest(metadata=metadata):
+                self.parent['progress'] = [self.part(1, conversation=metadata)]
+                self.assert_rejected_without_write('invalid_progress_conversation')
+
+    def test_conversation_requires_authored_text_and_supports_maximum_u64(self):
+        metadata = self.conversation(observed_at_ms=2 ** 64 - 1)
+        metadata['turn_id'] = 2 ** 64 - 1
+        metadata['activity']['elapsed_ms'] = 2 ** 64 - 1
+        self.parent['progress'] = [self.part(1, conversation=metadata, text='多行\n\r\t文字')]
+        self.save()
+        self.assertTrue(runtime.delivery_gate(self.path, self.request))
+        for extra in ({'image_path': '/fixture/image.png'}, {'text': 'body\x7f'}):
+            with self.subTest(extra=extra):
+                self.parent['progress'] = [self.part(1, conversation=metadata, **extra)]
+                self.assert_rejected_without_write('invalid_progress_conversation')
+        self.parent['progress'] = [dict(text='系统进度', state='Sent', conversation=metadata)]
+        self.assert_rejected_without_write('invalid_progress_conversation')
+
     def test_failed_unknown_and_sending_still_consume_their_actual_window(self):
         for anchor in (None, 'followup-1'):
             with self.subTest(anchor=anchor):

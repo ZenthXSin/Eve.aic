@@ -1164,12 +1164,14 @@ async fn run_qqbot_composed(
             plugin
         };
 
+        let expression_store = Arc::new(eve_training_sqlite::SqliteExpressions::open(
+            &options.state_directory.join("training-expressions.sqlite3"),
+        )?);
         kernel.register(Box::new(
-            TrainingPlugin::new(options.training)?.with_phrase_learning().with_expression_store(
-                Arc::new(eve_training_sqlite::SqliteExpressions::open(
-                    &options.state_directory.join("training-expressions.sqlite3"),
-                )?),
-            ),
+            TrainingPlugin::new(options.training)?
+                .with_phrase_learning()
+                .with_expression_store(expression_store.clone())
+                .with_conversation_store(expression_store),
         ))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
         // 分段设置先于模型与通道加载；损坏或版本不兼容时在这里拒绝启动并保留原字节。
@@ -2686,7 +2688,8 @@ async fn run_qqbot_composed(
             phrase_policy.clone(),
             budget_gate.clone(),
         ));
-        // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
+        // 后台任务与子代理共用执行器；编程委托使用独立 coding 用途，
+        // 其余任务仍使用 task。两者各自记录模型健康与输出上限，不计入自主运行预算。
         if tasks.is_some() || options.subagents {
             let _ = task_late
                 .config
@@ -2697,7 +2700,10 @@ async fn run_qqbot_composed(
                 worker_permissions.clone(),
                 &worker_tools,
                 worker_config.clone(),
-                observed(qq_tasks::MODEL_USE)?,
+                qq_tasks::WorkerModels {
+                    task: observed(qq_tasks::MODEL_USE)?,
+                    coding: observed("coding")?,
+                },
                 history_digests.clone(),
             )
             .await?;
@@ -3259,6 +3265,11 @@ async fn run_qqbot_composed(
             plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;
         }
         let panel_memory = memory.clone();
+        plugin = plugin.with_conversation_observer(Arc::new(
+            qq_memory_observer::ConversationObserver {
+                training: training.0.clone(),
+            },
+        ));
         if let Some(memory) = memory {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
@@ -3269,7 +3280,6 @@ async fn run_qqbot_composed(
             plugin = plugin.with_interaction_observer(Arc::new(qq_memory_observer::Observer {
                 memory,
                 sessions: sessions.0.clone(),
-                training: Some(training.0.clone()),
             }))?;
         }
         let settings = registry

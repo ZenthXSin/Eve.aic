@@ -353,6 +353,11 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         ])
         .await;
         let h = Harness::start(root.path(), &server.url, protocol).await;
+        // 显式设置首轮强度，验证工具往返冻结该值，下一轮才采用在途中保存的 omit。
+        h.update(
+            &[(config::OPENAI_NAMESPACE, "reasoning_effort", json!("low"))],
+            ApplyMode::Immediate,
+        );
         let gate = Arc::new(ToolGate::default());
         let first = h.submit("first", gate.clone());
         let request = server.next().await;
@@ -863,6 +868,243 @@ async fn independent_auxiliary_endpoint_and_chat_protocol_never_receive_primary_
         "401 不额外重试"
     );
     h.stop().await;
+}
+
+#[tokio::test]
+async fn coding_use_routes_independent_endpoint_credentials_and_limits_without_changing_other_uses()
+{
+    use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};
+    let root = tempfile::tempdir().unwrap();
+    let mut primary_server = Server::start((0..6).map(|_| final_reply("chat")).collect()).await;
+    let mut rejected = Reply::json(json!({"error":{"message":"synthetic coding rejection"}}));
+    rejected.status = 401;
+    let mut coding_server =
+        Server::start(vec![final_reply("chat"), final_reply("chat"), rejected]).await;
+    let h = Harness::start_with_validator(root.path(), &primary_server.url, "chat", true).await;
+    let bank = Arc::new(eve_model_credentials::CredentialBank::default());
+    bank.bind(
+        CredentialPurpose::Primary,
+        crate::model_credentials::PRIMARY,
+        Some("primary-synthetic".into()),
+    )
+    .unwrap();
+    bank.bind(
+        CredentialPurpose::Auxiliary,
+        crate::model_credentials::AUXILIARY,
+        Some("coding-synthetic".into()),
+    )
+    .unwrap();
+    let coding_resolver = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
+        .with_use("coding")
+        .with_timeout_cap(Duration::from_millis(900));
+    let original = coding_resolver.resolve().unwrap();
+    let shown = summary(h.settings.as_ref(), Some("coding")).unwrap();
+    assert_eq!(shown.model, "model-a");
+    assert_eq!(shown.role, Some(ModelRole::Primary));
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_provider",
+                json!("openai"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_model",
+                json!("coding-model"),
+            ),
+            (MODELS_NAMESPACE, "auxiliary_small_timeout_ms", json!(1800)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_max_output_tokens",
+                json!(19),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_credential_ref",
+                json!(crate::model_credentials::AUXILIARY),
+            ),
+            (
+                config::MODEL_USES_NAMESPACE,
+                "coding_role",
+                json!("auxiliary_small"),
+            ),
+            (
+                config::MODEL_USES_NAMESPACE,
+                "coding_max_output_tokens",
+                json!(7),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "auxiliary_base_url",
+                json!(coding_server.url.trim_end_matches("/responses")),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "auxiliary_protocol",
+                json!("chat"),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "auxiliary_reasoning_effort",
+                json!("high"),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    let coding = coding_resolver.resolve().unwrap();
+    assert_eq!(coding.provider_timeout, Duration::from_millis(900));
+    assert!(!Arc::ptr_eq(&original.provider, &coding.provider));
+    assert!(Arc::ptr_eq(
+        &coding.provider,
+        &coding_resolver.resolve().unwrap().provider
+    ));
+    let shown = summary(h.settings.as_ref(), Some("coding")).unwrap();
+    assert_eq!(shown.role, Some(ModelRole::AuxiliarySmall));
+    assert_eq!(shown.model, "coding-model");
+    assert_eq!(shown.protocol, "chat");
+    assert_eq!(shown.max_output_tokens, Some(7));
+    assert_eq!(
+        shown.max_output_tokens_key,
+        "runtime.model_uses.coding_max_output_tokens"
+    );
+    let missing = Arc::new(eve_model_credentials::CredentialBank::default());
+    missing
+        .bind(
+            CredentialPurpose::Primary,
+            crate::model_credentials::PRIMARY,
+            Some("primary-synthetic".into()),
+        )
+        .unwrap();
+    assert!(
+        CoreModelResolver::from_credentials(h.settings.clone(), Ok(missing))
+            .with_use("coding")
+            .resolve()
+            .is_err()
+    );
+    let request = || ModelRequest {
+        session: None,
+        messages: vec![ChatMessage::text(ChatRole::User, "编程模型独立路由验收")],
+        tools: vec![],
+    };
+    // 已冻结的编程轮次与其他用途始终留在原主模型，配置仅影响下一次编程解析。
+    original.provider.complete(request()).await.unwrap();
+    for purpose in ["dialogue", "task", "conversation_learning", "summary"] {
+        assert_eq!(
+            summary(h.settings.as_ref(), Some(purpose)).unwrap().model,
+            "model-a"
+        );
+        CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
+            .with_use(purpose)
+            .resolve()
+            .unwrap()
+            .provider
+            .complete(request())
+            .await
+            .unwrap();
+    }
+    for _ in 0..5 {
+        let captured = primary_server.next().await;
+        assert!(
+            captured
+                .headers
+                .starts_with("POST /v1/chat/completions HTTP/1.1")
+        );
+        assert!(
+            captured
+                .headers
+                .to_lowercase()
+                .contains("authorization: bearer primary-synthetic\r\n")
+        );
+        assert!(!captured.headers.contains("coding-synthetic"));
+        assert_eq!(captured.body["model"], "model-a");
+        assert_eq!(captured.body["max_tokens"], 32);
+        assert!(captured.body.get("temperature").is_none());
+        assert!(captured.body.get("reasoning").is_none());
+        assert!(captured.body.get("reasoning_effort").is_none());
+    }
+    coding.provider.complete(request()).await.unwrap();
+    let captured = coding_server.next().await;
+    assert!(
+        captured
+            .headers
+            .starts_with("POST /v1/chat/completions HTTP/1.1")
+    );
+    assert!(
+        captured
+            .headers
+            .to_lowercase()
+            .contains("authorization: bearer coding-synthetic\r\n")
+    );
+    assert!(!captured.headers.contains("primary-synthetic"));
+    assert_eq!(captured.body["model"], "coding-model");
+    assert_eq!(captured.body["max_tokens"], 7);
+    assert!(captured.body.get("temperature").is_none());
+    assert_eq!(captured.body["reasoning_effort"], "high");
+    h.update(
+        &[(
+            config::OPENAI_NAMESPACE,
+            "reasoning_effort",
+            json!("medium"),
+        )],
+        ApplyMode::Immediate,
+    );
+    CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
+        .with_use("dialogue")
+        .resolve()
+        .unwrap()
+        .provider
+        .complete(request())
+        .await
+        .unwrap();
+    let captured = primary_server.next().await;
+    assert_eq!(captured.body["model"], "model-a");
+    assert_eq!(captured.body["reasoning_effort"], "medium");
+    assert!(captured.body.get("temperature").is_none());
+    let coding_after_effort = coding_resolver.resolve().unwrap();
+    coding_after_effort
+        .provider
+        .complete(request())
+        .await
+        .unwrap();
+    let captured = coding_server.next().await;
+    assert_eq!(captured.body["model"], "coding-model");
+    assert_eq!(captured.body["reasoning_effort"], "high");
+    assert_eq!(captured.body["max_tokens"], 7);
+    assert!(captured.body.get("temperature").is_none());
+    assert!(
+        coding_after_effort
+            .provider
+            .complete(request())
+            .await
+            .is_err()
+    );
+    assert_eq!(coding_server.next().await.body["model"], "coding-model");
+    assert!(
+        primary_server.requests.try_recv().is_err(),
+        "编程失败不得调用主模型兜底"
+    );
+    assert!(coding_server.requests.try_recv().is_err(), "401 不额外重试");
+    h.stop().await;
+    let reopened =
+        Harness::start_with_validator(root.path(), &primary_server.url, "chat", true).await;
+    let shown = summary(reopened.settings.as_ref(), Some("coding")).unwrap();
+    assert_eq!(shown.model, "coding-model");
+    assert_eq!(shown.role, Some(ModelRole::AuxiliarySmall));
+    assert_eq!(shown.protocol, "chat");
+    assert_eq!(shown.max_output_tokens, Some(7));
+    let primary = capture(reopened.settings.as_ref(), Some("dialogue")).unwrap();
+    let coding = capture(reopened.settings.as_ref(), Some("coding")).unwrap();
+    assert_eq!(
+        selected_config(&primary).unwrap().reasoning_effort(),
+        Some("medium")
+    );
+    assert_eq!(
+        selected_config(&coding).unwrap().reasoning_effort(),
+        Some("high")
+    );
+    reopened.stop().await;
 }
 
 #[tokio::test]

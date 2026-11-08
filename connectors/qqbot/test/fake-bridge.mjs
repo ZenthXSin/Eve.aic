@@ -224,7 +224,7 @@ for await (const line of lines) {
   }
   if (cmd.type === "reply") {
     checkReply(cmd, scenario.messages[index]);
-    send({ type: "delivery", id: cmd.id, ok: !scenario.send_fail, message_id: "out-1" });
+    send({ type: "delivery", id: cmd.id, ok: !scenario.send_fail, message_id: "out-" + cmd.id });
   } else if (cmd.type !== "finish") throw new Error("unexpected_command");
   index++; emitNext();
 }

@@ -436,6 +436,7 @@ const NO_TASK: &str = "当前会话没有可控制的任务，请先发送普通
 const BLOCKED: &str = "任务提交状态未确认，当前会话已阻塞；请检查保存状态，不能自动重试。";
 
 pub(crate) struct Services {
+    pub conversation_observer: Option<Arc<dyn crate::QqConversationObserver>>,
     pub live: Option<Arc<crate::LiveDialogue>>,
     pub control: Arc<dyn ControlService>,
     pub messages: Arc<dyn MessageService>,
@@ -1371,6 +1372,7 @@ pub(crate) async fn run(
     mut stop: watch::Receiver<bool>,
 ) -> PluginResult<()> {
     let Services {
+        conversation_observer,
         live: live_dialogue,
         control,
         messages,
@@ -1400,6 +1402,35 @@ pub(crate) async fn run(
         group_access,
         admission,
     } = services;
+    let mut learning = match crate::conversation_observer::ConversationObservations::load(
+        &ctx,
+        conversation_observer,
+    ) {
+        Ok(mut pending) => {
+            if pending.flush(&ctx).is_err() {
+                warn(&ctx, "conversation_observer_restore_failed");
+            }
+            for entry in ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.app_id == config.app_id)
+            {
+                for progress in &entry.progress {
+                    if pending
+                        .restore_sent(&ctx, &config.app_id, &entry.message, progress)
+                        .is_err()
+                    {
+                        warn(&ctx, "conversation_observer_restore_failed");
+                    }
+                }
+            }
+            pending
+        }
+        Err(_) => {
+            warn(&ctx, "conversation_observer_state_unavailable");
+            crate::conversation_observer::ConversationObservations::disabled()
+        }
+    };
     let (closed, receiver) = watch::channel(false);
     let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let (steps_tx, mut steps_rx) = mpsc::channel::<ControlEvent>(256);
@@ -1500,6 +1531,11 @@ pub(crate) async fn run(
     let mut next_authored = tokio::time::Instant::now();
     let mut pushing_speech: Option<crate::QqSpeechEvent> = None;
     let mut pushing_input_reply: Option<crate::live::ClaimedInputReply> = None;
+    let mut pushing_conversation: Option<(
+        Message,
+        String,
+        eve_training_api::ConversationMetadata,
+    )> = None;
     let mut considering_speech: Option<ConsideringSpeech> = None;
     let mut ready_speech: Option<ReadySpeech> = None;
     let mut speech_retries = speech_retry::SpeechRetry::default();
@@ -1945,7 +1981,16 @@ pub(crate) async fn run(
                             if let Some(outgoing) = live_waiting.remove(&message.id) { outgoing.complete(LiveDelivery::not_sent(Some("passive_quota_exhausted"))); }
                             continue;
                         }
+                        let snapshot = control.snapshot(&event.key.session).ok().flatten();
+                        let mut conversation = crate::conversation_observer::activity_metadata(snapshot.as_ref());
+                        if let Some(activity) = snapshot.as_ref().and_then(|s| foreground_activity.learning_activity(s)) {
+                            conversation.activity = Some(activity);
+                        }
+                        conversation.turn_id = event.event.turn_id;
+                        conversation.source_kind = Some("qq_sent".into());
+                        conversation.reply_to = Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human, reply_anchor.as_deref().unwrap_or(&message.id)));
                         entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive, necessary: necessary_question,
+                            conversation: (decision_id.is_some() && image_path.is_none()).then_some(conversation),
                             decision_id, platform_message_id: None,image_path:image_path.clone(), reply_anchor });
                         last_progress.insert(message.id.clone(), tokio::time::Instant::now());
                         ledger.save(&ctx)?;
@@ -2004,7 +2049,7 @@ pub(crate) async fn run(
                 let part = ledger.entries[index].progress.len();
                 ledger.entries[index].progress.push(Progress {
                     text: notice.text.clone(), state: PartState::Sending, proactive: false,
-                    necessary: false, decision_id: None, platform_message_id: None, image_path: None, reply_anchor: None,
+                    necessary: false, decision_id: None, platform_message_id: None, image_path: None, reply_anchor: None, conversation: None,
                 });
                 ledger.save(&ctx)?;
                 if host_progress.current(&notice)
@@ -2448,6 +2493,15 @@ pub(crate) async fn run(
                         continue;
                     }
                     pushing_input_reply=Some(claim);
+                    let snapshot = control.snapshot(&claimed_key.session).ok().flatten();
+                    let mut metadata = crate::conversation_observer::activity_metadata(snapshot.as_ref());
+                    if let Some(activity) = snapshot.as_ref().and_then(|s| foreground_activity.learning_activity(s)) {
+                        metadata.activity = Some(activity);
+                    }
+                    metadata.turn_id = Some(claimed_turn);
+                    metadata.reply_to = Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human, &ready.event.anchor));
+                    metadata.source_kind = Some("qq_foreground_sent".into());
+                    pushing_conversation = Some((route.clone(), ready.text.clone(), metadata));
                     write(&mut stdin,json!({"type":"passive_push","version":1,"id":id,"scope":"c2c","target_id":route.target_id,
                         "text":ready.text,"based_on_message_id":ready.event.anchor,"sender_id":route.user_id,"foreground":true})).await?;
                     pushing=Some(AuxiliaryDelivery{id,scope:route.scope.clone(),target:route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
@@ -2516,6 +2570,10 @@ pub(crate) async fn run(
                         let mut frame=json!({"type":if passive {"passive_push"} else {"push"},"version":1,"id":id,"scope":route.scope,"target_id":route.target_id,"text":ready.text,
                             "based_on_message_id":ready.event.anchor,"sender_id":route.user_id});
                         if route.scope=="group" {frame["mention_user_id"]=json!(route.user_id);}
+                        pushing_conversation = Some((route.clone(), ready.text.clone(), eve_training_api::ConversationMetadata {
+                            reply_to: Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human, &ready.event.anchor)),
+                            source_kind: Some("qq_spoken_push".into()), ..Default::default()
+                        }));
                         write(&mut stdin,frame).await?;
                         pushing=Some(AuxiliaryDelivery{id,scope:route.scope,target:route.target_id,deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
                         pushing_speech=Some(ready.event);
@@ -2581,6 +2639,12 @@ pub(crate) async fn run(
                 ) {
                     match hook.inner.claim_authored_push(&push) {
                         Ok(true) => {
+                            let route = Message { id: anchor.clone(), scope: "group".into(), target_id: target.clone(), user_id: speaker_id.clone(),
+                                text: push.message.text.clone(), quoted: None, attachments: vec![] };
+                            pushing_conversation = Some((route, push.message.text.clone(), eve_training_api::ConversationMetadata {
+                                reply_to: Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human, &anchor)),
+                                source_kind: Some("qq_group_sent".into()), ..Default::default()
+                            }));
                             write(&mut stdin,json!({"type":"restore_anchor","version":1,"scope":"group","target_id":target,"sender_id":speaker_id,"message_id":anchor,"group_chime":true})).await?;
                             write(&mut stdin,json!({"type":"push","version":1,"id":push.message.id,"scope":"group","target_id":target,"text":push.message.text,"based_on_message_id":anchor,"sender_id":speaker_id,"group_chime":true})).await?;
                             pushing=Some(AuxiliaryDelivery{id:push.message.id,scope:"group".into(),target,deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
@@ -2738,6 +2802,7 @@ pub(crate) async fn run(
                         if let Some(files) = &files { report_file(files, &ctx, &delivery.id, QqFileResult::Unknown); }
                     }
                     if pushing.as_ref().is_some_and(|d| d.deadline <= now) {
+                        pushing_conversation = None;
                         let delivery = pushing.take().expect("timed out push");
                         if let Some(event)=pushing_speech.take() {
                             if let Some(speaker)=&speech {speaker.delivered(&event,QqOutreachResult::Unknown)?;}
@@ -2991,7 +3056,14 @@ pub(crate) async fn run(
                             let index = ledger.find(&config.app_id, id).expect("progress receipt");
                             ledger.entries[index].progress[part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.entries[index].progress[part].platform_message_id = if ok && ledger.entries[index].progress[part].decision_id.is_some() { frame.get("message_id").and_then(Value::as_str).map(str::to_owned) } else { None };
+                            if ok && let Some(metadata) = &mut ledger.entries[index].progress[part].conversation {
+                                metadata.observed_at_ms = crate::conversation_observer::observed_at_ms();
+                            }
                             ledger.save(&ctx)?;
+                            // Sent 持久化后立刻逐条采集；后续工具/模型失败不撤销已发生的交流。
+                            if learning.restore_sent(&ctx, &config.app_id, &ledger.entries[index].message, &ledger.entries[index].progress[part]).is_err() {
+                                warn(&ctx, "conversation_observer_sent_failed");
+                            }
                             if progress_rejected_before_send(&frame) {
                                 rejected_before_send.insert((id.clone(), part));
                             }
@@ -3028,6 +3100,15 @@ pub(crate) async fn run(
                             let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             if !ok { delivery_log(&ctx, "outreach_push_failed_no_retry", &frame); }
+                            // 群旁路与后回复也逐条保存真实送达；先进入学习待写记录，再结算来源。
+                            if let Some((route, text, mut metadata)) = pushing_conversation.take()
+                                && ok {
+                                metadata.observed_at_ms = crate::conversation_observer::observed_at_ms();
+                                match crate::conversation_observer::ConversationRecord::sent(&config.app_id, &route, frame["message_id"].as_str().expect("validated"), &text, metadata) {
+                                    Ok(record) => if learning.push(&ctx, record).is_err() { warn(&ctx, "conversation_observer_sent_failed"); },
+                                    Err(_) => warn(&ctx, "conversation_observer_sent_invalid"),
+                                }
+                            }
                             let result=outreach_result(&frame,ok);
                             if let Some(event)=pushing_speech.take() {
                                 if let Some(speaker)=&speech {speaker.delivered(&event,result.clone())?;}
@@ -3062,11 +3143,34 @@ pub(crate) async fn run(
                             let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             let index = ledger.find(&config.app_id, &message.id).expect("inserted receipt");
+                            if delivery.segmented() && frame.get("index").and_then(Value::as_u64) != u64::try_from(delivery.index).ok() {
+                                warn(&ctx, "delivery_index_mismatch"); continue;
+                            }
+                            // 旧输出模式也逐条保存真实可见正文；命令、故障通知与附带模板不冒充 Eve。
+                            // 本地 outbox 先于通道终态保存，崩溃后只恢复观察，不补发平台消息。
+                            if ok && let ReplyGuard::Completed(event) = &delivery.reply.guard
+                                && delivery.appendix.as_ref().is_none_or(|(_, part)| *part != delivery.index) {
+                                let entry = &ledger.entries[index];
+                                let body = if delivery.segmented() {
+                                    let part = &entry.segments.as_ref().expect("segmented receipt").parts[delivery.index];
+                                    &entry.reply.as_deref().expect("segmented reply")[part.start..part.end]
+                                } else { delivery.reply.text.as_str() };
+                                let metadata = eve_training_api::ConversationMetadata {
+                                    observed_at_ms: crate::conversation_observer::observed_at_ms(),
+                                    reply_to: Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human, &message.id)),
+                                    turn_id: event.event.turn_id,
+                                    source_kind: Some(if delivery.segmented() { "qq_segment_sent" } else { "qq_reply_sent" }.into()),
+                                    activity: Some(eve_training_api::ConversationActivity { phase: "completed".into(), elapsed_ms: None, tool_name: None }),
+                                    ..Default::default()
+                                };
+                                match crate::conversation_observer::ConversationRecord::sent(&config.app_id, message,
+                                    frame["message_id"].as_str().expect("validated"), body, metadata) {
+                                    Ok(record) => if learning.push(&ctx, record).is_err() { warn(&ctx, "conversation_observer_sent_failed"); },
+                                    Err(_) => warn(&ctx, "conversation_observer_sent_invalid"),
+                                }
+                            }
                             if delivery.segmented() {
                                 let part = delivery.index;
-                                if frame.get("index").and_then(Value::as_u64) != u64::try_from(part).ok() {
-                                    warn(&ctx, "delivery_index_mismatch"); continue;
-                                }
                                 let segments = ledger.entries[index].segments.as_mut().expect("segmented receipt");
                                 let last = part + 1 == segments.parts.len();
                                 segments.parts[part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
@@ -3129,22 +3233,35 @@ pub(crate) async fn run(
                             delivering.remove(position);
                         }
                         Some("group_observation") => {
-                            let Some(observer) = &group_observer else { continue; };
-                            let Ok(message) = serde_json::from_value::<Message>(frame["message"].clone()) else {
+                            let Ok(mut message) = serde_json::from_value::<Message>(frame["message"].clone()) else {
                                 warn(&ctx, "invalid_group_observation"); continue;
                             };
                             if !message.valid() || message.scope != "group" {
                                 continue;
                             }
+                            if message.text.split_whitespace().next() == Some("/bind") { message.text = "/bind [已隐藏]".into(); }
                             // 未放行的群不记录会话、不进群聊观察，与普通消息同一判定。
                             if let Some(whitelist) = &group_whitelist
                                 && !whitelist.contains(&message.target_id).unwrap_or(false)
                             {
                                 continue;
                             }
+                            let original = match frame.get("original_text") {
+                                Some(Value::String(text)) if text.len() <= 32768 => Some(text.as_str()),
+                                None | Some(Value::Null) => None,
+                                _ => { warn(&ctx, "invalid_original_text"); continue; }
+                            };
+                            let session = message.session_key(&config.app_id)?;
+                            let snapshot = control.snapshot(&session).ok().flatten();
+                            let observed = crate::conversation_observer::ConversationRecord::received(&config.app_id, &message, original,
+                                frame.get("source_at_ms").and_then(Value::as_u64), snapshot.as_ref())?
+                                .with_activity(snapshot.as_ref().and_then(|s| foreground_activity.learning_activity(s)));
+                            let at_ms = observed.metadata().observed_at_ms.unwrap_or(1);
+                            // 全量群旁观也先持久采集真实正文，再交插话/表达筛选。
+                            if learning.push(&ctx, observed).is_err() { warn(&ctx, "conversation_observer_input_failed"); }
                             conversations.record_message(&config.app_id, &message)?;
-                            let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |v| v.as_millis() as u64);
-                            if observer.observe(&message, frame["sender_name"].as_str(), frame["mentions_me"].as_bool().unwrap_or(false), at_ms).is_err() {
+                            if let Some(observer) = &group_observer
+                                && observer.observe(&message, frame["sender_name"].as_str(), frame["mentions_me"].as_bool().unwrap_or(false), at_ms).is_err() {
                                 warn(&ctx,"group_observation_failed");
                             }
                         }
@@ -3160,7 +3277,7 @@ pub(crate) async fn run(
                             let sender_name = payload.get("sender_name").and_then(Value::as_str).map(str::to_owned);
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
-                                object.remove("sender_name"); object.remove("raw"); object.remove("original_text");
+                                object.remove("sender_name"); object.remove("raw"); object.remove("original_text"); object.remove("source_at_ms");
                                 if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str())) {
                                     warn(&ctx, "ignored_message_fields");
                                 }
@@ -3212,6 +3329,13 @@ pub(crate) async fn run(
                                         }
                                     }
                                 }
+                                let session = message.session_key(&config.app_id)?;
+                                let snapshot = control.snapshot(&session).ok().flatten();
+                                let observed = crate::conversation_observer::ConversationRecord::received(&config.app_id, &message,
+                                    original_text.as_deref(), frame.get("source_at_ms").and_then(Value::as_u64), snapshot.as_ref())?
+                                    .with_activity(snapshot.as_ref().and_then(|s| foreground_activity.learning_activity(s)));
+                                // 与表达筛选、命令路由、模型结果和回复成功解耦；先持久记录待写事件。
+                                if learning.push(&ctx, observed).is_err() { warn(&ctx, "conversation_observer_input_failed"); }
                                 conversations.record_original(&ctx, &config.app_id, &message,
                                     if private_text.is_some() { None } else { original_text.clone() })?;
                                 conversations.record_message(&config.app_id, &message)?;
@@ -3298,10 +3422,6 @@ pub(crate) async fn run(
                                         if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
                                             warn(&ctx, "expression_learning_failed");
                                         }
-                                        if let Some(body) = original_text.as_ref().filter(|text| !text.trim().is_empty() && text.len() <= eve_training_api::MAX_CONVERSATION_BODY_BYTES && !text.contains("```") && !text.lines().any(|line| line.trim_start().starts_with('>')))
-                                            && training.observe_conversation(&scope, eve_training_api::ConversationMessage {
-                                                id: message.id.clone(), speaker: scope.user_id.clone(), role: eve_training_api::ConversationRole::Human, text: body.clone(),
-                                            }).is_err() { warn(&ctx, "conversation_learning_failed"); }
                                     }
                                     if let Some(live) = &live_dialogue {
                                         let session = message.session_key(&config.app_id)?;
@@ -3574,6 +3694,7 @@ mod tests {
             platform_message_id: None,
             image_path: None,
             reply_anchor: None,
+            conversation: None,
         });
         let confirmed = super::BTreeSet::from([("parent".into(), 0)]);
         let missing = super::BTreeSet::new();

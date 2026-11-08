@@ -2,7 +2,10 @@
 use crate::qq_memory;
 use eve_memory_api::{CompletedInteraction, MemoryAdmin, MemoryError};
 use eve_plugin_api::{PluginError, PluginResult};
-use eve_qqbot_plugin::{QqInteraction, QqInteractionObserver};
+use eve_qqbot_plugin::{
+    QqConversationMessage, QqConversationObserver, QqInteraction, QqInteractionObserver,
+    QqInteractionSource,
+};
 use eve_session_api::SessionService;
 use ring::digest::{Context, SHA256};
 use std::{
@@ -13,7 +16,51 @@ use std::{
 pub(crate) struct Observer {
     pub memory: Arc<dyn MemoryAdmin>,
     pub sessions: Arc<dyn SessionService>,
-    pub training: Option<Arc<dyn eve_training_api::TrainingService>>,
+}
+
+/// 与完成轮次记忆导入独立；每条接收与每条真实送达都可形成学习依据。
+pub(crate) struct ConversationObserver {
+    pub training: Arc<dyn eve_training_api::TrainingService>,
+}
+
+impl QqConversationObserver for ConversationObserver {
+    fn observe(&self, message: &QqConversationMessage<'_>) -> PluginResult<()> {
+        let personal = eve_llm_api::ContextScope {
+            session_id: message.session().session_id.clone(),
+            user_id: message.session().user_id.clone(),
+        };
+        let speaker = if message.role() == eve_training_api::ConversationRole::Human {
+            &personal.user_id
+        } else {
+            "eve"
+        };
+        if message.metadata().source_kind.as_deref() != Some("qq_group_sent") {
+            crate::conversation_learning::observe_with_metadata(
+                self.training.as_ref(),
+                &personal,
+                message.id(),
+                speaker,
+                message.role(),
+                message.text(),
+                Some(message.metadata().clone()),
+            )?;
+        }
+        if message.source() == QqInteractionSource::GroupMessage {
+            crate::conversation_learning::observe_with_metadata(
+                self.training.as_ref(),
+                &eve_llm_api::ContextScope {
+                    session_id: message.conversation().into(),
+                    user_id: crate::qq_group::USER.into(),
+                },
+                message.id(),
+                speaker,
+                message.role(),
+                message.text(),
+                Some(message.metadata().clone()),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn failure() -> PluginError {
@@ -97,19 +144,6 @@ impl QqInteractionObserver for Observer {
         })?;
         if saved.scope != scope {
             return Err(failure());
-        }
-        if let Some(training) = &self.training {
-            crate::conversation_learning::observe(
-                training.as_ref(),
-                &eve_llm_api::ContextScope {
-                    session_id: scope.session_id,
-                    user_id: scope.user_id,
-                },
-                &format!("eve:{}", interaction.message_id()),
-                "eve",
-                eve_training_api::ConversationRole::Eve,
-                interaction.assistant_text(),
-            )?;
         }
         Ok(())
     }

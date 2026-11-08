@@ -5,12 +5,14 @@
 保存原始合成输入、实际回复、持久经验及失败；不以关键词计分宣称达到真人水平。
 """
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -26,7 +28,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-config", type=Path)
     parser.add_argument("--model", help="覆盖测试模型名称，保留配置中的端点和凭据")
-    parser.add_argument("--reasoning-effort", default="medium", choices=["none", "low", "medium", "high"])
+    parser.add_argument("--reasoning-effort", choices=["none", "low", "medium", "high"],
+                        help="仅在测试模型支持且显式指定时发送思考强度")
     parser.add_argument("--min-cache-hit-rate", type=float, default=.85)
     args = parser.parse_args()
     if not 0 <= args.min_cache_hit_rate <= 1:
@@ -49,8 +52,10 @@ def main():
                        EVE_OPENAI_TIMEOUT_SECONDS="60", EVE_OPENAI_TRANSIENT_RETRIES="false",
                        EVE_MODELS_PRIMARY_TIMEOUT_MS="60000",
                        EVE_TRACE_DIALOGUE_TIMING="true",
-                       EVE_OPENAI_MAX_OUTPUT_TOKENS="2048", EVE_OPENAI_REASONING_EFFORT=args.reasoning_effort,
+                       EVE_OPENAI_MAX_OUTPUT_TOKENS="2048",
                        EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS="0", EVE_CONTEXT_COMPACT_AT_TOKENS="0")
+    if args.reasoning_effort is not None:
+        environment["EVE_OPENAI_REASONING_EFFORT"] = args.reasoning_effort
     report = {"model": environment.get("EVE_OPENAI_MODEL"), "reasoning_effort":args.reasoning_effort,
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "work": str(work), "dialogue": [], "lessons": [], "errors": [], "model_metrics": [],
@@ -123,6 +128,14 @@ def main():
             raise RuntimeError("Web API 状态 " + str(error.code)) from None
 
     def lessons():
+        database = state / "training-expressions.sqlite3"
+        if database.exists():
+            with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_scopes'").fetchone():
+                    return [lesson for checkpoint, in db.execute(
+                        "SELECT checkpoint FROM conversation_scopes WHERE session_id=? AND checkpoint IS NOT NULL",
+                        ("web:chat:" + "a" * 32,)) for lesson in json.loads(checkpoint)["lessons"]]
+        # 指定旧二进制时仍可观察其旧快照；新表存在但损坏时不回退到旧经验。
         path = state / "state.json"
         if not path.exists():
             return []
