@@ -5,6 +5,38 @@ use std::sync::Arc;
 
 pub(crate) const NAMESPACE: &str = "runtime.history";
 pub(crate) struct ConfiguredHistory(pub(crate) Arc<dyn ConfigService>);
+/// 编程子代理总输入的估算 token 容量；与主对话的自适应上限独立。
+pub(crate) struct ConfiguredCodingHistory(pub(crate) Arc<dyn ConfigService>);
+
+pub(crate) fn coding_limit(snapshot: &ConfigSnapshot) -> Result<usize, LlmError> {
+    let limit: usize = snapshot
+        .get("coding_limit_tokens")
+        .map_err(|_| LlmError::Configuration("编程子代理上下文上限无法读取".into()))?;
+    if !(10000..=1000000).contains(&limit) {
+        return Err(LlmError::Configuration(
+            "编程子代理上下文上限必须为 10000 至 1000000 token".into(),
+        ));
+    }
+    Ok(limit)
+}
+
+impl HistoryWindowResolver for ConfiguredCodingHistory {
+    fn adaptive_limit(&self) -> Result<Option<usize>, LlmError> {
+        let snapshot = self
+            .0
+            .snapshot(NAMESPACE, 1)
+            .map_err(|_| LlmError::Configuration("编程子代理上下文配置无法读取".into()))?;
+        coding_limit(&snapshot).map(Some)
+    }
+
+    fn resolve(&self) -> Result<HistoryWindow, LlmError> {
+        let snapshot = self
+            .0
+            .snapshot(NAMESPACE, 1)
+            .map_err(|_| LlmError::Configuration("编程子代理历史窗口配置无法读取".into()))?;
+        window(&snapshot)
+    }
+}
 
 pub(crate) fn window(snapshot: &ConfigSnapshot) -> Result<HistoryWindow, LlmError> {
     let read = || -> Result<HistoryWindow, eve_config_api::ConfigError> {

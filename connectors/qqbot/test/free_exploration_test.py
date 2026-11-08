@@ -21,6 +21,7 @@ import uuid
 
 import idle_loop_test as idle
 from dialogue_tools_test import text_response, tool_response
+from model_adapter_fixture import delegated_messages
 
 
 SOURCE_PREFIX = "subject-explore:"
@@ -232,13 +233,7 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
         self.assertEqual(self.baseline_grant["issued"], 0)
 
     def observation(self, body):
-        packets = []
-        for message in body["messages"]:
-            text = message.get("content") or ""
-            prefix = '{"kind":"eve.delegated_context"'
-            if prefix in text:
-                packet = json.JSONDecoder().raw_decode(text[text.index(prefix):])[0]
-                packets.extend(packet["messages"])
+        packets = delegated_messages(body)
         observations = [json.loads(message["text"][len(idle.PREFIX):]) for message in packets
                         if (message.get("text") or "").startswith(idle.PREFIX)]
         self.assertEqual(len(observations), 1)
@@ -385,17 +380,17 @@ class FreeExplorationAcceptance(idle.IdleLoopAcceptance):
 
     @staticmethod
     def exploration_context(body):
-        for message in body["messages"]:
-            text = message.get("content") or ""
-            prefix = '{"kind":"eve.delegated_context"'
-            if prefix not in text:
+        contexts = []
+        for saved in delegated_messages(body):
+            try:
+                value = json.loads(saved.get("text") or "")
+            except (ValueError, TypeError):
                 continue
-            packet = json.JSONDecoder().raw_decode(text[text.index(prefix):])[0]
-            for saved in packet["messages"]:
-                value = json.loads(saved["text"])
-                if value.get("kind") == "eve.exploration.context.v1":
-                    return value
-        raise AssertionError("探索请求没有携带已冻结的上下文")
+            if isinstance(value, dict) and value.get("kind") == "eve.exploration.context.v1":
+                contexts.append(value)
+        if len(contexts) != 1:
+            raise AssertionError("探索请求必须携带唯一的已冻结上下文")
+        return contexts[0]
 
     def worker_requests(self, task):
         messages = json.loads(task["spec"]["context"]["messages_json"])

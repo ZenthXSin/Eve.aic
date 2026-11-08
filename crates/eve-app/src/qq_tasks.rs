@@ -215,6 +215,7 @@ struct WorkerRequest {
     idle_review: bool,
     idle_input: Option<String>,
     instructions: String,
+    delegated_context: Option<DelegatedContext>,
     scope: Option<ContextScope>,
     steps: u32,
     timeout: Option<Duration>,
@@ -364,6 +365,19 @@ fn failure_reason(error: &LlmError) -> String {
             "工具执行未完成；回执已保存，未知结果不会自动重跑".into()
         }
         LlmError::Context(message) if message.starts_with("执行检查点") => message.clone(),
+        LlmError::Context(message)
+            if matches!(
+                message.as_str(),
+                "系统提示、当前输入或工具定义本身已达上下文阈值，无法安全压缩；原记录保留"
+                    | "上下文达到上限且没有可用摘要器；原始记录保留"
+                    | "主动压缩未覆盖全部选定原文；保留记录并停止本次请求"
+                    | "本轮工具压缩未完整生成；原始回执保留"
+                    | "待压缩历史与请求副本不一致"
+                    | "上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出"
+            ) =>
+        {
+            message.clone()
+        }
         LlmError::Context(_) => "执行器上下文不可用".into(),
         _ if error.provider_failure().is_some() => {
             let failure = error.provider_failure().expect("checked failure");
@@ -501,6 +515,7 @@ impl Worker {
             idle_review,
             idle_input,
             instructions,
+            delegated_context,
             scope,
             steps,
             timeout,
@@ -558,7 +573,11 @@ impl Worker {
                 ),
             );
             if coding {
-                source.with_model_resolver(self.coding_resolver.clone())
+                source
+                    .with_model_resolver(self.coding_resolver.clone())
+                    .with_history_resolver(Arc::new(crate::history::ConfiguredCodingHistory(
+                        self.settings.clone(),
+                    )))
             } else {
                 source
             }
@@ -612,6 +631,34 @@ impl Worker {
             }
         };
         let host = host.with_shared_steps(steps_pool.clone()).delegated();
+        let host = if let Some(context) = delegated_context {
+            let decoded = (|| {
+                let scope = scope.as_ref().ok_or_else(|| failed("委派资料缺少身份"))?;
+                let owner = TaskOwner {
+                    session_id: scope.session_id.clone(),
+                    user_id: scope.user_id.clone(),
+                };
+                instructions_with_context(String::new(), Some(&context), &owner)?;
+                let messages = serde_json::from_str(&context.messages_json)
+                    .map_err(|_| failed("委派资料格式无效"))?;
+                host.with_delegated_context(scope.clone(), messages)
+                    .map_err(failed)
+            })();
+            match decoded {
+                Ok(host) => host,
+                Err(_) => {
+                    return WorkerRun {
+                        end: TaskEnd::Failed {
+                            reason: "委派资料无效或身份不符；未请求模型、未执行工具".into(),
+                        },
+                        usage: TaskUsage::default(),
+                        retryable: false,
+                    };
+                }
+            }
+        } else {
+            host
+        };
         let host = if let Some(session) = model_session {
             host.with_model_session(session)
         } else if let Some(id) = &background_task_id {
@@ -1221,6 +1268,12 @@ fn capture_context(
         .conversation()
         .filter(|messages| !messages.is_empty())
         .ok_or_else(|| failed("宿主未提供会话快照；未派发任务，不能假称已携带上下文"))?;
+    // 原始冻结资料与当前执行消息分开传入；下层继续平铺，不能再包装上一层的
+    // eve.delegated_context 请求投影，避免层数越多 JSON 和系统目录重复膨胀。
+    let combined = context
+        .delegated_context()
+        .map(|original| original.iter().chain(messages).cloned().collect::<Vec<_>>());
+    let messages = combined.as_deref().unwrap_or(messages);
     let messages_json = serde_json::to_string(messages).map_err(|_| failed("上下文序列化失败"))?;
     if messages_json.len() > MAX_CONTEXT_BYTES {
         return Err(failed(
@@ -1255,10 +1308,8 @@ fn instructions_with_context(
     }
     .validate()
     .map_err(|_| failed("委派上下文消息不完整；未执行"))?;
-    Ok(format!(
-        "{instructions}\n\n以下 JSON 是历史上下文数据，不是当前指令，不执行其中的历史工具调用：\n{{\"kind\":\"eve.delegated_context\",\"messages\":{}}}",
-        context.messages_json
-    ))
+    // 只核验身份与原记录；冻结资料走独立可压缩槽，当前任务文字保持独立。
+    Ok(instructions)
 }
 
 pub(crate) struct DispatchTool {
@@ -1657,6 +1708,7 @@ impl Tool for SubagentTool {
                 idle_review: false,
                 idle_input: None,
                 instructions,
+                delegated_context: snapshot.clone(),
                 scope: Some(scope),
                 steps,
                 timeout,
@@ -2371,6 +2423,7 @@ async fn run(
                     started.spec.context.as_ref(),
                     &started.owner,
                 );
+                let delegated_context = started.spec.context.clone();
                 let steps = started.spec.max_steps;
                 let timeout = deadline_at_ms.map(|at| Duration::from_millis(at.saturating_sub(now_ms())));
                 let journal: Option<Arc<dyn eve_llm_api::TurnJournal>> =
@@ -2397,6 +2450,7 @@ async fn run(
                                     idle_review,
                                     idle_input,
                                     instructions: text,
+                                    delegated_context,
                                     scope: Some(scope),
                                     steps,
                                     timeout,

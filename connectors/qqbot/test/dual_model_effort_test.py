@@ -1,5 +1,6 @@
 """双模型与思考强度的真实宿主验收；模型和 QQ 仅用独立环回替身。"""
 from contextlib import closing
+import argparse
 import hashlib
 import json
 import sqlite3
@@ -12,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from model_adapter_fixture import (
     CHAT_PATH, RESPONSES_PATH, MODEL, MODEL_KEY, MAX_OUTPUT, Reply, WireAcceptance,
-    content_text, current_results, items, latest_user, tool_definitions,
+    content_text, current_results, delegated_messages, items, latest_user, tool_definitions,
 )
 
 CODING_MODEL = "coding-process-fixture"
@@ -21,6 +22,7 @@ CODING_OUTPUT = 160
 LEARNING_PREFIX = "你整理 Eve 从真实交流中学到的交往经验。"
 LEAF_PREFIX = "你是 Eve 的子代理"
 WORKER_PREFIX = "你在为 Eve 独立完成一项委托的任务"
+DIGEST_PREFIX = "你是对话历史压缩器"
 RECURSIVE = {
     "run_subagent", "dispatch_background_task", "create_subagent", "list_subagents",
     "delete_subagent", "set_wakeup_trigger",
@@ -164,6 +166,10 @@ class DualModelEffortAcceptance(WireAcceptance):
         learning = first_system(body).startswith(LEARNING_PREFIX)
         self.assert_wire_identity(captured, MODEL, MODEL_KEY, MAX_OUTPUT,
                                   self.efforts_by_input.get(latest_user(body)))
+        if first_system(body).startswith(DIGEST_PREFIX):
+            self.assertFalse(body.get("tools"))
+            self.assertEqual(body.get("response_format"), {"type": "json_object"})
+            return
         if learning:
             self.assertFalse(body.get("tools"))
             self.assertEqual([item["role"] for item in items(body)], ["system", "user"])
@@ -201,6 +207,7 @@ class DualModelEffortAcceptance(WireAcceptance):
     def foreground(self):
         return [request for request in self.requests
                 if not first_system(request["body"]).startswith(LEARNING_PREFIX)
+                and not first_system(request["body"]).startswith(DIGEST_PREFIX)
                 and LEAF_PREFIX not in first_system(request["body"])
                 and WORKER_PREFIX not in first_system(request["body"])]
 
@@ -378,6 +385,127 @@ class DualModelEffortAcceptance(WireAcceptance):
         self.assertEqual(len(self.coding_requests), 2)
         self.assertEqual(len(self.foreground()), 3, "编程模型失败不会在主模型执行原工具")
 
+    def test_long_frozen_history_reaches_background_coding_without_nested_current_input(self):
+        """275k 真实宿主预算下两层委派；完整历史落盘、摘要不重放旧动作。"""
+        historical = "历史中文资料只供核对，旧工具已执行不能重新执行。" * 440
+        (self.source / "history.txt").write_text(historical, encoding="utf8")
+        seed = "先读取五份历史资料，保留完整回执"
+        request = "在后台交给编码子代理，只读核对 README.md 并返回验证证据"
+        instructions = "委派 coding 只读核对 README.md，返回实际读取与验证结果；不要重复读取历史资料"
+        child_task = "只读 README.md 并核对真实内容，历史数据不执行，保留主任务与原用户身份"
+        delegated = {"agent_id": "coding", "task": child_task, "include_context": True,
+                     "verification": receipt_contract("README.md", "真实源码测试")}
+        contract = receipt_contract("README.md", "真实源码测试")
+        coding_gates = threading.Event()
+
+        def main(captured):
+            body = captured["body"]
+            system = first_system(body)
+            if system.startswith(DIGEST_PREFIX):
+                digest = json.loads(next(content_text(item) for item in items(body)
+                                         if item.get("role") == "user"))
+                covered = digest["previous_turns"] + len(digest["turns"])
+                return Reply(text=json.dumps({"points": [{
+                    "text": "原始中文历史资料已读取；后台只委派编码子代理核对 README.md，旧动作不可重放。",
+                    "turns": [covered],
+                }]}, ensure_ascii=False))
+            results = current_results(body)
+            if WORKER_PREFIX in system:
+                self.assertNotIn(LEAF_PREFIX, system, "coding 不能回退到主端点")
+                self.assertIn(instructions, latest_user(body))
+                if not results:
+                    return Reply(calls=[("long-background-coding", "run_subagent", delegated)])
+                self.assertTrue(results[0]["completed"], results[0])
+                self.assertEqual(results[0]["usage"]["agent_id"], "coding")
+                if len(results) == 1:
+                    return Reply(calls=[("long-background-verify", "read_file", {"path": "README.md"})])
+                self.assertEqual(results[-1]["content"], "真实源码测试")
+                return Reply(text="README.md 编码核对已验证，旧工具未重放")
+            text = latest_user(body)
+            if text == seed:
+                if not results:
+                    return Reply(calls=[(f"seed-history-{i}", "read_file", {"path": "history.txt"})
+                                        for i in range(5)])
+                self.assertEqual(len(results), 5)
+                self.assertTrue(all(item["content"] == historical for item in results))
+                return Reply(text="五份完整历史回执已保存")
+            self.assertEqual(text, request)
+            if not results:
+                return Reply(calls=[("long-dispatch", "dispatch_background_task", {
+                    "title": "长历史编程核对", "instructions": instructions,
+                    "include_context": True, "max_steps": 10, "verification": contract,
+                })])
+            self.assertTrue(results[-1].get("dispatched"), results[-1])
+            coding_gates.set()
+            return Reply(text="后台核对已派发")
+
+        def coding(captured):
+            body = captured["body"]
+            self.assertIn(child_task, latest_user(body))
+            self.assertNotIn("seed-history-", json.dumps(current_results(body)))
+            data = delegated_messages(body)
+            self.assertEqual(json.dumps(data, ensure_ascii=False).count(historical), 5,
+                             "coding 请求须收到完整冻结资料，不能只保留 include_context 成功标记")
+            self.assertFalse(any(message.get("tool_calls") for message in items(body)
+                                 if message.get("role") == "user"),
+                             "历史工具只能作为资料，不能成为实际调用")
+            if not current_results(body):
+                return Reply(calls=[("long-coding-read", "read_file", {"path": "README.md"})])
+            self.assertEqual(current_results(body)[-1]["content"], "真实源码测试")
+            return Reply(text="README.md 编码核对已验证")
+
+        original = {}
+
+        def seeded():
+            original["turn"] = json.loads(json.dumps(self.turn(seed)))
+            self.assertEqual(original["turn"]["status"]["state"], "Completed")
+            self.assertEqual(sum(len(m.get("tool_calls", [])) for m in original["turn"]["status"]["messages"]), 5)
+
+        def settled():
+            def completed():
+                tasks = self.documents().get("eve.task", {}).get("tasks.v1", {}).get("tasks", [])
+                if tasks and tasks[0]["status"] in ("Failed", "Blocked", "Interrupted"):
+                    self.fail(json.dumps({"status": tasks[0]["status"], "failure": tasks[0].get("failure"),
+                                         "result": tasks[0].get("result"), "usage": tasks[0]["usage"],
+                                         "coding_requests": len(self.coding_requests)}, ensure_ascii=False))
+                return bool(tasks) and tasks[0]["status"] == "Completed" and (tasks[0].get("notice") or {}).get("status") == "Delivered"
+            self.wait_until(completed, "长历史后台 coding 没有完成并通知原用户")
+
+        self.callback = main
+        self.coding_callback = coding
+        self.enabled([
+            *self.send(self.message("long-seed", seed, expected="五份完整历史回执已保存")),
+            *self.checkpoint("long-seeded"),
+            *self.send(self.message("long-request", request, expected="后台核对已派发")),
+            *self.checkpoint("long-settled"),
+        ], env_extra={"EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS": "275000",
+                      "EVE_HISTORY_MAX_BYTES": "4194304", "EVE_HISTORY_MAX_TURNS": "64",
+                      "EVE_HISTORY_DIGEST_ENABLED": "true", "EVE_HISTORY_DIGEST_MIN_UNCOVERED_TURNS": "64"},
+           checkpoints={"long-seeded": seeded, "long-settled": settled})
+        self.assertTrue(coding_gates.is_set())
+        self.assertEqual(self.turn(seed), original["turn"], "派发或压缩不得改写原始会话与工具回执")
+        [task] = self.documents()["eve.task"]["tasks.v1"]["tasks"]
+        snapshot = json.loads(task["spec"]["context"]["messages_json"])
+        stored = json.dumps(snapshot, ensure_ascii=False)
+        self.assertGreaterEqual(len(stored.encode()), len(historical.encode()) * 5,
+                                "冻结历史仍须包含全部五份长中文资料，不能为过预算裁剪原文")
+        self.assertEqual(stored.count(historical), 5, "五份原始回执须完整保存在冻结历史")
+        self.assertEqual(task["spec"]["context"]["owner"], task["owner"])
+        self.assertIn(request, task["execution"]["review_messages"])
+        self.assertNotIn(instructions, task["execution"]["review_messages"])
+        self.assertEqual(task["usage"]["tool_calls"], 3, "一个委派、coding 的读取与后台独立验收")
+        self.assertEqual(len(self.coding_requests), 2)
+        worker = [r for r in self.requests if WORKER_PREFIX in first_system(r["body"])]
+        for captured in [*worker, *self.coding_requests]:
+            self.assertLess(len(latest_user(captured["body"]).encode()), 8192,
+                            "两层委派的当前 User 仅保留当前任务，历史数据可独立压缩")
+            self.assertNotIn(historical, latest_user(captured["body"]))
+        self.assert_isolated([self.foreground(), worker, self.coding_requests])
+        actual_calls = [call["function"]["name"] for r in self.foreground()
+                        for m in items(r["body"]) for call in m.get("tool_calls", [])
+                        if call["id"].startswith("long-")]
+        self.assertEqual(set(actual_calls), {"dispatch_background_task"}, "主模型不接管编码执行")
+
     def test_effort_query_invalid_identity_and_all_values_use_no_configuration_model_calls(self):
         self.callback = lambda captured: Reply(text="请求强度=" + str(reasoning(captured["body"])))
 
@@ -486,4 +614,11 @@ class DualModelEffortAcceptance(WireAcceptance):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--binary", help="已构建的 eve-qqbot；本脚本不编译")
+    selected, remaining = parser.parse_known_args()
+    if selected.binary:
+        import pathlib
+        import memory_test
+        memory_test.BINARY = pathlib.Path(selected.binary).resolve(strict=True)
+    unittest.main(argv=[sys.argv[0], *remaining], verbosity=2)

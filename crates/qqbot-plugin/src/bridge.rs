@@ -892,6 +892,7 @@ struct ProgressDelivery {
     message: Message,
     part: usize,
     host_activity: bool,
+    live_turn_id: Option<u64>,
     deadline: tokio::time::Instant,
 }
 struct AuxiliaryDelivery {
@@ -2000,7 +2001,10 @@ pub(crate) async fn run(
                             let mut frame=json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text,"proactive":proactive,"explicit":explicit_send,"based_on_message_id":based_on_message_id});
                             if let Some(path)=image_path {frame["image_path"]=json!(path);}
                             write(&mut stdin,frame).await?;
+                            let live_turn_id = event.event.turn_id.filter(|_| explicit_send);
+                            timing(timing_diagnostics && live_turn_id.is_some(), "reply_written", live_turn_id);
                             progress_delivery.push(ProgressDelivery { message: message.clone(), part, host_activity: false,
+                                live_turn_id,
                                 deadline: tokio::time::Instant::now() + DELIVERY_TIMEOUT });
                         } else {
                             ledger.entries[index].progress[part].state = PartState::Failed;
@@ -2061,7 +2065,7 @@ pub(crate) async fn run(
                     write(&mut stdin, json!({"type":"progress", "version":1, "id":message.id,
                         "index":part, "text":notice.text, "proactive":false, "explicit":false,
                         "host_activity":true, "based_on_message_id":message.id})).await?;
-                    progress_delivery.push(ProgressDelivery {message, part, host_activity: true,
+                    progress_delivery.push(ProgressDelivery {message, part, host_activity: true, live_turn_id: None,
                         deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
                 } else {
                     // 尚未写入桥接，Node 没有领取这个序号；撤销准备记录，不占用后续正式发言的序号和额度。
@@ -3060,6 +3064,7 @@ pub(crate) async fn run(
                                 metadata.observed_at_ms = crate::conversation_observer::observed_at_ms();
                             }
                             ledger.save(&ctx)?;
+                            if ok { timing(timing_diagnostics && progress.live_turn_id.is_some(), "delivery_confirmed", progress.live_turn_id); }
                             // Sent 持久化后立刻逐条采集；后续工具/模型失败不撤销已发生的交流。
                             if learning.restore_sent(&ctx, &config.app_id, &ledger.entries[index].message, &ledger.entries[index].progress[part]).is_err() {
                                 warn(&ctx, "conversation_observer_sent_failed");
@@ -3259,7 +3264,12 @@ pub(crate) async fn run(
                             let at_ms = observed.metadata().observed_at_ms.unwrap_or(1);
                             // 全量群旁观也先持久采集真实正文，再交插话/表达筛选。
                             if learning.push(&ctx, observed).is_err() { warn(&ctx, "conversation_observer_input_failed"); }
-                            conversations.record_message(&config.app_id, &message)?;
+                            // 群旁观有自己的插话与学习锚点，不是新的主对话输入。
+                            // 这里只更新可信身份和路由；推进 latest_messages 会使后台
+                            // 发言去读取没有进入主对话原文库的消息，并永久等待其原文。
+                            conversations.record(&session, &message.scope);
+                            conversations.record_group_identity(&config.app_id, session,
+                                &message.target_id, &message.user_id, message.conversation_key(&config.app_id)?)?;
                             if let Some(observer) = &group_observer
                                 && observer.observe(&message, frame["sender_name"].as_str(), frame["mentions_me"].as_bool().unwrap_or(false), at_ms).is_err() {
                                 warn(&ctx,"group_observation_failed");

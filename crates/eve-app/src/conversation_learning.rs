@@ -159,27 +159,30 @@ impl Background {
                     if *stopped.borrow() { return Ok(()); }
                     if gate.admits_category(crate::qq_budget::CONVERSATION_LEARNING, 1)?
                         && let Some(batch) = training.take_conversation_batch(crate::qq_tasks::now_ms())? {
+                        // 批次号只在当前范围递增；沿用学习请求的稳定匿名会话键，避免跨范围同号误判为重放。
+                        let scope_hash = eve_llm_api::ModelSession::scoped("conversation-learning", &batch.scope)?
+                            .session_id().to_owned();
                         let result = tokio::select! { biased;
                             _ = stopped.changed() => { return Ok(()); },
                             result = tokio::time::timeout(Duration::from_secs(60), learner.learn(batch.clone())) => result.unwrap_or(Err(LlmError::ProviderTimeout)),
                         };
                         match result {
                             Ok(drafts) => match training.finish_conversation_batch(&batch, drafts, crate::qq_tasks::now_ms()) {
-                                Ok(saved) => eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"batch":batch.id,"outcome":"learned","saved":saved})),
+                                Ok(saved) => eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"scope_hash":scope_hash,"batch":batch.id,"outcome":"learned","saved":saved})),
                                 Err(error) => {
                                     // 持久提交失败或结果未知不是模型输出拒绝：不能再提交 fail，
                                     // 更不能拿旧快照覆盖可能已经保存的经验和消费位置。
                                     if !matches!(error, eve_plugin_api::PluginError::Task(_)) {
-                                        eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"batch":batch.id,"outcome":"storage_unconfirmed","reason":error.to_string()}));
+                                        eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"scope_hash":scope_hash,"batch":batch.id,"outcome":"storage_unconfirmed","reason":error.to_string()}));
                                         return Err(error.into());
                                     }
-                                    eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"batch":batch.id,"outcome":"rejected","reason":error.to_string()}));
+                                    eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"scope_hash":scope_hash,"batch":batch.id,"outcome":"rejected","reason":error.to_string()}));
                                     // 重置或停止已经令批次失效，不恢复它；其他输出错误按同批有限重试。
                                     training.fail_conversation_batch(&batch, crate::qq_tasks::now_ms())?;
                                 }
                             },
                             Err(error) => {
-                                eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"batch":batch.id,"outcome":"failed","attempt":batch.attempt,"reason":error.to_string()}));
+                                eprintln!("EVE_CONVERSATION_LEARNING {}", serde_json::json!({"scope_hash":scope_hash,"batch":batch.id,"outcome":"failed","attempt":batch.attempt,"reason":error.to_string()}));
                                 training.fail_conversation_batch(&batch, crate::qq_tasks::now_ms())?;
                             }
                         }

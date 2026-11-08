@@ -836,6 +836,7 @@ pub struct ToolExecutionContext {
     model_session: Option<ModelSession>,
     continuation: TaskContinuation,
     conversation: Option<Arc<Vec<ChatMessage>>>,
+    delegated_context: Option<Arc<Vec<ChatMessage>>>,
     review_user_messages: Option<Arc<Vec<String>>>,
     review_evidence_guard: Option<Arc<dyn ReviewEvidenceGuard>>,
     shared_steps: Option<SharedToolSteps>,
@@ -876,6 +877,7 @@ impl ToolExecutionContext {
             model_session: None,
             continuation: TaskContinuation::default(),
             conversation: None,
+            delegated_context: None,
             review_user_messages: None,
             review_evidence_guard: None,
             shared_steps: None,
@@ -962,6 +964,15 @@ impl ToolExecutionContext {
     }
     pub fn conversation(&self) -> Option<&[ChatMessage]> {
         self.conversation.as_deref().map(Vec::as_slice)
+    }
+    /// 委派入口原样冻结的资料，独立于当前执行会话与真实授权原话。
+    /// 下层委派直接平铺这些原记录，不重新嵌套模型请求里的 JSON 数据投影。
+    pub fn with_delegated_context(mut self, messages: Arc<Vec<ChatMessage>>) -> Self {
+        self.delegated_context = Some(messages);
+        self
+    }
+    pub fn delegated_context(&self) -> Option<&[ChatMessage]> {
+        self.delegated_context.as_deref().map(Vec::as_slice)
     }
     /// 宿主从压缩前历史采集的最近六条真实用户正文；不能用摘要、工具结果或模型自报授权替代。
     pub fn with_review_user_messages(mut self, messages: Arc<Vec<String>>) -> Self {

@@ -31,6 +31,31 @@ def content_text(message):
     return "".join(part.get("text", "") for part in content)
 
 
+def delegated_messages(body):
+    """读取旧整体包和新独立资料记录，不依赖 JSON 字段顺序。"""
+    saved = []
+    decoder = json.JSONDecoder()
+    for item in items(body):
+        if item.get("role") != "user":
+            continue
+        text = content_text(item)
+        if "eve.delegated_context" not in text:
+            continue
+        offset = 0
+        while (start := text.find("{", offset)) >= 0:
+            try:
+                record, offset = decoder.raw_decode(text, start)
+            except ValueError:
+                offset = start + 1
+                continue
+            if not isinstance(record, dict) or record.get("kind") != "eve.delegated_context":
+                continue
+            messages = record["messages"] if "messages" in record else [record["message"]]
+            assert isinstance(messages, list) and all(isinstance(m, dict) for m in messages)
+            saved.extend(messages)
+    return saved
+
+
 def latest_user(body):
     return next(content_text(item) for item in reversed(items(body))
                 if item.get("role") == "user")

@@ -271,6 +271,31 @@ async fn coding_subagent_routes_only_its_model_and_preserves_context_budget_and_
             );
             assert!(
                 request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ChatRole::User)
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .len()
+                    < 8192
+            );
+            assert!(
+                !request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ChatRole::User)
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .contains("已有源码线索")
+            );
+            assert!(
+                request
                     .tools
                     .iter()
                     .all(|tool| !ORCHESTRATION_TOOLS.contains(&tool.name.as_str()))
@@ -356,6 +381,7 @@ async fn ordinary_and_custom_coding_named_roles_and_background_keep_task_model()
             idle_review: false,
             idle_input: None,
             instructions: "源码调试字样不改变普通后台模型".into(),
+            delegated_context: None,
             scope: Some(scope()),
             steps: 5,
             timeout: None,
@@ -427,4 +453,41 @@ async fn coding_failure_and_revoked_identity_never_fall_back_or_restart_work() {
     assert!(rejected_coding.requests.lock().unwrap().is_empty());
     assert_eq!(rejected_coding.resolutions.load(Ordering::SeqCst), 0);
     rejected.kernel.stop_all().await.unwrap();
+}
+
+#[test]
+fn nested_delegation_flattens_original_records_without_wrapping_current_instructions() {
+    let original = vec![
+        ChatMessage::text(ChatRole::System, "旧系统资料"),
+        ChatMessage::text(ChatRole::User, "旧用户原话"),
+    ];
+    let current = vec![
+        ChatMessage::text(ChatRole::System, "后台系统资料"),
+        ChatMessage::text(ChatRole::User, "后台当前任务"),
+    ];
+    let caller = context("flatten", eve_llm_api::SharedToolSteps::new(5).unwrap())
+        .with_delegated_context(Arc::new(original.clone()))
+        .with_conversation(Arc::new(current.clone()));
+    let captured = capture_context(&json!({"include_context":true}), &caller)
+        .unwrap()
+        .unwrap();
+    let messages: Vec<ChatMessage> = serde_json::from_str(&captured.messages_json).unwrap();
+    assert_eq!(
+        messages,
+        original.into_iter().chain(current).collect::<Vec<_>>()
+    );
+    assert!(!captured.messages_json.contains("eve.delegated_context"));
+    assert_eq!(
+        instructions_with_context("本次编程委托".into(), Some(&captured), &captured.owner).unwrap(),
+        "本次编程委托"
+    );
+    assert_eq!(
+        caller.review_user_messages().unwrap(),
+        ["读取本项目源码并核验"]
+    );
+    let stranger = TaskOwner {
+        user_id: "someone-else".into(),
+        ..captured.owner.clone()
+    };
+    assert!(instructions_with_context("本次编程委托".into(), Some(&captured), &stranger).is_err());
 }

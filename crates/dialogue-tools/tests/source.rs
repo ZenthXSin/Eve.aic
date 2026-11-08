@@ -1,6 +1,9 @@
-use eve_dialogue_tools::Services;
+use eve_dialogue_tools::{CapabilitiesContext, Services};
 use eve_knowledge_api::{BoxFuture, FetchFailure, FetchedPage, SourceFetcher, SourcePolicy};
-use eve_llm_api::{ContextScope, Tool, ToolCall, ToolExecutionContext};
+use eve_llm_api::{
+    ContextAssembler, ContextScope, ContextSnapshot, LlmFuture, Tool, ToolCall,
+    ToolExecutionContext, TurnInput,
+};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -154,4 +157,65 @@ async fn open_web_tool_reads_a_host_outside_every_research_seed() {
         .unwrap();
     assert_eq!(result["url"], "https://another.example/arbitrary/page");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+struct FixedContext;
+impl ContextAssembler for FixedContext {
+    fn assemble(&self, _: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
+        Box::pin(async {
+            Ok(ContextSnapshot {
+                revision: "fixed-1".into(),
+                pinned: vec!["existing host fact".into()],
+                ..ContextSnapshot::default()
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn capability_names_remain_discoverable_without_duplicating_full_tool_definitions() {
+    let (read_source, _) = tool(false);
+    let mut source = read_source.definition();
+    source
+        .description
+        .push_str(&"long tool documentation".repeat(1000));
+    let mut recall = source.clone();
+    recall.name = "recall_group_messages".into();
+    let definitions = vec![source, recall];
+    let original_definitions = definitions.clone();
+    let seeds = vec!["https://docs.invalid/approved/index".to_string()];
+    let context = CapabilitiesContext {
+        inner: Arc::new(FixedContext),
+        definitions,
+        source_seeds: seeds.clone(),
+        runner: None,
+    };
+
+    let snapshot = context
+        .assemble(TurnInput {
+            text: "what can you do?".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot.pinned[0], "existing host fact");
+    assert_eq!(snapshot.pinned.len(), 2);
+    let notice: Value = serde_json::from_str(&snapshot.pinned[1]).unwrap();
+    assert_eq!(notice["kind"], "eve.host.capabilities");
+    assert_eq!(
+        notice["conversation_tools"],
+        json!([
+            {"name": "read_source"},
+            {"name": "recall_group_messages"},
+        ])
+    );
+    assert_eq!(notice["research_entry_pages"], json!(seeds));
+    assert_eq!(notice["group_history"]["automatic_recent_raw_messages"], 20);
+    assert_eq!(
+        context.definitions, original_definitions,
+        "request definitions retain complete descriptions and argument schemas"
+    );
+    assert!(
+        snapshot.pinned[1].len() < 2048,
+        "host facts stay small regardless of complete tool documentation size"
+    );
 }
