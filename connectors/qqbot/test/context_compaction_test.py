@@ -64,7 +64,7 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
             self.assertIn("对话历史压缩器", request["body"]["messages"][0]["content"])
             self.assertEqual(request["body"].get("tools", []), [])
 
-    def test_150k_tool_context_is_summarized_then_continues_and_restart_recomputes_selected_history(self):
+    def test_150k_tool_context_reuses_full_history_digest_after_restart_without_applying_it_to_selected_history(self):
         content = "中文结果" * 2700
         (self.source / "README.md").write_text(content, encoding="utf8")
         self.dialogue_calls = 0
@@ -77,7 +77,8 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
             self.dialogue_calls += 1
             if self.dialogue_calls == 1:
                 return tool_response([("read_file", {"path": "README.md"})] * 8)
-            self.assertTrue(any("宿主上下文压缩摘要" in (m.get("content") or "") for m in body["messages"]))
+            has_summary = any("宿主上下文压缩摘要" in (m.get("content") or "") for m in body["messages"])
+            self.assertEqual(has_summary, body["messages"][-1].get("content") != "缩小窗口后接着")
             self.assertFalse(any(m.get("tool_calls") or m["role"] == "tool" for m in body["messages"]))
             return text_response("全部完成")
 
@@ -109,11 +110,35 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
         self.assertEqual(sum(len(m.get("tool_calls", [])) for m in messages), 8)
         self.assertEqual(sum(len(m.get("tool_results", [])) for m in messages), 8)
         self.assertIn(content, json.dumps(completed, ensure_ascii=False))
-        # 分层选择后的索引不能复用全历史covered_turns，持久摘要不作本轮缓存。
+        # 此时仅有两轮，max_turns=2 的计划完整保留原历史；重启必须复用有原文
+        # 指纹的同会话摘要，不能把“存在计划”误当成“筛选了历史”而重复压缩。
         previous = json.dumps(completed, sort_keys=True)
+        later = json.dumps(self.turn("接着检查"), sort_keys=True)
+        persisted = {path.name: path.read_bytes() for path in self.digest_files()}
+        self.assertTrue(persisted, "完整历史压缩应留下可跨重启复用的摘要")
         requests_before = len(self.digest_requests())
+        dialogue_before = self.dialogue_calls
         self.run_window([*self.send(self.message("restart", "重启后接着", expected="全部完成"))], env_extra=env, extra=features)
-        self.assertGreater(len(self.digest_requests()), requests_before, "重启后必须针对重新选择的完整原轮次安全重算摘要")
+        self.assertEqual(len(self.digest_requests()), requests_before, "完整原历史前缀未变，重启不得再次请求摘要模型")
+        self.assertEqual(self.dialogue_calls, dialogue_before + 1, "重启仅调用一次主对话，不重放旧工具")
+        self.assertEqual({path.name: path.read_bytes() for path in self.digest_files()}, persisted)
+        restarted = self.dialogue("重启后接着")
+        self.assertEqual([m["content"] for m in restarted["messages"] if m["role"] == "user"],
+                         ["接着检查", "重启后接着"], "缓存只覆盖旧前缀，最近原话和当前输入必须保留")
+        self.assertEqual(self.turn("重启后接着")["status"]["state"], "Completed")
+        for message in self.turn("重启后接着")["status"]["messages"]:
+            self.assertFalse(message.get("tool_calls") or message.get("tool_results"))
+        self.assertEqual(json.dumps(self.turn("读取八次并核验完成"), sort_keys=True), previous)
+        self.assertEqual(json.dumps(self.turn("接着检查"), sort_keys=True), later)
+
+        # 真正筛选子序列时，原 covered_turns 绝不能套到最新一轮并误删它。
+        # 选中的小轮次无需压缩，原持久摘要仍保留但不注入本次请求。
+        self.run_window([*self.send(self.message("selected", "缩小窗口后接着", expected="全部完成"))],
+                        env_extra={**env, "EVE_HISTORY_MAX_TURNS": "1"}, extra=features)
+        selected = self.dialogue("缩小窗口后接着")
+        self.assertEqual([m["content"] for m in selected["messages"] if m["role"] == "user"],
+                         ["重启后接着", "缩小窗口后接着"])
+        self.assertEqual(self.turn("缩小窗口后接着")["status"]["state"], "Completed")
         self.assertEqual(json.dumps(self.turn("读取八次并核验完成"), sort_keys=True), previous)
 
 
