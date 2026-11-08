@@ -147,8 +147,12 @@ jobs:
               "https://api.github.com/repos/Anuken/Mindustry/releases/assets/620209090"
           fi
           echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gradle.zip" \
-            "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          if ! curl -fsSL --retry 3 -o "$RUNNER_TEMP/gradle.zip" \
+            "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"; then
+            curl --fail --location --retry 3 -H 'Accept: application/octet-stream' \
+              -o "$RUNNER_TEMP/gradle.zip" \
+              "https://api.github.com/repos/gradle/gradle-distributions/releases/assets/347704202"
+          fi
           echo "${GRADLE_SHA256}  $RUNNER_TEMP/gradle.zip" | sha256sum -c -
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
           java -version

@@ -10,6 +10,7 @@ import unittest
 import delegation_context_test as delegation
 from background_task_test import calls
 from dialogue_tools_test import text_response
+from model_adapter_fixture import delegated_messages
 
 
 class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
@@ -66,8 +67,9 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
     def test_error_handoff_has_100_steps_preserves_receipts_and_never_replays(self):
         def respond(body):
             if self.is_worker(body):
-                self.assertIn("SAVED_COMMAND_RECEIPT", self.text(body))
-                self.assertIn("原任务检查", self.text(body))
+                frozen = json.dumps(delegated_messages(body), ensure_ascii=False)
+                self.assertIn("SAVED_COMMAND_RECEIPT", frozen)
+                self.assertIn("原任务检查", frozen)
                 self.assertFalse(self.definitions(body) & {"dispatch_background_task","run_subagent"})
                 return text_response("原任务已核实完成，旧命令未重跑")
             return self.foreground(body)
@@ -104,7 +106,7 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
             if not self.results(body):
                 self.worker_starts+=1
                 if self.approved:
-                    self.assertIn("明确同意追加",self.text(body))
+                    self.assertIn("明确同意追加",json.dumps(delegated_messages(body),ensure_ascii=False))
                     return calls(("approved-complete","task_progress",{"status":"completed","remaining":"已完成并核验"}))
                 return calls(("pending","task_progress",{"status":"in_progress","remaining":"还有核验工作未完成"}),
                              *[(f"echo-{i}","echo",{"text":str(i)}) for i in range(99)])
@@ -159,7 +161,7 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
     def test_preflight_rejection_is_not_an_unconfirmed_side_effect(self):
         def respond(body):
             if self.is_worker(body):
-                self.assertIn("UnknownTool", self.text(body))
+                self.assertIn("UnknownTool", json.dumps(delegated_messages(body), ensure_ascii=False))
                 return text_response("已经核对拒绝回执，未发生外部操作")
             if not self.results(body):
                 return calls(("not-installed", "nonexistent_tool", {}))
@@ -181,7 +183,15 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         def respond(body):
             if self.is_worker(body):
                 worker_requests.append(body)
-                self.assertIn("eve.failed_turn", self.text(body))
+                failed = []
+                for message in delegated_messages(body):
+                    try:
+                        record = json.loads(message.get("text") or "")
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(record, dict) and record.get("kind") == "eve.failed_turn":
+                        failed.append(record)
+                self.assertEqual([record["original_input"] for record in failed], [failed_input])
                 return text_response("已检查现有回执，未规定完整验收条件")
             if self.text(body) != failed_input:
                 return text_response("收到原始范围")
@@ -316,7 +326,7 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
 
         def respond(body):
             if self.is_worker(body):
-                self.assertIn("SAVED_COMMAND_RECEIPT", self.text(body))
+                self.assertIn("SAVED_COMMAND_RECEIPT", json.dumps(delegated_messages(body), ensure_ascii=False))
                 return text_response("已核对保存的命令回执，没有重跑")
             return self.foreground(body)
 

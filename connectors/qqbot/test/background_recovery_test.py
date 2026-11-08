@@ -8,6 +8,7 @@ import unittest
 import delegation_context_test as context
 from background_task_test import calls
 from dialogue_tools_test import text_response
+from model_adapter_fixture import delegated_messages
 
 
 class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
@@ -54,8 +55,11 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
                     "include_context":True, "verification":self.verification}))
             self.assertTrue(self.results(body)[-1]["dispatched"])
             return text_response("后台已派发")
-        self.assertIn("FROZEN_PARENT_561", self.text(body))
-        self.assertNotIn("AFTER_SNAPSHOT_874", self.text(body))
+        frozen = json.dumps(delegated_messages(body), ensure_ascii=False)
+        self.assertIn("FROZEN_PARENT_561", frozen)
+        self.assertIn("派发恢复任务", frozen)
+        self.assertNotIn("AFTER_SNAPSHOT_874", json.dumps(body, ensure_ascii=False))
+        self.assertIn("执行一次命令，再读取 once.txt 核对内容哈希后完成。", self.text(body))
         if not self.results(body):
             return calls(("actual-once", "run_command", self.once_command))
         self.assertIn("ACTUAL_SAVED_RECEIPT", json.dumps(self.results(body)))
