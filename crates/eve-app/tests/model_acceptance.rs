@@ -365,7 +365,7 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
     let checked = tokio::task::spawn_blocking(move || {
         model_check::run(&options, MARKER, || {
             let mut c = command(&url);
-            // 验证核心默认模型和协议，空参数在 Chat 下显式使用 low。
+            // 验证核心默认模型和协议；未设置思考强度时不向提供方传入该参数。
             c.env_remove("EVE_OPENAI_MODEL")
                 .env_remove("EVE_OPENAI_PROTOCOL")
                 .env_remove("EVE_OPENAI_REASONING_EFFORT");
@@ -400,7 +400,7 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
         std::collections::BTreeSet::from(["echo", "context_notes"])
     );
     assert!(first.get("input").is_none());
-    assert_eq!(first["reasoning_effort"], "low");
+    assert!(first.get("reasoning_effort").is_none());
     assert!(
         first.get("max_tokens").is_none(),
         "默认不向模型指定输出 token 上限"

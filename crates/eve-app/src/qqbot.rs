@@ -2688,7 +2688,8 @@ async fn run_qqbot_composed(
             phrase_policy.clone(),
             budget_gate.clone(),
         ));
-        // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
+        // 后台任务与子代理共用执行器；编程委托使用独立 coding 用途，
+        // 其余任务仍使用 task。两者各自记录模型健康与输出上限，不计入自主运行预算。
         if tasks.is_some() || options.subagents {
             let _ = task_late
                 .config
@@ -2699,7 +2700,10 @@ async fn run_qqbot_composed(
                 worker_permissions.clone(),
                 &worker_tools,
                 worker_config.clone(),
-                observed(qq_tasks::MODEL_USE)?,
+                qq_tasks::WorkerModels {
+                    task: observed(qq_tasks::MODEL_USE)?,
+                    coding: observed("coding")?,
+                },
                 history_digests.clone(),
             )
             .await?;

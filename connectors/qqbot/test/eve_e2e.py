@@ -70,7 +70,7 @@ class Acceptance(unittest.TestCase):
                     index = sum(not is_conversation_learning(request) for request in outer.requests)
                     outer.request_documents.append(outer.documents())
                 assert body["model"] == outer.expected_model
-                assert body["reasoning_effort"] == "low"
+                assert "reasoning_effort" not in body
                 if not learning:
                     outer.request_arrived(index).touch()
                 messages = body["messages"]

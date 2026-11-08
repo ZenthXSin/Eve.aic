@@ -139,6 +139,10 @@ pub(crate) fn openai_schema() -> ConfigSchema {
                 "auxiliary_protocol".into(),
                 string("", "EVE_OPENAI_AUXILIARY_PROTOCOL"),
             ),
+            (
+                "auxiliary_reasoning_effort".into(),
+                string("", "EVE_OPENAI_AUXILIARY_REASONING_EFFORT"),
+            ),
             ("semantic_query_background".into(), semantic_background),
             (
                 "semantic_query_timeout_ms".into(),
@@ -152,7 +156,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
             ("model_role".into(), string("", "EVE_OPENAI_MODEL_ROLE")),
             (
                 "reasoning_effort".into(),
-                string("low", "EVE_OPENAI_REASONING_EFFORT"),
+                string("omit", "EVE_OPENAI_REASONING_EFFORT"),
             ),
             (
                 "timeout_seconds".into(),
@@ -172,7 +176,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
 /// 按用途选择模型角色与单次输出上限；随每次模型解析读取，保存后下一次请求生效。
 pub(crate) const MODEL_USES_NAMESPACE: &str = "runtime.model_uses";
 /// 用途名与健康记录、自主预算类别一致。
-pub(crate) const MODEL_USES: [&str; 25] = [
+pub(crate) const MODEL_USES: [&str; 26] = [
     "dialogue",
     "speech",
     "plan",
@@ -187,6 +191,7 @@ pub(crate) const MODEL_USES: [&str; 25] = [
     "reflection",
     "summary",
     "task",
+    "coding",
     "digest",
     "phrase",
     "conversation_learning",
@@ -456,10 +461,15 @@ pub(crate) fn provider_config_for(
         let limit: u32 = snapshot.get("max_output_tokens")?;
         config.max_output_tokens = (limit != 0).then_some(limit);
     }
-    let effort: String = snapshot.get("reasoning_effort")?;
+    let mut effort: String = snapshot.get("reasoning_effort")?;
+    if purpose == eve_llm_api::CredentialPurpose::Auxiliary {
+        let independent: String = snapshot.get("auxiliary_reasoning_effort")?;
+        if !matches!(independent.as_str(), "" | "inherit") {
+            effort = independent;
+        }
+    }
     config.reasoning_effort = match effort.as_str() {
-        "omit" => None,
-        "" => Some("low".into()),
+        "omit" | "" => None,
         _ => Some(effort),
     };
     if adapter == "codex" {
@@ -579,13 +589,20 @@ mod tests {
         })
         .collect();
         CoreConfigValidator.validate(&snapshots).unwrap();
-        for route in ["unknown", "jev", "semantic", "", "auxiliary_small"] {
+        for purpose in ["summary", "coding"] {
+            for route in ["unknown", "jev", "semantic", "", "auxiliary_small"] {
+                snapshots
+                    .get_mut(MODEL_USES_NAMESPACE)
+                    .unwrap()
+                    .values
+                    .insert(use_role_field(purpose), json!(route));
+                assert!(CoreConfigValidator.validate(&snapshots).is_err());
+            }
             snapshots
                 .get_mut(MODEL_USES_NAMESPACE)
                 .unwrap()
                 .values
-                .insert("summary_role".into(), json!(route));
-            assert!(CoreConfigValidator.validate(&snapshots).is_err());
+                .insert(use_role_field(purpose), json!("primary"));
         }
         let roles = snapshots.get_mut(eve_config_api::MODELS_NAMESPACE).unwrap();
         for (key, value) in [
@@ -594,6 +611,13 @@ mod tests {
             ("auxiliary_small_model", json!("synthetic-auxiliary")),
         ] {
             roles.values.insert(key.into(), value);
+        }
+        for purpose in ["summary", "coding"] {
+            snapshots
+                .get_mut(MODEL_USES_NAMESPACE)
+                .unwrap()
+                .values
+                .insert(use_role_field(purpose), json!("auxiliary_small"));
         }
         CoreConfigValidator.validate(&snapshots).unwrap();
         snapshots
@@ -721,11 +745,12 @@ mod tests {
             settings.values.insert("protocol".into(), json!(protocol));
             assert_eq!(
                 provider_config(&settings, None).unwrap().reasoning_effort(),
-                Some("low")
+                None
             );
             for (value, expected) in [
-                ("", Some("low")),
+                ("", None),
                 ("none", Some("none")),
+                ("low", Some("low")),
                 ("medium", Some("medium")),
                 ("omit", None),
             ] {
@@ -736,6 +761,43 @@ mod tests {
                     provider_config(&settings, None).unwrap().reasoning_effort(),
                     expected
                 );
+            }
+            settings
+                .values
+                .insert("reasoning_effort".into(), json!("medium"));
+            for (value, expected) in [
+                ("", Some("medium")),
+                ("inherit", Some("medium")),
+                ("omit", None),
+                ("none", Some("none")),
+                ("high", Some("high")),
+            ] {
+                settings
+                    .values
+                    .insert("auxiliary_reasoning_effort".into(), json!(value));
+                assert_eq!(
+                    provider_config(&settings, None).unwrap().reasoning_effort(),
+                    Some("medium"),
+                    "辅助覆盖不改变主模型"
+                );
+                let mut auxiliary = profile();
+                for adapter in ["openai", "codex"] {
+                    if adapter == "codex" && protocol == "chat" {
+                        continue;
+                    }
+                    auxiliary.provider = adapter.into();
+                    assert_eq!(
+                        provider_config_for(
+                            &settings,
+                            Some(&auxiliary),
+                            eve_llm_api::CredentialPurpose::Auxiliary,
+                        )
+                        .unwrap()
+                        .reasoning_effort(),
+                        expected,
+                        "{protocol}/{adapter}/{value}"
+                    );
+                }
             }
         }
     }
@@ -812,6 +874,7 @@ mod tests {
         // 宿主按这些名称解析模型；缺字段会让该用途每次解析都失败。
         for name in [
             "dialogue",
+            "coding",
             "plan",
             "preference",
             "progress",

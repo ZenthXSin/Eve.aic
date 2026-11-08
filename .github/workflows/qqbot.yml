@@ -105,6 +105,7 @@ jobs:
         if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
           set -euo pipefail
+          set -x
           mkdir -p "${RUNNER_TEMP}/eve-adapter-process-evidence"
           python3 connectors/qqbot/test/model_adapter_test.py 2>&1 | tee "${RUNNER_TEMP}/eve-adapter-process-evidence/qq.log"
       - name: 实际 QQ 热更新交接与回执去重验收

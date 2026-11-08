@@ -612,7 +612,10 @@ impl WebAutonomy {
             permissions,
             &self.worker_tools,
             self.worker_config.clone(),
-            resolver(crate::qq_tasks::MODEL_USE),
+            crate::qq_tasks::WorkerModels {
+                task: resolver(crate::qq_tasks::MODEL_USE),
+                coding: resolver("coding"),
+            },
             self.digests.clone(),
         )
         .await?;

@@ -405,7 +405,10 @@ async fn failure_handoff_survives_archive_and_task_restart_then_executes_followu
             fixture.permissions.clone(),
             &["inspect_source".into()],
             LlmHostConfig::default(),
-            Arc::new(Resolver(background.clone())),
+            WorkerModels {
+                task: Arc::new(Resolver(background.clone())),
+                coding: Arc::new(Resolver(ScriptedProvider::new(vec![]))),
+            },
             Arc::new(NoDigest),
         )
         .await
