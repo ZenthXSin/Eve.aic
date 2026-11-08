@@ -1,9 +1,11 @@
 """实际 eve-qqbot 进程的内生反思验收；只使用本地 HTTP 和替身 QQ 桥接。"""
 from fixture_auth import configure_fixture_progress
+from contextlib import closing
 import json
 import os
 import pathlib
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -58,8 +60,12 @@ class CognitionAcceptance(unittest.TestCase):
             def respond(self):
                 assert self.path == "/v1/chat/completions"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                latest = body["messages"][-1]["content"]
-                kind = "reflection" if "unverified_waiting_input" in latest else "chat"
+                messages = body["messages"]
+                latest = messages[-1]["content"]
+                learning = (messages[0]["role"] == "system" and messages[0]["content"].startswith(
+                    "你整理 Eve 从真实交流中学到的交往经验。"))
+                kind = ("conversation_learning" if learning else
+                        "reflection" if "unverified_waiting_input" in latest else "chat")
                 release = outer.run_release
                 with outer.lock:
                     outer.requests.append({"kind": kind, "body": body, "run": outer.runs,
@@ -73,7 +79,11 @@ class CognitionAcceptance(unittest.TestCase):
                         if release.wait(0.01):
                             return
                         assert time.monotonic() < deadline, "response gate timed out"
-                text = outer.reflection_text if kind == "reflection" else latest
+                if learning:
+                    outer.assert_learning_request(body)
+                    text = '{"lessons":[]}'
+                else:
+                    text = outer.reflection_text if kind == "reflection" else latest
                 encoded = json.dumps({"choices": [{"index": 0, "finish_reason": "stop",
                     "message": {"role": "assistant", "content": text}}]}).encode()
                 self.send_response(200)
@@ -100,6 +110,32 @@ class CognitionAcceptance(unittest.TestCase):
         document = json.loads(self.state_path.read_text())
         return {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
                 for owner, entries in document["entries"].items()}
+
+    def assert_learning_request(self, body):
+        messages = body["messages"]
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
+        self.assertFalse(body.get("tools"))
+        self.assertEqual(body.get("response_format"), {"type": "json_object"})
+        batch = json.loads(messages[-1]["content"])
+        self.assertTrue({"id", "scope", "messages", "lessons", "attempt", "feedback_pairs"} <= set(batch))
+        self.assertEqual(set(batch["scope"]), {"session_id", "user_id"})
+        self.assertTrue(batch["id"])
+        self.assertIn(batch["attempt"], (1, 2, 3))
+        self.assertTrue(batch["messages"])
+        self.assertEqual(len({message["id"] for message in batch["messages"]}), len(batch["messages"]))
+        path = self.work / "state/training-expressions.sqlite3"
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            for message in batch["messages"]:
+                self.assertIn(message["role"], ("human", "eve"))
+                self.assertTrue(message["speaker"])
+                self.assertIsInstance(message["text"], str)
+                row = db.execute("SELECT sequence,message_json FROM conversation_events "
+                    "WHERE session_id=? AND user_id=? AND message_id=?", (
+                        batch["scope"]["session_id"], batch["scope"]["user_id"], message["id"])).fetchone()
+                self.assertIsNotNone(row, "交流学习必须来自同范围已持久的真实消息")
+                self.assertEqual(message["metadata"]["sequence"], row[0])
+                # 本夹具只有短消息，模型批次应保留完整正文与首次记录的元数据。
+                self.assertEqual(message, json.loads(row[1]), "交流学习不得伪造或改写消息来源")
 
     def goals(self):
         return self.documents()["eve.cognition"]["cognition.v1"]["state"]["goals"]

@@ -349,17 +349,16 @@ impl QqOutreach for Group {
         } else {
             self.store.finish(id, sent).map_err(failed)?;
         }
-        if let Some(outbound) = outbound {
-            if let Some(engine) = self.engine.get()
-                && let Some(message) = self
-                    .store
-                    .message(&outbound.reply.conversation, &format!("{id}:reply"))
-                    .map_err(failed)?
-            {
-                engine.record_outgoing(message);
-            }
-            // 逐条送达学习已由通道 push 回执接点持久采集。
+        if let Some(outbound) = outbound
+            && let Some(engine) = self.engine.get()
+            && let Some(message) = self
+                .store
+                .message(&outbound.reply.conversation, &format!("{id}:reply"))
+                .map_err(failed)?
+        {
+            engine.record_outgoing(message);
         }
+        // 逐条送达学习已由通道 push 回执接点持久采集。
         Ok(())
     }
 }

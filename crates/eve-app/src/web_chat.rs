@@ -360,16 +360,16 @@ impl WebChat {
         };
         // 独立训练存储按消息 ID 幂等；不为学习进度另写业务回执。
         // 原回执持续保留全部输入与已提交输出，恢复只重投观察，不运行模型或工具。
-        if input && let Some(message) = &receipt.learning_input {
-            if training
+        if input
+            && let Some(message) = &receipt.learning_input
+            && training
                 .observe_conversation(&scope, message.clone())
                 .is_err()
-            {
-                self.learning_stopped
-                    .store(true, std::sync::atomic::Ordering::Release);
-                eprintln!("EVE_WEB_CONVERSATION observation_stopped");
-                return Ok(());
-            }
+        {
+            self.learning_stopped
+                .store(true, std::sync::atomic::Ordering::Release);
+            eprintln!("EVE_WEB_CONVERSATION observation_stopped");
+            return Ok(());
         }
         if output
             && !receipt.local_control
