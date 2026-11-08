@@ -129,19 +129,7 @@ impl QqGroupObserver for Group {
         };
         observed.at_ms = observed.at_ms.max(original.at_ms.saturating_add(1));
         let appended = self.store.append(&observed).map_err(failed)?;
-        if appended {
-            crate::conversation_learning::observe(
-                self.training.as_ref(),
-                &ContextScope {
-                    session_id: observed.conversation.clone(),
-                    user_id: USER.into(),
-                },
-                &observed.id,
-                "eve",
-                eve_training_api::ConversationRole::Eve,
-                &observed.text,
-            )?;
-        }
+        // 交流学习由通道每条真实 Sent 独立采集；这里的整轮聚合只供群记忆使用。
         self.store
             .link_reply(&observed.conversation, &source, &observed.id)
             .map_err(failed)?;
@@ -219,17 +207,7 @@ impl QqGroupObserver for Group {
                     &id,
                     &message.text,
                 )?;
-                crate::conversation_learning::observe(
-                    self.training.as_ref(),
-                    &ContextScope {
-                        session_id: conversation.clone(),
-                        user_id: USER.into(),
-                    },
-                    &id,
-                    &message.user_id,
-                    eve_training_api::ConversationRole::Human,
-                    &message.text,
-                )?;
+                // 完整原文已由独立通道观察器逐条采集；本处只维护旧表达统计。
             }
             Ok(())
         })();
@@ -380,17 +358,7 @@ impl QqOutreach for Group {
             {
                 engine.record_outgoing(message);
             }
-            crate::conversation_learning::observe(
-                self.training.as_ref(),
-                &ContextScope {
-                    session_id: outbound.reply.conversation,
-                    user_id: USER.into(),
-                },
-                &format!("{id}:reply"),
-                "eve",
-                eve_training_api::ConversationRole::Eve,
-                &outbound.reply.text,
-            )?;
+            // 逐条送达学习已由通道 push 回执接点持久采集。
         }
         Ok(())
     }

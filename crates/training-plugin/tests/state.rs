@@ -327,7 +327,7 @@ async fn expression_features_exclude_commands_quoted_material_and_freeze_scoped_
         .assemble_scoped(input(), Some(one.clone()))
         .await
         .unwrap();
-    assert!(frozen.revision.starts_with("eve-training-5:"));
+    assert!(frozen.revision.starts_with("eve-training-6:"));
     assert!(frozen.profile.contains("当前可信会话"));
     assert!(!frozen.profile.contains("我想出去"));
     let fallback = context

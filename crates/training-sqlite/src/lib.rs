@@ -1,4 +1,4 @@
-//! 不含原文的表达统计数据库；旧 JSON 只幂等导入，不删除、不改写。
+//! 表达统计与完整交流事件数据库；旧 JSON 只幂等导入，不删除、不改写。
 use eve_llm_api::ContextScope;
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_training_api::{ExpressionRecord, ExpressionSnapshot, ExpressionStore};
@@ -17,6 +17,7 @@ use std::{
     },
     time::Duration,
 };
+mod conversation;
 
 fn failed() -> PluginError {
     PluginError::State("表达统计数据库不可用；原记录保留，未清空或回退到空状态".into())
@@ -119,6 +120,7 @@ impl SqliteExpressions {
         db.prepare("SELECT session_id,user_id,id,body,chars,paragraphs,question,formal,casual,active FROM expressions LIMIT 0").map_err(|_| failed())?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")
             .map_err(|_| failed())?;
+        conversation::initialize(&db)?;
         Ok(Self {
             connection: Mutex::new(db),
             healthy: AtomicBool::new(true),
@@ -132,6 +134,9 @@ impl SqliteExpressions {
             return Err(failed());
         }
         let mut connection = self.connection.lock().map_err(|_| failed())?;
+        if !self.healthy.load(Ordering::Acquire) {
+            return Err(failed());
+        }
         let result = operation(&mut connection);
         if result
             .as_ref()

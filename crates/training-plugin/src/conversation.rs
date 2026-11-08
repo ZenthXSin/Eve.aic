@@ -5,6 +5,8 @@ use eve_plugin_api::PluginResult;
 use eve_training_api::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+mod persistent;
+pub(crate) use persistent::PersistentConversations;
 
 pub(crate) const KEY: &str = "conversation.v1";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -29,6 +31,8 @@ struct Scope {
     ready_at: u64,
     inflight: Option<ConversationBatch>,
     lessons: Vec<ConversationLesson>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    history: Vec<ConversationLessonRevision>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +62,7 @@ fn digest_valid(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn message_valid(m: &ConversationMessage) -> bool {
-    identifier(&m.id) && identifier(&m.speaker) && text(&m.text, MAX_CONVERSATION_BODY_BYTES)
+    conversation_message_valid(m)
 }
 fn lesson_valid(l: &ConversationLesson) -> bool {
     identifier(&l.id)
@@ -127,6 +131,7 @@ impl Conversations {
                     || s.seen.iter().map(|r| &r.id).collect::<BTreeSet<_>>().len() != s.seen.len()
                     || s.lessons.len() > MAX_CONVERSATION_LESSONS
                     || !s.lessons.iter().all(lesson_valid)
+                    || s.history.iter().any(|r| !lesson_valid(&r.lesson))
                     || s.lessons
                         .iter()
                         .map(|l| &l.id)
@@ -158,7 +163,9 @@ impl Conversations {
         if !valid(scope) || !message_valid(&message) {
             return Err(error("交流样本身份或正文无效"));
         }
-        let body = hash(&serde_json::to_vec(&message).map_err(|_| error("交流样本编码失败"))?);
+        let mut core = message.clone();
+        core.metadata = None;
+        let body = hash(&serde_json::to_vec(&core).map_err(|_| error("交流样本编码失败"))?);
         let id = hash(message.id.as_bytes());
         let index = match self.scopes.iter().position(|s| s.scope == *scope) {
             Some(index) => index,
@@ -175,6 +182,7 @@ impl Conversations {
                     ready_at: 0,
                     inflight: None,
                     lessons: vec![],
+                    history: vec![],
                 });
                 self.scopes.len() - 1
             }
@@ -238,6 +246,7 @@ impl Conversations {
             scope: s.scope.clone(),
             messages: s.messages.clone(),
             lessons: s.lessons.clone(),
+            lesson_history: vec![],
             attempt: 1,
         };
         s.pending = 0;
@@ -327,9 +336,10 @@ impl Conversations {
                 .filter(|i| batch.messages[*i].role == ConversationRole::Human)
                 .collect();
             let feedback = humans.iter().any(|i| {
-                indices
+                batch.messages[..*i]
                     .iter()
-                    .any(|j| j < i && batch.messages[*j].role == ConversationRole::Eve)
+                    .rposition(|m| m.role == ConversationRole::Eve)
+                    .is_some_and(|j| indices.contains(&j))
             });
             if humans.is_empty()
                 || (draft.assessment == ConversationAssessment::Observation && humans.len() < 2)
@@ -371,7 +381,13 @@ impl Conversations {
                         .min_by_key(|(_, l)| (l.active, l.updated_at_ms))
                         .map(|(i, _)| i)
                         .expect("full");
-                    s.lessons.remove(index);
+                    s.history.push(ConversationLessonRevision {
+                        sequence: s.history.len() as u64 + 1,
+                        lesson: s.lessons.remove(index),
+                        reason: "capacity".into(),
+                        batch_id: Some(batch.id.clone()),
+                        recorded_at_ms: Some(now),
+                    });
                 }
                 let id = format!("lesson-{}", self.next);
                 self.next = self
@@ -402,6 +418,15 @@ impl Conversations {
             }) {
                 continue;
             }
+            if !lesson.evidence.is_empty() {
+                s.history.push(ConversationLessonRevision {
+                    sequence: s.history.len() as u64 + 1,
+                    lesson: lesson.clone(),
+                    reason: "before_update".into(),
+                    batch_id: Some(batch.id.clone()),
+                    recorded_at_ms: Some(now),
+                });
+            }
             match draft.assessment {
                 ConversationAssessment::Observation => {
                     lesson.observations = lesson.observations.saturating_add(1)
@@ -414,7 +439,7 @@ impl Conversations {
                     lesson.counterexamples = lesson.counterexamples.saturating_add(1)
                 }
             }
-            if draft.assessment == ConversationAssessment::Correction {
+            if draft.assessment != ConversationAssessment::Counterexample {
                 lesson.situation = draft.situation.clone();
                 lesson.response = draft.response.clone();
                 lesson.avoid = draft.avoid.clone();
@@ -438,6 +463,13 @@ impl Conversations {
                     .evaluated_message_ids
                     .drain(..lesson.evaluated_message_ids.len() - 64);
             }
+            s.history.push(ConversationLessonRevision {
+                sequence: s.history.len() as u64 + 1,
+                lesson: lesson.clone(),
+                reason: "updated".into(),
+                batch_id: Some(batch.id.clone()),
+                recorded_at_ms: Some(now),
+            });
             changed += 1;
         }
         s.inflight = None;
@@ -456,7 +488,15 @@ impl Conversations {
             return Ok(false);
         };
         s.messages.clear();
-        s.lessons.clear();
+        for lesson in s.lessons.drain(..) {
+            s.history.push(ConversationLessonRevision {
+                sequence: s.history.len() as u64 + 1,
+                lesson,
+                reason: "reset".into(),
+                batch_id: None,
+                recorded_at_ms: None,
+            });
+        }
         s.inflight = None;
         s.pending = 0;
         s.generation = s

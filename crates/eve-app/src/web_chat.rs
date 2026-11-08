@@ -83,6 +83,12 @@ struct Receipt {
     local_control: bool,
     #[serde(default)]
     memory_recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    learning_input: Option<eve_training_api::ConversationMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    learning_input_binding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    learning_output_at_ms: Option<u64>,
     state: ChatState,
 }
 pub(crate) struct WebChat {
@@ -97,9 +103,76 @@ pub(crate) struct WebChat {
     subject_admission: Option<Arc<dyn eve_qqbot_plugin::QqAdmission>>,
     memory: Option<crate::web_memory::Observer>,
     training: Option<Arc<dyn eve_training_api::TrainingService>>,
+    learning_stopped: std::sync::atomic::AtomicBool,
 }
 fn unavailable<T>(_: T) -> PanelError {
     PanelError::Unavailable
+}
+fn observed_at_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|time| time.as_millis().try_into().ok())
+}
+fn fingerprint(text: &str) -> String {
+    digest(&SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+fn learning_binding(
+    conversation_id: &str,
+    request_id: &str,
+    original_fingerprint: &str,
+    message: &eve_training_api::ConversationMessage,
+) -> String {
+    // 和已保存的请求 claim 交叉绑定；/bind 原文不为校验目的重新保存。
+    fingerprint(
+        &serde_json::to_string(&(conversation_id, request_id, original_fingerprint, message))
+            .expect("交流消息可序列化"),
+    )
+}
+impl Receipt {
+    fn learning_valid(&self) -> bool {
+        match (&self.learning_input, &self.learning_input_binding) {
+            (None, None) => true,
+            (Some(message), Some(binding)) => {
+                let Some(metadata) = &message.metadata else {
+                    return false;
+                };
+                let original = match metadata.source_kind.as_deref() {
+                    Some("web_input") => fingerprint(&message.text) == self.fingerprint,
+                    Some("web_redacted_input") => message.text == "/bind [已隐藏]",
+                    _ => false,
+                };
+                message.id == self.state.request_id
+                    && message.speaker == fingerprint(USER)
+                    && message.role == eve_training_api::ConversationRole::Human
+                    && eve_training_api::conversation_message_valid(message)
+                    && metadata.sequence.is_none()
+                    && metadata.fragment.is_none()
+                    && metadata.context.is_none()
+                    && metadata.source_at_ms.is_none()
+                    && metadata.reply_to.is_none()
+                    && metadata.turn_id.is_none()
+                    && metadata.activity.as_ref().is_some_and(|activity| {
+                        activity.phase == "received"
+                            && activity.elapsed_ms.is_none()
+                            && activity.tool_name.is_none()
+                    })
+                    && original
+                    && *binding
+                        == learning_binding(
+                            &self.state.conversation_id,
+                            &self.state.request_id,
+                            &self.fingerprint,
+                            message,
+                        )
+            }
+            _ => false,
+        }
+    }
 }
 fn read_bound(path: &Path, limit: u64) -> PanelResult<Vec<u8>> {
     let file = fs::File::open(path).map_err(unavailable)?;
@@ -190,6 +263,7 @@ impl WebChat {
             subject_admission: None,
             memory: None,
             training: None,
+            learning_stopped: std::sync::atomic::AtomicBool::new(false),
         })
     }
     pub(crate) fn with_business(mut self, business: Arc<crate::qq_business::BusinessTool>) -> Self {
@@ -230,6 +304,11 @@ impl WebChat {
         self
     }
     fn observe_memory(&self, receipt: &mut Receipt) -> PanelResult<()> {
+        // 已持久可见回复的学习不依赖完整轮次记忆导入是否成功。
+        self.observe_learning(receipt)?;
+        self.record_memory(receipt)
+    }
+    fn record_memory(&self, receipt: &mut Receipt) -> PanelResult<()> {
         if receipt.local_control || receipt.memory_recorded || receipt.state.status != "completed" {
             return Ok(());
         }
@@ -238,21 +317,6 @@ impl WebChat {
         };
         let error = match memory.record(&receipt.state, &receipt.fingerprint) {
             Ok(()) => {
-                if let (Some(training), Some(text)) = (&self.training, &receipt.state.text) {
-                    let session = key(&receipt.state.conversation_id)?;
-                    crate::conversation_learning::observe(
-                        training.as_ref(),
-                        &ContextScope {
-                            session_id: session.session_id,
-                            user_id: session.user_id,
-                        },
-                        &format!("eve:{}", receipt.state.request_id),
-                        "eve",
-                        eve_training_api::ConversationRole::Eve,
-                        text,
-                    )
-                    .map_err(unavailable)?;
-                }
                 receipt.memory_recorded = true;
                 None
             }
@@ -270,13 +334,128 @@ impl WebChat {
         }
         Ok(())
     }
-    /// 只恢复已落盘的完成回执，不重发输入、模型或工具。
-    /// 单次流式扫描避免把无限期保留的幂等回执全部装入内存。
+
+    fn observe_learning(&self, receipt: &Receipt) -> PanelResult<()> {
+        self.observe_learning_records(receipt, true, true)
+    }
+    fn observe_learning_records(
+        &self,
+        receipt: &Receipt,
+        input: bool,
+        output: bool,
+    ) -> PanelResult<()> {
+        let Some(training) = &self.training else {
+            return Ok(());
+        };
+        if self
+            .learning_stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let session = key(&receipt.state.conversation_id)?;
+        let scope = ContextScope {
+            session_id: session.session_id,
+            user_id: session.user_id,
+        };
+        // 独立训练存储按消息 ID 幂等；不为学习进度另写业务回执。
+        // 原回执持续保留全部输入与已提交输出，恢复只重投观察，不运行模型或工具。
+        if input && let Some(message) = &receipt.learning_input {
+            if training
+                .observe_conversation(&scope, message.clone())
+                .is_err()
+            {
+                self.learning_stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                eprintln!("EVE_WEB_CONVERSATION observation_stopped");
+                return Ok(());
+            }
+        }
+        if output
+            && !receipt.local_control
+            && receipt.state.status == "completed"
+            && let Some(text) = &receipt.state.text
+        {
+            let metadata = eve_training_api::ConversationMetadata {
+                observed_at_ms: receipt.learning_output_at_ms,
+                reply_to: Some(receipt.state.request_id.clone()),
+                turn_id: receipt.state.turn_id,
+                source_kind: Some("web_visible_response".into()),
+                activity: Some(eve_training_api::ConversationActivity {
+                    phase: "completed".into(),
+                    elapsed_ms: None,
+                    tool_name: None,
+                }),
+                ..Default::default()
+            };
+            if crate::conversation_learning::observe_with_metadata(
+                training.as_ref(),
+                &scope,
+                &format!("eve:{}", receipt.state.request_id),
+                "eve",
+                eve_training_api::ConversationRole::Eve,
+                text,
+                Some(metadata),
+            )
+            .is_err()
+            {
+                self.learning_stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                eprintln!("EVE_WEB_CONVERSATION observation_stopped");
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn learning_input(
+        &self,
+        request: &ChatSubmit,
+    ) -> Option<eve_training_api::ConversationMessage> {
+        self.training.as_ref()?;
+        let private = request.text.split_whitespace().next() == Some("/bind");
+        let text = if private {
+            "/bind [已隐藏]"
+        } else {
+            &request.text
+        };
+        let message = eve_training_api::ConversationMessage {
+            id: request.request_id.clone(),
+            speaker: fingerprint(USER),
+            role: eve_training_api::ConversationRole::Human,
+            text: text.into(),
+            metadata: Some(eve_training_api::ConversationMetadata {
+                observed_at_ms: observed_at_ms(),
+                source_kind: Some(
+                    if private {
+                        "web_redacted_input"
+                    } else {
+                        "web_input"
+                    }
+                    .into(),
+                ),
+                activity: Some(eve_training_api::ConversationActivity {
+                    phase: "received".into(),
+                    elapsed_ms: None,
+                    tool_name: None,
+                }),
+                ..Default::default()
+            }),
+        };
+        if !eve_training_api::conversation_message_valid(&message) {
+            eprintln!("EVE_WEB_CONVERSATION invalid_input_not_observed");
+            return None;
+        }
+        Some(message)
+    }
+    /// 恢复已落盘的输入和完成回执，不重发输入、模型或工具。
+    /// 只排序小型时间索引；正文逐条读取，不用恢复时刻补猜原先时序。
     pub(crate) fn recover_memory(&self) -> PanelResult<()> {
-        if self.memory.is_none() {
+        if self.memory.is_none() && self.training.is_none() {
             return Ok(());
         }
         let _active = self.admission.lock().map_err(unavailable)?;
+        let mut records = Vec::new();
         for entry in fs::read_dir(&self.claims).map_err(unavailable)? {
             let name = entry.map_err(unavailable)?.file_name();
             let Some((conversation_id, request_id)) = name
@@ -286,13 +465,69 @@ impl WebChat {
             else {
                 return Err(PanelError::Unavailable);
             };
-            let mut receipt = self
+            let receipt = self
                 .load(&ChatLookup {
                     conversation_id: conversation_id.into(),
                     request_id: request_id.into(),
                 })?
                 .ok_or(PanelError::Unavailable)?;
-            self.observe_memory(&mut receipt)?;
+            if self.training.is_some() {
+                if let Some(message) = &receipt.learning_input {
+                    records.push((
+                        conversation_id.to_owned(),
+                        request_id.to_owned(),
+                        message.metadata.as_ref().and_then(|m| m.observed_at_ms),
+                        false,
+                    ));
+                }
+                if !receipt.local_control
+                    && receipt.state.status == "completed"
+                    && receipt.state.text.is_some()
+                {
+                    records.push((
+                        conversation_id.to_owned(),
+                        request_id.to_owned(),
+                        receipt.learning_output_at_ms,
+                        true,
+                    ));
+                }
+            }
+        }
+        records.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.2.is_none().cmp(&right.2.is_none()))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        for (conversation_id, request_id, _, output) in records {
+            let receipt = self
+                .load(&ChatLookup {
+                    conversation_id,
+                    request_id,
+                })?
+                .ok_or(PanelError::Unavailable)?;
+            self.observe_learning_records(&receipt, !output, output)?;
+        }
+        if self.memory.is_some() {
+            for entry in fs::read_dir(&self.claims).map_err(unavailable)? {
+                let name = entry.map_err(unavailable)?.file_name();
+                let Some((conversation_id, request_id)) = name
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .and_then(|name| name.split_once('-'))
+                else {
+                    return Err(PanelError::Unavailable);
+                };
+                let mut receipt = self
+                    .load(&ChatLookup {
+                        conversation_id: conversation_id.into(),
+                        request_id: request_id.into(),
+                    })?
+                    .ok_or(PanelError::Unavailable)?;
+                self.record_memory(&mut receipt)?;
+            }
         }
         Ok(())
     }
@@ -367,6 +602,7 @@ impl WebChat {
             || receipt.state.request_id != id.request_id
             || receipt.fingerprint.len() != 64
             || !receipt.fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+            || !receipt.learning_valid()
             || receipt.state.generation.as_ref().is_some_and(|g| {
                 g.generation == 0
                     || g.session != key(&id.conversation_id).expect("已验证编号")
@@ -470,6 +706,7 @@ impl WebChat {
             if report.run.commit == CommitState::Completed && report.run.failure.is_none() {
                 receipt.state.status = "completed".into();
                 receipt.state.text = report.run.text;
+                receipt.learning_output_at_ms = observed_at_ms();
             } else {
                 receipt.state.status = if matches!(
                     report.run.commit,
@@ -511,11 +748,7 @@ impl WebChat {
             return Err(PanelError::Unavailable);
         }
         let lookup = request.lookup();
-        let fingerprint: String = digest(&SHA256, request.text.as_bytes())
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let fingerprint = fingerprint(&request.text);
         let session = key(&request.conversation_id)?;
         if let Some(receipt) = self.load(&lookup)? {
             if receipt.fingerprint != fingerprint {
@@ -526,12 +759,24 @@ impl WebChat {
                 self.control.snapshot(&session).map_err(control_error)?,
             );
         }
+        let learning_input = self.learning_input(&request);
+        let learning_input_binding = learning_input.as_ref().map(|message| {
+            learning_binding(
+                &request.conversation_id,
+                &request.request_id,
+                &fingerprint,
+                message,
+            )
+        });
         // 可信 HTTP 原文的明确缩权先落意图再执行，不能被同会话在途模型审核挡住。
         // 这条路径不授权新业务；重复请求只返回原回执，崩溃窗口保留 unknown。
         if let Some(business) = &self.business
             && crate::qq_business::BusinessTool::is_restriction_input(&request.text)
         {
             let mut receipt = Receipt {
+                learning_input,
+                learning_input_binding,
+                learning_output_at_ms: None,
                 version: 1,
                 fingerprint,
                 local_control: true,
@@ -555,6 +800,7 @@ impl WebChat {
             };
             let originals = (|| {
                 self.save(&receipt, true)?;
+                self.observe_learning(&receipt)?;
                 let ingress = self.ingress.as_ref().ok_or(PanelError::Unavailable)?;
                 ingress
                     .record(&session, &receipt.state.request_id, &request.text)
@@ -648,6 +894,9 @@ impl WebChat {
             }
         }
         let mut receipt = Receipt {
+            learning_input,
+            learning_input_binding,
+            learning_output_at_ms: None,
             version: 1,
             fingerprint,
             local_control: false,
@@ -678,6 +927,7 @@ impl WebChat {
                         let saved = self.save(&receipt, true);
                         admission.abandon(&session, &source).map_err(unavailable)?;
                         saved?;
+                        self.observe_learning(&receipt)?;
                         return Ok(receipt.state);
                     }
                 }
@@ -692,6 +942,7 @@ impl WebChat {
             }
             return Err(error);
         }
+        self.observe_learning(&receipt)?;
         if let Some(ingress) = &self.ingress
             && let Err(error) = ingress.record(&session, &receipt.state.request_id, &request.text)
         {
@@ -720,18 +971,12 @@ impl WebChat {
                 session_id: session.session_id.clone(),
                 user_id: session.user_id.clone(),
             };
-            training
+            if training
                 .observe_user_message(&scope, &receipt.state.request_id, &request.text)
-                .map_err(unavailable)?;
-            crate::conversation_learning::observe(
-                training.as_ref(),
-                &scope,
-                &receipt.state.request_id,
-                &session.user_id,
-                eve_training_api::ConversationRole::Human,
-                &request.text,
-            )
-            .map_err(unavailable)?;
+                .is_err()
+            {
+                eprintln!("EVE_WEB_EXPRESSION observation_failed");
+            }
         }
         let submitted = self.control.submit_with_metadata(
             ControlInput {

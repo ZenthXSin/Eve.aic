@@ -99,6 +99,30 @@ impl ForegroundActivity {
             .filter(|batch| batch.key == *key && batch.turn_id == turn_id)
             .cloned()
     }
+
+    /// 运行时已交付工具批次、仍等待回执；耗时自交付计，不冒充实际执行或成功。
+    pub(super) fn learning_activity(
+        &self,
+        snapshot: &eve_control_api::ControlSnapshot,
+    ) -> Option<eve_training_api::ConversationActivity> {
+        let batch = self.current(&snapshot.key, snapshot.turn_id?)?;
+        let mut names = batch.remaining.values().filter(|name| {
+            !matches!(
+                name.as_str(),
+                "send_message" | "send_sticker" | "wait_for_input" | "task_progress"
+            )
+        });
+        let first = names.next()?.clone();
+        Some(eve_training_api::ConversationActivity {
+            phase: "awaiting_tool_results".into(),
+            elapsed_ms: batch.since.elapsed().as_millis().try_into().ok(),
+            tool_name: if names.next().is_none() {
+                Some(first)
+            } else {
+                None
+            },
+        })
+    }
 }
 
 pub(super) struct ForegroundInput {

@@ -1164,12 +1164,14 @@ async fn run_qqbot_composed(
             plugin
         };
 
+        let expression_store = Arc::new(eve_training_sqlite::SqliteExpressions::open(
+            &options.state_directory.join("training-expressions.sqlite3"),
+        )?);
         kernel.register(Box::new(
-            TrainingPlugin::new(options.training)?.with_phrase_learning().with_expression_store(
-                Arc::new(eve_training_sqlite::SqliteExpressions::open(
-                    &options.state_directory.join("training-expressions.sqlite3"),
-                )?),
-            ),
+            TrainingPlugin::new(options.training)?
+                .with_phrase_learning()
+                .with_expression_store(expression_store.clone())
+                .with_conversation_store(expression_store),
         ))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
         // 分段设置先于模型与通道加载；损坏或版本不兼容时在这里拒绝启动并保留原字节。
@@ -3259,6 +3261,11 @@ async fn run_qqbot_composed(
             plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;
         }
         let panel_memory = memory.clone();
+        plugin = plugin.with_conversation_observer(Arc::new(
+            qq_memory_observer::ConversationObserver {
+                training: training.0.clone(),
+            },
+        ));
         if let Some(memory) = memory {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
@@ -3269,7 +3276,6 @@ async fn run_qqbot_composed(
             plugin = plugin.with_interaction_observer(Arc::new(qq_memory_observer::Observer {
                 memory,
                 sessions: sessions.0.clone(),
-                training: Some(training.0.clone()),
             }))?;
         }
         let settings = registry

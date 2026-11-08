@@ -47,6 +47,7 @@ fn event(id: &str, role: ConversationRole, body: &str) -> ConversationMessage {
         .into(),
         role,
         text: body.into(),
+        metadata: None,
     }
 }
 fn seed(t: &dyn TrainingService, s: &ContextScope, prefix: &str) {

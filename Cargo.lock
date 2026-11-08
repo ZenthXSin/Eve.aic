@@ -2915,6 +2915,7 @@ dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

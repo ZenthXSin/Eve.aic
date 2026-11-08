@@ -116,6 +116,16 @@ pub struct Message {
     pub quoted: Option<QuotedMessage>,
 }
 impl Message {
+    /// 学习元数据中的通道上下文；不拼接进用户原文，不声称附件内容已读取。
+    pub(crate) fn learning_context(&self) -> Option<String> {
+        if self.quoted.is_none() && self.attachments.is_empty() {
+            return None;
+        }
+        let mut copy = self.clone();
+        copy.text.clear();
+        Some(copy.turn_text())
+    }
+
     pub fn turn_text(&self) -> String {
         let mut text = self.text.clone();
         if let Some(quoted) = &self.quoted {
@@ -361,6 +371,9 @@ pub(crate) struct Progress {
     /// 群聊显式发言实际使用的后到消息窗口；缺省仍使用原轮消息。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_anchor: Option<String>,
+    /// 显式文字发送时的真实活动与确认送达观察时间；旧回执缺失时间保持未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<eve_training_api::ConversationMetadata>,
 }
 pub(crate) fn passive_progress(entry: &Receipt) -> usize {
     passive_progress_at(entry, &entry.message.id)
@@ -887,6 +900,39 @@ fn validate_receipt_shape(entry: &Receipt) -> PluginResult<()> {
                         || progress.proactive
                         || progress.decision_id.is_none()
                 })
+                || progress.conversation.as_ref().is_some_and(|metadata| {
+                    progress.decision_id.is_none()
+                        || progress.image_path.is_some()
+                        || metadata.sequence.is_some()
+                        || metadata.fragment.is_some()
+                        || metadata.source_at_ms.is_some()
+                        || metadata.context.is_some()
+                        || metadata.source_kind.as_deref() != Some("qq_sent")
+                        || metadata.turn_id.is_some_and(|id| id == 0)
+                        || metadata
+                            .observed_at_ms
+                            .is_some_and(|at| at == 0 || progress.state != PartState::Sent)
+                        || metadata.reply_to.as_deref()
+                            != Some(
+                                crate::conversation_observer::message_id(
+                                    eve_training_api::ConversationRole::Human,
+                                    progress
+                                        .reply_anchor
+                                        .as_deref()
+                                        .unwrap_or(&entry.message.id),
+                                )
+                                .as_str(),
+                            )
+                        || !eve_training_api::conversation_message_valid(
+                            &eve_training_api::ConversationMessage {
+                                id: "qq-progress-validation".into(),
+                                speaker: "eve".into(),
+                                role: eve_training_api::ConversationRole::Eve,
+                                text: progress.text.clone(),
+                                metadata: Some(metadata.clone()),
+                            },
+                        )
+                })
                 || !matches!(
                     progress.state,
                     PartState::Sending | PartState::Sent | PartState::Failed | PartState::Unknown
@@ -1034,6 +1080,7 @@ mod tests {
                 platform_message_id: Some("platform-text".into()),
                 image_path: None,
                 reply_anchor: None,
+                conversation: None,
             },
             Progress {
                 text: "开心的猫，图片描述不是文字发言".into(),
@@ -1044,6 +1091,7 @@ mod tests {
                 platform_message_id: Some("platform-image".into()),
                 image_path: Some("/stickers/cat.png".into()),
                 reply_anchor: None,
+                conversation: None,
             },
             Progress {
                 text: "投递未知的话".into(),
@@ -1054,6 +1102,7 @@ mod tests {
                 platform_message_id: None,
                 image_path: None,
                 reply_anchor: None,
+                conversation: None,
             },
             Progress {
                 text: "明确失败的话".into(),
@@ -1064,6 +1113,7 @@ mod tests {
                 platform_message_id: None,
                 image_path: None,
                 reply_anchor: None,
+                conversation: None,
             },
         ];
         let ledger = round_trip(entry).unwrap();
@@ -1092,6 +1142,7 @@ mod tests {
             platform_message_id: Some("message".into()),
             image_path: None,
             reply_anchor: None,
+            conversation: None,
         });
         let mut ledger = round_trip(entry).unwrap();
         let valid: serde_json::Value = serde_json::from_slice(&ledger.encode().unwrap()).unwrap();
@@ -1137,6 +1188,7 @@ mod tests {
                 platform_message_id: (index < 63).then(|| format!("platform-{index}")),
                 image_path: None,
                 reply_anchor: None,
+                conversation: None,
             });
         }
         let bytes = serde_json::to_vec(&entry).unwrap();
@@ -1226,6 +1278,7 @@ mod tests {
                 platform_message_id: None,
                 image_path: None,
                 reply_anchor: None,
+                conversation: None,
                 necessary: false,
                 text: "资料检索已返回结果。".into(),
                 state,
@@ -1244,6 +1297,7 @@ mod tests {
                 platform_message_id: None,
                 image_path: None,
                 reply_anchor: None,
+                conversation: None,
                 necessary: false,
                 text: "回执".into(),
                 state: Sent,
@@ -1261,6 +1315,7 @@ mod tests {
             platform_message_id: None,
             image_path: None,
             reply_anchor: None,
+            conversation: None,
             text: "需要保留哪个目录？".into(),
             state: Sent,
             proactive: false,
@@ -1284,6 +1339,7 @@ mod tests {
                 platform_message_id: None,
                 image_path: None,
                 reply_anchor: None,
+                conversation: None,
                 necessary: false,
                 text: "真实阶段".into(),
                 state: if i == 5 { Sending } else { Sent },
@@ -1315,6 +1371,7 @@ mod tests {
             platform_message_id: (state == Sent).then(|| format!("platform-{index}")),
             image_path: None,
             reply_anchor: anchor.map(str::to_owned),
+            conversation: None,
         }
     }
 

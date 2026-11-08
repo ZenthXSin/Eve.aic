@@ -156,6 +156,7 @@ jobs:
           python3 connectors/qqbot/test/recall_test.py
           python3 connectors/qqbot/test/learning_test.py
           python3 connectors/qqbot/test/learning_decision_test.py
+          python3 -B connectors/qqbot/test/message_learning_flow_test.py --binary target/debug/eve-qqbot
           python3 connectors/qqbot/test/interest_test.py
           python3 connectors/qqbot/test/research_test.py
           python3 connectors/qqbot/test/practice_test.py

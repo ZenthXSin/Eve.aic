@@ -31,7 +31,7 @@ fn large_import_and_scoped_statistics_survive_reset_restart_and_conflicts() {
     let path = dir.path().join("expressions.sqlite3");
     let legacy: Vec<_> = (0..2709).map(|n| row(n, "one")).collect();
     let db = SqliteExpressions::open(&path).unwrap();
-    db.import_legacy(&legacy).unwrap();
+    ExpressionStore::import_legacy(&db, &legacy).unwrap();
     for n in 2709..5000 {
         assert!(db.insert(&row(n, "one")).unwrap());
     }
@@ -52,9 +52,9 @@ fn large_import_and_scoped_statistics_survive_reset_restart_and_conflicts() {
     assert_eq!(db.snapshot(None).unwrap().unwrap().samples, 1);
     drop(db);
     let restored = SqliteExpressions::open(&path).unwrap();
-    restored.import_legacy(&legacy).unwrap();
+    ExpressionStore::import_legacy(&restored, &legacy).unwrap();
     // Even a changed legacy digest must not reactivate reset rows.
-    restored.import_legacy(&legacy[..2708]).unwrap();
+    ExpressionStore::import_legacy(&restored, &legacy[..2708]).unwrap();
     assert!(
         !restored
             .get(&scope("one"), &row(0, "one").id)
