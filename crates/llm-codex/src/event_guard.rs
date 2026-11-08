@@ -148,5 +148,14 @@ fn decode_item(item: &Value, completed: bool) -> Result<ResponseItem, LlmError> 
 }
 
 fn signature(item: &ResponseItem) -> Result<String, LlmError> {
-    serde_json::to_string(item).map_err(|_| protocol("原 SSE 输出项无法核对"))
+    let mut comparable = item.clone();
+    if let ResponseItem::Reasoning {
+        encrypted_content, ..
+    } = &mut comparable
+    {
+        // 上游可以在 done 和 completed 中重新封装同一思考项的密文。
+        // 密文不参与执行；只排除这个字段，仍核对身份、摘要及所有其他项。
+        *encrypted_content = None;
+    }
+    serde_json::to_string(&comparable).map_err(|_| protocol("原 SSE 输出项无法核对"))
 }

@@ -1080,6 +1080,125 @@ async fn completed_output_cannot_hide_a_missing_or_changed_done_item() {
 }
 
 #[tokio::test]
+async fn rewrapped_reasoning_ciphertext_preserves_completed_text_and_function_batch() {
+    let reasoning = json!({
+        "type":"reasoning", "id":"reasoning-1", "summary":[],
+        "encrypted_content":"synthetic-done-envelope"
+    });
+    let mut rewrapped = reasoning.clone();
+    rewrapped["encrypted_content"] = json!("synthetic-completed-envelope");
+    let text = message("m", "已完成检查", "final_answer");
+    let call = function("f", "call-1", "{\"part\":1}");
+    let mut text_completion = completed();
+    text_completion["response"]["output"] = json!([rewrapped.clone(), text.clone()]);
+    let mut tool_completion = completed();
+    tool_completion["response"]["output"] = json!([rewrapped, call.clone()]);
+    let fixture = Fixture::start(vec![
+        Reply::sse(vec![
+            done(reasoning.clone()),
+            json!({"type":"response.output_text.delta","delta":"已完成检查"}),
+            done(text),
+            text_completion,
+        ]),
+        Reply::sse(vec![done(reasoning), done(call), tool_completion]),
+    ])
+    .await;
+    let provider = fixture.provider();
+    let sink = Sink::default();
+    assert_eq!(
+        provider.stream(request(session()), &sink).await.unwrap(),
+        ModelResponse::Final {
+            text: "已完成检查".into()
+        }
+    );
+    assert_eq!(*sink.0.lock().unwrap(), "已完成检查");
+    let tool_sink = Sink::default();
+    assert_eq!(
+        provider
+            .stream(request(session().for_request(2)), &tool_sink)
+            .await
+            .unwrap(),
+        ModelResponse::ToolCalls {
+            calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "echo".into(),
+                arguments: json!({"part":1}),
+            }]
+        }
+    );
+    assert!(tool_sink.0.lock().unwrap().is_empty());
+    assert_eq!(fixture.captures().len(), 2);
+}
+
+#[tokio::test]
+async fn rewrapped_reasoning_cannot_hide_changed_identity_summary_text_or_tool() {
+    let reasoning = json!({
+        "type":"reasoning", "id":"reasoning-1", "summary":[],
+        "encrypted_content":"synthetic-done-envelope"
+    });
+    let text = message("m", "已完成检查", "final_answer");
+    let call = function("f", "call-1", "{\"part\":1}");
+    let mut rewrapped = reasoning.clone();
+    rewrapped["encrypted_content"] = json!("synthetic-completed-envelope");
+    let output = json!([rewrapped, text.clone(), call.clone()]);
+    let mut changed_id = output.clone();
+    changed_id[0]["id"] = json!("reasoning-other");
+    let mut changed_summary = output.clone();
+    changed_summary[0]["summary"] = json!([{"type":"summary_text","text":"合成摘要"}]);
+    let mut changed_content = output.clone();
+    changed_content[0]["content"] = json!([{"type":"reasoning_text","text":"合成内容"}]);
+    let mut changed_text = output.clone();
+    changed_text[1]["content"][0]["text"] = json!("不同正文");
+    let mut changed_call = output.clone();
+    changed_call[2]["arguments"] = json!("{\"part\":2}");
+    let mut changed_encrypted_call = output.clone();
+    changed_encrypted_call[2]["encrypted_function_args"] = json!(["synthetic-tool-envelope"]);
+    let mut changed_type = output;
+    changed_type[0]["type"] = json!("unknown_output");
+    let cases = [
+        changed_id,
+        changed_summary,
+        changed_content,
+        changed_text,
+        changed_call,
+        changed_encrypted_call,
+        changed_type,
+    ];
+    let case_count = cases.len();
+    let replies = cases
+        .into_iter()
+        .map(|output| {
+            let mut completion = completed();
+            completion["response"]["output"] = output;
+            Reply::sse(vec![
+                done(reasoning.clone()),
+                json!({"type":"response.output_text.delta","delta":"已完成检查"}),
+                done(text.clone()),
+                done(call.clone()),
+                completion,
+            ])
+        })
+        .collect();
+    let fixture = Fixture::start(replies).await;
+    let usage = Arc::new(Usage::default());
+    let provider = fixture
+        .provider()
+        .with_usage_observer(usage.clone(), "main");
+    for ordinal in 1..=case_count {
+        let sink = Sink::default();
+        assert!(matches!(
+            provider
+                .stream(request(session().for_request(ordinal as u64)), &sink)
+                .await,
+            Err(LlmError::Protocol(_))
+        ));
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+    assert!(usage.0.lock().unwrap().is_empty());
+    assert_eq!(fixture.captures().len(), case_count);
+}
+
+#[tokio::test]
 async fn matching_completed_output_keeps_original_done_order_and_allows_annotations() {
     let first = function("first", "first", "{\"position\":1}");
     let second = function("second", "second", "{\"position\":2}");
