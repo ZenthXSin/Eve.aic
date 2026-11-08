@@ -10,7 +10,7 @@
 
 胶水层将 Eve 历史、图片、函数定义与回执转为原 Codex 类型。仅追加 Eve 的 `max_output_tokens`、JSON 对象输出格式，并在 reasoning 未配置时省略该字段；永远不发送 temperature。原源码无需为兼容服务改动。原 `stream_request` 会以 thread ID 覆盖 request ID，且原请求类型没有输出上限字段，所以 Eve 选用同一原客户端的公开 `stream(Value, headers, ...)` 入口。两入口共享原 `stream_encoded`、HTTP、重试和 SSE；稳定用户会话与持久请求序号属于 Eve 的桥接策略，不能声称 HTTP 默认参数与完整 Codex 完全相同。
 
-只有收到原 parser 的完成事件且已添加的输出项都有完成回执，才返回文本或函数批次。reasoning 和 commentary 不冒充终态回复；不支持的原生工具明确失败。原 `SseTelemetry` 回调仅做只读合同校验，阻止损坏或 incomplete 事件被原宽容解码跳过后交付部分工具；完成事件实际提供 `output` 时，核对其与原 done 项数量和内容一致，不补造缺失项。不产生或修改事件、不另写 SSE parser。合法引用标注不妨碍普通正文交付，但 Eve 文本契约不单独返回 annotation 结构。Eve 当前通用协议不能持久化完整 Codex 原生 reasoning、加密上下文、非文本输出或混合最终文本与函数批次，因此此模块不是整个 Codex core/runtime。
+只有收到原 parser 的完成事件且已添加的输出项都有完成回执，才返回文本或函数批次。reasoning 和 commentary 不冒充终态回复；不支持的原生工具明确失败。原 `SseTelemetry` 回调仅做只读合同校验，阻止损坏或 incomplete 事件被原宽容解码跳过后交付部分工具；完成事件实际提供 `output` 时，核对其与原 done 项数量和内容一致，不补造缺失项。同一 reasoning 项的 `encrypted_content` 可以被上游重新封装，比较时仅排除该不透明密文，仍核对身份、摘要和内容；工具参数、工具加密参数和最终正文不放宽。不产生或修改事件、不另写 SSE parser。合法引用标注不妨碍普通正文交付，但 Eve 文本契约不单独返回 annotation 结构。Eve 当前通用协议不能持久化完整 Codex 原生 reasoning、加密上下文、非文本输出或混合最终文本与函数批次，因此此模块不是整个 Codex core/runtime。
 
 原 parser 的文本增量不携带输出项身份和 phase，Eve 的 sink 又必须恰等最终正文，所以本适配器仍按原 SSE 持续接收与校验，正文在完整响应验证后一次交给宿主，工具批次不交付 commentary。当前不提供逐字预览，避免将过渡说明混入回复或触发宿主的完整性错误。
 
