@@ -84,6 +84,7 @@ impl Harness {
             permissions,
             logger,
             CoreBootstrap {
+                configured_foreground_steps: false,
                 steering: None,
                 tool_scope_policy: None,
                 host_config: LlmHostConfig::default(),

@@ -22,7 +22,8 @@ WORKER = "你在为 Eve 独立完成一项委托的任务"
 TASKS = '{"kind":"eve.background_tasks"'
 ORCHESTRATION = {"dispatch_background_task", "list_background_tasks", "cancel_background_task", "run_subagent"}
 REPRODUCTION_TOOLS = {"manage_failure_reproduction"}
-CHAT_TOOLS = PLATFORM_TOOLS | {"echo", "task_progress", "manage_conversation_learning"} | ORCHESTRATION | REPRODUCTION_TOOLS | {"create_subagent","list_subagents","delete_subagent"}
+SUBAGENT_RECORD_TOOLS = {"list_subagent_runs"}
+CHAT_TOOLS = PLATFORM_TOOLS | {"echo", "task_progress", "manage_conversation_learning"} | ORCHESTRATION | REPRODUCTION_TOOLS | SUBAGENT_RECORD_TOOLS | {"create_subagent","list_subagents","delete_subagent"}
 ASK = "帮我在后台把日志整理一下"
 DISPATCHED = "好，已经在后台处理，做完私聊你。"
 INSTRUCTIONS = "读取三份日志，统计错误条数，给出结论。"
@@ -108,7 +109,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(roles.count("user"), 1, "执行器看不到对话")
         if not body.get("tools"):
             return text_response(RESULT)
-        self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | {"echo", "task_progress", "manage_conversation_learning"} | ({"run_subagent"} if self.worker_subagents else set()), "后台执行者可以委派叶子子代理与隔离复现，但不能再派发后台任务")
+        self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | {"echo", "task_progress", "manage_conversation_learning"} | ({"run_subagent"} | SUBAGENT_RECORD_TOOLS if self.worker_subagents else set()), "后台执行者可以委派叶子子代理与读取同范围执行记录，但不能再派发后台任务")
         done = len(self.results(body))
         return calls((f"step-{done}", "echo", {"text": f"第 {done + 1} 步"}))
 
@@ -299,7 +300,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 self.assertEqual([m["role"] for m in body["messages"]].count("user"), 1, "子代理看不到对话")
                 if not body.get("tools"):
                     return text_response("echo 可用。")
-                self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | {"echo", "task_progress", "manage_conversation_learning"})
+                self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | SUBAGENT_RECORD_TOOLS | {"echo", "task_progress", "manage_conversation_learning"})
                 if not self.results(body):
                     return calls(("probe", "echo", {"text": "ping"}))
                 [echoed] = self.results(body)
@@ -311,17 +312,26 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 return calls(("delegate", "run_subagent", {"task": task, "max_steps": 2}))
             [result] = results
             self.assertFalse(result["completed"])
-            self.assertTrue(result["blocked"])
+            self.assertFalse(result["blocked"], "缺少合同与实际工作阻塞分开")
+            self.assertEqual(result["status"], "returned_pending_verification")
+            self.assertEqual(result["verification"], {"status": "unverifiable",
+                                                       "reason": "missing_frozen_completion_contract"})
             self.assertFalse(result["include_context"])
-            self.assertIn("echo 可用。", result["result"])
-            self.assertIn("宿主验收未通过", result["result"])
-            self.assertEqual(result["usage"], {"steps_used": 1, "max_steps": 2, "model_requests": 2,
-                                               "shared_steps_used": 2, "shared_steps_remaining": 98,
-                                               "agent_id": "general"})
+            self.assertEqual(result["result"], "echo 可用。", "原始执行结果仍完整返回")
+            usage = result["usage"]
+            self.assertEqual({key: usage[key] for key in (
+                "steps_used", "max_steps", "model_requests", "shared_steps_used",
+                "shared_steps_remaining", "delegated_steps_remaining", "parent_reserved_steps",
+                "agent_id")}, {"steps_used": 1, "max_steps": 2, "model_requests": 2,
+                               "shared_steps_used": 2, "shared_steps_remaining": 98,
+                               "delegated_steps_remaining": 78, "parent_reserved_steps": 20,
+                               "agent_id": "general"})
+            self.assertRegex(usage["run_id"], r"^[a-f0-9]{64}$", "真实执行记录可按 ID 查询")
             return text_response("子代理取得了 echo 回执，结果尚未通过宿主验收。")
         self.callback = respond
         self.run_eve(self.send(self.message("ask", "帮我确认一下 echo 能不能用",
-                                           expected="子代理取得了 echo 回执，结果尚未通过宿主验收。")))
+                                           expected="子代理取得了 echo 回执，结果尚未通过宿主验收。")),
+                     env_extra={"EVE_FOREGROUND_STEPS": "100"})
         self.assertEqual(len(self.worker_requests()), 2)
         self.assertEqual(self.tasks(), [], "子代理不进入后台任务账本")
 

@@ -4,6 +4,7 @@ import unittest
 
 import history_digest_test as digest
 from dialogue_tools_test import text_response, tool_response
+from request_messages import conversation_messages
 
 
 class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
@@ -78,7 +79,9 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
             if self.dialogue_calls == 1:
                 return tool_response([("read_file", {"path": "README.md"})] * 8)
             has_summary = any("宿主上下文压缩摘要" in (m.get("content") or "") for m in body["messages"])
-            self.assertEqual(has_summary, body["messages"][-1].get("content") != "缩小窗口后接着")
+            current = next(m["content"] for m in reversed(conversation_messages(body["messages"]))
+                           if m["role"] == "user")
+            self.assertEqual(has_summary, current != "缩小窗口后接着")
             self.assertFalse(any(m.get("tool_calls") or m["role"] == "tool" for m in body["messages"]))
             return text_response("全部完成")
 
@@ -123,7 +126,7 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
         self.assertEqual(self.dialogue_calls, dialogue_before + 1, "重启仅调用一次主对话，不重放旧工具")
         self.assertEqual({path.name: path.read_bytes() for path in self.digest_files()}, persisted)
         restarted = self.dialogue("重启后接着")
-        self.assertEqual([m["content"] for m in restarted["messages"] if m["role"] == "user"],
+        self.assertEqual([m["content"] for m in conversation_messages(restarted["messages"]) if m["role"] == "user"],
                          ["接着检查", "重启后接着"], "缓存只覆盖旧前缀，最近原话和当前输入必须保留")
         self.assertEqual(self.turn("重启后接着")["status"]["state"], "Completed")
         for message in self.turn("重启后接着")["status"]["messages"]:
@@ -136,7 +139,7 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
         self.run_window([*self.send(self.message("selected", "缩小窗口后接着", expected="全部完成"))],
                         env_extra={**env, "EVE_HISTORY_MAX_TURNS": "1"}, extra=features)
         selected = self.dialogue("缩小窗口后接着")
-        self.assertEqual([m["content"] for m in selected["messages"] if m["role"] == "user"],
+        self.assertEqual([m["content"] for m in conversation_messages(selected["messages"]) if m["role"] == "user"],
                          ["重启后接着", "缩小窗口后接着"])
         self.assertEqual(self.turn("缩小窗口后接着")["status"]["state"], "Completed")
         self.assertEqual(json.dumps(self.turn("读取八次并核验完成"), sort_keys=True), previous)

@@ -95,7 +95,10 @@ impl TurnBudget {
 
 /// 同一主任务与全部子代理共享的工具步数；与模型请求预算独立，不跨任务共用。
 #[derive(Clone, Debug)]
-pub struct SharedToolSteps(std::sync::Arc<SharedStepsInner>);
+pub struct SharedToolSteps {
+    inner: std::sync::Arc<SharedStepsInner>,
+    parent_reserve: usize,
+}
 #[derive(Debug)]
 struct SharedStepsInner {
     limit: usize,
@@ -111,35 +114,52 @@ impl SharedToolSteps {
         if limit == 0 {
             return Err(LlmError::Configuration("共享步数上限不能为零".into()));
         }
-        Ok(Self(std::sync::Arc::new(SharedStepsInner {
-            limit,
-            usage: Mutex::new(SharedStepUsage::default()),
-        })))
+        Ok(Self {
+            inner: std::sync::Arc::new(SharedStepsInner {
+                limit,
+                usage: Mutex::new(SharedStepUsage::default()),
+            }),
+            parent_reserve: 0,
+        })
     }
     pub fn limit(&self) -> usize {
-        self.0.limit
+        self.inner.limit
+    }
+    /// 创建共享同一计数的子代理视图，给父执行者保留收尾额度。
+    /// 嵌套或再次克隆只能保持/收窄视图，不能恢复父视图的余额。
+    pub fn with_parent_reserve(&self, reserve: usize) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            parent_reserve: self.parent_reserve.max(reserve).min(self.limit()),
+        }
+    }
+    pub fn parent_reserve(&self) -> usize {
+        self.parent_reserve
     }
     pub fn usage(&self) -> Result<SharedStepUsage, LlmError> {
-        self.0
+        self.inner
             .usage
             .lock()
             .map(|u| *u)
             .map_err(|_| LlmError::Backend("共享步数不可用".into()))
     }
     pub fn remaining(&self) -> Result<usize, LlmError> {
-        Ok(self.limit().saturating_sub(self.usage()?.tool_calls))
+        Ok(self
+            .limit()
+            .saturating_sub(self.parent_reserve)
+            .saturating_sub(self.usage()?.tool_calls))
     }
     /// 整批准入，失败不扣减；调用失败、拒绝或取消不返还已准入步数。
     pub fn reserve(&self, count: usize) -> Result<bool, LlmError> {
         let mut usage = self
-            .0
+            .inner
             .usage
             .lock()
             .map_err(|_| LlmError::Backend("共享步数不可用".into()))?;
         let Some(next) = usage
             .tool_calls
             .checked_add(count)
-            .filter(|n| *n <= self.limit())
+            .filter(|n| *n <= self.limit().saturating_sub(self.parent_reserve))
         else {
             return Ok(false);
         };
@@ -148,7 +168,7 @@ impl SharedToolSteps {
     }
     pub fn record_model_request(&self) -> Result<(), LlmError> {
         let mut usage = self
-            .0
+            .inner
             .usage
             .lock()
             .map_err(|_| LlmError::Backend("共享步数不可用".into()))?;
@@ -161,7 +181,7 @@ impl SharedToolSteps {
     /// 仅在独立后台任务恢复、尚未准入新调用时恢复已持久化计数。
     pub fn restore(&self, prior: SharedStepUsage) -> Result<(), LlmError> {
         let mut usage = self
-            .0
+            .inner
             .usage
             .lock()
             .map_err(|_| LlmError::Backend("共享步数不可用".into()))?;
@@ -213,5 +233,73 @@ mod shared_tests {
         assert_eq!(pool.remaining().unwrap(), 1);
         pool.record_model_request().unwrap();
         assert_eq!(pool.usage().unwrap().model_requests, 5);
+    }
+
+    #[test]
+    fn parallel_delegates_cannot_spend_the_parents_completion_reserve() {
+        let parent = SharedToolSteps::new(100).unwrap();
+        assert!(parent.reserve(7).unwrap());
+        let child = parent.with_parent_reserve(20);
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                let child = child.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        let _ = child.reserve(1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(parent.usage().unwrap().tool_calls, 80);
+        assert_eq!(child.remaining().unwrap(), 0);
+        assert_eq!(parent.remaining().unwrap(), 20);
+        assert!(!child.reserve(1).unwrap());
+        // 父线程完成核验、记忆写入、发言后同样不能超支。
+        assert!(parent.reserve(20).unwrap());
+        assert!(!parent.reserve(1).unwrap());
+        assert_eq!(parent.usage().unwrap().tool_calls, 100);
+    }
+
+    #[test]
+    fn delegated_reserve_tracks_parent_spending_and_cannot_be_reclaimed() {
+        let parent = SharedToolSteps::new(12).unwrap();
+        let child = parent.with_parent_reserve(3);
+        assert_eq!(child.remaining().unwrap(), 9);
+        assert!(parent.reserve(2).unwrap());
+        assert_eq!(child.remaining().unwrap(), 7);
+        // 整批超额不部分扣费，已准入后失败则不退还。
+        assert!(!child.reserve(8).unwrap());
+        assert_eq!(parent.usage().unwrap().tool_calls, 2);
+        assert!(child.reserve(7).unwrap());
+        let cloned = child.with_parent_reserve(0);
+        assert_eq!(cloned.parent_reserve(), 3);
+        assert!(!cloned.reserve(1).unwrap());
+        assert_eq!(parent.remaining().unwrap(), 3);
+        assert_eq!(
+            parent.with_parent_reserve(usize::MAX).remaining().unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn restored_parent_and_child_keep_spent_steps_without_regranting_the_reserve() {
+        let parent = SharedToolSteps::new(100).unwrap();
+        parent
+            .restore(SharedStepUsage {
+                tool_calls: 76,
+                model_requests: 20,
+            })
+            .unwrap();
+        let child = parent.with_parent_reserve(20);
+        assert_eq!(parent.remaining().unwrap(), 24);
+        assert_eq!(child.remaining().unwrap(), 4);
+        assert!(child.reserve(4).unwrap());
+        assert!(child.restore(SharedStepUsage::default()).is_err());
+        assert!(!child.reserve(1).unwrap());
+        assert!(parent.reserve(20).unwrap());
+        assert_eq!(parent.usage().unwrap().tool_calls, 100);
     }
 }

@@ -28,6 +28,7 @@ pub(crate) struct WebAutonomy {
     reasoning: Arc<OnceLock<Arc<crate::qq_model::Commands>>>,
     worker_tools: Vec<String>,
     worker_config: eve_runtime::LlmHostConfig,
+    run_storage: Arc<dyn crate::qq_tasks::RunStorage>,
     api_key: String,
 }
 
@@ -327,6 +328,9 @@ impl WebAutonomy {
             .push(Arc::new(crate::qq_tasks::SubagentTool {
                 late: late.clone(),
             }));
+        bootstrap
+            .tools
+            .push(Arc::new(crate::qq_tasks::ListRuns { late: late.clone() }));
         for kind in 0..3 {
             bootstrap
                 .tools
@@ -550,6 +554,9 @@ impl WebAutonomy {
                 .map(|tool| tool.definition().name)
                 .collect(),
             worker_config: bootstrap.host_config.clone(),
+            run_storage: Arc::new(crate::qq_tasks::SqliteRunStorage::open(
+                &state.join("subagent-runs.sqlite3"),
+            )?),
             api_key: bootstrap.api_key.clone(),
         })
     }
@@ -617,6 +624,7 @@ impl WebAutonomy {
                 coding: resolver("coding"),
             },
             self.digests.clone(),
+            self.run_storage.clone(),
         )
         .await?;
         worker.authorize_with(self.admin.clone());

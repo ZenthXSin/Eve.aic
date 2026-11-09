@@ -34,7 +34,7 @@ DEFAULT_TOOLS = {
     "list_interests", "list_goals", "manage_goal", "list_skills", "list_forged_tools",
     "manage_skill", "manage_forged_tool", "set_reminder", "cancel_reminder",
     "dispatch_background_task", "list_background_tasks", "cancel_background_task",
-    "run_subagent", "create_subagent", "list_subagents", "delete_subagent",
+    "run_subagent", "list_subagent_runs", "create_subagent", "list_subagents", "delete_subagent",
     "set_wakeup_trigger", "list_wakeup_triggers", "cancel_wakeup_trigger",
     "sleep", "task_progress", "save_workflow_tool", "list_workflow_tools",
     "run_workflow_tool", "inspect_runtime_health", "send_message",
@@ -92,6 +92,9 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
                 assert self.path == "/v1/chat/completions"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 latest = body["messages"][-1].get("content") or ""
+                # 宿主可在尾部追加预算事实；发送是否完成以真实工具回执为准。
+                last_turn_message = next(message for message in reversed(body["messages"])
+                                         if message["role"] != "system")
                 try:
                     decoded = json.loads(latest)
                 except (ValueError, TypeError):
@@ -101,9 +104,9 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
                     kind = "speech"
                     outer.assertFalse(body.get("tools"), "后台事实审视没有执行工具")
                     response = text_response(json.dumps(outer.speech(decoded["host_event"]), ensure_ascii=False))
-                elif (body["messages"][-1]["role"] == "tool" and
-                      body["messages"][-1].get("tool_call_id") == "fixture-expression"):
-                    receipt = json.loads(body["messages"][-1]["content"])
+                elif (last_turn_message["role"] == "tool" and
+                      last_turn_message.get("tool_call_id") == "fixture-expression"):
+                    receipt = json.loads(last_turn_message["content"])
                     outer.assertTrue(receipt["sent"] and receipt["message_id"], receipt)
                     response = text_response("内部结束，不再补发")
                 elif is_progress_request(body):

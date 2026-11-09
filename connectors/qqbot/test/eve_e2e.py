@@ -74,7 +74,8 @@ class Acceptance(unittest.TestCase):
                 if not learning:
                     outer.request_arrived(index).touch()
                 messages = body["messages"]
-                latest = messages[-1]
+                # 全功能训练可在末尾追加预算说明，响应仍以实际对话消息为准。
+                latest = next(message for message in reversed(messages) if message["role"] != "system")
                 spoken_receipt = (outer.explicit_speech and latest["role"] == "tool"
                                   and "sent" in json.loads(latest["content"]))
                 reason = "stop"

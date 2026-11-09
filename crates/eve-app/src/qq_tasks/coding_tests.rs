@@ -62,6 +62,35 @@ impl eve_llm_api::HistoryDigests for NoDigest {
 }
 #[derive(Default)]
 struct Probe(Mutex<Vec<ToolExecutionContext>>);
+struct BlockProgress;
+impl Tool for BlockProgress {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "task_progress".into(),
+            description: "记录真实未完成事项".into(),
+            argument_schema: json!({"type":"object","properties":{
+                "status":{"const":"blocked"},"remaining":{"type":"string"}},
+                "required":["status","remaining"],"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::ParallelSafe),
+        }
+    }
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        if value["status"] == "blocked"
+            && value["remaining"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        {
+            Ok(())
+        } else {
+            Err(invalid("缺少真实阻塞事项"))
+        }
+    }
+    fn execute(&self, call: ToolCall, _: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move { Ok(call.arguments) })
+    }
+}
+
 impl Tool for Probe {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -119,7 +148,7 @@ async fn open_fixture(task: Arc<Model>, coding: Arc<Model>, authorized: bool) ->
         .register(Box::new(
             services::CoreServices::new()
                 .unwrap()
-                .with_tools(vec![probe.clone()]),
+                .with_tools(vec![probe.clone(), Arc::new(BlockProgress)]),
         ))
         .unwrap();
     kernel.start_all().await.unwrap();
@@ -127,13 +156,14 @@ async fn open_fixture(task: Arc<Model>, coding: Arc<Model>, authorized: bool) ->
         &kernel,
         registry.clone(),
         permissions,
-        &["inspect_source".into()],
+        &["inspect_source".into(), "task_progress".into()],
         LlmHostConfig::default(),
         WorkerModels {
             task: Arc::new(Resolver(task)),
             coding: Arc::new(Resolver(coding)),
         },
         Arc::new(NoDigest),
+        Arc::new(SqliteRunStorage::open(&directory.path().join("subagent-runs.sqlite3")).unwrap()),
     )
     .await
     .unwrap();
@@ -245,12 +275,17 @@ async fn coding_subagent_routes_only_its_model_and_preserves_context_budget_and_
         result["completed"], false,
         "未给验收合同不能把工具执行夸成完成"
     );
-    assert_eq!(result["blocked"], true);
-    assert!(
-        result["result"]
-            .as_str()
-            .unwrap()
-            .contains("已按实际工具结果核对源码")
+    assert_eq!(result["blocked"], false, "缺少验收合同不表示实际工作被阻塞");
+    assert_eq!(result["status"], "returned_pending_verification");
+    assert_eq!(
+        result["verification"],
+        json!({
+            "status":"unverifiable", "reason":"missing_frozen_completion_contract"
+        })
+    );
+    assert_eq!(
+        result["result"], "已按实际工具结果核对源码",
+        "保留真实输出，不追加失败自述"
     );
     assert_eq!(result["usage"]["steps_used"], 1);
     assert_eq!(result["usage"]["model_requests"], 2);
@@ -491,4 +526,146 @@ fn nested_delegation_flattens_original_records_without_wrapping_current_instruct
         ..captured.owner.clone()
     };
     assert!(instructions_with_context("本次编程委托".into(), Some(&captured), &stranger).is_err());
+}
+
+#[test]
+fn subagent_result_preserves_pending_mismatch_and_actual_blocking_as_distinct_outcomes() {
+    use eve_task_api::TaskCompletionAssessment;
+    let original = "已取得真实工具回执，仍需核验整体目标";
+    let usage = json!({"steps_used":2,"model_requests":3});
+    for (assessment, status, blocked) in [
+        (
+            TaskCompletionAssessment::Unverifiable {
+                reason: "missing_frozen_completion_contract".into(),
+            },
+            "returned_pending_verification",
+            false,
+        ),
+        (
+            TaskCompletionAssessment::Unverifiable {
+                reason: "unknown_tool_effect_not_replayed".into(),
+            },
+            "returned_pending_verification",
+            false,
+        ),
+        (
+            TaskCompletionAssessment::Mismatch {
+                reason: "receipt_effect_mismatch".into(),
+            },
+            "verification_mismatch",
+            false,
+        ),
+        (
+            TaskCompletionAssessment::Blocked {
+                reason: "还缺用户指定的输入文件".into(),
+            },
+            "blocked",
+            true,
+        ),
+    ] {
+        let result = subagent_result(
+            TaskEnd::Blocked {
+                result: original.into(),
+            },
+            Some(assessment.clone()),
+            usage.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(result["status"], status);
+        assert_eq!(result["blocked"], blocked);
+        assert_eq!(result["completed"], false);
+        assert_eq!(
+            result["verification"],
+            serde_json::to_value(assessment).unwrap()
+        );
+        assert_eq!(result["result"], original);
+        assert_eq!(result["usage"], usage);
+    }
+    let legacy = subagent_result(
+        TaskEnd::Blocked {
+            result: original.into(),
+        },
+        None,
+        usage.clone(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy["blocked"], true,
+        "没有独立分类的既有真实阻塞不能冒充已核验"
+    );
+    assert_eq!(legacy["completed"], false);
+    let completed = subagent_result(
+        TaskEnd::Completed {
+            result: "固定合同满足".into(),
+        },
+        Some(TaskCompletionAssessment::Verified),
+        usage.clone(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(completed["completed"], true);
+    assert_eq!(completed["blocked"], false);
+    assert_eq!(completed["status"], "completed");
+    assert!(
+        subagent_result(
+            TaskEnd::Completed {
+                result: original.into()
+            },
+            None,
+            usage.clone(),
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        subagent_result(
+            TaskEnd::Blocked {
+                result: original.into()
+            },
+            Some(TaskCompletionAssessment::Verified),
+            usage,
+            false
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn coding_explicit_blocking_receipt_remains_blocked_even_without_a_completion_contract() {
+    let task = Model::scripted(vec![]);
+    let coding = Model::scripted(vec![
+        Ok(ModelResponse::ToolCalls {
+            calls: vec![ToolCall {
+                id: "blocked-step".into(),
+                name: "task_progress".into(),
+                arguments: json!({"status":"blocked","remaining":"仍缺指定的输入文件"}),
+            }],
+        }),
+        final_text("已有检查结果，缺少输入文件无法继续"),
+    ]);
+    let fixture = open_fixture(task.clone(), coding.clone(), true).await;
+    let pool = eve_llm_api::SharedToolSteps::new(5).unwrap();
+    assert!(pool.reserve(1).unwrap());
+    let result = invoke(
+        &fixture,
+        "coding",
+        context("blocked-coding", pool.clone()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["blocked"], true);
+    assert_eq!(result["completed"], false);
+    assert_eq!(
+        result["verification"],
+        json!({"status":"blocked","reason":"仍缺指定的输入文件"})
+    );
+    assert_eq!(result["result"], "已有检查结果，缺少输入文件无法继续");
+    assert_eq!(pool.remaining().unwrap(), 3);
+    assert_eq!(coding.requests.lock().unwrap().len(), 2);
+    assert!(task.requests.lock().unwrap().is_empty());
+    fixture.kernel.stop_all().await.unwrap();
 }
