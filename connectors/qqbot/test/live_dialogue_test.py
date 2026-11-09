@@ -283,6 +283,232 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.assertEqual([p.get('proactive', False) for p in parts], [False, False, True, True])
         self.assertTrue(all(p['state'] == 'Sent' and p['platform_message_id'] for p in parts))
 
+    def assert_parts_result(self, result, states, attempted, *, mode='explicit_parts',
+                            requested=None):
+        """核对模型实际收到的聚合回执，不把入队当作平台确认。"""
+        self.assertIsNone(result['message_id'])
+        self.assertTrue(result['session_id'])
+        self.assertEqual(result['applied_mode'], mode)
+        self.assertEqual(result['requested_part_count'], requested or len(states))
+        self.assertEqual(result['actual_part_count'], len(states))
+        self.assertEqual(result['sent_count'], states.count('sent'))
+        self.assertEqual(result['attempted_count'], sum(attempted))
+        self.assertIs(result['sent'], all(state == 'sent' for state in states))
+        expected_status = ('sent' if result['sent'] else 'partial' if 'sent' in states
+                           else states[0])
+        self.assertEqual(result['delivery_status'], expected_status)
+        self.assertEqual([part['index'] for part in result['parts']], list(range(len(states))))
+        self.assertEqual([part['delivery_status'] for part in result['parts']], states)
+        self.assertEqual([part['attempted'] for part in result['parts']], attempted)
+        for part, state in zip(result['parts'], states):
+            self.assertIs(part['sent'], state == 'sent')
+            if state == 'sent':
+                self.assertTrue(part['message_id'])
+            else:
+                self.assertIsNone(part['message_id'])
+
+    def test_explicit_parts_preserve_repeated_short_messages_with_distinct_real_receipts(self):
+        observed = []
+
+        def respond(body):
+            if not self.all_results(body):
+                return self.choose('send_message', {'parts': [{'text': '嗯'}, {'text': '嗯'}]})
+            result = self.all_results(body)[-1]
+            self.assert_parts_result(result, ['sent', 'sent'], [True, True])
+            self.assertEqual([part['message_id'] for part in result['parts']],
+                             ['progress-parts-short-0', 'progress-parts-short-1'])
+            observed.append(result)
+            return dialogue.text_response('内部结束')
+
+        self.callback = respond
+        summary = self.run_live(self.send(self.message('parts-short', '按你的节奏说两句')),
+                                more=['--segmented'])
+        self.assertEqual(len(observed), 1, '一次工具调用产生一次聚合结果')
+        self.assertEqual([frame['text'] for frame in self.progress('parts-short')], ['嗯', '嗯'])
+        parts = self.receipt('parts-short')['progress']
+        self.assertEqual([part['state'] for part in parts], ['Sent', 'Sent'])
+        self.assertEqual([part['platform_message_id'] for part in parts],
+                         [part['message_id'] for part in observed[0]['parts']])
+        digest = hashlib.sha256(b'call-send_message-0-1').hexdigest()
+        self.assertEqual([part['decision_id'] for part in parts],
+                         [f'speech-parts-{digest}-{index}' for index in range(2)])
+        self.assertEqual(summary['sent'], 2)
+
+    def parts_stop_after_failed_receipt(self, diagnostic, state):
+        observed = []
+
+        def respond(body):
+            if not self.all_results(body):
+                return self.choose('send_message', {'parts': [
+                    {'text': '第一条已经核实'}, {'text': '第二条的投递待确认'}, {'text': '第三条不能发送'}]})
+            result = self.all_results(body)[-1]
+            self.assert_parts_result(result, ['sent', state, 'not_sent'], [True, True, False])
+            self.assertEqual(result['stopped_by'], state)
+            self.assertEqual(result['parts'][2]['failure_kind'], f'previous_part_{state}')
+            self.assertEqual(result['parts'][0]['message_id'], 'progress-parts-failure-0')
+            observed.append(result)
+            return dialogue.text_response('内部结束，保留已知的发送结果')
+
+        self.callback = respond
+        message = self.message('parts-failure', '逐条报告你核实的内容') | {
+            'progress_diagnostics': [{}, {'ok': False, **diagnostic}]}
+        self.run_live(self.send(message), more=['--segmented'])
+        self.assertEqual(len(observed), 1)
+        self.assertEqual([frame['text'] for frame in self.progress('parts-failure')],
+                         ['第一条已经核实', '第二条的投递待确认'])
+        parts = self.receipt('parts-failure')['progress']
+        self.assertEqual([part['state'] for part in parts],
+                         ['Sent', 'Unknown' if state == 'unknown' else 'Failed'])
+        self.assertTrue(parts[0]['platform_message_id'])
+        self.assertFalse(parts[1].get('platform_message_id'))
+
+    def test_explicit_parts_stop_after_http_rejection_and_preserve_sent_prefix(self):
+        self.parts_stop_after_failed_receipt({'failure_kind': 'http', 'http_status': 403},
+                                            'not_sent')
+
+    def test_explicit_parts_stop_after_unknown_delivery_without_retry_or_suffix_send(self):
+        self.parts_stop_after_failed_receipt({'failure_kind': 'timeout'}, 'unknown')
+
+    def test_new_input_during_part_pause_stops_old_suffix_and_is_consumed_in_same_turn(self):
+        observed = []
+
+        def respond(body):
+            if self.chat_rounds == 1:
+                return self.choose('send_message', {'parts': [
+                    {'text': '先确认这一条'}, {'text': '延后的旧结论', 'after_ms': 3000},
+                    {'text': '后面的旧结论'}]})
+            if self.chat_rounds == 2:
+                result = self.all_results(body)[-1]
+                self.assert_parts_result(result, ['sent', 'stale', 'not_sent'],
+                                         [True, False, False])
+                self.assertEqual(result['stopped_by'], 'stale')
+                self.assertEqual(result['parts'][2]['failure_kind'], 'previous_part_stale')
+                self.assertIn('事情变了，先不要发旧结论', self.users(body))
+                observed.append(result)
+                return self.choose('send_message', {'text': '好，按你刚补充的情况继续'})
+            self.assertEqual(self.chat_rounds, 3)
+            self.assertTrue(self.all_results(body)[-1]['sent'])
+            return dialogue.text_response('同一轮内部结束')
+
+        self.callback = respond
+        self.run_live([{'send': self.message('parts-paused', '按顺序说你的结论')},
+            self.wait_command('parts-paused', 'progress'), {'delay_ms': 150},
+            {'send': self.message('parts-changed', '事情变了，先不要发旧结论')},
+            self.wait_receipt('parts-changed', 'Merged'), self.wait_receipt('parts-paused'),
+            self.wait_command('parts-paused', 'finish')], more=['--segmented'])
+        self.assertEqual(len(observed), 1)
+        self.assertEqual([frame['text'] for frame in self.progress('parts-paused')],
+                         ['先确认这一条', '好，按你刚补充的情况继续'])
+        self.assertFalse(self.progress('parts-changed'))
+        turns = [turn for session in self.documents()['eve.session']['sessions.v1']['sessions'].values()
+                 for turn in session['turns']]
+        self.assertEqual(len(turns), 1)
+        self.assertEqual([message['text'] for message in turns[0]['status']['messages']
+                          if message['role'] == 'User'],
+                         ['按顺序说你的结论', '事情变了，先不要发旧结论'])
+
+    def test_explicit_parts_merge_full_text_when_channel_segmentation_is_disabled(self):
+        observed = []
+
+        def respond(body):
+            if not self.all_results(body):
+                return self.choose('send_message', {'parts': [
+                    {'text': '第一条完整内容'}, {'text': '第二条完整内容'}]})
+            result = self.all_results(body)[-1]
+            self.assert_parts_result(result, ['sent'], [True], mode='merged_disabled',
+                                     requested=2)
+            observed.append(result)
+            return dialogue.text_response('内部结束')
+
+        self.callback = respond
+        self.run_live(self.send(self.message('parts-disabled', '说出所有内容')))
+        self.assertEqual(len(observed), 1)
+        self.assertEqual([frame['text'] for frame in self.progress('parts-disabled')],
+                         ['第一条完整内容\n\n第二条完整内容'])
+        self.assertEqual([part['state'] for part in self.receipt('parts-disabled')['progress']], ['Sent'])
+
+    def test_segment_commands_apply_to_live_parts_and_preserve_merged_tail_text(self):
+        observed = {}
+        command_results = {}
+        commands = {
+            'segment-off': ('/segment off', '已关闭本会话分段', False, None),
+            'segment-on': ('/segment on', '已开启本会话分段', True, None),
+            'segment-limit': ('/segment parts 2', '已将本会话分段上限设为 2 段', True, 2),
+        }
+        requests = {'关闭后试一次': (['关闭后的第一条', '关闭后的第二条'],
+                                    'merged_disabled', 1),
+                    '重新开启后试一次': (['开启后的第一条', '开启后的第二条'],
+                                          'explicit_parts', 2),
+                    '限制两条后试一次': (['保留第一条', '尾部第二条', '尾部第三条'],
+                                          'merged_limit', 2)}
+
+        def respond(body):
+            current = self.users(body)[-1]
+            texts, mode, actual = requests[current]
+            results = self.results(body)
+            if not results:
+                return self.choose('send_message', {'parts': [{'text': text} for text in texts]})
+            result = results[-1]
+            self.assert_parts_result(result, ['sent'] * actual, [True] * actual,
+                                     mode=mode, requested=len(texts))
+            observed[current] = result
+            return dialogue.text_response('内部结束')
+
+        def decide(facts):
+            event = facts['host_event']
+            self.assertEqual(event['kind'], 'host_operation_result')
+            id = next(id for id, (text, _, _, _) in commands.items()
+                      if text == event['user_text'])
+            self.assertIn(commands[id][1], event['result'])
+            self.assertNotIn(id, command_results)
+            command_results[id] = event['result']
+            return {'action': 'silence'}
+
+        def inspect_command(id):
+            def inspect():
+                self.wait_until(lambda: any(event['id'] == f'host-reply:{id}' and state == 'silence'
+                    for event, state, _ in self.speech_rows()), '分段命令的沉默决定没有落盘')
+                self.assertIn(id, command_results)
+                preferences = self.documents()['eve.segment.preferences']['preferences.v1']
+                self.assertEqual(preferences['version'], 1)
+                [setting] = preferences['scopes']
+                routing = json.dumps(['1904159860', 'c2c', 'user-1', 'user-1'],
+                                     separators=(',', ':')).encode()
+                session = 'qq:' + hashlib.sha256(routing).hexdigest()
+                self.assertEqual(setting['scope'], {
+                    'channel': 'qq', 'session_id': session, 'user_id': session})
+                self.assertIs(setting['enabled'], commands[id][2])
+                self.assertEqual(setting['max_segments'], commands[id][3])
+                self.assertIsNone(setting['pause_percent'])
+                self.assertEqual(self.receipt(id)['state'], 'Handled')
+                self.assertIsNone(self.receipt(id)['reply'])
+            return inspect
+
+        def command(id):
+            return [*self.send(self.message(id, commands[id][0])), *self.checkpoint(id)]
+
+        self.callback = respond
+        self.speech_callback = decide
+        # live 宿主命令先保存结果事实，Eve 可沉默；设置在下一次显式发送前已经落盘。
+        self.run_live([*command('segment-off'),
+            *self.send(self.message('parts-off', '关闭后试一次')),
+            *command('segment-on'),
+            *self.send(self.message('parts-on', '重新开启后试一次')),
+            *command('segment-limit'),
+            *self.send(self.message('parts-limit', '限制两条后试一次'))],
+            more=['--segmented'], checkpoints={id: inspect_command(id) for id in commands})
+        self.assertEqual(set(observed), set(requests))
+        self.assertEqual(set(command_results), set(commands))
+        self.assertEqual(self.chat_rounds, 6, '三个设置命令不能调用聊天模型')
+        self.assertEqual(len(self.speech_requests), 3, '命令结果各由独立发言模型决定沉默')
+        self.assertFalse([event for event in self.events if event.get('type') == 'push'])
+        self.assertEqual([frame['text'] for frame in self.progress('parts-off')],
+                         ['关闭后的第一条\n\n关闭后的第二条'])
+        self.assertEqual([frame['text'] for frame in self.progress('parts-on')],
+                         ['开启后的第一条', '开启后的第二条'])
+        self.assertEqual([frame['text'] for frame in self.progress('parts-limit')],
+                         ['保留第一条', '尾部第二条\n\n尾部第三条'])
+
     def test_failed_send_does_not_generate_an_automatic_replacement(self):
         def respond(body):
             if self.chat_rounds == 1:

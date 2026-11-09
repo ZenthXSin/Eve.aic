@@ -144,7 +144,7 @@ if (scenario.script) {
       if (cmd.type === "stop") { stopped = true; return; }
       // 锚点恢复与窗口关闭是控制帧，不应被当成另一条聊天回复。
       if (cmd.type === "restore_anchor" || cmd.type === "close_foreground") {
-        if (cmd.type === "close_foreground") foregroundWindows.delete(cmd.id);
+        if (cmd.type === "close_foreground" && cmd.keep_window !== true) foregroundWindows.delete(cmd.id);
         commands.push(cmd);continue;
       }
       if (cmd.type === "open_foreground") {

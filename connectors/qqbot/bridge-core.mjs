@@ -280,13 +280,22 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   const unschedule = timers.clearTimeout ?? clearTimeout;
   // A timed-out transport may still be inside the SDK. Keep it in activeSends
   // until it settles, so repeated timeouts cannot create unbounded requests.
-  async function boundedSend(operation, timeout) {
+  async function boundedSend(operation, timeout, flight) {
     if (activeSends >= limit) {
       warn("outbound_limit");
       throw new Error("outbound_limit");
     }
     activeSends++;
-    const pending = Promise.resolve().then(operation).finally(() => { activeSends--; });
+    if (flight) flight.busy = true;
+    const pending = Promise.resolve().then(operation).finally(() => {
+      activeSends--;
+      if (flight) {
+        flight.busy = false;
+        const reopened = flight.reopen;
+        delete flight.reopen;
+        if (reopened) reopenForeground(reopened.id, reopened.window);
+      }
+    });
     let timer;
     try {
       return await Promise.race([pending, new Promise((_, reject) => {
@@ -317,7 +326,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   }
   // Share one bound across passive replies, segments and proactive messages.
   // Admission failure happens before the SDK call and is never queued/retried.
-  async function sendText(target, text, mention, timeout = SEND_TIMEOUT_MS, guard) {
+  async function sendText(target, text, mention, timeout = SEND_TIMEOUT_MS, guard, flight) {
     text = mentionedText(target, text, mention);
     if (Buffer.byteLength(text) > 32768) throw new Error("reply_limit");
     const started = now();
@@ -327,7 +336,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         if (guard && !guard()) throw new Error("stale_decision");
         invoked = true;
         return bot.sendText(target, text);
-      }, timeout);
+      }, timeout, flight);
       responseReceived = true;
       if (!validMessageId(result?.id)) throw new Error("platform_message_id_unknown");
       return result;
@@ -753,19 +762,30 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       }
     }
   }
+  // 开窗不发送；SDK 超时后尚在途时，只保留当前窗口的一次重开意图。
+  function reopenForeground(id, saved) {
+    if (closed || passiveWindows.get(id) !== saved || saved.foreground !== true || saved.parent) return;
+    const remainingMs = Math.floor(PASSIVE_REPLY_WINDOW_MS - Math.max(0, now() - saved.receivedAt));
+    if (saved.target.scope !== "c2c" || saved.remaining <= 0 || remainingMs <= 0 ||
+        latestInput.get(routeKey(saved.target.scope,saved.target.targetId,saved.senderId)) !== id) return;
+    if (saved.flight?.busy) { saved.flight.reopen = {id,window:saved}; return; }
+    if (saved.sending) return;
+    saved.active = true;
+    send({type:"foreground_window",id,remaining_ms:remainingMs,remaining:saved.remaining});
+  }
   // 活跃主轮和收尾后的补充都只使用原消息额度；没有窗口时不退回主动消息。
   async function passivePush(frame) {
     if (!validMessageId(frame.id)) {warn("invalid_command");return;}
     const reject = kind => send({type:"delivery",id:frame.id,push:true,ok:false,failure_kind:kind});
     const item = passiveWindows.get(frame.based_on_message_id);
-    if (!item) {reject("passive_window_missing");return;}
+    if (!item || item.active === false) {reject("passive_window_missing");return;}
     const parent = item.parent;
     if ((frame.foreground === true) !== (item.foreground === true)) {reject("passive_window_missing");return;}
     if (frame.scope !== "c2c" || item.target.scope !== frame.scope || item.target.targetId !== frame.target_id || item.senderId !== frame.sender_id ||
         latestInput.get(routeKey(frame.scope,frame.target_id,frame.sender_id)) !== frame.based_on_message_id) {reject("stale_decision");return;}
     if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS) {passiveWindows.delete(frame.based_on_message_id);reject("passive_window_elapsed");return;}
     if (parent && (pending.get(frame.based_on_message_id) !== parent || parent.finished || parent.next !== undefined)) {reject("stale_decision");return;}
-    if (item.sending || parent?.sending || item.attempts.has(frame.id)) {warn("duplicate_reply");return;}
+    if (item.sending || item.flight?.busy || parent?.sending || item.attempts.has(frame.id)) {warn("duplicate_reply");return;}
     // 活跃主轮保留最后一个被动名额；额度取父对象实时值，不能被重复开窗恢复。
     const remaining = parent ? passiveLimit(parent.target.scope) - 1 - (parent.passiveProgress ?? parent.progress ?? 0) : item.remaining;
     if (remaining <= 0) {reject("passive_quota_exhausted");return;}
@@ -777,11 +797,13 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     } else item.remaining--;
     // 失败或未知也占额度，桥接层不重发。
     item.sending = true;
+    // 保留窗口换代后仍共用在途所有权；模型超时不能证明 SDK 已经结束。
+    const flight = item.flight ??= {busy:false};
     try {
       const guard = () => !closed && passiveWindows.get(frame.based_on_message_id) === item && now() - item.receivedAt < PASSIVE_REPLY_WINDOW_MS &&
         (!parent || (pending.get(frame.based_on_message_id) === parent && !parent.finished && parent.next === undefined)) &&
         latestInput.get(routeKey(frame.scope,frame.target_id,frame.sender_id)) === frame.based_on_message_id;
-      const result = await sendText(item.target,frame.text,undefined,SEND_TIMEOUT_MS,guard);
+      const result = await sendText(item.target,frame.text,undefined,SEND_TIMEOUT_MS,guard,flight);
       send({type:"delivery",id:frame.id,push:true,ok:true,delivery_mode:"passive",message_id:result.id});
     } catch (err) {send({type:"delivery",id:frame.id,push:true,ok:false,...diagnostic(err)});}
     finally {
@@ -803,11 +825,26 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if (frame.type === "close_foreground") {
         const parent = pending.get(frame.id);
         if (parent) delete parent.foregroundClaim;
-        if (passiveWindows.get(frame.id)?.foreground === true) passiveWindows.delete(frame.id);
+        const window = passiveWindows.get(frame.id);
+        if (window?.foreground === true) {
+          if (window.flight) delete window.flight.reopen;
+          if (frame.keep_window === true && !window.parent &&
+              now() - window.receivedAt < PASSIVE_REPLY_WINDOW_MS && window.remaining > 0 &&
+              latestInput.get(routeKey(window.target.scope,window.target.targetId,window.senderId)) === frame.id) {
+            // 替换对象令所有旧发送 guard 失效；新开窗只恢复原预算，不恢复旧决定。
+            passiveWindows.set(frame.id,{...window,sending:false,active:false});
+          } else passiveWindows.delete(frame.id);
+        }
         return;
       }
       if (frame.type === "open_foreground") {
         if (!validMessageId(frame.id)) {warn("invalid_command");return;}
+        const saved = passiveWindows.get(frame.id);
+        // 已合并的真实输入已从 pending 移出；只重报原窗口，不重置时刻、额度或尝试记录。
+        if (saved?.foreground === true && !saved.parent) {
+          reopenForeground(frame.id,saved);
+          return;
+        }
         const item = pending.get(frame.id);
         if (!item || item.target.scope !== "c2c" || item.finished || item.sending || item.next !== undefined ||
             latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) !== frame.id) return;

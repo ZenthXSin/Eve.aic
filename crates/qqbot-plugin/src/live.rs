@@ -137,8 +137,79 @@ impl LiveSend {
 pub struct LiveDialogue {
     turns: Mutex<BTreeMap<Key, Weak<Turn>>>,
     outgoing: Mutex<VecDeque<LiveSend>>,
+    segmentation: Mutex<Option<LiveSegmentation>>,
+}
+#[derive(Clone)]
+struct LiveSegmentation {
+    preferences: Option<Arc<dyn eve_segment_api::SegmentPreferences>>,
+    policy: eve_segment_api::SegmentPolicy,
 }
 impl LiveDialogue {
+    /// 可信宿主在装配完成后配置；None 表示通道明确关闭分条。
+    /// 未装配的独立工具夹具仍使用 QQ 默认策略与默认偏好。
+    pub fn configure_segmentation(
+        &self,
+        preferences: Option<Arc<dyn eve_segment_api::SegmentPreferences>>,
+        policy: eve_segment_api::SegmentPolicy,
+    ) -> PluginResult<()> {
+        policy
+            .validate()
+            .map_err(|_| PluginError::Task("实时分条策略无效".into()))?;
+        if policy.max_segments > crate::QQ_MAX_SEGMENTS
+            || policy.defaults.max_segment_bytes > 32768
+            || policy.max_pause_ms > crate::QQ_SEGMENT_POLICY.max_pause_ms
+        {
+            return Err(PluginError::Task("实时分条策略超出 QQ 上限".into()));
+        }
+        *self
+            .segmentation
+            .lock()
+            .map_err(|_| PluginError::Task("实时分条设置锁不可用".into()))? =
+            Some(LiveSegmentation {
+                preferences,
+                policy,
+            });
+        Ok(())
+    }
+
+    fn effective_segmentation(
+        &self,
+        scope: &ContextScope,
+    ) -> Result<eve_segment_api::EffectiveSegmentation, ToolExecutionError> {
+        let unavailable = || ToolExecutionError::Rejected("当前分条设置不可用；未发送消息".into());
+        let configured = self.segmentation.lock().map_err(|_| unavailable())?.clone();
+        let (preference, policy) = match configured {
+            Some(LiveSegmentation {
+                preferences: Some(store),
+                policy,
+            }) => {
+                let preference = store
+                    .get(&eve_segment_api::SegmentScope {
+                        channel: crate::QQ_SEGMENT_CHANNEL.into(),
+                        session_id: scope.session_id.clone(),
+                        user_id: scope.user_id.clone(),
+                    })
+                    .map_err(|_| unavailable())?;
+                (preference, policy)
+            }
+            Some(LiveSegmentation {
+                preferences: None,
+                policy,
+            }) => (
+                eve_segment_api::SegmentPreference {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                policy,
+            ),
+            None => (
+                eve_segment_api::SegmentPreference::default(),
+                crate::QQ_SEGMENT_POLICY,
+            ),
+        };
+        preference.effective(&policy).map_err(|_| unavailable())
+    }
+
     /// 与主轮消费争用同一个输入锁。主轮已取走输入时，前台不能再领取其即时交流。
     /// 先持久保存 sending，再让同消息批次看见交接；失败不吞输入、不宣称接手。
     /// persist 在锁内复核活动身份；返回 false 表示资格已撤销且没有写入发送状态。
@@ -476,12 +547,181 @@ impl TurnSteering for Turn {
 }
 
 struct SendMessage(Arc<LiveDialogue>);
+const MAX_SEND_PARTS: usize = 5;
+const MAX_SEND_BYTES: usize = 32768;
+
+#[derive(Debug, Eq, PartialEq)]
+struct SendPart {
+    text: String,
+    after_ms: u64,
+}
+struct PreparedParts {
+    parts: Vec<SendPart>,
+    requested_part_count: usize,
+    applied_mode: &'static str,
+}
+
+fn prepare_parts(
+    parts: &[Value],
+    after_ms: u64,
+    effective: eve_segment_api::EffectiveSegmentation,
+) -> Result<PreparedParts, ToolExecutionError> {
+    let mut chosen = parts
+        .iter()
+        .map(|part| SendPart {
+            text: part["text"].as_str().unwrap().into(),
+            after_ms: part.get("after_ms").and_then(Value::as_u64).unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+    chosen[0].after_ms = chosen[0].after_ms.max(after_ms);
+    let maximum = if effective.enabled {
+        effective.limits.max_segments
+    } else {
+        1
+    };
+    let applied_mode = if !effective.enabled {
+        "merged_disabled"
+    } else if chosen.len() > maximum {
+        "merged_limit"
+    } else {
+        "explicit_parts"
+    };
+    if chosen.len() > maximum {
+        let tail = chosen.split_off(maximum - 1);
+        chosen.push(SendPart {
+            text: tail
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            after_ms: tail[0].after_ms,
+        });
+    }
+    if chosen.iter().map(|part| part.text.len()).sum::<usize>() > MAX_SEND_BYTES
+        || chosen
+            .iter()
+            .any(|part| part.text.len() > effective.limits.max_segment_bytes)
+    {
+        return Err(ToolExecutionError::Rejected(
+            "应用当前分条设置后正文超过字节上限；未发送消息".into(),
+        ));
+    }
+    for part in chosen.iter_mut().skip(1) {
+        part.after_ms = (part.after_ms * u64::from(effective.pause_percent) / 100)
+            .min(effective.limits.max_pause_ms);
+    }
+    Ok(PreparedParts {
+        parts: chosen,
+        requested_part_count: parts.len(),
+        applied_mode,
+    })
+}
+
+fn send_digest(id: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, id.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 只区分宿主同一次显式分条计划的不同部分，不豁免旧未知决定的重放。
+pub(crate) fn distinct_parts_of_same_send(first: &str, second: &str) -> bool {
+    fn identity(value: &str) -> Option<(&str, usize)> {
+        let (digest, ordinal) = value.strip_prefix("speech-parts-")?.rsplit_once('-')?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || ordinal.len() != 1
+        {
+            return None;
+        }
+        let ordinal = ordinal.parse::<usize>().ok()?;
+        (ordinal < MAX_SEND_PARTS).then_some((digest, ordinal))
+    }
+    matches!((identity(first), identity(second)),
+        (Some((left, a)), Some((right, b))) if left == right && a != b)
+}
+
+fn valid_send_text(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        !text.trim().is_empty()
+            && text.len() <= MAX_SEND_BYTES
+            && !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+    })
+}
+
+impl SendMessage {
+    /// 每条复用原发送队列与真实回执；后一条不会提前入队。
+    async fn send_one(
+        &self,
+        scope: &ContextScope,
+        turn: &Arc<Turn>,
+        context: &ToolExecutionContext,
+        part: &SendPart,
+        call_id: String,
+        needs_answer: bool,
+    ) -> Result<(LiveDelivery, bool), ToolExecutionError> {
+        let rejected = || ToolExecutionError::Rejected("当前没有可投递的对话轮次".into());
+        let changed = turn.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let current = || -> Result<bool, ToolExecutionError> {
+            let input = turn.input.lock().map_err(|_| rejected())?;
+            Ok(input.accepting
+                && input.messages.is_empty()
+                && !context.is_cancel_requested()
+                && context.check_review_evidence().is_ok())
+        };
+        if !current()? {
+            return Ok((LiveDelivery::Stale, false));
+        }
+        if part.after_ms > 0 {
+            tokio::select! {
+                _ = &mut changed => return Ok((LiveDelivery::Stale, false)),
+                _ = tokio::time::sleep(Duration::from_millis(part.after_ms)) => {}
+            }
+        }
+        if !current()? {
+            return Ok((LiveDelivery::Stale, false));
+        }
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut queue = self.0.outgoing.lock().map_err(|_| rejected())?;
+            if queue.len() >= 64 {
+                return Err(rejected());
+            }
+            queue.push_back(LiveSend {
+                scope: scope.clone(),
+                turn_id: turn.id,
+                text: part.text.clone(),
+                image: None,
+                needs_answer,
+                call_id,
+                context: context.clone(),
+                turn: Arc::downgrade(turn),
+                result: sender,
+            });
+        }
+        // 队列已经交出；通道消失不能证明没有发，未获得回执记未知。
+        let result = receiver.await.unwrap_or(LiveDelivery::Unknown);
+        let result = match result {
+            LiveDelivery::Sent(id) if !crate::state::valid_message_id(&id) => LiveDelivery::Unknown,
+            other => other,
+        };
+        Ok((result, true))
+    }
+}
+
 impl Tool for SendMessage {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "由你决定在当前会话说什么；用于闲聊、提问、进展和最终回应。只在你想说且内容值得说时调用，没有固定汇报次数。普通 final 只结束内部处理，不自动发送。每次一条完整消息，最多 32768 UTF-8 字节；长内容自行决定分条。after_ms 可选择 0 至 10000 毫秒后再说，默认现在；期间有新消息则旧决定不发，返回 stale，交给你重新考虑。不会结束当前任务。只向可信的原会话发送，不接受地址。sent=true 且有 message_id 才确认送达；unknown 不重发；not_sent/stale 没有确认送达。not_sent 的 failure_kind 若为 passive_window_elapsed / passive_window_missing / passive_quota_exhausted，需等待同一用户的新输入带来有效回复窗口，不要改写正文反复尝试；duplicate_text 表示已有相同正文的投递记录，不重放。不要把未完成说成完成，不重复已说过的话。".into(),
-            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":32768},"after_ms":{"type":"integer","minimum":0,"maximum":10000},"purpose":{"type":"string","enum":["conversation","progress","question","authorization","answer"]}},"required":["text"],"additionalProperties":false}),
+            description: "自主向当前可信会话发送闲聊、进展、提问或回答；普通 final 只结束内部处理，不自动发送。text 是完整一条；parts 明确选择 1 至 5 个消息边界（每项 text、可选 after_ms），两者必须二选一，总计最多 32768 UTF-8 字节。实际条数遵循 /segment（默认最多 3 条，硬上限 5）；关闭时用两个换行合成全文，超上限合并尾部，保留正文；设置不可用则零发送。顶层与第一部分 after_ms 取较大值；后续在上一条真实回执后等待，按当前节奏缩放并截到停顿上限；0 至 10000 毫秒，默认立即，不按字数模拟打字。逐条等待真实回执；失败、未知或新输入停止后缀。attempted=false 表示未交给发送队列；单条 sent=true 且有 message_id 才确认送达，parts 的 sent=true 表示所有实际部分均确认，根 message_id 为 null，请读 parts 和 applied_mode。unknown 不重发；passive_window_* / passive_quota_exhausted 等待新输入，不反复改写尝试；duplicate_text 不重放。不结束任务、不接受地址，不把未完成说成完成。".into(),
+            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":32768},"parts":{"type":"array","minItems":1,"maxItems":5,"items":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":32768},"after_ms":{"type":"integer","minimum":0,"maximum":10000}},"required":["text"],"additionalProperties":false}},"after_ms":{"type":"integer","minimum":0,"maximum":10000},"purpose":{"type":"string","enum":["conversation","progress","question","authorization","answer"]}},"oneOf":[{"required":["text"]},{"required":["parts"]}],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "eve.qq.live-send".into() }),
         }
@@ -489,7 +729,7 @@ impl Tool for SendMessage {
     fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
         if value.as_object().is_none_or(|v| {
             v.keys()
-                .any(|k| !matches!(k.as_str(), "text" | "purpose" | "after_ms"))
+                .any(|k| !matches!(k.as_str(), "text" | "parts" | "purpose" | "after_ms"))
         }) || value.get("purpose").is_some_and(|p| {
             !matches!(
                 p.as_str(),
@@ -498,19 +738,33 @@ impl Tool for SendMessage {
         }) || value
             .get("after_ms")
             .is_some_and(|p| p.as_u64().is_none_or(|ms| ms > 10_000))
-            || value
-                .get("text")
-                .and_then(Value::as_str)
-                .is_none_or(|text| {
-                    text.trim().is_empty()
-                        || text.len() > 32768
-                        || text
-                            .chars()
-                            .any(|c| c.is_control() && c != '\n' && c != '\t')
+            || (value.get("text").is_some() == value.get("parts").is_some())
+            || value.get("text").is_some_and(|text| !valid_send_text(text))
+            || value.get("parts").is_some_and(|parts| {
+                parts.as_array().is_none_or(|parts| {
+                    parts.is_empty()
+                        || parts.len() > MAX_SEND_PARTS
+                        || parts.iter().any(|part| {
+                            part.as_object().is_none_or(|fields| {
+                                fields
+                                    .keys()
+                                    .any(|k| !matches!(k.as_str(), "text" | "after_ms"))
+                            }) || part.get("text").is_none_or(|text| !valid_send_text(text))
+                                || part.get("after_ms").is_some_and(|delay| {
+                                    delay.as_u64().is_none_or(|ms| ms > 10_000)
+                                })
+                        })
+                        || parts
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .map(str::len)
+                            .sum::<usize>()
+                            > MAX_SEND_BYTES
                 })
+            })
         {
             return Err(ToolValidationError {
-                message: "text 需要 1 至 32768 UTF-8 字节，after_ms 为 0 至 10000 的整数".into(),
+                message: "text 与 parts 必须二选一；parts 为 1 至 5 条，总计 1 至 32768 UTF-8 字节，after_ms 为 0 至 10000 的整数".into(),
             });
         }
         Ok(())
@@ -536,86 +790,87 @@ impl Tool for SendMessage {
             {
                 return Err(rejected());
             }
-            let session_id = scope.session_id.clone();
-            let stale = || json!({"sent":false,"message_id":null,"session_id":session_id,"delivery_status":"stale"});
-            let changed = turn.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if context.check_review_evidence().is_err()
-                || !turn
-                    .input
-                    .lock()
-                    .map_err(|_| rejected())?
-                    .messages
-                    .is_empty()
-            {
-                return Ok(stale());
-            }
-            if let Some(ms) = call
+            let digest = send_digest(&call.id);
+            let after_ms = call
                 .arguments
                 .get("after_ms")
                 .and_then(Value::as_u64)
-                .filter(|ms| *ms > 0)
-            {
-                tokio::select! {
-                    _ = &mut changed => return Ok(stale()),
-                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
-                }
-            }
-            if context.is_cancel_requested()
-                || context.check_review_evidence().is_err()
-                || !turn
-                    .input
-                    .lock()
-                    .map_err(|_| rejected())?
-                    .messages
-                    .is_empty()
-            {
-                return Ok(stale());
-            }
-            let (sender, receiver) = oneshot::channel();
-            {
-                let mut queue = self.0.outgoing.lock().map_err(|_| rejected())?;
-                if queue.len() >= 64 {
-                    return Err(rejected());
-                }
-                queue.push_back(LiveSend {
-                    scope,
-                    turn_id,
+                .unwrap_or(0);
+            let needs_answer = matches!(
+                call.arguments.get("purpose").and_then(Value::as_str),
+                Some("question" | "authorization")
+            );
+            let Some(parts) = call.arguments.get("parts").and_then(Value::as_array) else {
+                let part = SendPart {
                     text: call.arguments["text"]
                         .as_str()
                         .ok_or_else(rejected)?
                         .trim()
                         .into(),
-                    image: None,
-                    needs_answer: matches!(
-                        call.arguments.get("purpose").and_then(Value::as_str),
-                        Some("question" | "authorization")
-                    ),
-                    call_id: format!(
-                        "speech-{}",
-                        ring::digest::digest(&ring::digest::SHA256, call.id.as_bytes())
-                            .as_ref()
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                    ),
-                    context,
-                    turn: Arc::downgrade(&turn),
-                    result: sender,
-                });
+                    after_ms,
+                };
+                let (result, _) = self
+                    .send_one(
+                        &scope,
+                        &turn,
+                        &context,
+                        &part,
+                        format!("speech-{digest}"),
+                        needs_answer,
+                    )
+                    .await?;
+                return Ok(delivery_json(result, &scope.session_id));
+            };
+            let prepared = prepare_parts(parts, after_ms, self.0.effective_segmentation(&scope)?)?;
+            let mut receipts = Vec::with_capacity(prepared.parts.len());
+            let mut stopped = None;
+            for (index, part) in prepared.parts.iter().enumerate() {
+                if let Some(reason) = stopped {
+                    receipts.push(json!({"index":index,"sent":false,"message_id":null,
+                        "delivery_status":"not_sent","attempted":false,"failure_kind":reason}));
+                    continue;
+                }
+                let (result, attempted) = match self
+                    .send_one(
+                        &scope,
+                        &turn,
+                        &context,
+                        part,
+                        format!("speech-parts-{digest}-{index}"),
+                        needs_answer,
+                    )
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    // 拒绝发生在入队前，已有发送前缀仍由聚合回执保留。
+                    Err(_) => (LiveDelivery::NotSentReason("queue_unavailable"), false),
+                };
+                stopped = match &result {
+                    LiveDelivery::Sent(_) => None,
+                    LiveDelivery::Unknown => Some("previous_part_unknown"),
+                    LiveDelivery::Stale => Some("previous_part_stale"),
+                    LiveDelivery::NotSent | LiveDelivery::NotSentReason(_) => {
+                        Some("previous_part_not_sent")
+                    }
+                };
+                let mut receipt = delivery_json(result, &scope.session_id);
+                receipt["index"] = json!(index);
+                receipt["attempted"] = json!(attempted);
+                receipts.push(receipt);
             }
-            let result = receiver
-                .await
-                .map_err(|_| ToolExecutionError::Failed("消息投递结果未知，不要重发".into()))?;
-            Ok(delivery_json(result, &session_id))
+            let mut result = parts_delivery_json(receipts, &scope.session_id);
+            result["requested_part_count"] = json!(prepared.requested_part_count);
+            result["actual_part_count"] = json!(prepared.parts.len());
+            result["applied_mode"] = json!(prepared.applied_mode);
+            Ok(result)
         })
     }
 }
 
 fn delivery_json(result: LiveDelivery, session_id: &str) -> Value {
     let (status, message_id, reason) = match result {
-        LiveDelivery::Sent(id) => ("sent", Some(id), None),
+        LiveDelivery::Sent(id) if crate::state::valid_message_id(&id) => ("sent", Some(id), None),
+        LiveDelivery::Sent(_) => ("unknown", None, None),
         LiveDelivery::Unknown => ("unknown", None, None),
         LiveDelivery::NotSent => ("not_sent", None, None),
         LiveDelivery::NotSentReason(reason) => ("not_sent", None, Some(reason)),
@@ -626,6 +881,32 @@ fn delivery_json(result: LiveDelivery, session_id: &str) -> Value {
         value["failure_kind"] = json!(reason);
     }
     value
+}
+
+fn parts_delivery_json(parts: Vec<Value>, session_id: &str) -> Value {
+    let sent_count = parts.iter().filter(|part| part["sent"] == true).count();
+    let all_sent = sent_count == parts.len();
+    let stopped = parts.iter().find(|part| part["sent"] != true).cloned();
+    let status = if all_sent {
+        "sent"
+    } else if sent_count > 0 {
+        "partial"
+    } else {
+        stopped
+            .as_ref()
+            .and_then(|part| part["delivery_status"].as_str())
+            .unwrap_or("not_sent")
+    };
+    let mut result = json!({"sent":all_sent,"message_id":null,"session_id":session_id,
+        "delivery_status":status,"sent_count":sent_count,
+        "attempted_count":parts.iter().filter(|part| part["attempted"] == true).count(),"parts":parts});
+    if let Some(stopped) = stopped {
+        result["stopped_by"] = stopped["delivery_status"].clone();
+        if let Some(reason) = stopped.get("failure_kind") {
+            result["failure_kind"] = reason.clone();
+        }
+    }
+    result
 }
 
 struct WaitForInput(Arc<LiveDialogue>);
@@ -691,6 +972,335 @@ impl Tool for WaitForInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parts_scope() -> ContextScope {
+        ContextScope {
+            session_id: "trusted-session".into(),
+            user_id: "owner".into(),
+        }
+    }
+
+    async fn next_part(live: &LiveDialogue) -> LiveSend {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(outgoing) = live.next() {
+                    return outgoing;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("本部分应进入发送队列")
+    }
+
+    #[test]
+    fn explicit_parts_validate_exclusive_shape_and_total_utf8_budget() {
+        let tool = Arc::new(LiveDialogue::default()).send_tool();
+        for invalid in [
+            json!({}),
+            json!({"text":"嗯", "parts":[{"text":"嗯"}]}),
+            json!({"parts":[]}),
+            json!({"parts":[{"text":" "}]}),
+            json!({"parts":[{"text":"嗯","address":"other"}]}),
+            json!({"parts":[{"text":"嗯","after_ms":-1}]}),
+            json!({"parts":[{"text":"嗯","after_ms":1.5}]}),
+            json!({"parts":[{"text":"嗯","after_ms":10001}]}),
+            json!({"parts":[{"text":"含\u{0000}控制符"}]}),
+            json!({"parts":[{"text":"嗯"},{"text":"嗯"},{"text":"嗯"},{"text":"嗯"},{"text":"嗯"},{"text":"嗯"}]}),
+            json!({"parts":[{"text":"中".repeat(6000)},{"text":"文".repeat(6000)}]}),
+            json!({"parts":[{"text":"嗯"}],"extra":true}),
+        ] {
+            assert!(tool.validate_arguments(&invalid).is_err(), "{invalid}");
+        }
+        for valid in [
+            json!({"text":"保持兼容"}),
+            json!({"parts":[{"text":"嗯"},{"text":"嗯","after_ms":0}]}),
+            json!({"parts":[{"text":"两行\n\t正文"}],"after_ms":10000,"purpose":"question"}),
+        ] {
+            tool.validate_arguments(&valid).unwrap();
+        }
+    }
+
+    #[test]
+    fn preference_preserves_text_combines_tail_and_scales_only_between_parts() {
+        use eve_segment_api::SegmentPreference;
+        let values = vec![
+            json!({"text":" 第一部分 ","after_ms":3000}),
+            json!({"text":"第二部分", "after_ms":4000}),
+            json!({"text":"第三部分", "after_ms":10000}),
+        ];
+        let effective = SegmentPreference {
+            max_segments: Some(2),
+            pause_percent: Some(50),
+            ..Default::default()
+        }
+        .effective(&crate::QQ_SEGMENT_POLICY)
+        .unwrap();
+        let prepared = prepare_parts(&values, 3500, effective).unwrap();
+        assert_eq!(prepared.applied_mode, "merged_limit");
+        assert_eq!(prepared.requested_part_count, 3);
+        assert_eq!(
+            prepared.parts,
+            [
+                SendPart {
+                    text: " 第一部分 ".into(),
+                    after_ms: 3500
+                },
+                SendPart {
+                    text: "第二部分\n\n第三部分".into(),
+                    after_ms: 1250
+                },
+            ]
+        );
+        let disabled = SegmentPreference {
+            enabled: Some(false),
+            pause_percent: Some(0),
+            ..Default::default()
+        }
+        .effective(&crate::QQ_SEGMENT_POLICY)
+        .unwrap();
+        let whole = prepare_parts(&values, 3500, disabled).unwrap();
+        assert_eq!(whole.applied_mode, "merged_disabled");
+        assert_eq!(
+            whole.parts,
+            [SendPart {
+                text: " 第一部分 \n\n第二部分\n\n第三部分".into(),
+                after_ms: 3500,
+            }]
+        );
+        let near_limit = vec![
+            json!({"text":"a".repeat(MAX_SEND_BYTES - 1)}),
+            json!({"text":"b"}),
+        ];
+        assert!(
+            prepare_parts(&near_limit, 0, disabled).is_err(),
+            "合并新增换行也必须计入总预算"
+        );
+    }
+
+    #[derive(Default)]
+    struct ChangingPreferences {
+        preference: Mutex<eve_segment_api::SegmentPreference>,
+        unavailable: Mutex<bool>,
+        scopes: Mutex<Vec<eve_segment_api::SegmentScope>>,
+    }
+    impl eve_segment_api::SegmentPreferences for ChangingPreferences {
+        fn get(
+            &self,
+            scope: &eve_segment_api::SegmentScope,
+        ) -> eve_segment_api::SegmentPreferenceResult<eve_segment_api::SegmentPreference> {
+            scope.validate()?;
+            self.scopes.lock().unwrap().push(scope.clone());
+            if *self.unavailable.lock().unwrap() {
+                return Err(eve_segment_api::SegmentPreferenceError::Unavailable);
+            }
+            Ok(*self.preference.lock().unwrap())
+        }
+        fn update(
+            &self,
+            _: &eve_segment_api::SegmentScope,
+            _: eve_segment_api::SegmentChange,
+        ) -> eve_segment_api::SegmentPreferenceResult<eve_segment_api::SegmentPreference> {
+            panic!("发送工具不能修改用户设置")
+        }
+    }
+
+    #[tokio::test]
+    async fn segmentation_configuration_reads_current_trusted_scope_and_fails_without_sending() {
+        let live = Arc::new(LiveDialogue::default());
+        let scope = parts_scope();
+        let _turn = live.open(&scope, 7).unwrap();
+        let defaults = live.effective_segmentation(&scope).unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.limits.max_segments, 3);
+        live.configure_segmentation(None, crate::QQ_SEGMENT_POLICY)
+            .unwrap();
+        assert!(!live.effective_segmentation(&scope).unwrap().enabled);
+        let store = Arc::new(ChangingPreferences::default());
+        live.configure_segmentation(Some(store.clone()), crate::QQ_SEGMENT_POLICY)
+            .unwrap();
+        assert_eq!(
+            live.effective_segmentation(&scope)
+                .unwrap()
+                .limits
+                .max_segments,
+            3
+        );
+        store.preference.lock().unwrap().max_segments = Some(2);
+        assert_eq!(
+            live.effective_segmentation(&scope)
+                .unwrap()
+                .limits
+                .max_segments,
+            2
+        );
+        assert!(
+            store
+                .scopes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|seen| seen.channel == "qq"
+                    && seen.session_id == scope.session_id
+                    && seen.user_id == scope.user_id)
+        );
+        *store.unavailable.lock().unwrap() = true;
+        let result = live
+            .send_tool()
+            .execute(
+                ToolCall {
+                    id: "bad-preferences".into(),
+                    name: "send_message".into(),
+                    arguments: json!({"parts":[{"text":"绝不静默回退"}]}),
+                },
+                ToolExecutionContext::new()
+                    .with_scope(Some(scope))
+                    .with_turn_id(Some(7)),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolExecutionError::Rejected(_))));
+        assert!(live.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_parts_wait_for_each_real_receipt_and_use_stable_distinct_ids() {
+        let live = Arc::new(LiveDialogue::default());
+        let scope = parts_scope();
+        let _turn = live.open(&scope, 7).unwrap();
+        let tool = live.send_tool();
+        let context = ToolExecutionContext::new()
+            .with_scope(Some(scope))
+            .with_turn_id(Some(7));
+        let sending = tokio::spawn(async move {
+            tool.execute(ToolCall {
+            id: "three-parts".into(), name: "send_message".into(),
+            arguments: json!({"parts":[{"text":"嗯"},{"text":"嗯"},{"text":"完成了"}],"purpose":"question"}),
+        }, context).await
+        });
+        for index in 0..3 {
+            let outgoing = next_part(&live).await;
+            assert_eq!(
+                outgoing.call_id,
+                format!("speech-parts-{}-{index}", send_digest("three-parts"))
+            );
+            assert!(outgoing.needs_answer);
+            assert!(outgoing.current());
+            tokio::task::yield_now().await;
+            assert!(live.next().is_none(), "尚无回执不能提前入队下一条");
+            assert!(!sending.is_finished());
+            outgoing.complete(LiveDelivery::Sent(format!("platform-part-{index}")));
+        }
+        let result = sending.await.unwrap().unwrap();
+        assert_eq!(result["sent"], true);
+        assert!(result["message_id"].is_null());
+        assert_eq!(result["sent_count"], 3);
+        assert_eq!(result["attempted_count"], 3);
+        assert_eq!(result["actual_part_count"], 3);
+        assert_eq!(result["applied_mode"], "explicit_parts");
+        for index in 0..3 {
+            assert_eq!(
+                result["parts"][index]["message_id"],
+                format!("platform-part-{index}")
+            );
+            assert_eq!(result["parts"][index]["index"], index);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_parts_stop_after_unknown_invalid_id_not_sent_or_stale() {
+        for (outcome, state, suffix_reason) in [
+            (LiveDelivery::Unknown, "unknown", "previous_part_unknown"),
+            (
+                LiveDelivery::Sent(String::new()),
+                "unknown",
+                "previous_part_unknown",
+            ),
+            (LiveDelivery::NotSent, "not_sent", "previous_part_not_sent"),
+            (LiveDelivery::Stale, "stale", "previous_part_stale"),
+        ] {
+            let live = Arc::new(LiveDialogue::default());
+            let scope = parts_scope();
+            let _turn = live.open(&scope, 7).unwrap();
+            let tool = live.send_tool();
+            let context = ToolExecutionContext::new()
+                .with_scope(Some(scope))
+                .with_turn_id(Some(7));
+            let sending = tokio::spawn(async move {
+                tool.execute(ToolCall {
+                id: "partial-plan".into(), name: "send_message".into(),
+                arguments: json!({"parts":[{"text":"已完成前缀"},{"text":"本条未确认"},{"text":"后缀绝不能发"}]}),
+            }, context).await
+            });
+            next_part(&live)
+                .await
+                .complete(LiveDelivery::Sent("prefix-id".into()));
+            next_part(&live).await.complete(outcome);
+            let result = sending.await.unwrap().unwrap();
+            assert!(!result["sent"].as_bool().unwrap());
+            assert_eq!(result["delivery_status"], "partial");
+            assert_eq!(result["stopped_by"], state);
+            assert_eq!(result["sent_count"], 1);
+            assert_eq!(result["attempted_count"], 2);
+            assert_eq!(result["parts"][1]["delivery_status"], state);
+            assert_eq!(result["parts"][2]["attempted"], false);
+            assert_eq!(result["parts"][2]["failure_kind"], suffix_reason);
+            assert!(live.next().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn new_input_interrupts_part_pause_and_preserves_confirmed_prefix() {
+        let live = Arc::new(LiveDialogue::default());
+        let scope = parts_scope();
+        let turn = live.open(&scope, 7).unwrap();
+        let tool = live.send_tool();
+        let context = ToolExecutionContext::new()
+            .with_scope(Some(scope.clone()))
+            .with_turn_id(Some(7));
+        let sending = tokio::spawn(async move {
+            tool.execute(ToolCall {
+            id: "paused-plan".into(), name: "send_message".into(),
+            arguments: json!({"parts":[{"text":"先说这一条"},{"text":"这条过时了","after_ms":3000},{"text":"后缀也过时了"}]}),
+        }, context).await
+        });
+        next_part(&live)
+            .await
+            .complete(LiveDelivery::Sent("prefix-id".into()));
+        tokio::task::yield_now().await;
+        assert!(live.steer(&scope, 7, "先停一下".into(), || Ok(())).unwrap());
+        let result = tokio::time::timeout(Duration::from_secs(1), sending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["delivery_status"], "partial");
+        assert_eq!(result["parts"][1]["delivery_status"], "stale");
+        assert_eq!(result["parts"][1]["attempted"], false);
+        assert_eq!(result["parts"][2]["attempted"], false);
+        assert_eq!(result["sent_count"], 1);
+        assert_eq!(turn.take(false).unwrap(), ["先停一下"]);
+        assert!(live.next().is_none());
+    }
+
+    #[test]
+    fn dedup_exception_only_identifies_distinct_ordinals_of_one_explicit_send() {
+        let first = format!("speech-parts-{}-0", send_digest("one-plan"));
+        let next = format!("speech-parts-{}-1", send_digest("one-plan"));
+        assert!(distinct_parts_of_same_send(&first, &next));
+        assert!(!distinct_parts_of_same_send(&first, &first));
+        assert!(!distinct_parts_of_same_send(
+            &first,
+            &format!("speech-parts-{}-1", send_digest("other-plan"))
+        ));
+        for malformed in [
+            "speech-parts-abc-1".to_owned(),
+            format!("speech-parts-{}-5", send_digest("one-plan")),
+            format!("speech-parts-{}-01", send_digest("one-plan")),
+            format!("speech-{}", send_digest("one-plan")),
+        ] {
+            assert!(!distinct_parts_of_same_send(&first, &malformed));
+        }
+    }
 
     #[tokio::test]
     async fn confirmed_delivery_rejection_exposes_reason_without_claiming_sent() {
