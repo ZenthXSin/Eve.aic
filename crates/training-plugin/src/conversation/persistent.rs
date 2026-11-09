@@ -46,6 +46,35 @@ struct Claim {
     /// 只有宿主已经明确记录失败，才可重新请求这次无工具学习。
     retryable: bool,
 }
+
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SweepOutcome {
+    Succeeded,
+    Failed,
+    Unknown,
+}
+impl SweepOutcome {
+    fn combine(self, previous: Option<Self>) -> Self {
+        match (self, previous) {
+            (Self::Unknown, _) | (_, Some(Self::Unknown)) => Self::Unknown,
+            (Self::Failed, _) | (_, Some(Self::Failed)) => Self::Failed,
+            _ => Self::Succeeded,
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SweepAccounting {
+    failed: u64,
+    unknown: u64,
+    unclassified: u64,
+    legacy_processed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial: Option<SweepOutcome>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Sweep {
@@ -60,10 +89,24 @@ struct Sweep {
     model_requests: u64,
     #[serde(default)]
     covered: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accounting: Option<SweepAccounting>,
 }
 impl Sweep {
     fn pending(&self) -> bool {
         self.cursor.sequence <= self.sequences.len() as u64
+    }
+    fn initialize_accounting(&mut self) {
+        if self.accounting.is_none() {
+            self.accounting = Some(SweepAccounting {
+                unclassified: self.cursor.sequence - 1,
+                legacy_processed: self.processed,
+                partial: (self.cursor.text_offset != 0 || self.cursor.context_offset != 0)
+                    .then_some(SweepOutcome::Unknown),
+                ..Default::default()
+            });
+            self.processed = 0;
+        }
     }
 }
 
@@ -126,7 +169,7 @@ impl Checkpoint {
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(state("交流消费检查点超限；保留原记录"));
         }
-        let value: Self =
+        let mut value: Self =
             serde_json::from_slice(bytes).map_err(|_| state("交流消费检查点损坏；保留原记录"))?;
         let mut ids = BTreeSet::new();
         if value.version != 2
@@ -208,6 +251,10 @@ impl Checkpoint {
             return Err(state("交流消费检查点内容无效；未清空"));
         }
         validate_checkpoint(store, row, &value)?;
+        // 不扫描批次归档来猜旧分片结果；下次真实提交时一并保存迁移后的统计。
+        for sweep in value.sweep.iter_mut().chain(&mut value.sweep_archive) {
+            sweep.initialize_accounting();
+        }
         Ok(value)
     }
     fn next_name(&mut self, prefix: &str) -> PluginResult<String> {
@@ -278,8 +325,8 @@ fn validate_checkpoint(
             return Err(state("交流当前经验与已保存版本不一致；保留原记录"));
         }
     }
-    if let Some(sweep) = &checkpoint.sweep
-        && (!super::identifier(&sweep.id)
+    for sweep in checkpoint.sweep.iter().chain(&checkpoint.sweep_archive) {
+        if !super::identifier(&sweep.id)
             || sweep.sequences.len() > 250_000
             || sweep.cursor.sequence == 0
             || sweep.cursor.sequence > sweep.sequences.len() as u64 + 1
@@ -288,9 +335,36 @@ fn validate_checkpoint(
                 .iter()
                 .any(|s| *s == 0 || *s >= row.next_sequence)
             || sweep.sequences.iter().collect::<BTreeSet<_>>().len() != sweep.sequences.len()
-            || sweep.processed > sweep.sequences.len() as u64)
-    {
-        return Err(state("交流重访检查点无效"));
+            || sweep.processed > sweep.cursor.sequence - 1
+        {
+            return Err(state("交流重访检查点无效"));
+        }
+        let partial = sweep.cursor.text_offset != 0 || sweep.cursor.context_offset != 0;
+        if partial {
+            let sequence = sweep
+                .sequences
+                .get(sweep.cursor.sequence as usize - 1)
+                .ok_or_else(|| state("交流重访末尾不能含分片偏移"))?;
+            let mut cursor = sweep.cursor.clone();
+            cursor.sequence = *sequence;
+            validate_cursor(store, row, &cursor)?;
+        }
+        if let Some(accounting) = &sweep.accounting {
+            let consumed = [
+                sweep.processed,
+                accounting.failed,
+                accounting.unknown,
+                accounting.unclassified,
+            ]
+            .into_iter()
+            .try_fold(0_u64, u64::checked_add);
+            if consumed != Some(sweep.cursor.sequence - 1)
+                || accounting.legacy_processed > accounting.unclassified
+                || accounting.partial.is_some() != partial
+            {
+                return Err(state("交流重访消息统计与消费位置不一致；保留原记录"));
+            }
+        }
     }
     let Some(claim) = &checkpoint.inflight else {
         return Ok(());
@@ -544,16 +618,52 @@ impl PersistentConversations {
                     Checkpoint::load(&row, self.store.as_ref()).map(|checkpoint| (row, checkpoint))
                 })
                 .collect::<PluginResult<Vec<_>>>()?;
+            let mut request_usage = std::collections::BTreeMap::<String, u64>::new();
+            for (_, checkpoint) in &candidates {
+                for sweep in checkpoint.sweep.iter().chain(&checkpoint.sweep_archive) {
+                    let used = request_usage.entry(sweep.id.clone()).or_default();
+                    *used = used.saturating_add(sweep.model_requests);
+                }
+            }
             candidates.sort_by_key(|(_, c)| (c.last_claimed_at, c.ready_at));
             for (row, mut checkpoint) in candidates {
-                let wants_maintenance = checkpoint.inflight.as_ref().map_or_else(
-                    || checkpoint.sweep.as_ref().is_some_and(Sweep::pending),
-                    |claim| claim.sweep,
-                );
-                if maintenance != wants_maintenance {
+                if checkpoint
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|claim| claim.sweep && claim.retryable)
+                    && checkpoint.sweep.as_ref().is_some_and(|sweep| {
+                        request_usage
+                            .get(&sweep.id)
+                            .is_some_and(|used| *used >= 4096)
+                    })
+                {
+                    // 维护入口在额度用尽后可能不再运行；普通领取也可完成这次本地结算。
+                    // 这里只处理已明确失败的等待重试批次，不触碰在途未知请求。
+                    let claim = checkpoint.inflight.take().expect("checked retryable claim");
+                    advance(&mut checkpoint, &claim, "failed", 0)?;
+                    checkpoint.pending_since_ms = None;
+                    checkpoint.ready_at = 0;
+                    self.save(
+                        &row,
+                        &checkpoint,
+                        vec![],
+                        Some(ConversationBatchArchive {
+                            batch: claim.batch,
+                            outcome: "budget_exhausted".into(),
+                            recorded_at_ms: Some(now),
+                        }),
+                    )?;
+                    return Ok(None);
+                }
+                if checkpoint
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|claim| maintenance != claim.sweep)
+                    || maintenance && !checkpoint.sweep.as_ref().is_some_and(Sweep::pending)
+                {
                     continue;
                 }
-                if !enabled(&row.scope) && !checkpoint.sweep.as_ref().is_some_and(Sweep::pending) {
+                if !maintenance && !enabled(&row.scope) {
                     continue;
                 }
                 if now < checkpoint.ready_at {
@@ -580,24 +690,27 @@ impl PersistentConversations {
                     self.save(&row, &checkpoint, vec![], None)?;
                     return Ok(Some(batch));
                 }
-                if checkpoint.sweep.as_ref().is_some_and(Sweep::pending) {
+                if maintenance {
                     let batch = self.take_sweep(&row, &mut checkpoint, now)?;
                     return Ok(Some(batch));
                 }
-                if let Some(sweep) = &checkpoint.sweep
-                    && !sweep.pending()
-                {
-                    let covered: BTreeSet<_> = sweep.covered.iter().copied().collect();
-                    let before = checkpoint.cursor.clone();
-                    while covered.contains(&checkpoint.cursor.sequence) {
-                        checkpoint.cursor = Cursor::at(checkpoint.cursor.sequence + 1);
-                    }
-                    if checkpoint.cursor != before {
-                        self.save(&row, &checkpoint, vec![], None)?;
-                        return Ok(None);
-                    }
+                // 冻结来源由独立维护游标负责；只越过集合内的事件，保留夹在其间的新输入。
+                // 旧请求也保留预约，不能在换请求或预算耗尽后复活失败、未知来源。
+                let reserved: BTreeSet<_> = checkpoint
+                    .sweep
+                    .iter()
+                    .chain(&checkpoint.sweep_archive)
+                    .flat_map(|sweep| sweep.sequences.iter().copied())
+                    .collect();
+                let before = checkpoint.cursor.clone();
+                while reserved.contains(&checkpoint.cursor.sequence) {
+                    checkpoint.cursor = Cursor::at(checkpoint.cursor.sequence + 1);
                 }
+                let cursor_changed = checkpoint.cursor != before;
                 if checkpoint.cursor.sequence >= row.next_sequence {
+                    if cursor_changed {
+                        self.save(&row, &checkpoint, vec![], None)?;
+                    }
                     continue;
                 }
                 let events = self.store.events(
@@ -626,7 +739,7 @@ impl PersistentConversations {
                         .or(first_observed.filter(|t| *t <= now))
                         .unwrap_or(now);
                     if now.saturating_sub(since) < RETRY_MS {
-                        if checkpoint.pending_since_ms.is_none() {
+                        if checkpoint.pending_since_ms.is_none() || cursor_changed {
                             checkpoint.pending_since_ms = Some(since);
                             self.save(&row, &checkpoint, vec![], None)?;
                         }
@@ -646,11 +759,7 @@ impl PersistentConversations {
                 let start = checkpoint.cursor.clone();
                 let mut after = start.clone();
                 for event in &events {
-                    if checkpoint
-                        .sweep
-                        .as_ref()
-                        .is_some_and(|s| !s.pending() && s.covered.contains(&event.sequence))
-                    {
+                    if reserved.contains(&event.sequence) {
                         break;
                     }
                     if event.sequence != after.sequence {
@@ -826,6 +935,7 @@ impl PersistentConversations {
                 interrupted_batches: 0,
                 model_requests: 0,
                 covered: vec![],
+                accounting: Some(SweepAccounting::default()),
             });
             self.save(&row, &checkpoint, vec![], None)
         })
@@ -834,6 +944,7 @@ impl PersistentConversations {
         self.run(|| {
             let mut status = ConversationSweepStatus {
                 id: id.into(),
+                message_counts: Some(ConversationSweepMessageCounts::default()),
                 ..Default::default()
             };
             for row in self.store.scopes()? {
@@ -853,6 +964,17 @@ impl PersistentConversations {
                     status.failed_batches += sweep.failed_batches;
                     status.interrupted_batches += sweep.interrupted_batches;
                     status.model_requests += sweep.model_requests;
+                    let accounting = sweep.accounting.expect("initialized accounting");
+                    let counts = status.message_counts.as_mut().expect("initialized counts");
+                    counts.failed += accounting.failed;
+                    counts.unknown += accounting.unknown;
+                    counts.unclassified += accounting.unclassified;
+                    counts.legacy_processed += accounting.legacy_processed;
+                    counts.partial += u64::from(accounting.partial.is_some());
+                    counts.partial_failed +=
+                        u64::from(accounting.partial == Some(SweepOutcome::Failed));
+                    counts.partial_unknown +=
+                        u64::from(accounting.partial == Some(SweepOutcome::Unknown));
                 }
             }
             status.completed = status.scopes > 0 && status.remaining == 0;
@@ -1144,23 +1266,31 @@ fn advance(
             .sweep
             .as_mut()
             .ok_or_else(|| state("交流重访完成缺少请求"))?;
-        let consumed = claim.after.sequence.saturating_sub(sweep.cursor.sequence);
-        if outcome == "completed" {
-            sweep.processed += consumed;
-            for index in sweep.cursor.sequence..claim.after.sequence {
-                sweep.covered.push(sweep.sequences[index as usize - 1]);
+        let fragment_outcome = match outcome {
+            "completed" => SweepOutcome::Succeeded,
+            "failed" => SweepOutcome::Failed,
+            "interrupted" => SweepOutcome::Unknown,
+            _ => return Err(state("交流重访结局无效")),
+        };
+        let accounting = sweep.accounting.as_mut().expect("initialized accounting");
+        let mut message_outcome = fragment_outcome.combine(accounting.partial.take());
+        for index in sweep.cursor.sequence..claim.after.sequence {
+            match message_outcome {
+                SweepOutcome::Succeeded => sweep.processed += 1,
+                SweepOutcome::Failed => accounting.failed += 1,
+                SweepOutcome::Unknown => accounting.unknown += 1,
             }
+            sweep.covered.push(sweep.sequences[index as usize - 1]);
+            message_outcome = fragment_outcome;
+        }
+        if claim.after.text_offset != 0 || claim.after.context_offset != 0 {
+            accounting.partial = Some(message_outcome);
         }
         if outcome == "failed" {
             sweep.failed_batches += 1;
         }
         if outcome == "interrupted" {
             sweep.interrupted_batches += 1;
-        }
-        if outcome != "completed" {
-            for index in sweep.cursor.sequence..claim.after.sequence {
-                sweep.covered.push(sweep.sequences[index as usize - 1]);
-            }
         }
         sweep.updated += updated;
         sweep.cursor = claim.after.clone();

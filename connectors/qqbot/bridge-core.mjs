@@ -16,20 +16,47 @@ export const PASSIVE_REPLY_WINDOW_MS = 240000;
 export const SEND_TIMEOUT_MS = 30000;
 export const FILE_TIMEOUT_MS = 110000;
 const passiveLimit = scope => scope === "c2c" ? 4 : MAX_SEGMENTS;
+function* errorChain(err) {
+  const seen = new Set();
+  for (let depth = 0; depth < 8 && err && typeof err === "object" && !seen.has(err); depth++) {
+    seen.add(err);
+    yield err;
+    err = err.cause;
+  }
+}
+function transportKind(err) {
+  for (const cause of errorChain(err)) {
+    if (["AbortError", "TimeoutError"].includes(cause.name) ||
+        ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(cause.code)) return "timeout";
+    if (["ENOTFOUND", "EAI_AGAIN"].includes(cause.code)) return "dns";
+    if (["ECONNRESET", "ECONNREFUSED", "EPIPE", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET"].includes(cause.code)) return "connection";
+    if (["CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "ERR_TLS_CERT_ALTNAME_INVALID"].includes(cause.code)) return "tls";
+  }
+  return "transport_unknown";
+}
+function failureStage(err, responseReceived) {
+  if (responseReceived) return "receipt_validation";
+  for (const cause of errorChain(err)) {
+    // SDK 已丢失 cause 时只认固定包装阶段，不从错误正文猜网络原因或转发正文。
+    if (typeof cause.message === "string" && ["Network error getting access_token:",
+      "Token fetch failed: HTTP ", "Failed to parse access_token response:",
+      "Failed to get access_token:"].some(prefix => cause.message.startsWith(prefix))) return "sdk_token";
+    if (cause.name === "ApiError" && Number.isInteger(cause.httpStatus)) {
+      return cause.httpStatus >= 200 && cause.httpStatus < 300 ? "receipt_validation" : "sdk_message_request";
+    }
+  }
+  return "sdk_operation";
+}
 function diagnostic(err) {
   const out = {};
   const status = err?.httpStatus ?? err?.statusCode;
   const code = err?.bizCode ?? err?.code;
   if (Number.isInteger(status) && status >= 100 && status <= 599) out.http_status = status;
   if (Number.isSafeInteger(code)) out.biz_code = code;
-  // 仅分类标准网络错误码，不记录原始 error、请求体或凭据；未知投递仍不重试。
-  const transport = typeof err?.cause?.code === "string" ? err.cause.code : err?.code;
-  out.failure_kind = ["stale_decision", "outbound_limit", "reply_limit"].includes(err?.message) ? err.message : out.http_status ? "http" :
-    ["AbortError", "TimeoutError"].includes(err?.name) ||
-      ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(transport) ? "timeout" :
-    ["ENOTFOUND", "EAI_AGAIN"].includes(transport) ? "dns" :
-    ["ECONNRESET", "ECONNREFUSED", "EPIPE", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET"].includes(transport) ? "connection" :
-    ["CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "ERR_TLS_CERT_ALTNAME_INVALID"].includes(transport) ? "tls" : "transport_unknown";
+  // 2xx 后读取/解析回执失败仍可能已经送达；HTTP 状态不能把它变成确定未发送。
+  out.failure_kind = out.http_status >= 200 && out.http_status < 300 ? "transport_unknown" :
+    ["stale_decision", "outbound_limit", "reply_limit"].includes(err?.message) ? err.message :
+    out.http_status ? "http" : transportKind(err);
   return out;
 }
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
@@ -293,12 +320,29 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   async function sendText(target, text, mention, timeout = SEND_TIMEOUT_MS, guard) {
     text = mentionedText(target, text, mention);
     if (Buffer.byteLength(text) > 32768) throw new Error("reply_limit");
-    const result = await boundedSend(() => {
-      if (guard && !guard()) throw new Error("stale_decision");
-      return bot.sendText(target, text);
-    }, timeout);
-    if (!validMessageId(result?.id)) throw new Error("platform_message_id_unknown");
-    return result;
+    const started = now();
+    let invoked = false, responseReceived = false;
+    try {
+      const result = await boundedSend(() => {
+        if (guard && !guard()) throw new Error("stale_decision");
+        invoked = true;
+        return bot.sendText(target, text);
+      }, timeout);
+      responseReceived = true;
+      if (!validMessageId(result?.id)) throw new Error("platform_message_id_unknown");
+      return result;
+    } catch (err) {
+      if (invoked) {
+        const detail = diagnostic(err);
+        send({type:"warning",code:"send_failure",outbound:{version:1,
+          stage:failureStage(err,responseReceived),
+          failure_kind:responseReceived && err?.message === "platform_message_id_unknown"
+            ? "platform_message_id_unknown" : detail.failure_kind,
+          elapsed_ms:Math.min(Number.MAX_SAFE_INTEGER,Math.max(0,Math.floor(now()-started))),
+          ...(detail.http_status === undefined ? {} : {http_status:detail.http_status})}});
+      }
+      throw err;
+    }
   }
   // 文件走同一条并发上限；路径已由 Rust 侧解析并校验，这里只做形状检查。
   async function sendFile(target, localPath, name, caption) {

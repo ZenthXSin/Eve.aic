@@ -134,6 +134,81 @@ async fn restart_rejects_forged_claims_without_archiving_or_changing_checkpoint(
 }
 
 #[tokio::test]
+async fn restart_rejects_sweep_statistics_that_disagree_with_consumed_messages() {
+    for corruption in ["count", "partial", "archive"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("training.sqlite3");
+        let state = Arc::new(MemoryStateStore::default());
+        let store = Arc::new(SqliteExpressions::open(&path).unwrap());
+        let (kernel, result, registry) = start(state.clone(), store.clone()).await;
+        result.unwrap();
+        let training = service(&registry);
+        for index in 0..4 {
+            training
+                .observe_conversation(
+                    &scope(),
+                    ConversationMessage {
+                        id: format!("sweep-{index}"),
+                        speaker: "human".into(),
+                        role: ConversationRole::Human,
+                        text: format!("原消息 {index}"),
+                        metadata: None,
+                    },
+                )
+                .unwrap();
+        }
+        training
+            .request_conversation_sweep("check-counts", &scope(), &[1, 2, 3, 4])
+            .unwrap();
+        if corruption == "archive" {
+            let batch = training
+                .take_conversation_maintenance_batch(100_000, 4096)
+                .unwrap()
+                .unwrap();
+            training
+                .finish_conversation_batch(&batch, vec![], 100_001)
+                .unwrap();
+            training
+                .request_conversation_sweep("new-counts", &scope(), &[1])
+                .unwrap();
+        }
+        kernel.stop_all().await.unwrap();
+        let row = store.scope(&scope()).unwrap().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(row.checkpoint.as_ref().unwrap()).unwrap();
+        match corruption {
+            "count" => value["sweep"]["accounting"]["failed"] = 1.into(),
+            "partial" => value["sweep"]["accounting"]["partial"] = "failed".into(),
+            "archive" => value["sweep_archive"][0]["accounting"]["unknown"] = 1.into(),
+            _ => unreachable!(),
+        }
+        let forged = serde_json::to_vec(&value).unwrap();
+        assert!(
+            store
+                .commit(
+                    &scope(),
+                    &ConversationCommit {
+                        expected_revision: row.revision,
+                        checkpoint: forged.clone(),
+                        revisions: vec![],
+                        batch: None,
+                    }
+                )
+                .unwrap()
+        );
+        let archived = archive_count(&path);
+        let (kernel, result, _) = start(state, store.clone()).await;
+        assert!(result.is_err(), "{corruption}");
+        assert_eq!(
+            store.scope(&scope()).unwrap().unwrap().checkpoint.unwrap(),
+            forged
+        );
+        assert_eq!(archive_count(&path), archived);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn legacy_claim_preserves_explicit_empty_context_when_recovering() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("training.sqlite3");

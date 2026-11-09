@@ -1,6 +1,7 @@
 //! QQ/Web 共用的交流学习组合；只在后台做无工具分析，前台读取持久经验。
 use crate::AppError;
 mod maintenance;
+mod scheduling;
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
 };
@@ -10,6 +11,34 @@ use eve_training_api::{
 use ring::digest::{SHA256, digest};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
+
+pub(crate) const MAINTENANCE_PROVIDER_CAP_SECONDS: u64 = 180;
+const NORMAL_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+// CoreModelResolver 给 SSE 传输期限额外一秒收尾；worker 再留一秒核对输出。
+const MAINTENANCE_BATCH_TIMEOUT: Duration =
+    Duration::from_secs(MAINTENANCE_PROVIDER_CAP_SECONDS + 2);
+
+async fn learn_batch(
+    learner: &dyn ConversationLearner,
+    batch: eve_training_api::ConversationBatch,
+    maintenance: bool,
+    stopped: &mut watch::Receiver<bool>,
+) -> Option<Result<Vec<eve_training_api::ConversationLessonDraft>, LlmError>> {
+    if *stopped.borrow() {
+        return None;
+    }
+    let timeout = if maintenance {
+        MAINTENANCE_BATCH_TIMEOUT
+    } else {
+        NORMAL_BATCH_TIMEOUT
+    };
+    tokio::select! { biased;
+        _ = stopped.changed() => None,
+        result = tokio::time::timeout(timeout, learner.learn(batch)) => {
+            Some(result.unwrap_or(Err(LlmError::ProviderTimeout)))
+        },
+    }
+}
 
 pub(crate) fn observe_with_metadata(
     training: &dyn TrainingService,
@@ -159,6 +188,7 @@ impl Background {
     ) -> Self {
         let mut maintenance = directory.map(maintenance::Maintenance::new);
         let mut maintenance_error: Option<String> = None;
+        let mut batches = scheduling::AlternatingBatches::default();
         let (active, mut activation) = watch::channel(false);
         let (stop, mut stopped) = watch::channel(false);
         let (done, finished) = watch::channel(false);
@@ -179,22 +209,25 @@ impl Background {
                         } else { maintenance_error = None; }
                     }
                     if *stopped.borrow() { return Ok(()); }
-                    let maintenance_batch = if maintenance_learner.is_some() && maintenance.as_ref().is_some_and(|m| m.ready()) {
-                        training.take_conversation_maintenance_batch(crate::qq_tasks::now_ms(), 4096)?
-                    } else { None };
-                    let is_maintenance = maintenance_batch.is_some();
-                    let batch = if is_maintenance { maintenance_batch }
-                        else if gate.admits_category(crate::qq_budget::CONVERSATION_LEARNING, 1)? {
-                            training.take_conversation_batch(crate::qq_tasks::now_ms())?
-                        } else { None };
-                    if let Some(batch) = batch {
+                    let selected = batches.take(
+                        || -> Result<_, AppError> {
+                            if gate.admits_category(crate::qq_budget::CONVERSATION_LEARNING, 1)? {
+                                Ok(training.take_conversation_batch(crate::qq_tasks::now_ms())?)
+                            } else { Ok(None) }
+                        },
+                        || -> Result<_, AppError> {
+                            if maintenance_learner.is_some() && maintenance.as_ref().is_some_and(|m| m.ready()) {
+                                Ok(training.take_conversation_maintenance_batch(crate::qq_tasks::now_ms(), 4096)?)
+                            } else { Ok(None) }
+                        },
+                    )?;
+                    if let Some((is_maintenance, batch)) = selected {
                         let learner = if is_maintenance { maintenance_learner.as_ref().expect("maintenance learner") } else { &learner };
                         // 批次号只在当前范围递增；沿用学习请求的稳定匿名会话键，避免跨范围同号误判为重放。
                         let scope_hash = eve_llm_api::ModelSession::scoped("conversation-learning", &batch.scope)?
                             .session_id().to_owned();
-                        let result = tokio::select! { biased;
-                            _ = stopped.changed() => { return Ok(()); },
-                            result = tokio::time::timeout(Duration::from_secs(60), learner.learn(batch.clone())) => result.unwrap_or(Err(LlmError::ProviderTimeout)),
+                        let Some(result) = learn_batch(learner.as_ref(), batch.clone(), is_maintenance, &mut stopped).await else {
+                            return Ok(());
                         };
                         match result {
                             Ok(drafts) => match training.finish_conversation_batch(&batch, drafts, crate::qq_tasks::now_ms()) {
@@ -244,5 +277,161 @@ impl Background {
         self.task
             .await
             .map_err(|_| "交流学习后台异常；原状态保留")?
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use eve_llm_api::{LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelSelection};
+    use eve_training_api::{ConversationBatch, ConversationLessonDraft};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Probe {
+        completion_after: Duration,
+        requests: Mutex<Vec<ModelRequest>>,
+        dropped: AtomicUsize,
+    }
+    struct InFlight<'a>(&'a AtomicUsize);
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl LlmProvider for Probe {
+        fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+            Box::pin(async move {
+                let _inflight = InFlight(&self.dropped);
+                self.requests.lock().unwrap().push(request);
+                tokio::time::sleep(self.completion_after).await;
+                Ok(ModelResponse::Final {
+                    text: r#"{"lessons":[]}"#.into(),
+                })
+            })
+        }
+    }
+    struct Resolver {
+        provider: Arc<Probe>,
+        timeout: Duration,
+    }
+    impl LlmModelResolver for Resolver {
+        fn resolve(&self) -> Result<ModelSelection, LlmError> {
+            Ok(ModelSelection {
+                provider: self.provider.clone(),
+                provider_timeout: self.timeout,
+            })
+        }
+    }
+    fn batch() -> ConversationBatch {
+        ConversationBatch {
+            id: "conversation-revisit-v2-1-1".into(),
+            scope: ContextScope {
+                session_id: "original-conversation".into(),
+                user_id: "original-user".into(),
+            },
+            messages: vec![ConversationMessage {
+                id: "original-message".into(),
+                speaker: "original-speaker".into(),
+                role: ConversationRole::Human,
+                text: "完整保留的历史消息".into(),
+                metadata: None,
+            }],
+            lessons: vec![],
+            lesson_history: vec![],
+            attempt: 1,
+        }
+    }
+    fn learner(
+        completion_after: u64,
+        provider_timeout: u64,
+    ) -> (Arc<Probe>, eve_training_plugin::ModelConversationLearner) {
+        let provider = Arc::new(Probe {
+            completion_after: Duration::from_secs(completion_after),
+            requests: Mutex::new(vec![]),
+            dropped: AtomicUsize::new(0),
+        });
+        let learner = eve_training_plugin::ModelConversationLearner::new(Arc::new(Resolver {
+            provider: provider.clone(),
+            timeout: Duration::from_secs(provider_timeout),
+        }));
+        (provider, learner)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_model_result_after_sixty_seconds_keeps_original_session() {
+        let (probe, learner) = learner(90, MAINTENANCE_PROVIDER_CAP_SECONDS + 1);
+        let (_stop, mut stopped) = watch::channel(false);
+        let original = batch();
+        let start = tokio::time::Instant::now();
+        let result = learn_batch(&learner, original.clone(), true, &mut stopped).await;
+        assert!(matches!(result, Some(Ok(ref drafts)) if drafts.is_empty()));
+        assert_eq!(start.elapsed(), Duration::from_secs(90));
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let expected = eve_llm_api::ModelSession::scoped("conversation-learning", &original.scope)
+            .unwrap()
+            .with_turn(&original.id)
+            .unwrap()
+            .for_request(1);
+        assert_eq!(requests[0].session.as_ref(), Some(&expected));
+        assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_uses_provider_deadline_and_preserves_shorter_configuration() {
+        for timeout in [MAINTENANCE_PROVIDER_CAP_SECONDS + 1, 31] {
+            let (probe, learner) = learner(300, timeout);
+            let (_stop, mut stopped) = watch::channel(false);
+            let start = tokio::time::Instant::now();
+            assert!(matches!(
+                learn_batch(&learner, batch(), true, &mut stopped).await,
+                Some(Err(LlmError::ProviderTimeout))
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(timeout));
+            assert_eq!(probe.requests.lock().unwrap().len(), 1);
+            assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    struct SlowLearner;
+    impl ConversationLearner for SlowLearner {
+        fn learn(&self, _batch: ConversationBatch) -> LlmFuture<'_, Vec<ConversationLessonDraft>> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Ok(vec![])
+            })
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_bounds_maintenance_at_182_seconds_and_normal_at_60() {
+        for (maintenance, expected) in [(true, 182), (false, 60)] {
+            let (_stop, mut stopped) = watch::channel(false);
+            let start = tokio::time::Instant::now();
+            assert!(matches!(
+                learn_batch(&SlowLearner, batch(), maintenance, &mut stopped).await,
+                Some(Err(LlmError::ProviderTimeout))
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(expected));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_cancellation_drops_provider_without_retry_or_failure_result() {
+        let (probe, learner) = learner(300, MAINTENANCE_PROVIDER_CAP_SECONDS + 1);
+        let (stop, mut stopped) = watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let task =
+            tokio::spawn(async move { learn_batch(&learner, batch(), true, &mut stopped).await });
+        tokio::task::yield_now().await;
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        stop.send_replace(true);
+        assert!(task.await.unwrap().is_none());
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
     }
 }

@@ -77,6 +77,48 @@ async fn open(
 fn checkpoint(store: &dyn ConversationStore) -> serde_json::Value {
     serde_json::from_slice(&store.scope(&scope()).unwrap().unwrap().checkpoint.unwrap()).unwrap()
 }
+fn replace_checkpoint(store: &dyn ConversationStore, value: &serde_json::Value) {
+    let row = store.scope(&scope()).unwrap().unwrap();
+    assert!(
+        store
+            .commit(
+                &scope(),
+                &ConversationCommit {
+                    expected_revision: row.revision,
+                    checkpoint: serde_json::to_vec(value).unwrap(),
+                    revisions: vec![],
+                    batch: None,
+                },
+            )
+            .unwrap()
+    );
+}
+fn sweep_counts(status: &ConversationSweepStatus) -> &ConversationSweepMessageCounts {
+    let counts = status.message_counts.as_ref().unwrap();
+    assert_eq!(
+        status.total,
+        status.processed + counts.failed + counts.unknown + counts.unclassified + status.remaining
+    );
+    assert!(counts.partial <= status.remaining);
+    assert!(counts.partial_failed + counts.partial_unknown <= counts.partial);
+    counts
+}
+fn fail_sweep_batch(training: &dyn TrainingService, mut batch: ConversationBatch, now: &mut u64) {
+    for attempt in 1..=3 {
+        assert_eq!(batch.attempt, attempt);
+        training.fail_conversation_batch(&batch, *now).unwrap();
+        *now += 180_001;
+        if attempt < 3 {
+            let retry = training
+                .take_conversation_maintenance_batch(*now, 4096)
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.id, batch.id);
+            assert_eq!(retry.messages, batch.messages);
+            batch = retry;
+        }
+    }
+}
 fn observe(training: &dyn TrainingService, from: usize, count: usize) {
     for index in from..from + count {
         training
@@ -941,6 +983,10 @@ async fn full_history_sweep_preserves_lessons_order_live_input_and_request_ident
     let status = training.conversation_sweep_status("full-a").unwrap();
     assert!(status.completed);
     assert_eq!((status.total, status.processed, status.updated), (6, 6, 1));
+    assert_eq!(
+        sweep_counts(&status),
+        &ConversationSweepMessageCounts::default()
+    );
     let live = training.take_conversation_batch(300000).unwrap().unwrap();
     assert_eq!(live.messages.last().unwrap().id, "m-5");
     assert!(!live.messages.iter().any(|m| m.id == "m-6"));
@@ -1048,6 +1094,10 @@ async fn full_history_budget_and_restart_keep_unknown_terminal_and_later_events_
     assert_eq!(progress.interrupted_batches, 1);
     assert_eq!(progress.model_requests, 1);
     assert_eq!(progress.processed, 0);
+    assert_eq!(
+        sweep_counts(&progress).unknown,
+        claimed.messages.len() as u64
+    );
     let next = reopened
         .take_conversation_maintenance_batch(200000, 4096)
         .unwrap()
@@ -1067,6 +1117,462 @@ async fn full_history_budget_and_restart_keep_unknown_terminal_and_later_events_
             .unwrap()
             .completed
     );
+}
+
+#[tokio::test]
+async fn full_history_fragment_outcomes_survive_restart_and_count_whole_messages() {
+    for (first_outcome, last_outcome, failed, unknown, processed) in [
+        ("failed", "completed", 1, 0, 1),
+        ("interrupted", "completed", 0, 1, 1),
+        ("completed", "failed", 2, 0, 0),
+        ("failed", "interrupted", 0, 2, 0),
+        ("interrupted", "failed", 1, 1, 0),
+        ("completed", "completed", 0, 0, 2),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("training.sqlite3");
+        let sql = Arc::new(SqliteExpressions::open(&path).unwrap());
+        let state = Arc::new(MemoryStateStore::default());
+        let (kernel, training) = open(state.clone(), sql.clone()).await;
+        let mut original = event(0);
+        original.text = "\\".repeat(MAX_CONVERSATION_BODY_BYTES);
+        original.metadata.as_mut().unwrap().context =
+            Some("\n".repeat(MAX_CONVERSATION_CONTEXT_BYTES));
+        training
+            .observe_conversation(&scope(), original.clone())
+            .unwrap();
+        training.observe_conversation(&scope(), event(1)).unwrap();
+        training
+            .request_conversation_sweep("fragment-outcomes", &scope(), &[1, 2])
+            .unwrap();
+        let mut now = 100_000;
+        let first = training
+            .take_conversation_maintenance_batch(now, 4096)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.messages.len(), 1);
+        let first_fragment = first.messages[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .fragment
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            first_fragment.text_end + first_fragment.context_end
+                < original.text.len() + MAX_CONVERSATION_CONTEXT_BYTES
+        );
+        match first_outcome {
+            "failed" => fail_sweep_batch(training.as_ref(), first.clone(), &mut now),
+            "completed" => {
+                training
+                    .finish_conversation_batch(&first, vec![], now)
+                    .unwrap();
+            }
+            "interrupted" => {}
+            _ => unreachable!(),
+        }
+        kernel.stop_all().await.unwrap();
+        let (kernel, training) = open(state.clone(), sql.clone()).await;
+        let partial = training
+            .conversation_sweep_status("fragment-outcomes")
+            .unwrap();
+        let counts = sweep_counts(&partial);
+        assert_eq!(
+            (partial.processed, partial.remaining, counts.partial),
+            (0, 2, 1)
+        );
+        assert_eq!((counts.failed, counts.unknown), (0, 0));
+        assert_eq!(counts.partial_failed, u64::from(first_outcome == "failed"));
+        assert_eq!(
+            counts.partial_unknown,
+            u64::from(first_outcome == "interrupted")
+        );
+        now += 200_000;
+        let last = training
+            .take_conversation_maintenance_batch(now, 4096)
+            .unwrap()
+            .unwrap();
+        assert_ne!(last.id, first.id);
+        assert_eq!(last.messages.len(), 2);
+        let last_fragment = last.messages[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .fragment
+            .as_ref()
+            .unwrap();
+        assert_eq!(last_fragment.text_start, first_fragment.text_end);
+        assert_eq!(last_fragment.context_start, first_fragment.context_end);
+        assert_eq!(
+            format!("{}{}", first.messages[0].text, last.messages[0].text),
+            original.text
+        );
+        match last_outcome {
+            "failed" => fail_sweep_batch(training.as_ref(), last, &mut now),
+            "completed" => {
+                training
+                    .finish_conversation_batch(&last, vec![], now)
+                    .unwrap();
+            }
+            "interrupted" => {}
+            _ => unreachable!(),
+        }
+        kernel.stop_all().await.unwrap();
+        let (kernel, training) = open(state, sql.clone()).await;
+        let done = training
+            .conversation_sweep_status("fragment-outcomes")
+            .unwrap();
+        let counts = sweep_counts(&done);
+        assert!(done.completed);
+        assert_eq!(
+            (done.processed, counts.failed, counts.unknown),
+            (processed, failed, unknown)
+        );
+        assert_eq!(counts.partial, 0);
+        assert_eq!(
+            done.failed_batches,
+            u64::from(first_outcome == "failed") + u64::from(last_outcome == "failed")
+        );
+        assert_eq!(
+            done.interrupted_batches,
+            u64::from(first_outcome == "interrupted") + u64::from(last_outcome == "interrupted")
+        );
+        assert!(
+            training
+                .take_conversation_maintenance_batch(now + 200_000, 4096)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            training
+                .take_conversation_batch(now + 200_000)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            checkpoint(sql.as_ref())["sweep"]["covered"],
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(
+            sql.events(&scope(), 1, 2).unwrap()[0].message.text,
+            original.text
+        );
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn full_history_legacy_statistics_stay_unclassified_without_changing_consumption() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, training) = open(state.clone(), sql.clone()).await;
+    observe(training.as_ref(), 0, 4);
+    training
+        .request_conversation_sweep("legacy-complete", &scope(), &[1, 2, 3, 4])
+        .unwrap();
+    let batch = training
+        .take_conversation_maintenance_batch(100_000, 4096)
+        .unwrap()
+        .unwrap();
+    training
+        .finish_conversation_batch(&batch, vec![], 100_001)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let mut old = checkpoint(sql.as_ref());
+    old["sweep"].as_object_mut().unwrap().remove("accounting");
+    replace_checkpoint(sql.as_ref(), &old);
+    let old_bytes = sql.scope(&scope()).unwrap().unwrap().checkpoint.unwrap();
+    let (kernel, training) = open(state.clone(), sql.clone()).await;
+    let status = training
+        .conversation_sweep_status("legacy-complete")
+        .unwrap();
+    let counts = sweep_counts(&status);
+    assert!(status.completed);
+    assert_eq!(
+        (
+            status.processed,
+            status.remaining,
+            counts.unclassified,
+            counts.legacy_processed
+        ),
+        (0, 0, 4, 4)
+    );
+    assert_eq!(
+        sql.scope(&scope()).unwrap().unwrap().checkpoint.unwrap(),
+        old_bytes
+    );
+    training
+        .request_conversation_sweep("after-legacy", &scope(), &[1])
+        .unwrap();
+    let saved = checkpoint(sql.as_ref());
+    assert_eq!(saved["cursor"], old["cursor"]);
+    assert_eq!(saved["lessons"], old["lessons"]);
+    assert_eq!(
+        saved["sweep_archive"][0]["covered"],
+        old["sweep"]["covered"]
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, training) = open(state, sql).await;
+    assert_eq!(
+        training
+            .conversation_sweep_status("legacy-complete")
+            .unwrap(),
+        status
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn full_history_legacy_partial_cannot_become_success_after_its_last_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, training) = open(state.clone(), sql.clone()).await;
+    let mut message = event(0);
+    message.text = "\\".repeat(MAX_CONVERSATION_BODY_BYTES);
+    training.observe_conversation(&scope(), message).unwrap();
+    training
+        .request_conversation_sweep("legacy-partial", &scope(), &[1])
+        .unwrap();
+    let first = training
+        .take_conversation_maintenance_batch(100_000, 4096)
+        .unwrap()
+        .unwrap();
+    training
+        .finish_conversation_batch(&first, vec![], 100_001)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let mut old = checkpoint(sql.as_ref());
+    old["sweep"].as_object_mut().unwrap().remove("accounting");
+    replace_checkpoint(sql.as_ref(), &old);
+    let (kernel, training) = open(state, sql.clone()).await;
+    let status = training
+        .conversation_sweep_status("legacy-partial")
+        .unwrap();
+    assert_eq!(
+        (
+            status.processed,
+            status.remaining,
+            sweep_counts(&status).partial_unknown
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(checkpoint(sql.as_ref()), old);
+    let last = training
+        .take_conversation_maintenance_batch(200_000, 4096)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.id, last.id);
+    training
+        .finish_conversation_batch(&last, vec![], 200_001)
+        .unwrap();
+    let done = training
+        .conversation_sweep_status("legacy-partial")
+        .unwrap();
+    assert!(done.completed);
+    assert_eq!((done.processed, sweep_counts(&done).unknown), (0, 1));
+    assert_eq!(
+        checkpoint(sql.as_ref())["sweep"]["covered"],
+        serde_json::json!([1])
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[test]
+fn old_sweep_status_does_not_default_message_results_to_success() {
+    let status: ConversationSweepStatus = serde_json::from_value(serde_json::json!({
+        "id": "old", "scopes": 1, "total": 4, "processed": 4, "remaining": 0,
+        "updated": 0, "failed_batches": 0, "interrupted_batches": 0,
+        "model_requests": 1, "completed": true
+    }))
+    .unwrap();
+    assert!(status.message_counts.is_none());
+}
+
+#[tokio::test]
+async fn pending_and_archived_sweeps_leave_unreserved_live_messages_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let (kernel, training) = open(Arc::new(MemoryStateStore::default()), sql.clone()).await;
+    observe(training.as_ref(), 0, 150);
+    let sources: Vec<_> = (1..=150)
+        .filter(|sequence| *sequence != 3 && *sequence != 149)
+        .collect();
+    training
+        .request_conversation_sweep("with-live-holes", &scope(), &sources)
+        .unwrap();
+    let first = training
+        .take_conversation_maintenance_batch(100_000, 1)
+        .unwrap()
+        .unwrap();
+    assert!(training.take_conversation_batch(100_001).unwrap().is_none());
+    training
+        .finish_conversation_batch(&first, vec![], 100_002)
+        .unwrap();
+    let progress = training
+        .conversation_sweep_status("with-live-holes")
+        .unwrap();
+    assert!(!progress.completed);
+    assert!(
+        training
+            .take_conversation_maintenance_batch(200_000, 1)
+            .unwrap()
+            .is_none()
+    );
+    let live = training.take_conversation_batch(200_000).unwrap().unwrap();
+    assert_eq!(live.messages.last().unwrap().id, "m-2");
+    assert_eq!(checkpoint(sql.as_ref())["cursor"]["sequence"], 3);
+    training
+        .finish_conversation_batch(&live, vec![], 200_001)
+        .unwrap();
+    assert_eq!(
+        training
+            .conversation_sweep_status("with-live-holes")
+            .unwrap(),
+        progress
+    );
+
+    // 旧请求已终态但普通位置尚未经过尾部；换请求后仍不得重投它。
+    let last = training
+        .take_conversation_maintenance_batch(300_000, 4096)
+        .unwrap()
+        .unwrap();
+    let mut now = 300_001;
+    fail_sweep_batch(training.as_ref(), last, &mut now);
+    let done = training
+        .conversation_sweep_status("with-live-holes")
+        .unwrap();
+    assert!(done.completed);
+    assert!(sweep_counts(&done).failed > 0);
+    assert_eq!(checkpoint(sql.as_ref())["cursor"]["sequence"], 149);
+    training
+        .request_conversation_sweep("later-request", &scope(), &[1])
+        .unwrap();
+    let live = training.take_conversation_batch(now).unwrap().unwrap();
+    assert_eq!(live.messages.last().unwrap().id, "m-148");
+    assert!(!live.messages.iter().any(|message| message.id == "m-149"));
+    training
+        .finish_conversation_batch(&live, vec![], now + 1)
+        .unwrap();
+    assert!(training.take_conversation_batch(now + 2).unwrap().is_none());
+    assert_eq!(checkpoint(sql.as_ref())["cursor"]["sequence"], 151);
+    assert!(
+        !training
+            .conversation_sweep_status("later-request")
+            .unwrap()
+            .completed
+    );
+    assert_eq!(
+        training
+            .conversation_sweep_status("with-live-holes")
+            .unwrap(),
+        done
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn exhausted_sweep_releases_only_explicitly_failed_claim_without_another_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("training.sqlite3");
+    let sql = Arc::new(SqliteExpressions::open(&path).unwrap());
+    let (kernel, training) = open(Arc::new(MemoryStateStore::default()), sql.clone()).await;
+    observe(training.as_ref(), 0, 140);
+    training
+        .request_conversation_sweep("hard-budget", &scope(), &(1..=140).collect::<Vec<_>>())
+        .unwrap();
+    let mut seeded = checkpoint(sql.as_ref());
+    // 种下累计请求计数，只运行最后一次真实状态机领取；不伪造批次或结果。
+    seeded["sweep"]["model_requests"] = 4095.into();
+    replace_checkpoint(sql.as_ref(), &seeded);
+    let claimed = training
+        .take_conversation_maintenance_batch(100_000, 4096)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.attempt, 1);
+    observe(training.as_ref(), 140, 4);
+    let in_flight = checkpoint(sql.as_ref());
+    assert!(training.take_conversation_batch(100_001).unwrap().is_none());
+    assert_eq!(checkpoint(sql.as_ref()), in_flight);
+    assert!(batch_outcomes(&path).is_empty());
+    training.fail_conversation_batch(&claimed, 100_002).unwrap();
+    assert!(
+        training
+            .take_conversation_maintenance_batch(100_003, 4096)
+            .unwrap()
+            .is_none()
+    );
+    assert!(training.take_conversation_batch(100_003).unwrap().is_none());
+    let progress = training.conversation_sweep_status("hard-budget").unwrap();
+    assert_eq!(
+        (
+            progress.model_requests,
+            progress.failed_batches,
+            progress.processed
+        ),
+        (4096, 1, 0)
+    );
+    assert_eq!(
+        sweep_counts(&progress).failed,
+        claimed.messages.len() as u64
+    );
+    assert_eq!(batch_outcomes(&path), ["failed", "budget_exhausted"]);
+    let live = training.take_conversation_batch(100_004).unwrap().unwrap();
+    assert_eq!(live.messages.last().unwrap().id, "m-143");
+    training
+        .finish_conversation_batch(&live, vec![], 100_005)
+        .unwrap();
+    assert_eq!(
+        training.conversation_sweep_status("hard-budget").unwrap(),
+        progress
+    );
+    assert!(!progress.completed);
+    assert!(checkpoint(sql.as_ref())["inflight"].is_null());
+    assert_eq!(checkpoint(sql.as_ref())["cursor"]["sequence"], 145);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn sweep_reservation_keeps_existing_normal_claim_and_disabled_scope_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = Arc::new(SqliteExpressions::open(&dir.path().join("training.sqlite3")).unwrap());
+    let (kernel, training) = open(Arc::new(MemoryStateStore::default()), sql.clone()).await;
+    observe(training.as_ref(), 0, 8);
+    let ordinary = training.take_conversation_batch(100_000).unwrap().unwrap();
+    training
+        .request_conversation_sweep("existing-normal", &scope(), &[1, 2])
+        .unwrap();
+    assert!(
+        training
+            .take_conversation_maintenance_batch(100_001, 4096)
+            .unwrap()
+            .is_none()
+    );
+    training
+        .finish_conversation_batch(&ordinary, vec![], 100_002)
+        .unwrap();
+    let normal_cursor = checkpoint(sql.as_ref())["cursor"].clone();
+    training.set_enabled(&scope(), false).unwrap();
+    assert!(training.take_conversation_batch(200_000).unwrap().is_none());
+    let maintenance = training
+        .take_conversation_maintenance_batch(200_000, 4096)
+        .unwrap()
+        .unwrap();
+    training
+        .finish_conversation_batch(&maintenance, vec![], 200_001)
+        .unwrap();
+    assert_eq!(checkpoint(sql.as_ref())["cursor"], normal_cursor);
+    assert_eq!(
+        training
+            .conversation_sweep_status("existing-normal")
+            .unwrap()
+            .processed,
+        2
+    );
+    kernel.stop_all().await.unwrap();
 }
 
 #[tokio::test]

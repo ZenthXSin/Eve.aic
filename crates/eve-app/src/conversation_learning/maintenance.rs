@@ -9,7 +9,11 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
+use tokio::time::Instant;
+
+const TERMINAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +50,8 @@ pub(super) struct Maintenance {
     loaded: bool,
     request: Option<Request>,
     status: Option<Status>,
+    last_terminal_refresh: Option<Instant>,
+    terminal_refreshed: bool,
 }
 impl Maintenance {
     pub(super) fn new(directory: PathBuf) -> Self {
@@ -54,6 +60,8 @@ impl Maintenance {
             loaded: false,
             request: None,
             status: None,
+            last_terminal_refresh: None,
+            terminal_refreshed: false,
         }
     }
     pub(super) fn ready(&self) -> bool {
@@ -141,6 +149,29 @@ impl Maintenance {
             status.phase.as_str(),
             "completed" | "completed_with_failures" | "failed" | "budget_exhausted"
         ) {
+            // 额度耗尽后普通领取仍可能本地结算明确失败；只读刷新不重新开放维护。
+            // 其他终态每次进程启动成功刷新一次，补齐旧状态缺失的消息统计。
+            if (self.terminal_refreshed && status.phase != "budget_exhausted")
+                || self
+                    .last_terminal_refresh
+                    .is_some_and(|last| last.elapsed() < TERMINAL_REFRESH_INTERVAL)
+            {
+                return Ok(());
+            }
+            self.last_terminal_refresh = Some(Instant::now());
+            let progress = training.conversation_sweep_status(&request.id)?;
+            let phase = if status.phase == "completed" {
+                completed_phase(&progress)
+            } else {
+                status.phase.as_str()
+            };
+            if status.progress.as_ref() != Some(&progress) || phase != status.phase {
+                status.phase = phase.into();
+                status.progress = Some(progress);
+                atomic_json(&self.directory.join("status.json"), &status)?;
+                self.status = Some(status);
+            }
+            self.terminal_refreshed = true;
             return Ok(());
         }
         let outcome: Result<(), AppError> = async {
@@ -242,12 +273,7 @@ impl Maintenance {
                 status.phase = "budget_exhausted".into();
             }
             if progress.completed {
-                status.phase = if progress.failed_batches + progress.interrupted_batches == 0 {
-                    "completed"
-                } else {
-                    "completed_with_failures"
-                }
-                .into();
+                status.phase = completed_phase(&progress).into();
             }
             status.progress = Some(progress);
             Ok(())
@@ -261,6 +287,20 @@ impl Maintenance {
         Ok(())
     }
 }
+
+fn completed_phase(progress: &eve_training_api::ConversationSweepStatus) -> &'static str {
+    if progress.failed_batches == 0
+        && progress.interrupted_batches == 0
+        && progress.message_counts.as_ref().is_some_and(|counts| {
+            counts.failed == 0 && counts.unknown == 0 && counts.unclassified == 0
+        })
+    {
+        "completed"
+    } else {
+        "completed_with_failures"
+    }
+}
+
 fn secure_file(path: &Path) -> Result<fs::File, AppError> {
     #[cfg(unix)]
     {
@@ -316,7 +356,165 @@ mod tests {
     use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
     use eve_plugin_api::{PluginId, ServiceId};
     use eve_training_api::*;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct ProgressOnlyTraining {
+        progress: Mutex<ConversationSweepStatus>,
+        reads: AtomicUsize,
+    }
+    impl TrainingService for ProgressOnlyTraining {
+        fn conversation_sweep_status(
+            &self,
+            id: &str,
+        ) -> eve_plugin_api::PluginResult<ConversationSweepStatus> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let progress = self.progress.lock().unwrap().clone();
+            assert_eq!(id, progress.id);
+            Ok(progress)
+        }
+        fn enabled(&self, _: &ContextScope) -> eve_plugin_api::PluginResult<bool> {
+            panic!("终态只允许读取维护进度")
+        }
+        fn set_enabled(&self, _: &ContextScope, _: bool) -> eve_plugin_api::PluginResult<()> {
+            panic!("终态不改变学习开关")
+        }
+        fn take_conversation_maintenance_batch(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> eve_plugin_api::PluginResult<Option<ConversationBatch>> {
+            panic!("终态不领取模型批次")
+        }
+    }
+
+    fn terminal_fixture(
+        directory: &Path,
+        phase: &str,
+        progress: ConversationSweepStatus,
+    ) -> Maintenance {
+        let mut maintenance = Maintenance::new(directory.into());
+        maintenance.loaded = true;
+        maintenance.request = Some(Request {
+            version: 1,
+            id: progress.id.clone(),
+            source: "events.jsonl".into(),
+            sha256: "a".repeat(64),
+            records: progress.total,
+        });
+        maintenance.status = Some(Status {
+            version: 1,
+            id: progress.id.clone(),
+            sha256: "a".repeat(64),
+            records: progress.total,
+            phase: phase.into(),
+            imported_lines: progress.total,
+            confirmed_new_events: 0,
+            progress: Some(progress),
+            error: None,
+        });
+        atomic_json(
+            &directory.join("status.json"),
+            maintenance.status.as_ref().unwrap(),
+        )
+        .unwrap();
+        maintenance
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_status_refreshes_local_failure_without_reopening_or_frequent_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = ConversationSweepStatus {
+            id: "exhausted".into(),
+            scopes: 1,
+            total: 140,
+            remaining: 140,
+            model_requests: 4096,
+            message_counts: Some(ConversationSweepMessageCounts::default()),
+            ..Default::default()
+        };
+        let mut maintenance = terminal_fixture(dir.path(), "budget_exhausted", progress.clone());
+        let training = ProgressOnlyTraining {
+            progress: Mutex::new(progress),
+            reads: AtomicUsize::new(0),
+        };
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        maintenance.tick(&training, &stopped).await.unwrap();
+        {
+            let mut settled = training.progress.lock().unwrap();
+            settled.remaining = 12;
+            settled.failed_batches = 1;
+            settled.message_counts.as_mut().unwrap().failed = 128;
+        }
+        for _ in 0..10 {
+            maintenance.tick(&training, &stopped).await.unwrap();
+        }
+        tokio::time::advance(Duration::from_secs(59)).await;
+        maintenance.tick(&training, &stopped).await.unwrap();
+        assert_eq!(training.reads.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        maintenance.tick(&training, &stopped).await.unwrap();
+        assert_eq!(training.reads.load(Ordering::SeqCst), 2);
+        let path = dir.path().join("status.json");
+        let status: Status = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(status.phase, "budget_exhausted");
+        assert_eq!(
+            status.progress,
+            Some(training.progress.lock().unwrap().clone())
+        );
+        assert_eq!(status.progress.unwrap().model_requests, 4096);
+        assert!(!maintenance.ready());
+        // 保留额外 JSON 空白可证明相同进度未被原子重写，而非只比较序列化内容。
+        let mut unchanged = fs::read(&path).unwrap();
+        unchanged.extend_from_slice(b" \n");
+        fs::write(&path, &unchanged).unwrap();
+        tokio::time::advance(TERMINAL_REFRESH_INTERVAL).await;
+        maintenance.tick(&training, &stopped).await.unwrap();
+        assert_eq!(training.reads.load(Ordering::SeqCst), 3);
+        assert_eq!(fs::read(&path).unwrap(), unchanged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_status_refreshes_legacy_counts_once_and_keeps_completion_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = ConversationSweepStatus {
+            id: "legacy".into(),
+            scopes: 1,
+            total: 4,
+            processed: 4,
+            model_requests: 1,
+            completed: true,
+            ..Default::default()
+        };
+        let mut maintenance = terminal_fixture(dir.path(), "completed", old.clone());
+        let current = ConversationSweepStatus {
+            processed: 0,
+            message_counts: Some(ConversationSweepMessageCounts {
+                unclassified: 4,
+                legacy_processed: 4,
+                ..Default::default()
+            }),
+            ..old
+        };
+        let training = ProgressOnlyTraining {
+            progress: Mutex::new(current.clone()),
+            reads: AtomicUsize::new(0),
+        };
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        maintenance.tick(&training, &stopped).await.unwrap();
+        let status: Status =
+            serde_json::from_slice(&fs::read(dir.path().join("status.json")).unwrap()).unwrap();
+        assert_eq!(status.phase, "completed_with_failures");
+        assert_eq!(status.progress, Some(current));
+        assert!(!maintenance.ready());
+        for _ in 0..3 {
+            tokio::time::advance(TERMINAL_REFRESH_INTERVAL).await;
+            maintenance.tick(&training, &stopped).await.unwrap();
+        }
+        assert_eq!(training.reads.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn local_request_imports_into_actual_training_worker_once_and_reports_durable_completion()

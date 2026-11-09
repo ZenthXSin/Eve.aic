@@ -1154,6 +1154,129 @@ test("网络故障按固定类别记录且不重发未知投递", async () => {
   }
 });
 
+test("发送诊断读取有界 cause 链并终止环，不把原始异常写进协议", async () => {
+  const wrap = (error, count) => {
+    for (let index = 0; index < count; index++) error = new Error("PRIVATE_WRAPPER", {cause:error});
+    return error;
+  };
+  const cycle = new Error("PRIVATE_CYCLE");
+  cycle.cause = new Error("PRIVATE_CYCLE_TAIL", {cause:cycle});
+  const classifiedCycle = Object.assign(new Error("PRIVATE_CYCLE_CODE"), {code:"ECONNRESET"});
+  classifiedCycle.cause = classifiedCycle;
+  for (const [error, expected] of [
+    [wrap(Object.assign(new Error("PRIVATE_TIMEOUT"), {code:"UND_ERR_CONNECT_TIMEOUT"}), 2), "timeout"],
+    [wrap(Object.assign(new Error("PRIVATE_DNS"), {code:"ENOTFOUND"}), 7), "dns"],
+    [wrap(Object.assign(new Error("PRIVATE_TOO_DEEP"), {code:"ENOTFOUND"}), 8), "transport_unknown"],
+    [wrap(Object.assign(new Error("PRIVATE_ABORT"), {name:"AbortError"}), 2), "timeout"],
+    [wrap(Object.assign(new Error("PRIVATE_TLS"), {code:"CERT_HAS_EXPIRED"}), 2), "tls"],
+    [cycle, "transport_unknown"],
+    [classifiedCycle, "connection"],
+  ]) {
+    const f = fixture({fail:true, error}); f.message();
+    const command = {version:1,type:"progress",id:"in-1",index:0,text:"结果",explicit:true};
+    await within(f.bridge.command(command));
+    const delivery = f.frames.at(-1);
+    assert.equal(delivery.type, "delivery");
+    assert.equal(delivery.failure_kind, expected);
+    const warning = f.frames.find(frame => frame.code === "send_failure");
+    assert.equal(warning.outbound.stage, "sdk_operation");
+    assert.equal(warning.outbound.failure_kind, expected);
+    await f.bridge.command(command);
+    assert.equal(f.sent.length, 1, "Unknown 与已失败的序号都不重发");
+    assert.equal(f.frames.filter(frame => frame.type === "delivery").length, 1);
+    assert.ok(!JSON.stringify(f.frames).includes("PRIVATE"));
+  }
+});
+
+test("SDK 丢失 cause 时只报告已知请求阶段，不从错误文本猜网络原因", async () => {
+  for (const message of [
+    "Network error [PRIVATE_PATH]: fetch failed UND_ERR_CONNECT_TIMEOUT",
+    "Network error [PRIVATE_PATH]: fetch failed ECONNRESET",
+    "Request timeout [PRIVATE_PATH]: exceeded 30000ms",
+  ]) {
+    const error = Object.assign(new Error(message), {name:"ApiError", httpStatus:0, path:"PRIVATE_PATH"});
+    const f = fixture({fail:true, error, now:()=>100}); f.message();
+    await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"结果",explicit:true});
+    const warning = f.frames.find(frame => frame.code === "send_failure");
+    assert.deepEqual(warning, {version:1,type:"warning",code:"send_failure",outbound:{
+      version:1,stage:"sdk_message_request",failure_kind:"transport_unknown",elapsed_ms:0,
+    }});
+    assert.deepEqual(f.frames.at(-1), {
+      version:1,type:"delivery",id:"in-1",progress:true,index:0,ok:false,failure_kind:"transport_unknown",
+    });
+    assert.equal(f.sent.length, 1);
+    assert.ok(!JSON.stringify(f.frames).includes("PRIVATE"));
+  }
+});
+
+test("令牌异常独立标明 SDK 阶段，保留的深层 cause 才用于网络分类", async () => {
+  for (const [message, code, expected] of [
+    ["Network error getting access_token: PRIVATE_TOKEN", "UND_ERR_CONNECT_TIMEOUT", "timeout"],
+    ["Token fetch failed: HTTP 503 PRIVATE_TOKEN", undefined, "transport_unknown"],
+    ["Failed to parse access_token response: PRIVATE_TOKEN", undefined, "transport_unknown"],
+    ["Failed to get access_token: PRIVATE_TOKEN", "ECONNRESET", "connection"],
+  ]) {
+    const error = new Error(message, {cause:new TypeError("PRIVATE_FETCH", {
+      cause:Object.assign(new Error("PRIVATE_CAUSE"), {code}),
+    })});
+    const f = fixture({fail:true, error}); f.message();
+    await f.bridge.command({version:1,type:"reply",id:"in-1",text:"结果"});
+    const warning = f.frames.find(frame => frame.code === "send_failure");
+    assert.equal(warning.outbound.stage, "sdk_token");
+    assert.equal(warning.outbound.failure_kind, expected);
+    assert.equal(warning.outbound.http_status, undefined, "字符串中的状态不是结构化 HTTP 证据");
+    assert.equal(f.frames.at(-1).failure_kind, expected);
+    assert.equal(f.sent.length, 1);
+    assert.ok(!JSON.stringify(f.frames).includes("PRIVATE"));
+  }
+});
+
+test("HTTP 成功后的响应读取或解析异常保持未知，明确 HTTP 拒绝仍是失败", async () => {
+  for (const httpStatus of [200, 201, 204, 299, 403, 500]) {
+    for (const message of ["Failed to read response [PRIVATE_PATH]", "PRIVATE_NON_JSON_RESPONSE"]) {
+      let time = 100;
+      const error = Object.assign(new Error(message), {name:"ApiError", httpStatus, path:"PRIVATE_PATH"});
+      const f = fixture({fail:true,error,now:()=>time,hold(){time += 10_674;}}); f.message();
+      const command = {version:1,type:"progress",id:"in-1",index:0,text:"结果",explicit:true};
+      await f.bridge.command(command);
+      const accepted = httpStatus < 300;
+      const warning = f.frames.find(frame => frame.code === "send_failure");
+      assert.deepEqual(warning.outbound, {
+        version:1,stage:accepted ? "receipt_validation" : "sdk_message_request",
+        failure_kind:accepted ? "transport_unknown" : "http",elapsed_ms:10_674,http_status:httpStatus,
+      });
+      assert.deepEqual(f.frames.at(-1), {
+        version:1,type:"delivery",id:"in-1",progress:true,index:0,ok:false,
+        http_status:httpStatus,failure_kind:accepted ? "transport_unknown" : "http",
+      }, "delivery 保留旧字段形状，诊断元数据仅进入独立 warning");
+      await f.bridge.command(command);
+      assert.equal(f.sent.length, 1);
+      assert.equal(f.frames.filter(frame => frame.code === "send_failure").length, 1);
+      assert.equal(f.frames.filter(frame => frame.type === "delivery").length, 1);
+      assert.ok(!JSON.stringify(f.frames).includes("PRIVATE"));
+    }
+  }
+});
+
+test("发送诊断的耗时有界，未调用 SDK 的取消不会伪造发送故障", async () => {
+  for (const [elapsed, expected] of [[-10,0], [12.9,12], [Number.MAX_SAFE_INTEGER+1000,Number.MAX_SAFE_INTEGER]]) {
+    let time = 0;
+    const f = fixture({fail:true,now:()=>time,hold(){time=elapsed;}}); f.message();
+    await f.bridge.command({version:1,type:"reply",id:"in-1",text:"结果"});
+    assert.equal(f.frames.find(frame => frame.code === "send_failure").outbound.elapsed_ms, expected);
+  }
+  const f = fixture(); f.message();
+  const pending = f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"旧决定",explicit:true});
+  f.message("c2c", "new-input");
+  await pending;
+  assert.equal(f.frames.at(-1).failure_kind, "stale_decision");
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.frames.some(frame => frame.code === "send_failure"), false);
+  await f.bridge.command({version:1,type:"reply",id:"new-input",text:"新结果"});
+  assert.equal(f.frames.at(-1).ok, true);
+  assert.equal(f.frames.some(frame => frame.code === "send_failure"), false);
+});
+
 test("不同群友的明确回复保持原触发者，失败和容量不足不生成台词", async () => {
   const f=fixture();
   for (const [id,user] of [["a","member-a"],["b","member-b"]]) {
@@ -1216,6 +1339,13 @@ test("平台返回接受但缺少消息编号时保持未知，不宣称送达�
     assert.equal(delivery.failure_kind, "transport_unknown");
     assert.equal(f.sent.length, 1);
     assert.equal(delivery.notice_status, undefined);
+    const warning = f.frames.find(x => x.code === "send_failure");
+    assert.equal(warning.outbound.stage, "receipt_validation");
+    assert.equal(warning.outbound.failure_kind, "platform_message_id_unknown");
+    assert.equal(delivery.stage, undefined);
+    assert.equal(delivery.outbound, undefined);
+    await f.bridge.command({version:1,type:"reply",id:"in-1",text:"结果"});
+    assert.equal(f.sent.length, 1);
   }
   const file = fixture({fileResult:{upload:{id:"upload-only"}}});
   await file.bridge.command({version:1,type:"file",id:"file-unknown",scope:"c2c",target_id:"user-1",path:"/tmp/file.txt"});
