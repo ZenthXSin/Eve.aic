@@ -2,7 +2,7 @@ use eve_dialogue_tools::{CapabilitiesContext, Services};
 use eve_knowledge_api::{BoxFuture, FetchFailure, FetchedPage, SourceFetcher, SourcePolicy};
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmFuture, Tool, ToolCall,
-    ToolExecutionContext, TurnInput,
+    ToolExecutionContext, ToolExecutionError, TurnInput,
 };
 use serde_json::{Value, json};
 use std::sync::{
@@ -66,6 +66,58 @@ fn call(arguments: Value) -> ToolCall {
         arguments,
     }
 }
+
+struct FailedFetcher {
+    calls: Arc<AtomicUsize>,
+    failure: FetchFailure,
+}
+impl SourceFetcher for FailedFetcher {
+    fn fetch<'a>(
+        &'a self,
+        _: &'a SourcePolicy,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<FetchedPage, FetchFailure>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Err(self.failure) })
+    }
+}
+
+#[tokio::test]
+async fn returned_source_transport_failure_is_unavailable_without_retry() {
+    for failure in [
+        FetchFailure::Timeout,
+        FetchFailure::Network,
+        FetchFailure::HttpStatus(503),
+        FetchFailure::Empty,
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let services = Services {
+            source: Some((
+                SourcePolicy::unrestricted_web(),
+                Arc::new(FailedFetcher {
+                    calls: calls.clone(),
+                    failure,
+                }),
+            )),
+            ..Services::default()
+        };
+        let tool = services.tools().0.remove(0);
+        let result = tool
+            .execute(call(json!({"url":"https://docs.invalid/page"})), context())
+            .await
+            .unwrap_err();
+        let message = format!("来源页面读取失败（{failure:?}）；未自动重试");
+        let expected = match failure {
+            FetchFailure::Timeout | FetchFailure::Network => {
+                ToolExecutionError::Unavailable(message)
+            }
+            _ => ToolExecutionError::Failed(message),
+        };
+        assert_eq!(result, expected);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
 #[tokio::test]
 async fn scope_extra_identity_and_out_of_policy_urls_never_fetch() {
     assert!(Services::default().tools().0.is_empty());

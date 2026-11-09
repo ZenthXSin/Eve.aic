@@ -2891,6 +2891,7 @@ async fn run_tool(
             Err(error) => {
                 let code = match &error {
                     eve_llm_api::ToolExecutionError::Rejected(_) => ToolFailureCode::InvalidArguments,
+                    eve_llm_api::ToolExecutionError::Unavailable(_) => ToolFailureCode::Unavailable,
                     eve_llm_api::ToolExecutionError::Cancelled(_) => ToolFailureCode::Cancelled,
                     eve_llm_api::ToolExecutionError::Failed(_) => ToolFailureCode::ExecutionFailed,
                 };

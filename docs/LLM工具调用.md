@@ -89,6 +89,7 @@ Channel 输入
 | Registry/Inspector 读取失败，或权限后端返回非拒绝类错误 | 宿主后端错误 | 否，不伪装成工具缺失或权限拒绝 |
 | 模型请求未绑定的工具 | 该调用为 `UnknownTool` | 是 |
 | 调用时服务缺失、类型不符或定义漂移 | 该调用为 `Unavailable` | 是 |
+| 工具明确返回资源暂不可用，且确认没有未决业务副作用 | 该调用为 `Unavailable` | 是，不自动重试该工具 |
 | 调用时服务所有者不符、插件不存在或不再 Active | 该调用为 `OwnerMismatch` / `Inactive` | 是 |
 | 权限明确拒绝 | 该调用为 `PermissionDenied` | 是 |
 | 对象参数不满足工具校验 | 该调用为 `InvalidArguments` | 是 |
@@ -98,6 +99,8 @@ Channel 输入
 | Provider 错误、超时、不支持、协议损坏或轮数耗尽 | 对应 `LlmError` | 否 |
 
 `ToolFailureCode` 是公开枚举，测试比较错误码而不是说明文本。批次内一个 `ToolResult` 的失败不得抹除其余结果；只有无法安全继续整轮的宿主后端错误、Provider 错误、协议错误或调用者取消才终止整轮。工具校验/执行 panic 转为该调用的 `ExecutionFailed`，装配阶段定义回调或上下文 panic 转为宿主错误；均隔离同步调用与 Future 轮询，沿用只捕获 unwind、不承诺恢复 abort/双重/析构 panic 的边界。原始后端错误或 panic 载荷不直接回传模型。
+
+开启持久检查点时，`ExecutionFailed`、外层超时和取消可能包含未知副作用，仍终止接续。`ToolExecutionError::Unavailable` 仅用于工具已返回并确认没有未决业务副作用的资源失败，映射到现有持久 `ToolFailureCode::Unavailable`，不改变数据库格式。`read_source` 的抓取器明确返回 `Timeout` 或 `Network` 时使用此分类，让模型看到真实失败后决定换来源或收尾；不自动重试抓取，HTTP 状态和无效内容仍沿用原分类。模型请求后续失败并恢复时保留该读取回执，不重读旧调用；这不赋予旧编程子代理检查点自动重跑的能力。
 
 `LlmHostConfig` 的 Provider 超时、工具超时、工具取消收尾窗口和最大并发数均为正数；`max_parallel_tool_calls` 默认值为 `10`。组合层在本轮开始前从配置能力取得并校验这些值，形成不可变快照；确定性 Mock 切片可直接显式构造已校验配置。配置服务的命名空间、来源合并、自举和不可用策略由 Issue #32 定义，不能由 LLM 宿主私自解析环境变量或静默回退。每次 Provider 请求在 `complete` 返回且即将首次轮询其 Future 时独立开始计时；期限在同一轮询点与完成同时就绪时，期限优先，宿主丢弃该 Future 并返回 `LlmError::ProviderTimeout`，不自动重试。调用者丢弃 `run_turn` 时同样丢弃在途 Provider Future。上述本地取消均不能证明远端已停止或不会计费；也不能回滚已经完成的工具副作用。
 

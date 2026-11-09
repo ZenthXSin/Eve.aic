@@ -969,6 +969,236 @@ async fn restored_checkpoint_reuses_the_failed_model_request_without_replaying_t
 }
 
 #[tokio::test]
+async fn leaf_journal_returns_unavailable_to_model_and_continues_without_replaying_read() {
+    let scope = eve_llm_api::ContextScope {
+        session_id: "parent".into(),
+        user_id: "owner".into(),
+    };
+    let session = ModelSession::scoped("main", &scope)
+        .unwrap()
+        .with_turn("one")
+        .unwrap()
+        .fork("subagent", Some("one:code"))
+        .unwrap();
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("read-once", "read_source", json!({}))]),
+        tool_response(vec![call("other-evidence", "lookup", json!({}))]),
+        final_response("网页读取失败，按另一项证据收尾"),
+    ]);
+    let read = Arc::new(TestTool::new("read_source", None, ToolMode::Unavailable));
+    let lookup = Arc::new(TestTool::new("lookup", None, ToolMode::Echo));
+    let config = LlmHostConfig {
+        max_tool_rounds: 3,
+        ..Default::default()
+    };
+    let journal = Arc::new(MemoryJournal::default());
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![read.clone(), lookup.clone()],
+        config.clone(),
+    )
+    .await;
+    let result = host
+        .with_model_session(session.clone())
+        .with_leaf_turn_journal(journal.clone())
+        .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+        .await
+        .unwrap();
+    assert_eq!(result.text, "网页读取失败，按另一项证据收尾");
+    assert_eq!(*read.starts.lock().unwrap(), ["read-once"]);
+    assert_eq!(*lookup.starts.lock().unwrap(), ["other-evidence"]);
+    assert_eq!(result.diagnostics.started_tools, 2);
+    let unavailable = eve_llm_api::ToolResult::failure(
+        "read-once",
+        ToolFailureCode::Unavailable,
+        "来源页面读取失败（Timeout）；未自动重试",
+    )
+    .unwrap();
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|m| m.tool_results.contains(&unavailable))
+        );
+    }
+    let frame = journal.frame.lock().unwrap().clone().unwrap();
+    frame.validate(config.max_tool_calls).unwrap();
+    assert!(
+        frame
+            .messages
+            .iter()
+            .any(|m| m.tool_results.contains(&unavailable))
+    );
+    assert_eq!(frame.used_tool_calls, 2);
+    assert_eq!(frame.provider_requests, 3);
+    assert_eq!(frame.result.as_deref(), Some(result.text.as_str()));
+    // 新错误分类不赋予旧叶子检查点自动恢复或重做工具的能力。
+    let replay = RecordingProvider::scripted(vec![]);
+    let (host, _, _) = make_host(replay.clone(), vec![read.clone(), lookup], config).await;
+    assert!(
+        host.with_model_session(session)
+            .with_leaf_turn_journal(journal)
+            .run_scoped_turn_with_events(turn(), Some(scope), &ProgressRecorder::default())
+            .await
+            .is_err()
+    );
+    assert!(replay.requests.lock().unwrap().is_empty());
+    assert_eq!(*read.starts.lock().unwrap(), ["read-once"]);
+}
+
+#[tokio::test]
+async fn checkpoint_unavailable_receipt_survives_provider_recovery_without_replaying_read() {
+    let scope = eve_llm_api::ContextScope {
+        session_id: "background".into(),
+        user_id: "owner".into(),
+    };
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("read-once", "read_source", json!({}))]),
+        Err(LlmError::ProviderTimeout),
+        final_response("保留读取失败，未重做工具"),
+    ]);
+    let read = Arc::new(TestTool::new("read_source", None, ToolMode::Unavailable));
+    let journal = Arc::new(MemoryJournal::default());
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![read.clone()],
+        LlmHostConfig::default(),
+    )
+    .await;
+    let failure = host
+        .with_turn_journal(journal.clone())
+        .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.error, LlmError::ProviderTimeout);
+    let bytes = serde_json::to_vec(journal.frame.lock().unwrap().as_ref().unwrap()).unwrap();
+    let frame: eve_llm_api::TurnCheckpoint = serde_json::from_slice(&bytes).unwrap();
+    assert!(frame.resumable());
+    let restored = Arc::new(MemoryJournal::default());
+    *restored.frame.lock().unwrap() = Some(frame);
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![read.clone()],
+        LlmHostConfig::default(),
+    )
+    .await;
+    let output = host
+        .with_turn_journal(restored)
+        .run_scoped_turn_with_events(turn(), Some(scope), &ProgressRecorder::default())
+        .await
+        .unwrap();
+    assert_eq!(output.text, "保留读取失败，未重做工具");
+    assert_eq!(*read.starts.lock().unwrap(), ["read-once"]);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[1..] {
+        assert!(
+            request
+                .messages
+                .iter()
+                .flat_map(|m| &m.tool_results)
+                .any(|r| {
+                    r.call_id == "read-once"
+                        && matches!(
+                            r.output,
+                            eve_llm_api::ToolOutput::Failure {
+                                code: ToolFailureCode::Unavailable,
+                                ..
+                            }
+                        )
+                })
+        );
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_unavailable_does_not_hide_unknown_write_failure_or_outer_timeout() {
+    for outer_timeout in [false, true] {
+        let scope = eve_llm_api::ContextScope {
+            session_id: "parent".into(),
+            user_id: "owner".into(),
+        };
+        let read = Arc::new(TestTool::new(
+            "read_source",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Unavailable,
+        ));
+        let mut write = TestTool::new(
+            "write",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Error,
+        );
+        if outer_timeout {
+            write.delay = Duration::from_secs(30);
+        }
+        let write = Arc::new(write);
+        let config = LlmHostConfig {
+            tool_timeout: Duration::from_secs(5),
+            tool_timeout_overrides: if outer_timeout {
+                [("write".into(), Duration::from_millis(200))].into()
+            } else {
+                Default::default()
+            },
+            tool_cancellation_grace: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let provider = RecordingProvider::scripted(vec![
+            tool_response(vec![
+                call("read-once", "read_source", json!({})),
+                call("write-once", "write", json!({})),
+            ]),
+            final_response("未知写结果不允许自动接续"),
+        ]);
+        let journal = Arc::new(MemoryJournal::default());
+        let (host, _, _) = make_host(
+            provider.clone(),
+            vec![read.clone(), write.clone()],
+            config.clone(),
+        )
+        .await;
+        let failure = host
+            .with_leaf_turn_journal(journal.clone())
+            .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(failure.error, LlmError::Context(_)));
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        let frame = journal.frame.lock().unwrap().clone().unwrap();
+        assert!(!frame.resumable());
+        assert!(frame.pending_calls.is_empty());
+        let expected = if outer_timeout {
+            ToolFailureCode::TimedOut
+        } else {
+            ToolFailureCode::ExecutionFailed
+        };
+        for (id, code) in [
+            ("read-once", ToolFailureCode::Unavailable),
+            ("write-once", expected),
+        ] {
+            assert!(frame.messages.iter().flat_map(|m| &m.tool_results).any(|r| {
+                r.call_id == id && matches!(r.output, eve_llm_api::ToolOutput::Failure { code: actual, .. } if actual == code)
+            }));
+        }
+        // 普通后台恢复同样必须拒绝该记录，不能绕过叶子不续跑策略重放未知写操作。
+        let replay = RecordingProvider::scripted(vec![]);
+        let (host, _, _) =
+            make_host(replay.clone(), vec![read.clone(), write.clone()], config).await;
+        assert!(
+            host.with_turn_journal(journal)
+                .run_scoped_turn_with_events(turn(), Some(scope), &ProgressRecorder::default())
+                .await
+                .is_err()
+        );
+        assert!(replay.requests.lock().unwrap().is_empty());
+        assert_eq!(*read.starts.lock().unwrap(), ["read-once"]);
+        assert_eq!(*write.starts.lock().unwrap(), ["write-once"]);
+    }
+}
+
+#[tokio::test]
 async fn restored_changed_prompt_or_missing_fingerprint_uses_a_new_request_id() {
     let scope = eve_llm_api::ContextScope {
         session_id: "s".into(),
@@ -1411,6 +1641,7 @@ impl ContextAssembler for CountingContext {
 enum ToolMode {
     Echo,
     Error,
+    Unavailable,
     PanicSync,
     PanicFuture,
     WaitForCancellation(Arc<AtomicBool>),
@@ -1536,7 +1767,7 @@ impl Tool for TestTool {
                 seen.lock().unwrap().push(context);
                 Ok(json!({"id": call.id}))
             }),
-            ToolMode::Echo | ToolMode::Error => Box::pin(async move {
+            ToolMode::Echo | ToolMode::Error | ToolMode::Unavailable => Box::pin(async move {
                 starts.lock().expect("starts lock").push(call.id.clone());
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(current, Ordering::SeqCst);
@@ -1544,6 +1775,10 @@ impl Tool for TestTool {
                 active.fetch_sub(1, Ordering::SeqCst);
                 if matches!(mode, ToolMode::Error) {
                     Err(ToolExecutionError::Failed("工具执行失败".into()))
+                } else if matches!(mode, ToolMode::Unavailable) {
+                    Err(ToolExecutionError::Unavailable(
+                        "来源页面读取失败（Timeout）；未自动重试".into(),
+                    ))
                 } else {
                     Ok(json!({"id": call.id, "arguments": call.arguments}))
                 }
