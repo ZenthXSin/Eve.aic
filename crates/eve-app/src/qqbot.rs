@@ -2535,7 +2535,7 @@ async fn run_qqbot_composed(
         };
         // 兴趣观察与受控研究共用主模型配置；只在需要默认模型实现时读取凭据。
         let core_resolver =
-            |role: &str, cap_seconds: Option<u64>| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
+            |role: &str, cap_seconds: Option<u64>, maintenance: bool| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
                 let settings = registry
                     .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
                     .ok_or("兴趣学习配置服务缺失")?
@@ -2545,6 +2545,11 @@ async fn run_qqbot_composed(
                 let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
                 let resolver =
                     crate::models::CoreModelResolver::new(settings.0.clone(), key).with_use(role);
+                let resolver = if maintenance {
+                    resolver.with_conversation_maintenance()
+                } else {
+                    resolver
+                };
                 Ok(Arc::new(match cap_seconds {
                     Some(seconds) => resolver.with_timeout_cap(std::time::Duration::from_secs(seconds)),
                     None => resolver,
@@ -2556,12 +2561,20 @@ async fn run_qqbot_composed(
         let observed_capped = |role: &str, cap_seconds: Option<u64>| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
             model_health.register(role);
             Ok(Arc::new(eve_model_health::ObservedResolver::new(
-                core_resolver(role, cap_seconds)?,
+                core_resolver(role, cap_seconds, false)?,
                 role,
                 model_health.clone(),
             )))
         };
         let observed = |role: &str| observed_capped(role, None);
+        let maintenance_learning = || -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
+            model_health.register("conversation_learning");
+            Ok(Arc::new(eve_model_health::ObservedResolver::new(
+                core_resolver("conversation_learning", None, true)?,
+                "conversation_learning",
+                model_health.clone(),
+            )))
+        };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
         let budgeted_capped = |category: &str, cap_seconds: u64| {
             budget_gate.wrap(observed_capped(category, Some(cap_seconds))?, category)
@@ -2674,9 +2687,9 @@ async fn run_qqbot_composed(
             },
         ));
         conversation_background = Some(crate::conversation_learning::Background::start_with_maintenance(
-            training.0.clone(), Arc::new(eve_training_plugin::ModelConversationLearner::new(budget_gate.wrap(observed_capped("conversation_learning", Some(59))?, crate::qq_budget::CONVERSATION_LEARNING)?)), budget_gate.clone(),
+            training.0.clone(), Arc::new(eve_training_plugin::ModelConversationLearner::new(budget_gate.wrap(observed("conversation_learning")?, crate::qq_budget::CONVERSATION_LEARNING)?)), budget_gate.clone(),
             Some(options.state_directory.join("conversation-maintenance")),
-            Some(Arc::new(eve_training_plugin::ModelConversationLearner::new(observed_capped("conversation_learning", Some(crate::conversation_learning::MAINTENANCE_PROVIDER_CAP_SECONDS))?))),
+            Some(Arc::new(eve_training_plugin::ModelConversationLearner::new(maintenance_learning()?))),
         ));
         // 说法学习：训练中的会话攒够一批原话后学习一次；用途 phrase 单独记健康与输出上限。
         let _ = phrase_policy

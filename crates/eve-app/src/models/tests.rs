@@ -24,6 +24,8 @@ use tokio::sync::Notify;
 
 #[path = "codex_tests.rs"]
 mod codex;
+#[path = "learning_tests.rs"]
+mod learning;
 
 struct Harness {
     kernel: Kernel,

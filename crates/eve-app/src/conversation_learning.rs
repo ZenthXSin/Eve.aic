@@ -12,29 +12,22 @@ use ring::digest::{SHA256, digest};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-pub(crate) const MAINTENANCE_PROVIDER_CAP_SECONDS: u64 = 180;
-const NORMAL_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
-// CoreModelResolver 给 SSE 传输期限额外一秒收尾；worker 再留一秒核对输出。
-const MAINTENANCE_BATCH_TIMEOUT: Duration =
-    Duration::from_secs(MAINTENANCE_PROVIDER_CAP_SECONDS + 2);
+// 实际模型期限由每批解析的用途配置限制，包含模型槽排队；不再叠加旧的 60/182 秒。
+// 外层仅防自定义 learner 无界等待：最大可配置模型预算 + SSE 收尾一秒 + 核对一秒。
+const BATCH_TIMEOUT: Duration =
+    Duration::from_millis(crate::config::CONVERSATION_TIMEOUT_MAX_MS + 2000);
 
 async fn learn_batch(
     learner: &dyn ConversationLearner,
     batch: eve_training_api::ConversationBatch,
-    maintenance: bool,
     stopped: &mut watch::Receiver<bool>,
 ) -> Option<Result<Vec<eve_training_api::ConversationLessonDraft>, LlmError>> {
     if *stopped.borrow() {
         return None;
     }
-    let timeout = if maintenance {
-        MAINTENANCE_BATCH_TIMEOUT
-    } else {
-        NORMAL_BATCH_TIMEOUT
-    };
     tokio::select! { biased;
         _ = stopped.changed() => None,
-        result = tokio::time::timeout(timeout, learner.learn(batch)) => {
+        result = tokio::time::timeout(BATCH_TIMEOUT, learner.learn(batch)) => {
             Some(result.unwrap_or(Err(LlmError::ProviderTimeout)))
         },
     }
@@ -226,7 +219,7 @@ impl Background {
                         // 批次号只在当前范围递增；沿用学习请求的稳定匿名会话键，避免跨范围同号误判为重放。
                         let scope_hash = eve_llm_api::ModelSession::scoped("conversation-learning", &batch.scope)?
                             .session_id().to_owned();
-                        let Some(result) = learn_batch(learner.as_ref(), batch.clone(), is_maintenance, &mut stopped).await else {
+                        let Some(result) = learn_batch(learner.as_ref(), batch.clone(), &mut stopped).await else {
                             return Ok(());
                         };
                         match result {
@@ -361,14 +354,14 @@ mod timeout_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn maintenance_model_result_after_sixty_seconds_keeps_original_session() {
-        let (probe, learner) = learner(90, MAINTENANCE_PROVIDER_CAP_SECONDS + 1);
+    async fn maintenance_model_result_after_old_deadline_keeps_original_session() {
+        let (probe, learner) = learner(192, 301);
         let (_stop, mut stopped) = watch::channel(false);
         let original = batch();
         let start = tokio::time::Instant::now();
-        let result = learn_batch(&learner, original.clone(), true, &mut stopped).await;
+        let result = learn_batch(&learner, original.clone(), &mut stopped).await;
         assert!(matches!(result, Some(Ok(ref drafts)) if drafts.is_empty()));
-        assert_eq!(start.elapsed(), Duration::from_secs(90));
+        assert_eq!(start.elapsed(), Duration::from_secs(192));
         let requests = probe.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let expected = eve_llm_api::ModelSession::scoped("conversation-learning", &original.scope)
@@ -381,13 +374,13 @@ mod timeout_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn maintenance_uses_provider_deadline_and_preserves_shorter_configuration() {
-        for timeout in [MAINTENANCE_PROVIDER_CAP_SECONDS + 1, 31] {
-            let (probe, learner) = learner(300, timeout);
+    async fn learning_uses_provider_deadline_and_preserves_shorter_configuration() {
+        for timeout in [301, 181, 31] {
+            let (probe, learner) = learner(500, timeout);
             let (_stop, mut stopped) = watch::channel(false);
             let start = tokio::time::Instant::now();
             assert!(matches!(
-                learn_batch(&learner, batch(), true, &mut stopped).await,
+                learn_batch(&learner, batch(), &mut stopped).await,
                 Some(Err(LlmError::ProviderTimeout))
             ));
             assert_eq!(start.elapsed(), Duration::from_secs(timeout));
@@ -396,35 +389,47 @@ mod timeout_tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_learning_accepts_a_complete_result_after_sixty_seconds() {
+        let (probe, learner) = learner(109, 181);
+        let (_stop, mut stopped) = watch::channel(false);
+        let mut ordinary = batch();
+        ordinary.id = "conversation-1".into();
+        let start = tokio::time::Instant::now();
+        assert!(matches!(
+            learn_batch(&learner, ordinary, &mut stopped).await,
+            Some(Ok(ref drafts)) if drafts.is_empty()
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(109));
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+    }
+
     struct SlowLearner;
     impl ConversationLearner for SlowLearner {
         fn learn(&self, _batch: ConversationBatch) -> LlmFuture<'_, Vec<ConversationLessonDraft>> {
             Box::pin(async {
-                tokio::time::sleep(Duration::from_secs(600)).await;
+                tokio::time::sleep(Duration::from_secs(900)).await;
                 Ok(vec![])
             })
         }
     }
     #[tokio::test(start_paused = true)]
-    async fn worker_bounds_maintenance_at_182_seconds_and_normal_at_60() {
-        for (maintenance, expected) in [(true, 182), (false, 60)] {
-            let (_stop, mut stopped) = watch::channel(false);
-            let start = tokio::time::Instant::now();
-            assert!(matches!(
-                learn_batch(&SlowLearner, batch(), maintenance, &mut stopped).await,
-                Some(Err(LlmError::ProviderTimeout))
-            ));
-            assert_eq!(start.elapsed(), Duration::from_secs(expected));
-        }
+    async fn worker_bounds_custom_learner_at_maximum_configurable_budget() {
+        let (_stop, mut stopped) = watch::channel(false);
+        let start = tokio::time::Instant::now();
+        assert!(matches!(
+            learn_batch(&SlowLearner, batch(), &mut stopped).await,
+            Some(Err(LlmError::ProviderTimeout))
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(602));
     }
 
     #[tokio::test(start_paused = true)]
     async fn maintenance_cancellation_drops_provider_without_retry_or_failure_result() {
-        let (probe, learner) = learner(300, MAINTENANCE_PROVIDER_CAP_SECONDS + 1);
+        let (probe, learner) = learner(500, 301);
         let (stop, mut stopped) = watch::channel(false);
         let start = tokio::time::Instant::now();
-        let task =
-            tokio::spawn(async move { learn_batch(&learner, batch(), true, &mut stopped).await });
+        let task = tokio::spawn(async move { learn_batch(&learner, batch(), &mut stopped).await });
         tokio::task::yield_now().await;
         assert_eq!(probe.requests.lock().unwrap().len(), 1);
         tokio::time::advance(Duration::from_secs(10)).await;
