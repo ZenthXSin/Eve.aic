@@ -429,6 +429,12 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
 
     def test_segment_commands_apply_to_live_parts_and_preserve_merged_tail_text(self):
         observed = {}
+        command_results = {}
+        commands = {
+            'segment-off': ('/segment off', '已关闭本会话分段', False, None),
+            'segment-on': ('/segment on', '已开启本会话分段', True, None),
+            'segment-limit': ('/segment parts 2', '已将本会话分段上限设为 2 段', True, 2),
+        }
         requests = {'关闭后试一次': (['关闭后的第一条', '关闭后的第二条'],
                                     'merged_disabled', 1),
                     '重新开启后试一次': (['开启后的第一条', '开启后的第二条'],
@@ -448,26 +454,54 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
             observed[current] = result
             return dialogue.text_response('内部结束')
 
-        def command(id, text, contains):
-            message = self.message(id, text, contains=contains) | {'expected_type': 'reply'}
-            return [{'send': message}, self.wait_command(id, 'reply'), self.wait_receipt(id, 'Sent')]
+        def decide(facts):
+            event = facts['host_event']
+            self.assertEqual(event['kind'], 'host_operation_result')
+            id = next(id for id, (text, _, _, _) in commands.items()
+                      if text == event['user_text'])
+            self.assertIn(commands[id][1], event['result'])
+            self.assertNotIn(id, command_results)
+            command_results[id] = event['result']
+            return {'action': 'silence'}
+
+        def inspect_command(id):
+            def inspect():
+                self.wait_until(lambda: any(event['id'] == f'host-reply:{id}' and state == 'silence'
+                    for event, state, _ in self.speech_rows()), '分段命令的沉默决定没有落盘')
+                self.assertIn(id, command_results)
+                preferences = self.documents()['eve.segment.preferences']['preferences.v1']
+                self.assertEqual(preferences['version'], 1)
+                [setting] = preferences['scopes']
+                routing = json.dumps(['1904159860', 'c2c', 'user-1', 'user-1'],
+                                     separators=(',', ':')).encode()
+                session = 'qq:' + hashlib.sha256(routing).hexdigest()
+                self.assertEqual(setting['scope'], {
+                    'channel': 'qq', 'session_id': session, 'user_id': session})
+                self.assertIs(setting['enabled'], commands[id][2])
+                self.assertEqual(setting['max_segments'], commands[id][3])
+                self.assertIsNone(setting['pause_percent'])
+                self.assertEqual(self.receipt(id)['state'], 'Handled')
+                self.assertIsNone(self.receipt(id)['reply'])
+            return inspect
+
+        def command(id):
+            return [*self.send(self.message(id, commands[id][0])), *self.checkpoint(id)]
 
         self.callback = respond
-        # 只有 /segment 的固定命令回复允许 reply，其余仍由显式 send_message 投递。
-        self.run_eve([*command('segment-off', '/segment off', '已关闭本会话分段'),
+        self.speech_callback = decide
+        # live 宿主命令先保存结果事实，Eve 可沉默；设置在下一次显式发送前已经落盘。
+        self.run_live([*command('segment-off'),
             *self.send(self.message('parts-off', '关闭后试一次')),
-            *command('segment-on', '/segment on', '已开启本会话分段'),
+            *command('segment-on'),
             *self.send(self.message('parts-on', '重新开启后试一次')),
-            *command('segment-limit', '/segment parts 2', '已将本会话分段上限设为 2 段'),
+            *command('segment-limit'),
             *self.send(self.message('parts-limit', '限制两条后试一次'))],
-            milestones=None, more=['--segmented'], env_extra={'EVE_QQ_LIVE_INTERACTION': 'true'})
+            more=['--segmented'], checkpoints={id: inspect_command(id) for id in commands})
         self.assertEqual(set(observed), set(requests))
+        self.assertEqual(set(command_results), set(commands))
         self.assertEqual(self.chat_rounds, 6, '三个设置命令不能调用聊天模型')
-        self.assertFalse(self.narrations)
-        outputs = [event for event in self.events if event.get('direction') == 'out'
-                   and event.get('type') in ('reply', 'segment', 'sticker')]
-        self.assertEqual([(event['id'], event['type']) for event in outputs],
-                         [('segment-off', 'reply'), ('segment-on', 'reply'), ('segment-limit', 'reply')])
+        self.assertEqual(len(self.speech_requests), 3, '命令结果各由独立发言模型决定沉默')
+        self.assertFalse([event for event in self.events if event.get('type') == 'push'])
         self.assertEqual([frame['text'] for frame in self.progress('parts-off')],
                          ['关闭后的第一条\n\n关闭后的第二条'])
         self.assertEqual([frame['text'] for frame in self.progress('parts-on')],
