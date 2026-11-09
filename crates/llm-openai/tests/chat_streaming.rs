@@ -287,3 +287,138 @@ async fn mime_byte_budget_and_deadline_apply_to_chat_streams() {
         LlmError::ProviderTimeout
     );
 }
+
+#[tokio::test]
+async fn role_only_bootstrap_can_bind_once_to_the_first_text_or_tool_identity() {
+    for finish_null in [false, true] {
+        let mut bootstrap = chunk(json!({"role":"assistant"}), None);
+        if !finish_null {
+            bootstrap["choices"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("finish_reason");
+        }
+        let mut content = chunk(json!({"content":"完整正文"}), Some("stop"));
+        content["id"] = json!("actual-response");
+        let mut server = Server::start(vec![reply(vec![bootstrap, content])]).await;
+        let sink = Sink::default();
+        assert_eq!(
+            provider(&server).stream(request(), &sink).await.unwrap(),
+            ModelResponse::Final {
+                text: "完整正文".into()
+            }
+        );
+        assert_eq!(*sink.0.lock().unwrap(), "完整正文");
+        server.next().await;
+        assert!(server.requests.try_recv().is_err());
+    }
+    let mut call = chunk(
+        json!({"tool_calls":[{
+            "index":0,"id":"call-one","type":"function","function":{"name":"echo","arguments":"{}"}
+        }]}),
+        Some("tool_calls"),
+    );
+    call["id"] = json!("actual-response");
+    let server = Server::start(vec![reply(vec![
+        chunk(json!({"role":"assistant"}), None),
+        call,
+    ])])
+    .await;
+    let sink = Sink::default();
+    assert_eq!(
+        provider(&server).stream(request(), &sink).await.unwrap(),
+        ModelResponse::ToolCalls {
+            calls: vec![ToolCall {
+                id: "call-one".into(),
+                name: "echo".into(),
+                arguments: json!({})
+            }]
+        }
+    );
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_window_never_discards_semantics_or_allows_later_identity_changes() {
+    let bootstrap = chunk(json!({"role":"assistant"}), None);
+    let mut content = chunk(json!({"content":"正文"}), None);
+    content["id"] = json!("actual-response");
+    let mut finish = content.clone();
+    finish["choices"][0]["finish_reason"] = json!("stop");
+    let mut cases = Vec::new();
+    // content 的 null/空串仍是实际字段，不扩大已观测到的纯角色引导例外。
+    for extra in [
+        json!({"content":null}),
+        json!({"content":""}),
+        json!({"content":"已有正文"}),
+        json!({"tool_calls":null}),
+        json!({"tool_calls":[]}),
+        json!({"reasoning_content":"已有思考"}),
+        json!({"refusal":null}),
+        json!({"unknown_extra":null}),
+    ] {
+        let mut first = bootstrap.clone();
+        first["choices"][0]["delta"]
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        cases.push(vec![first, finish.clone()]);
+    }
+    for extra in [
+        json!({"usage":null}),
+        json!({"usage":{}}),
+        json!({"unknown_extra":null}),
+    ] {
+        let mut first = bootstrap.clone();
+        first
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        cases.push(vec![first, finish.clone()]);
+    }
+    let mut extra_choice = bootstrap.clone();
+    extra_choice["choices"][0]["unknown_extra"] = Value::Null;
+    cases.push(vec![extra_choice, finish.clone()]);
+    for middle in [
+        chunk(json!({"role":"assistant"}), None),
+        chunk(json!({}), None),
+        chunk(json!({"content":null}), None),
+        chunk(json!({"content":""}), None),
+        json!({"id":"chat-one","choices":[],"usage":{"prompt_tokens":10}}),
+    ] {
+        cases.push(vec![bootstrap.clone(), middle, finish.clone()]);
+    }
+    let mut empty_changed = chunk(json!({}), None);
+    empty_changed["id"] = json!("actual-response");
+    cases.push(vec![bootstrap.clone(), empty_changed, finish.clone()]);
+    let mut third_id = finish.clone();
+    third_id["id"] = json!("third-response");
+    cases.push(vec![bootstrap.clone(), content.clone(), third_id.clone()]);
+    let mut call = chunk(
+        json!({"tool_calls":[{
+            "index":0,"id":"call-one","type":"function","function":{"name":"echo","arguments":"{}"}
+        }]}),
+        None,
+    );
+    call["id"] = json!("actual-response");
+    cases.push(vec![bootstrap, call, third_id]);
+    let mut same_content = content;
+    same_content["id"] = json!("chat-one");
+    cases.push(vec![same_content, finish]);
+    for events in cases {
+        let mut server = Server::start(vec![reply(events)]).await;
+        let sink = Sink::default();
+        let error = provider(&server)
+            .with_transient_retries()
+            .stream(request(), &sink)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.protocol_failure(),
+            Some(ProtocolFailureKind::StreamInvalid)
+        );
+        assert!(sink.0.lock().unwrap().is_empty());
+        server.next().await;
+        assert!(server.requests.try_recv().is_err());
+    }
+}

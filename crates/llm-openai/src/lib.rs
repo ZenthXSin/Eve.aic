@@ -590,6 +590,7 @@ impl OpenAiProvider {
             let mut state = stream::ResponseStream::default();
             let mut chat_state = chat_stream::ChatStream::default();
             let mut received = 0;
+            let mut event_index = 0_u64;
             let mut chunk_deadline = first_deadline;
             loop {
                 let next = if let Some(policy) = policy {
@@ -647,10 +648,23 @@ impl OpenAiProvider {
                     }
                     received += 1;
                     if let Some((name, data)) = parser.byte(byte)? {
+                        event_index += 1;
                         let update = match self.config.protocol {
                             OpenAiProtocol::Responses => state.event(&name, &data)?,
                             OpenAiProtocol::ChatCompletions => {
-                                match chat_state.event(&name, &data)? {
+                                match chat_state.event(&name, &data).map_err(|failure| {
+                                    if let Some(detail) = failure.detail {
+                                        let mut fields = identity.fields();
+                                        fields["kind"] = serde_json::json!(
+                                            eve_llm_api::ProtocolFailureKind::StreamInvalid
+                                        );
+                                        fields["detail"] = serde_json::json!(detail);
+                                        fields["event_index"] = serde_json::json!(event_index);
+                                        fields["received_bytes"] = serde_json::json!(received);
+                                        eprintln!("EVE_MODEL_STREAM_DIAGNOSTIC {fields}");
+                                    }
+                                    failure.error
+                                })? {
                                     None => stream::Update::None,
                                     Some(response) => {
                                         // Chat 工具说明可能先于 tool_calls；终态前不把草稿当作最终文本。
