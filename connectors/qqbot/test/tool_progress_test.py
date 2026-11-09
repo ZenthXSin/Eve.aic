@@ -61,7 +61,7 @@ class ToolProgressAcceptance(progress.ProgressNarrationAcceptance):
         message = self.message('fifty', '连续合成调用') | {'accept_any': True}
         self.run_eve([{'send':message}, self.wait_receipt('fifty'),
                       *self.send(self.message('fresh', '新的测试', expected='下一轮正常'))],
-                     more=['--segmented'])
+                     more=['--segmented'], env_extra={'EVE_FOREGROUND_STEPS': '100'})
         self.assertEqual(self.chat_rounds, 103)
         self.assertGreaterEqual(len(self.progress('fifty')), 1)
         self.assertLessEqual(len(self.progress('fifty')), 3)
@@ -82,7 +82,8 @@ class ToolProgressAcceptance(progress.ProgressNarrationAcceptance):
             self.assertEqual(self.results(body), [])
             return dialogue.text_response('超额批次未执行')
         self.callback = respond
-        self.run_eve(self.send(self.message('over', '超额批次', expected='超额批次未执行')))
+        self.run_eve(self.send(self.message('over', '超额批次', expected='超额批次未执行')),
+                     env_extra={'EVE_FOREGROUND_STEPS': '100'})
         self.assertEqual(self.chat_rounds, 2)
         self.assertFalse(self.progress('over'))
         self.assertFalse(any(m['role'] == 'tool' for m in self.requests[-1]['body']['messages']))

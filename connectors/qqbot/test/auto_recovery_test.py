@@ -251,7 +251,7 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
                 *[(f"echo-{i}", "echo", {"text":"RECEIPT_START" + "x" * 32000 + f"RECEIPT_END_{i}"}) for i in range(98)])
         self.callback = respond
         self.run_recovery(self.send(self.message("limit-report", "完成原任务并部署", contains=["已完成文件写入", "部署尚未执行", "批准追加步数"])),
-            env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"0"})
+            env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"0", "EVE_FOREGROUND_STEPS":"100"})
         self.assertEqual(self.closing_requests, 2)
         self.assertFalse(self.tasks())
         turn = self.turn("完成原任务并部署")
@@ -271,7 +271,8 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
                 return calls(*[(f"echo-{i}", "echo", {"text":str(i)}) for i in range(100)])
             return calls(("never-run", "echo", {"text":"不得执行"}))
         self.callback = respond
-        self.run_recovery(self.send(self.message("no-report", "故障收尾", contains=["模型未能完成只读进度汇报", "未自动追加执行"])))
+        self.run_recovery(self.send(self.message("no-report", "故障收尾", contains=["模型未能完成只读进度汇报", "未自动追加执行"])),
+            env_extra={"EVE_FOREGROUND_STEPS":"100"})
         self.assertFalse(self.tasks())
         failure = self.turn("故障收尾")["status"]["failure"]
         self.assertEqual((failure["code"], failure["started_tools"]), ("RoundLimit", 100))
