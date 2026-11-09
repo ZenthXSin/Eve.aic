@@ -22,6 +22,7 @@ pub use json_size::serialized_json_size;
 mod llm_host;
 mod relation_judge;
 mod session_host;
+mod turn_continuity;
 pub use control_runner::SessionControlRunner;
 pub use llm_host::{
     ContextBinding, LlmHost, LlmHostConfig, ToolCallDiagnostic, TurnDiagnostics, TurnFailure,
