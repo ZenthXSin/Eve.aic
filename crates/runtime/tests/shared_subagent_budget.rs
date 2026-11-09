@@ -114,8 +114,25 @@ async fn resumed_parent_keeps_child_charges_and_refuses_a_batch_beyond_remaining
         assert!(saved.closing);
         saved.validate(4).unwrap();
     }
-    assert_eq!(provider.requests.lock().unwrap().len(), 2);
-    assert!(provider.requests.lock().unwrap()[1].tools.is_empty());
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].tools.is_empty());
+        for request in requests.iter() {
+            assert!(
+                request
+                    .messages
+                    .last()
+                    .unwrap()
+                    .text
+                    .as_deref()
+                    .unwrap()
+                    .contains(
+                        "根任务工具总额 4，父线程及全部子代理合计已用 3，本执行者当前最多可用 1",
+                    )
+            );
+        }
+    }
     rig.stop().await;
 }
 
@@ -195,6 +212,12 @@ async fn exhausted_delegate_stops_tools_while_parent_can_verify_with_reserved_st
         let requests = child_provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].tools.is_empty());
+        assert!(requests[0].messages.last().unwrap().text.as_deref().unwrap().contains(
+            "根任务工具总额 4，父线程及全部子代理合计已用 0，本执行者当前最多可用 2，本执行者不可消费的父线程保留额度为 2",
+        ));
+        assert!(requests[1].messages.last().unwrap().text.as_deref().unwrap().contains(
+            "根任务工具总额 4，父线程及全部子代理合计已用 2，本执行者当前最多可用 0，本执行者不可消费的父线程保留额度为 2",
+        ));
         assert!(requests[1].messages.iter().any(|m| {
             m.text
                 .as_deref()
@@ -228,6 +251,15 @@ async fn exhausted_delegate_stops_tools_while_parent_can_verify_with_reserved_st
     assert_eq!(pool.usage().unwrap().tool_calls, 4);
     assert_eq!(rig.starts.load(Ordering::SeqCst), 4);
     assert!(!pool.reserve(1).unwrap());
-    assert!(parent_provider.requests.lock().unwrap()[1].tools.is_empty());
+    {
+        let requests = parent_provider.requests.lock().unwrap();
+        assert!(requests[1].tools.is_empty());
+        assert!(requests[0].messages.last().unwrap().text.as_deref().unwrap().contains(
+            "根任务工具总额 4，父线程及全部子代理合计已用 2，本执行者当前最多可用 2，本执行者不可消费的父线程保留额度为 0",
+        ));
+        assert!(requests[1].messages.last().unwrap().text.as_deref().unwrap().contains(
+            "根任务工具总额 4，父线程及全部子代理合计已用 4，本执行者当前最多可用 0，本执行者不可消费的父线程保留额度为 0",
+        ));
+    }
     rig.stop().await;
 }

@@ -1774,6 +1774,122 @@ fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
 }
 
 #[tokio::test]
+async fn casual_expression_with_subagent_available_does_not_receive_task_budget_protocol() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("say", "send_message", json!({"text":"晚安"}))]),
+        tool_response(vec![call("sticker", "send_sticker", json!({}))]),
+        tool_response(vec![call("listen", "wait_for_input", json!({}))]),
+        final_response("内部结束"),
+    ]);
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let sticker = Arc::new(TestTool::new("send_sticker", None, ToolMode::Echo));
+    let wait = Arc::new(TestTool::new("wait_for_input", None, ToolMode::Echo));
+    let subagent = Arc::new(TestTool::new("run_subagent", None, ToolMode::Echo));
+    let (host, _, _, kernel) = make_host_with_registry(
+        provider.clone(),
+        vec![send, sticker, wait, subagent.clone()],
+        LlmHostConfig {
+            max_tool_calls: 8,
+            max_tool_rounds: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let output = host
+        .run_turn(TurnInput {
+            text: "晚安".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.diagnostics.started_tools, 3);
+    assert!(subagent.starts.lock().unwrap().is_empty());
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in requests.iter() {
+            assert!(request.tools.iter().any(|tool| tool.name == "run_subagent"));
+            assert!(request.messages.iter().all(|message| {
+                !message
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("宿主当前执行预算"))
+            }));
+        }
+    }
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn main_thread_business_work_receives_shared_balance_without_delegating() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("work", "echo", json!({}))]),
+        tool_response(vec![call(
+            "say",
+            "send_message",
+            json!({"text":"核验好了"}),
+        )]),
+        final_response("内部结束"),
+    ]);
+    let work = Arc::new(TestTool::new("echo", None, ToolMode::Echo));
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let subagent = Arc::new(TestTool::new("run_subagent", None, ToolMode::Echo));
+    let (host, _, _, kernel) = make_host_with_registry(
+        provider.clone(),
+        vec![work.clone(), send.clone(), subagent.clone()],
+        LlmHostConfig {
+            max_tool_calls: 8,
+            max_tool_rounds: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let pool = eve_llm_api::SharedToolSteps::new(8).unwrap();
+    let output = host
+        .with_shared_steps(pool.clone())
+        .run_turn(turn())
+        .await
+        .unwrap();
+    assert_eq!(output.diagnostics.started_tools, 2);
+    assert_eq!(pool.usage().unwrap().tool_calls, 2);
+    assert_eq!(*work.starts.lock().unwrap(), ["work"]);
+    assert_eq!(*send.starts.lock().unwrap(), ["say"]);
+    assert!(subagent.starts.lock().unwrap().is_empty());
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| { request.tools.iter().any(|tool| tool.name == "run_subagent") })
+        );
+        assert!(requests[0].messages.iter().all(|message| {
+            !message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("宿主当前执行预算"))
+        }));
+        for (request, used, remaining) in [(&requests[1], 1, 7), (&requests[2], 2, 6)] {
+            let budget = request.messages.last().unwrap();
+            assert_eq!(budget.role, ChatRole::System);
+            let text = budget.text.as_deref().unwrap();
+            assert!(text.contains(&format!("根任务工具总额 8，父线程及全部子代理合计已用 {used}，本执行者当前最多可用 {remaining}")));
+        }
+        // 动态余额不会写回缓存前缀或本轮持久历史。
+        assert_eq!(requests[0].messages[0], requests[2].messages[0]);
+        assert_eq!(requests[0].messages[1], requests[2].messages[1]);
+    }
+    assert!(output.transcript.iter().all(|message| {
+        !message
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("宿主当前执行预算"))
+    }));
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn explicit_expression_keeps_one_choice_inside_the_total_budget() {
     let provider = RecordingProvider::scripted(vec![
         tool_response(vec![call("work", "echo", json!({}))]),

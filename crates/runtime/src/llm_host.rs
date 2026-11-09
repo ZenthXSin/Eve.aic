@@ -1741,7 +1741,12 @@ impl LlmHost {
                 self.save_execution_checkpoint(frame, &diagnostics, &continuation)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
             }
-            let completion = self.complete(request, &mut diagnostics, events);
+            let completion = self.complete(
+                request,
+                &mut diagnostics,
+                continuation.remaining().is_some(),
+                events,
+            );
             let result = if let Some(deadline) = retry_deadline {
                 tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
@@ -2286,6 +2291,7 @@ impl LlmHost {
         &self,
         mut request: ModelRequest,
         diagnostics: &mut TurnDiagnostics,
+        has_remaining_work: bool,
         events: Option<&EventDelivery<'_>>,
     ) -> Result<ModelResponse, LlmError> {
         // 每次按实际剩余工具重建即时选择规则，不写回持久历史或检查点。
@@ -2324,24 +2330,42 @@ impl LlmHost {
                     .insert(0, ChatMessage::text(ChatRole::System, choice));
             }
         }
-        if let Some(steps) = &self.shared_steps
-            && (steps.parent_reserve() > 0
-                || request.tools.iter().any(|tool| tool.name == "run_subagent"))
-        {
+        if let Some(steps) = &self.shared_steps {
             let used = steps.usage()?.tool_calls;
-            let available = steps.remaining()?.min(
-                self.config
-                    .max_tool_calls
-                    .saturating_sub(diagnostics.calls.len()),
-            );
-            // 变化的余额放在请求末尾，固定提示和历史前缀不因每一步计数改写。
-            request.messages.push(ChatMessage::text(
-                ChatRole::System,
-                format!(
-                    "宿主当前执行预算（只描述本次额度，不新增任务或授权）：根任务工具总额 {}，父线程及全部子代理合计已用 {}，本执行者当前最多可用 {}，本执行者不可消费的父线程保留额度为 {}。所有并行调用共享余额，排队后可能减少；max_steps 不会重领额度。父线程仍可使用留给自己的额度完成核验、整合和交流。按工作需要使用，完成即停，不必用满；不足时交回实际成果和剩余工作。",
-                    steps.limit(), used, available, steps.parent_reserve(),
-                ),
-            ));
+            let shared_execution = steps.parent_reserve() > 0
+                || self.bindings.iter().any(|tool| tool.name == "run_subagent")
+                || used > diagnostics.calls.len();
+            // 有能力不等于正在执行任务。普通交流即使装配了 run_subagent，
+            // 也不注入任务协议；明确任务身份、剩余事项或本轮业务调用才展示余额。
+            let executing_task = steps.parent_reserve() > 0
+                || self.delegated
+                || self.exploration_session
+                || self.background_task_id.is_some()
+                || self.journal.is_some()
+                || self.execution_budget.is_some()
+                || has_remaining_work
+                || used > diagnostics.calls.len()
+                || diagnostics.calls.iter().any(|call| {
+                    !matches!(
+                        call.name.as_str(),
+                        "send_message" | "send_sticker" | "wait_for_input"
+                    )
+                });
+            if shared_execution && executing_task {
+                let available = steps.remaining()?.min(
+                    self.config
+                        .max_tool_calls
+                        .saturating_sub(diagnostics.calls.len()),
+                );
+                // 变化的余额放在请求末尾，固定提示和历史前缀不因每一步计数改写。
+                request.messages.push(ChatMessage::text(
+                    ChatRole::System,
+                    format!(
+                        "宿主当前执行预算（只描述本次额度，不新增任务或授权）：根任务工具总额 {}，父线程及全部子代理合计已用 {}，本执行者当前最多可用 {}，本执行者不可消费的父线程保留额度为 {}。所有并行调用共享余额，排队后可能减少；max_steps 不会重领额度。父线程仍可使用留给自己的额度完成核验、整合和交流。按工作需要使用，完成即停，不必用满；不足时交回实际成果和剩余工作。",
+                        steps.limit(), used, available, steps.parent_reserve(),
+                    ),
+                ));
+            }
         }
         request.validate()?;
         if let Some(budget) = &self.execution_budget {

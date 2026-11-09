@@ -2782,9 +2782,8 @@ pub(crate) async fn run(
                         },
                         Ok(_)=>{},
                         Err(error)=>{
-                            // 同批活动只判断一次；错误保存证据，下一批真实进展才再给交流机会。
-                            if pending.event.id.starts_with("foreground-progress:")
-                                && let Some(input)=foreground_inputs.get_mut(&pending.event.anchor) {input.resolved=true;}
+                            // 请求失败不是 silence / wait 决定。同一冻结事件按退避重试，
+                            // 不重新领取进度机会；批次结束、新原话或取消仍由 current 检查退役。
                             let retry=speech_retries.failed(&pending.event,tokio::time::Instant::now());
                             let postponed=speech.as_ref().is_some_and(|speaker|speaker.postpone(&pending.event,retry.as_millis() as u64).is_ok());
                             let _=ctx.log(speech_retry::failure_log(&pending.event,&error,pending.started.elapsed(),retry,postponed));
