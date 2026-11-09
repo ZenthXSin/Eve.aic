@@ -4,6 +4,7 @@
 确认后才允许后台学习、QQ 桥和 Web 工作；失败请求不得产生就绪信号。
 """
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -49,11 +50,22 @@ def encoded(value):
 def atomic_new(path, value):
     """在同目录创建完整控制文件，已存在的请求或确认不能被覆盖。"""
     data = encoded(value)
-    with tempfile.NamedTemporaryFile(dir=path.parent) as temporary:
-        temporary.write(data)
-        temporary.flush()
-        os.fsync(temporary.fileno())
-        os.link(temporary.name, path)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # link 后 unlink 会在发布后改变 ctime，与读者的严格身份校验竞争。
+        # Linux 原子移动且拒绝覆盖；不支持时明确失败，不退回硬链接。
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(temporary), -100, os.fsencode(path), 1) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)

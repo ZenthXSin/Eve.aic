@@ -28,7 +28,8 @@ class HistoryDigestAcceptance(window.HistoryWindowAcceptance):
 
     def dialogue(self, text):
         return next(r["body"] for r in self.requests
-                    if r["body"]["messages"][-1].get("content") == text
+                    if next((m.get("content") for m in reversed(conversation_messages(r["body"]["messages"]))
+                             if m["role"] == "user"), None) == text
                     and not r["body"]["messages"][0]["content"].startswith(DIGEST_PROMPT))
 
     def respond(self, body):
@@ -37,7 +38,8 @@ class HistoryDigestAcceptance(window.HistoryWindowAcceptance):
             covered = request["previous_turns"] + len(request["turns"])
             return text_response(json.dumps({"points": [{"text": POINT, "turns": [1]},
                 {"text": f"已经聊到第 {covered} 轮", "turns": [covered]}]}, ensure_ascii=False))
-        return text_response(body["messages"][-1]["content"])
+        return text_response(next(m["content"] for m in reversed(conversation_messages(body["messages"]))
+                                  if m["role"] == "user"))
 
     def test_persistent_digest_remains_independent_of_layered_history_and_hot_disable(self):
         self.callback = self.respond
