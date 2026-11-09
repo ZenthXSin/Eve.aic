@@ -264,6 +264,156 @@ class NaturalProgressAcceptance(live.LiveToolAcceptance):
         self.assertEqual(len(self.speech_requests), 1)
         self.assertIsNotNone(self.completed_main)
 
+    def retry_failed_decision(self, delivery):
+        # 等待真实的六十秒退避；只延长临时工具门控，不修改生产阈值或时钟。
+        path = self.source / 'gated-check.py'
+        path.write_text(path.read_text().replace('deadline=time.monotonic()+50',
+                                                'deadline=time.monotonic()+105'), encoding='utf8')
+        self.command['timeout_ms'] = 105_000
+        self.install_task(expected_delivery=delivery)
+        decisions = []
+        facts_seen = []
+        sessions = []
+
+        def decide(facts):
+            decision = self.decide(facts)
+            if facts['host_event'].get('kind') != PROGRESS_KIND:
+                return decision
+            decisions.append(time.monotonic())
+            body = self.speech_requests[-1]
+            request = next(item for item in self.requests if item['body'] is body)
+            sessions.append((body.get('prompt_cache_key'),
+                             request['session_headers']['session-id'],
+                             request['session_headers']['thread-id']))
+            facts_seen.append({key: value for key, value in facts.items() if key != 'now_ms'})
+            if len(decisions) == 1:
+                # 协议响应可解析，但不是有效决定；不能当作自主选择了沉默。
+                return {'action': 'speak', 'text': '', 'after_ms': 0}
+            self.assertEqual(len(decisions), 2, '成功后不可再次请求同一进度决定')
+            self.assertEqual(facts_seen[0], facts_seen[1],
+                             '重试必须沿用同一事件与冻结事实')
+            self.assertEqual(sessions[0], sessions[1], '重试必须保留稳定模型会话')
+            self.assertGreaterEqual(decisions[1] - decisions[0], 59.5,
+                                    '错误必须退避，不能成为两秒一次的模型轮询')
+            return decision
+
+        self.speech_callback = decide
+
+        def failed_but_retryable():
+            self.wait_progress('waiting')
+            [(event, state, decision)] = self.progress_rows()
+            self.assertIsNone(decision)
+            self.assertTrue(event['id'].startswith('foreground-progress:'))
+            self.assertFalse(self.executions.exists())
+            self.assertEqual(len(decisions), 1)
+            self.assertFalse(self.run_release.wait(55))
+            self.assertEqual(len(decisions), 1, '退避到期前不得重试发言模型')
+
+        def delivered_once():
+            self.wait_progress(delivery)
+            self.assertEqual(len(decisions), 2)
+            self.assertEqual(len(self.progress_rows()), 1)
+            self.assertFalse(self.executions.exists())
+            self.assertFalse(self.run_release.wait(4.5))
+            self.assertEqual(len(decisions), 2, '投递终态不得触发重新判断')
+
+        message = self.message('working', INITIAL)
+        mode = ([{'push_mode': {'ok': False, 'failure_kind': 'timeout'}}]
+                if delivery == 'unknown' else [])
+        self.run_natural([
+            *mode, {'send': message}, {'wait_file': str(self.tool_started)},
+            *self.checkpoint('failed-decision'), *self.checkpoint('retried-decision'),
+            {'touch': str(self.release_tool)}, self.wait_receipt('working'),
+            self.wait_command('working', 'finish'),
+        ], checkpoints={'failed-decision': failed_but_retryable,
+                        'retried-decision': delivered_once}, timeout=105)
+        self.assertEqual(self.executions.read_text(), 'x')
+        self.assertIsNotNone(self.completed_main)
+        self.assertEqual([event['text'] for event in self.outbound_progress()], [PROGRESS_TEXT])
+        self.assertEqual([state for _, state, _ in self.progress_rows()], [delivery])
+        self.assertEqual(len(decisions), 2)
+        return message
+
+    def test_failed_progress_decision_retries_the_same_event_and_delivers_once(self):
+        self.retry_failed_decision('sent')
+
+    def test_retried_progress_with_unknown_delivery_is_not_replayed_after_restart(self):
+        message = self.retry_failed_decision('unknown')
+        original_rows = self.progress_rows()
+        original_calls = len(self.speech_requests)
+        journal = self.work / 'state/developer-tools/operations.jsonl'
+        original_journal = journal.read_bytes()
+        self.callback = lambda _: dialogue.text_response('新交流正常，旧操作不重放。')
+        self.speech_callback = lambda _: self.fail('未知投递不能重新判断或重发')
+        self.run_natural([
+            {'send': message}, self.wait_command('working', 'finish'),
+            *self.send(self.message('fresh', '继续聊别的，原检查不用重做。')),
+        ])
+        self.assertEqual(self.progress_rows(), original_rows)
+        self.assertEqual(len(self.speech_requests), original_calls)
+        self.assertEqual(journal.read_bytes(), original_journal)
+        self.assertEqual(self.executions.read_text(), 'x')
+        self.assertFalse(self.outbound_progress())
+
+    def test_silence_is_a_decision_without_retry_and_business_still_completes(self):
+        self.install_task()
+
+        def silence(facts):
+            self.decide(facts)
+            return {'action': 'silence'}
+
+        self.speech_callback = silence
+
+        def silent_without_new_facts():
+            self.wait_progress('silence')
+            self.assertFalse(self.run_release.wait(4.5))
+            self.assertEqual(len(self.speech_requests), 1)
+            self.assertFalse(self.executions.exists())
+
+        self.run_natural([
+            {'send': self.message('working', INITIAL)}, {'wait_file': str(self.tool_started)},
+            *self.checkpoint('silence-without-new-facts'), {'touch': str(self.release_tool)},
+            self.wait_receipt('working'), self.wait_command('working', 'finish'),
+        ], checkpoints={'silence-without-new-facts': silent_without_new_facts})
+        self.assertEqual(self.executions.read_text(), 'x')
+        self.assertEqual(len(self.speech_requests), 1)
+        self.assertFalse(self.outbound_progress())
+
+    def test_new_input_retires_a_failed_progress_event_before_its_retry(self):
+        followup = '先别说进度，等这次实际检查结束。'
+        self.install_task(expected_followup=followup)
+        failed_events = []
+
+        def fail_decision(facts):
+            decision = self.decide(facts)
+            if facts['host_event'].get('kind') == PROGRESS_KIND:
+                failed_events.append(facts['event_id'])
+                self.assertEqual(len(failed_events), 1, '新原话不能唤醒旧失败事件')
+                return {'action': 'speak', 'text': '', 'after_ms': 0}
+            return decision
+
+        self.speech_callback = fail_decision
+
+        def old_event_retired():
+            self.wait_progress('stale')
+            [(event, state, decision)] = self.progress_rows()
+            self.assertEqual(event['id'], failed_events[0])
+            self.assertIsNone(decision)
+            self.assertFalse(self.run_release.wait(4.5))
+            self.assertEqual(len(failed_events), 1)
+
+        self.run_natural([
+            {'send': self.message('working', INITIAL)}, {'wait_file': str(self.tool_started)},
+            *self.checkpoint('failed-before-new-input'),
+            {'send': self.message('new-input', followup)}, self.wait_receipt('new-input', 'Merged'),
+            *self.checkpoint('failed-event-retired'), {'touch': str(self.release_tool)},
+            self.wait_receipt('working'), self.wait_command('working', 'finish'),
+        ], checkpoints={'failed-before-new-input': lambda: self.wait_progress('waiting'),
+                        'failed-event-retired': old_event_retired})
+        self.assertEqual(self.executions.read_text(), 'x')
+        self.assertEqual(len(failed_events), 1)
+        self.assertFalse(self.outbound_progress())
+
     def test_wait_does_not_reconsider_unchanged_tools_and_business_still_completes(self):
         self.install_task()
 
