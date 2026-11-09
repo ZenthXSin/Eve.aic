@@ -592,7 +592,7 @@ impl WebAutonomy {
             // 此 Web 组合中的固定组件期限减一秒；任务和压缩的整轮预算仍由宿主管理。
             let cap_seconds = match role {
                 "plan" => Some(29),
-                "research" | "conversation_learning" => Some(59),
+                "research" => Some(59),
                 "practice" => Some(89),
                 _ => None,
             };

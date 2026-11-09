@@ -65,6 +65,13 @@ impl ProviderConfig {
         }
     }
 
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::OpenAi(config) => config.request_timeout = timeout,
+            Self::Codex(config) => config.request_timeout = timeout,
+        }
+    }
+
     pub(crate) fn max_output_tokens(&self) -> Option<u32> {
         match self {
             Self::OpenAi(config) => config.max_output_tokens,

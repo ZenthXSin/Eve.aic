@@ -181,6 +181,9 @@ pub(crate) fn openai_schema() -> ConfigSchema {
 }
 /// 按用途选择模型角色与单次输出上限；随每次模型解析读取，保存后下一次请求生效。
 pub(crate) const MODEL_USES_NAMESPACE: &str = "runtime.model_uses";
+pub(crate) const CONVERSATION_LEARNING_TIMEOUT_MS: u64 = 180_000;
+pub(crate) const CONVERSATION_MAINTENANCE_TIMEOUT_MS: u64 = 300_000;
+pub(crate) const CONVERSATION_TIMEOUT_MAX_MS: u64 = 600_000;
 /// 用途名与健康记录、自主预算类别一致。
 pub(crate) const MODEL_USES: [&str; 26] = [
     "dialogue",
@@ -288,7 +291,7 @@ pub(crate) fn history_schema() -> ConfigSchema {
 }
 
 pub(crate) fn model_uses_schema() -> ConfigSchema {
-    let fields = MODEL_USES
+    let mut fields: BTreeMap<String, ConfigField> = MODEL_USES
         .into_iter()
         .flat_map(|name| {
             let mut field = ConfigField::new(
@@ -307,6 +310,27 @@ pub(crate) fn model_uses_schema() -> ConfigSchema {
             [(use_limit_field(name), field), (use_role_field(name), role)]
         })
         .collect();
+    for (name, default) in [
+        (
+            "conversation_learning_timeout_ms",
+            CONVERSATION_LEARNING_TIMEOUT_MS,
+        ),
+        (
+            "conversation_maintenance_timeout_ms",
+            CONVERSATION_MAINTENANCE_TIMEOUT_MS,
+        ),
+        ("conversation_learning_stream_idle_timeout_ms", 90_000),
+    ] {
+        let mut field = ConfigField::new(
+            ConfigKind::Integer {
+                minimum: Some(1000),
+                maximum: Some(CONVERSATION_TIMEOUT_MAX_MS as i64),
+            },
+            Some(json!(default)),
+        );
+        field.environment = Some(format!("EVE_MODEL_USE_{}", name.to_ascii_uppercase()));
+        fields.insert(name.into(), field);
+    }
     ConfigSchema {
         namespace: MODEL_USES_NAMESPACE.into(),
         version: 1,
@@ -906,6 +930,6 @@ mod tests {
             assert_eq!(field.default, Some(json!("primary")));
             assert!(!field.restart_required);
         }
-        assert_eq!(schema.fields.len(), MODEL_USES.len() * 2);
+        assert_eq!(schema.fields.len(), MODEL_USES.len() * 2 + 3);
     }
 }

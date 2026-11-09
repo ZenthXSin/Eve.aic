@@ -33,6 +33,8 @@ struct CapturedModel {
     role_revision: Option<u64>,
     /// 用途配置的单次输出上限；None 表示沿用所选模型。
     use_limit: Option<u32>,
+    /// 交流学习独立于主模型的期限；普通用途仍沿用模型期限。
+    use_timeout: Option<Duration>,
     natural_style: bool,
     streamed_completions: bool,
     transient_retries: bool,
@@ -78,6 +80,7 @@ pub(crate) struct CoreModelResolver {
     credentials: Result<Arc<dyn eve_llm_api::ModelCredentials>, eve_llm_api::CredentialError>,
     use_name: Option<String>,
     timeout_cap: Option<Duration>,
+    conversation_maintenance: bool,
     cached: Mutex<Option<CachedModel>>,
 }
 impl CoreModelResolver {
@@ -94,6 +97,7 @@ impl CoreModelResolver {
             credentials,
             use_name: None,
             timeout_cap: None,
+            conversation_maintenance: false,
             cached: Mutex::new(None),
         }
     }
@@ -112,8 +116,18 @@ impl CoreModelResolver {
         self
     }
 
+    /// 历史重访沿用交流学习的模型、凭据和会话用途，只切换有限时间预算。
+    pub(crate) fn with_conversation_maintenance(mut self) -> Self {
+        self.conversation_maintenance = true;
+        self
+    }
+
     fn capture(&self) -> Result<CapturedModel, LlmError> {
-        capture(&*self.settings, self.use_name.as_deref())
+        capture_for(
+            &*self.settings,
+            self.use_name.as_deref(),
+            self.conversation_maintenance,
+        )
     }
 }
 
@@ -175,7 +189,7 @@ pub(crate) fn summary(
     })
 }
 
-/// 所选对话模型配置叠加用途上限；不改变角色、端点或期限。
+/// 所选模型叠加用途输出上限与交流学习期限，不改变角色、端点或思考强度。
 fn selected_config(captured: &CapturedModel) -> Result<ProviderConfig, LlmError> {
     let mut config = config::provider_config_for(
         &captured.provider,
@@ -185,6 +199,9 @@ fn selected_config(captured: &CapturedModel) -> Result<ProviderConfig, LlmError>
     .map_err(|error| LlmError::Configuration(error.to_string()))?;
     if let Some(limit) = captured.use_limit {
         config.set_max_output_tokens(Some(limit));
+    }
+    if let Some(timeout) = captured.use_timeout {
+        config.set_timeout(timeout);
     }
     Ok(config)
 }
@@ -295,12 +312,20 @@ fn capture(
     settings: &dyn ConfigService,
     use_name: Option<&str>,
 ) -> Result<CapturedModel, LlmError> {
+    capture_for(settings, use_name, false)
+}
+
+fn capture_for(
+    settings: &dyn ConfigService,
+    use_name: Option<&str>,
+    conversation_maintenance: bool,
+) -> Result<CapturedModel, LlmError> {
     // 两个命名空间沿用同一 ConfigDocument revision；有界重读避免混用修订。
     for _ in 0..4 {
         let provider = settings
             .snapshot(config::OPENAI_NAMESPACE, 1)
             .map_err(|error| LlmError::Configuration(error.to_string()))?;
-        let (use_limit, selected_use_role) = match use_name {
+        let (use_limit, selected_use_role, learning_timeouts) = match use_name {
             Some(name) => {
                 let snapshot = settings
                     .snapshot(config::MODEL_USES_NAMESPACE, 1)
@@ -313,9 +338,12 @@ fn capture(
                     .map_err(|error| LlmError::Configuration(error.to_string()))?;
                 let role = config::model_use_role(&snapshot, name)
                     .map_err(|error| LlmError::Configuration(error.to_string()))?;
-                ((limit != 0).then_some(limit), role)
+                let timeouts = (name == "conversation_learning")
+                    .then(|| conversation_learning_timeouts(&snapshot, conversation_maintenance))
+                    .transpose()?;
+                ((limit != 0).then_some(limit), role, timeouts)
             }
-            None => (None, ModelRole::Primary),
+            None => (None, ModelRole::Primary, None),
         };
         let role = config::configured_role(&provider)
             .map_err(|error| LlmError::Configuration(error.to_string()))?;
@@ -378,31 +406,41 @@ fn capture(
         let codex = profile
             .as_ref()
             .is_some_and(|profile| profile.provider == "codex");
-        let stream_timeouts =
-            if (streamed_completions || codex) && matches!(use_name, Some("dialogue" | "digest")) {
-                let purpose = if role == Some(ModelRole::AuxiliarySmall) {
-                    eve_llm_api::CredentialPurpose::Auxiliary
-                } else {
-                    eve_llm_api::CredentialPurpose::Primary
-                };
-                let config = config::provider_config_for(&provider, profile.as_ref(), purpose)
-                    .map_err(|e| LlmError::Configuration(e.to_string()))?;
-                let mut policy = stream_timeout_policy(config.request_timeout())?;
-                if use_name == Some("digest") {
-                    policy.total = policy.total.min(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT);
-                    policy.first_response = policy.first_response.min(policy.total);
-                    policy.idle = policy.idle.min(policy.total);
-                }
-                Some(policy)
+        let stream_timeouts = if let Some(policy) = learning_timeouts {
+            let purpose = if role == Some(ModelRole::AuxiliarySmall) {
+                eve_llm_api::CredentialPurpose::Auxiliary
             } else {
-                None
+                eve_llm_api::CredentialPurpose::Primary
             };
+            let config = config::provider_config_for(&provider, profile.as_ref(), purpose)
+                .map_err(|e| LlmError::Configuration(e.to_string()))?;
+            config.uses_sse(streamed_completions).then_some(policy)
+        } else if (streamed_completions || codex) && matches!(use_name, Some("dialogue" | "digest"))
+        {
+            let purpose = if role == Some(ModelRole::AuxiliarySmall) {
+                eve_llm_api::CredentialPurpose::Auxiliary
+            } else {
+                eve_llm_api::CredentialPurpose::Primary
+            };
+            let config = config::provider_config_for(&provider, profile.as_ref(), purpose)
+                .map_err(|e| LlmError::Configuration(e.to_string()))?;
+            let mut policy = stream_timeout_policy(config.request_timeout())?;
+            if use_name == Some("digest") {
+                policy.total = policy.total.min(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT);
+                policy.first_response = policy.first_response.min(policy.total);
+                policy.idle = policy.idle.min(policy.total);
+            }
+            Some(policy)
+        } else {
+            None
+        };
         return Ok(CapturedModel {
             provider,
             profile,
             selected_role: role,
             role_revision,
             use_limit,
+            use_timeout: learning_timeouts.map(|policy| policy.total),
             natural_style,
             streamed_completions,
             transient_retries,
@@ -412,6 +450,33 @@ fn capture(
     Err(LlmError::Configuration(
         "模型配置持续变化，请在配置稳定后开启新轮。".into(),
     ))
+}
+fn conversation_learning_timeouts(
+    snapshot: &ConfigSnapshot,
+    maintenance: bool,
+) -> Result<StreamTimeoutPolicy, LlmError> {
+    let duration = |name: &str| -> Result<Duration, LlmError> {
+        let value: u64 = snapshot
+            .get(name)
+            .map_err(|error| LlmError::Configuration(error.to_string()))?;
+        if !(1000..=config::CONVERSATION_TIMEOUT_MAX_MS).contains(&value) {
+            return Err(LlmError::Configuration(format!(
+                "runtime.model_uses.{name} 必须为 1000 至 600000 毫秒"
+            )));
+        }
+        Ok(Duration::from_millis(value))
+    };
+    let total = duration(if maintenance {
+        "conversation_maintenance_timeout_ms"
+    } else {
+        "conversation_learning_timeout_ms"
+    })?;
+    // 首个非空块可等待完整预算；idle 仅约束相邻非空传输块，不证明语义进展。
+    Ok(StreamTimeoutPolicy {
+        first_response: total,
+        idle: duration("conversation_learning_stream_idle_timeout_ms")?.min(total),
+        total,
+    })
 }
 fn stream_timeout_policy(first: Duration) -> Result<StreamTimeoutPolicy, LlmError> {
     let duration = |name: &str, default: Duration| match std::env::var(name) {
