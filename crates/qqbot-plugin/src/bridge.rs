@@ -1584,7 +1584,7 @@ pub(crate) async fn run(
             let stale_foreground: Vec<_> = foreground_inputs.iter().filter_map(|(anchor,input)| {
                 let current=live_dialogue.as_ref().is_some_and(|live| input.current(live,&foreground_activity,control.as_ref()))
                     && conversations.latest_message_id(&input.key.session).ok().flatten().as_deref()==Some(anchor)
-                    && foreground_windows.get(anchor).is_none_or(|window|tokio::time::Instant::now()<window.deadline);
+                    && (input.progress || foreground_windows.get(anchor).is_none_or(|window|tokio::time::Instant::now()<window.deadline));
                 (!current).then_some(anchor.clone())
             }).collect();
             for anchor in stale_foreground {
@@ -1596,11 +1596,11 @@ pub(crate) async fn run(
                 write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor})).await?;
             }
             // 没有追加用户消息时，真正的慢工具也可获得一次自然交流机会。
-            // 只沿当前原消息的私聊窗口发送；短工具、已排队表达和近期主动说话让步。
+            // 只向当前原消息的私聊发送；短工具、已排队表达和近期主动说话让步。
             let mut open_progress_windows = Vec::new();
             if let (Some(speaker), Some(live)) = (&speech, &live_dialogue) {
                 for current in active.iter().filter(|current| current.message.scope == "c2c") {
-                    if current.started.elapsed() >= Duration::from_secs(225)
+                    if host_progress::quiet_request(&current.message.text)
                         || foreground_inputs.get(&current.message.id).is_some_and(|input| !input.resolved)
                         || live.has_outgoing(&current.key.session)
                         || last_progress.get(&current.message.id).is_some_and(|last| last.elapsed() < Duration::from_secs(60))
@@ -1613,7 +1613,7 @@ pub(crate) async fn run(
                     if snapshot.key != current.key || snapshot.phase != ControlPhase::Tools || snapshot.cancel_requested
                         || snapshot.events_retired || !live.progress_is_current(&scope, turn_id) { continue; }
                     let Some(batch) = foreground_activity.progress_candidate(&current.key, turn_id) else { continue };
-                    let input = ForegroundInput::progress(batch, current.message.id.clone());
+                    let input = ForegroundInput::progress(batch, current.message.id.clone(), current.started);
                     // 开窗期间子工具仍可能推进，首次判断前才冻结并持久化事实。
                     if let Some(previous) = foreground_inputs.insert(current.message.id.clone(), input) { speaker.retire(&previous.event)?; }
                     open_progress_windows.push(current.message.id.clone());
@@ -2479,15 +2479,20 @@ pub(crate) async fn run(
             // 前台新输入的交流不等待长工具返回；独立无工具决定仍需原窗口和真实活动。
             if let (Some(speaker),Some(live))=(&speech,&live_dialogue) {
                 if channel_idle && commands.is_empty() && routing.is_empty()
+                    // 决定恰逢被动窗口结束时先保留；到主动通道可用仍复用同一决定，不重新请求模型。
+                    && ready_foreground.as_ref().is_none_or(|ready|
+                        foreground_inputs.get(&ready.event.anchor).is_none_or(|input| !input.progress || input.proactive(tokio::time::Instant::now()))
+                        || foreground_windows.get(&ready.event.anchor).is_some_and(|window| window.remaining>0 && tokio::time::Instant::now()<window.deadline))
                     && let Some(ready)=ready_foreground.take() {
                     let current=foreground_inputs.get(&ready.event.anchor).is_some_and(|input| !input.resolved
                         && input.event==ready.event && input.current(live,&foreground_activity,control.as_ref()));
+                    let proactive=foreground_inputs.get(&ready.event.anchor).is_some_and(|input|input.proactive(tokio::time::Instant::now()));
                     let window=foreground_windows.get(&ready.event.anchor).is_some_and(|window|
                         window.remaining>0 && window.session==ready.event.session && tokio::time::Instant::now()<window.deadline);
                     let scope=eve_llm_api::ContextScope {session_id:ready.event.session.session_id.clone(),user_id:ready.event.session.user_id.clone()};
                     let recent_expression = ready.event.id.starts_with("foreground-progress:")
                         && last_progress.get(&ready.event.anchor).is_some_and(|last| last.elapsed() < Duration::from_secs(60));
-                    if !current || !window || recent_expression || live.has_outgoing(&ready.event.session) || !valid_outreach_text(&ready.text)
+                    if !current || (!window && !proactive) || recent_expression || live.has_outgoing(&ready.event.session) || !valid_outreach_text(&ready.text)
                         || !conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false) {
                         speaker.retire(&ready.event)?;
                         if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
@@ -2524,7 +2529,7 @@ pub(crate) async fn run(
                     let claimed_key=input.key.clone();
                     let claimed_turn=input.turn_id;
                     if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
-                    if let Some(window)=foreground_windows.get_mut(&ready.event.anchor) {window.remaining-=1;}
+                    if !proactive && let Some(window)=foreground_windows.get_mut(&ready.event.anchor) {window.remaining-=1;}
                     // 领取后主轮可以消费输入并恢复工作，不能据此撤销已经交接的即时交流。
                     // 取消或新的原话仍使尚未写出的操作失效。
                     let cancelled=!conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false)
@@ -2545,7 +2550,7 @@ pub(crate) async fn run(
                     metadata.reply_to = Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human, &ready.event.anchor));
                     metadata.source_kind = Some("qq_foreground_sent".into());
                     pushing_conversation = Some((route.clone(), ready.text.clone(), metadata));
-                    write(&mut stdin,json!({"type":"passive_push","version":1,"id":id,"scope":"c2c","target_id":route.target_id,
+                    write(&mut stdin,json!({"type":if proactive {"push"} else {"passive_push"},"version":1,"id":id,"scope":"c2c","target_id":route.target_id,
                         "text":ready.text,"based_on_message_id":ready.event.anchor,"sender_id":route.user_id,"foreground":true})).await?;
                     pushing=Some(AuxiliaryDelivery{id,scope:route.scope.clone(),target:route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
                     pushing_speech=Some(ready.event);
@@ -2554,7 +2559,7 @@ pub(crate) async fn run(
                 if considering_foreground.is_none() && ready_foreground.is_none() {
                     let now=tokio::time::Instant::now();
                     let events=foreground_inputs.values().filter(|input| !input.resolved && input.next<=now
-                        && foreground_windows.get(&input.event.anchor).is_some_and(|window|window.remaining>0 && now<window.deadline))
+                        && (input.proactive(now) || foreground_windows.get(&input.event.anchor).is_some_and(|window|window.remaining>0 && now<window.deadline)))
                         .map(|input|input.event.clone()).collect();
                     for event in speech_retries.order(events) {
                         if !speech_retries.eligible(&event,now) {continue;}

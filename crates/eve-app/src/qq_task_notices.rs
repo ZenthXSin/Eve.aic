@@ -251,11 +251,10 @@ impl ChannelAdapter {
         Ok(())
     }
 }
-impl QqOutreach for ChannelAdapter {
-    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+impl ChannelAdapter {
+    fn candidates_at(&self, now: u64) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
         let snapshot = self.tasks.progress_snapshot().map_err(error)?;
         snapshot.validate().map_err(error)?;
-        let now = now_ms()?;
         let mut output = Vec::new();
         for entry in snapshot.due(now) {
             if !self.allowed(&entry.owner)? {
@@ -272,15 +271,20 @@ impl QqOutreach for ChannelAdapter {
                 continue;
             }
             let token = eve_task_api::TaskProgressToken::from_task(&task).map_err(error)?;
-            // 周期只产生待审视事实，不强制说话；真实进展变化产生独立事件版本。
+            // 轮询时间不构成新事实；同一任务版本的 silence 持久复用，真实状态或检查点变化才重新审视。
             let checkpoint = task.execution.as_ref().and_then(|e| e.checkpoint.as_ref());
             output.push(crate::qq_speech::candidate(format!("{ID_PREFIX}{}",task.id),Some(SessionKey{session_id:task.owner.session_id.clone(),user_id:task.owner.user_id.clone()}),task.owner.user_id.clone(),serde_json::json!({
                 "kind":"background_task_observation","task_id":task.id,"token":token,"title":task.spec.title,"status":task.status,"created_at_ms":task.created_at_ms,"finished_at_ms":task.finished_at_ms,
                 "cancel_requested":task.cancel_requested,"resume_at_ms":task.execution.as_ref().and_then(|e|e.resume_at_ms),"remaining":checkpoint.and_then(|c|c.remaining.as_ref()),
-                "result":task.result,"failure":task.failure,"process_liveness":"unverified","observation_period":now/eve_task_api::TASK_PROGRESS_INTERVAL_MS
+                "result":task.result,"failure":task.failure,"process_liveness":"unverified"
             }))?);
         }
         Ok(output)
+    }
+}
+impl QqOutreach for ChannelAdapter {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        self.candidates_at(now_ms()?)
     }
     fn claim_candidate(
         &self,
@@ -379,6 +383,58 @@ mod tests {
             max_steps: 100,
             context: None,
         }
+    }
+
+    #[tokio::test]
+    async fn unchanged_blocked_task_has_one_speech_revision_across_poll_periods() {
+        let kernel = Kernel::new();
+        let plugin = TaskPlugin::new().unwrap();
+        let tasks = plugin.controller();
+        kernel.register(Box::new(plugin)).unwrap();
+        kernel.start_all().await.unwrap();
+        let scope = owner("qq:original", "alice");
+        let task = tasks
+            .create(&scope, spec(), "unchanged-progress", 1)
+            .unwrap();
+        tasks.start(&task.id, 2).unwrap();
+        let channel = ChannelAdapter {
+            tasks: Arc::new(tasks.clone()),
+            authorization: Arc::new(Authorization(AtomicBool::new(true))),
+            outreach: None,
+        };
+        let running = channel
+            .candidates_at(TASK_PROGRESS_INTERVAL_MS + 1)
+            .unwrap();
+        assert_eq!(running.len(), 1);
+        tasks
+            .finish(
+                &task.id,
+                TaskEnd::Blocked {
+                    result: "缺少部署配置".into(),
+                },
+                TaskUsage::default(),
+                TASK_PROGRESS_INTERVAL_MS + 2,
+            )
+            .unwrap();
+        let first = channel
+            .candidates_at(TASK_PROGRESS_INTERVAL_MS + 3)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].facts["status"], "Blocked");
+        assert!(first[0].facts.get("observation_period").is_none());
+        // 同一任务有真实状态改变时仍必须产生独立版本；不能把 silence 当永久屏蔽。
+        assert_ne!(running[0].version, first[0].version);
+        assert_eq!(running[0].id, first[0].id);
+        for elapsed in [2, 3, 48] {
+            assert_eq!(
+                channel
+                    .candidates_at(TASK_PROGRESS_INTERVAL_MS * elapsed + 1)
+                    .unwrap(),
+                first,
+                "时钟轮询不能变成需要再次审视的新任务事实"
+            );
+        }
+        kernel.stop_all().await.unwrap();
     }
 
     #[tokio::test]

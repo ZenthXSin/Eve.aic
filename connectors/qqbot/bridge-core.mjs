@@ -702,9 +702,21 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       return;
     }
     pushing.add(frame.id);
+    let foregroundParent, foregroundClaim;
     try {
       const scope = frame.scope ?? "c2c";
       if (!["c2c", "group"].includes(scope)) throw new Error("invalid_scope");
+      if (frame.foreground === true) {
+        const parent = pending.get(frame.based_on_message_id);
+        if (!parent?.foregroundClaim || scope !== "c2c" || parent.target.scope !== scope ||
+            parent.target.targetId !== frame.target_id || parent.senderId !== frame.sender_id ||
+            parent.finished || parent.next !== undefined) throw new Error("stale_decision");
+        if (parent.sending || parent.foregroundAttempts.has(frame.id)) {warn("duplicate_reply");return;}
+        foregroundParent = parent;
+        foregroundClaim = parent.foregroundClaim;
+        parent.foregroundAttempts.add(frame.id);
+        parent.sending = true;
+      }
       const mention=frame.mention_user_id;
       if (mention !== undefined && (scope !== "group" || !validId(mention))) throw new Error("invalid_mention");
       const parts=frame.parts ?? [[frame.text,0]];
@@ -723,7 +735,10 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         const remaining = deadline - now();
         if (remaining <= 0) throw Object.assign(new Error("push_timeout"), {name:"TimeoutError"});
         previousStarted = now();
-        const guard=frame.based_on_message_id === undefined ? undefined : () => validMessageId(frame.based_on_message_id) && validId(frame.sender_id) && latestInput.get(routeKey(scope,frame.target_id,frame.group_chime === true ? "*" : frame.sender_id)) === frame.based_on_message_id;
+        const guard=frame.based_on_message_id === undefined && !foregroundParent ? undefined : () => !closed &&
+          (!foregroundParent || (pending.get(frame.based_on_message_id) === foregroundParent &&
+            foregroundParent.foregroundClaim === foregroundClaim && !foregroundParent.finished && foregroundParent.next === undefined)) &&
+          validMessageId(frame.based_on_message_id) && validId(frame.sender_id) && latestInput.get(routeKey(scope,frame.target_id,frame.group_chime === true ? "*" : frame.sender_id)) === frame.based_on_message_id;
         result = await sendText({ scope, targetId: frame.target_id }, parts[index][0], mention, remaining, guard);
       }
       send({ type: "delivery", id: frame.id, push: true, ok: true,
@@ -732,6 +747,10 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       send({ type: "delivery", id: frame.id, push: true, ok: false, ...diagnostic(err) });
     } finally {
       pushing.delete(frame.id);
+      if (foregroundParent) {
+        foregroundParent.sending = false;
+        if (foregroundParent.finished) forgetPending(frame.based_on_message_id);
+      }
     }
   }
   // 活跃主轮和收尾后的补充都只使用原消息额度；没有窗口时不退回主动消息。
@@ -782,6 +801,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
       if (frame.type === "close_foreground") {
+        const parent = pending.get(frame.id);
+        if (parent) delete parent.foregroundClaim;
         if (passiveWindows.get(frame.id)?.foreground === true) passiveWindows.delete(frame.id);
         return;
       }
@@ -790,6 +811,9 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         const item = pending.get(frame.id);
         if (!item || item.target.scope !== "c2c" || item.finished || item.sending || item.next !== undefined ||
             latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) !== frame.id) return;
+        // 独立于被动期限的本轮交流身份；关闭再开创建新身份，已排队的旧主动发言不能复活。
+        item.foregroundClaim ??= {};
+        item.foregroundAttempts ??= new Set();
         const remaining = passiveLimit(item.target.scope) - 1 - (item.passiveProgress ?? item.progress ?? 0);
         const remainingMs = Math.floor(PASSIVE_REPLY_WINDOW_MS - Math.max(0, now() - item.receivedAt));
         if (remaining <= 0 || remainingMs <= 0) return;
@@ -797,7 +821,6 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         if (window && (window.parent !== item || window.foreground !== true)) return;
         for (const [id, saved] of passiveWindows) if (now() - saved.receivedAt >= PASSIVE_REPLY_WINDOW_MS) passiveWindows.delete(id);
         if (!window && passiveWindows.size >= limit) return;
-        item.foregroundAttempts ??= new Set();
         if (!window) passiveWindows.set(frame.id,{...item,parent:item,attempts:item.foregroundAttempts,foreground:true});
         send({type:"foreground_window",id:frame.id,remaining_ms:remainingMs,remaining});
         return;
@@ -813,6 +836,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if (frame.type === "push") { await push(frame); return; }
       if (frame.type === "file") { await pushFile(frame); return; }
       if (frame.type === "finish") {
+        const parent = pending.get(frame.id);
+        if (parent) delete parent.foregroundClaim;
         if (passiveWindows.get(frame.id)?.parent) passiveWindows.delete(frame.id);
         const parentId = retiredLiveInputs.get(frame.id);
         if (parentId !== undefined) {

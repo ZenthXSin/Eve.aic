@@ -233,6 +233,7 @@ pub(super) struct ForegroundInput {
     pub(super) next: Instant,
     batch: u64,
     pub(super) progress: bool,
+    proactive_at: Option<Instant>,
     decision_started: bool,
     progress_revision: u64,
 }
@@ -256,6 +257,7 @@ impl ForegroundInput {
                     "input_pending":true,"business_action":"continues_in_original_turn"}),
             },
             progress: false,
+            proactive_at: None,
             decision_started: false,
             progress_revision: batch.progress_revision,
             key: batch.key,
@@ -267,9 +269,11 @@ impl ForegroundInput {
         }
     }
 
-    pub(super) fn progress(batch: Batch, anchor: String) -> Self {
+    pub(super) fn progress(batch: Batch, anchor: String, started: Instant) -> Self {
         let mut value = Self::new(batch, anchor);
         value.progress = true;
+        // 只在原轮已确定超过被动回复期后使用独立主动通道，不延长平台窗口。
+        value.proactive_at = Some(started + std::time::Duration::from_secs(240));
         value.event.id = value
             .event
             .id
@@ -290,6 +294,10 @@ impl ForegroundInput {
             .remove("tools_elapsed_ms_at_input");
         value.next = Instant::now();
         value
+    }
+
+    pub(super) fn proactive(&self, now: Instant) -> bool {
+        self.progress && self.proactive_at.is_some_and(|at| now >= at)
     }
 
     /// 只在首次决策前冻结最新只读进展；之后同 event 的事实不变，缓存决定不再次调用模型。
@@ -386,6 +394,46 @@ mod tests {
     }
 
     #[test]
+    fn natural_progress_uses_a_separate_proactive_channel_after_the_original_window() {
+        let activity = ForegroundActivity::default();
+        let key = GenerationKey {
+            session: SessionKey::new("session", "owner").unwrap(),
+            task_id: "task".into(),
+            controller_epoch: [1; 16],
+            generation: 1,
+        };
+        activity.observe(&event(
+            &key,
+            TurnEventKind::ToolBatchStarted {
+                calls: vec![ToolCall {
+                    id: "coding".into(),
+                    name: "run_subagent".into(),
+                    arguments: json!({}),
+                }],
+            },
+        ));
+        let batch = activity.current(&key, 3).unwrap();
+        let started = Instant::now();
+        let natural = ForegroundInput::progress(batch.clone(), "original".into(), started);
+        assert!(!natural.proactive(started + std::time::Duration::from_secs(239)));
+        assert!(natural.proactive(started + std::time::Duration::from_secs(240)));
+        let after_compaction = ForegroundInput::progress(
+            batch.clone(),
+            "original".into(),
+            started - std::time::Duration::from_secs(250),
+        );
+        assert!(
+            after_compaction.proactive(started),
+            "压缩消耗旧窗口不能取消后续真实工具进度"
+        );
+        let input = ForegroundInput::new(batch, "new-input".into());
+        assert!(
+            !input.proactive(started + std::time::Duration::from_secs(1000)),
+            "旧输入即时回复仍不能自动升级主动消息"
+        );
+    }
+
+    #[test]
     fn long_batch_opportunity_needs_no_new_input_and_is_bounded_by_generation() {
         let activity = ForegroundActivity::default();
         let mut key = GenerationKey {
@@ -423,7 +471,7 @@ mod tests {
         };
         age(&activity, &key);
         let first = activity.progress_candidate(&key, 3).unwrap();
-        let input = ForegroundInput::progress(first, "original-message".into());
+        let input = ForegroundInput::progress(first, "original-message".into(), Instant::now());
         assert!(input.event.id.starts_with("foreground-progress:"));
         assert_eq!(input.event.facts["kind"], "foreground_tool_progress");
         assert_eq!(input.event.facts["input_pending"], false);
@@ -497,7 +545,7 @@ mod tests {
             .since -= std::time::Duration::from_secs(9);
         let batch = activity.progress_candidate(&key, 3).unwrap();
         let version = batch.version;
-        let mut first = ForegroundInput::progress(batch, "original".into());
+        let mut first = ForegroundInput::progress(batch, "original".into(), Instant::now());
         let snapshot = eve_llm_api::DelegatedToolProgress {
             submitted_calls: 1,
             pending_tool_names: vec!["run_command".into()],
@@ -549,6 +597,7 @@ mod tests {
         let mut second = ForegroundInput::progress(
             activity.progress_candidate(&key, 3).unwrap(),
             "original".into(),
+            Instant::now(),
         );
         second.prepare_decision(&activity);
         assert_ne!(first.event.id, second.event.id);
