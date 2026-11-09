@@ -30,6 +30,27 @@ const MAX_SEARCH_FILES: usize = 20_000;
 const MAX_SEARCH_LINE: usize = 240;
 /// 搜索跳过的目录名：版本库、工具账本与构建产物，不属于源码阅读范围。
 const SKIPPED_NAMES: [&str; 3] = [".git", ".eve-developer", "target"];
+#[derive(Default, serde::Serialize)]
+struct SearchSkipped {
+    excluded_name: usize,
+    protected: usize,
+    symlink: usize,
+    too_large: usize,
+    unreadable: usize,
+    non_utf8: usize,
+    other_file_type: usize,
+}
+impl SearchSkipped {
+    fn total(&self) -> usize {
+        self.excluded_name
+            + self.protected
+            + self.symlink
+            + self.too_large
+            + self.unreadable
+            + self.non_utf8
+            + self.other_file_type
+    }
+}
 fn sensitive_path(path: &str) -> bool {
     review::credential_path(path)
         || Path::new(path).components().any(|c| match c {
@@ -49,6 +70,10 @@ fn stopped(context: &ToolExecutionContext) -> bool {
 }
 fn failed(message: impl Into<String>) -> ToolExecutionError {
     ToolExecutionError::Failed(message.into())
+}
+/// 仅用于业务文件尚未写入时可以确定的参数或修订冲突。
+fn rejected(message: impl Into<String>) -> ToolExecutionError {
+    ToolExecutionError::Rejected(message.into())
 }
 fn hash(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
@@ -739,17 +764,28 @@ impl LocalDeveloper {
         let mut matches = Vec::new();
         let mut used = 0usize;
         let mut files = 0usize;
+        let mut files_searched = 0usize;
+        let mut directories_visited = 0usize;
+        let mut skipped_directories = 0usize;
+        let mut skipped = SearchSkipped::default();
         let mut truncated = false;
         'walk: while let Some((dir, prefix)) = queue.pop_front() {
             let mut entries = fs::read_dir(&dir)
                 .map_err(|_| failed("目录不可读取"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| failed("目录条目不可读取"))?;
+            directories_visited += 1;
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let kind = entry.file_type().map_err(|_| failed("文件类型不可读取"))?;
-                if kind.is_symlink() || SKIPPED_NAMES.contains(&name.as_str()) {
+                if kind.is_symlink() {
+                    skipped.symlink += 1;
+                    continue;
+                }
+                if SKIPPED_NAMES.contains(&name.as_str()) {
+                    skipped.excluded_name += 1;
+                    skipped_directories += usize::from(kind.is_dir());
                     continue;
                 }
                 let relative = if absolute {
@@ -769,9 +805,13 @@ impl LocalDeveloper {
                     || (Path::new(&relative).is_absolute()
                         && self.model_file_path(&relative, false).is_err())
                 {
+                    skipped.protected += 1;
+                    skipped_directories += usize::from(kind.is_dir());
                     continue;
                 }
                 if !sensitive && sensitive_path(&relative) {
+                    skipped.protected += 1;
+                    skipped_directories += usize::from(kind.is_dir());
                     continue;
                 }
                 if kind.is_dir() {
@@ -779,6 +819,7 @@ impl LocalDeveloper {
                     continue;
                 }
                 if !kind.is_file() {
+                    skipped.other_file_type += 1;
                     continue;
                 }
                 if files == MAX_SEARCH_FILES {
@@ -786,15 +827,20 @@ impl LocalDeveloper {
                     break 'walk;
                 }
                 files += 1;
-                if review::credential_path(&relative)
-                    || entry.metadata().is_ok_and(|m| m.len() > MAX_FILE as u64)
-                {
+                if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE as u64) {
+                    skipped.too_large += 1;
                     continue;
                 }
                 let Ok(bytes) = fs::read(entry.path()) else {
+                    skipped.unreadable += 1;
                     continue;
                 };
+                if bytes.len() > MAX_FILE {
+                    skipped.too_large += 1;
+                    continue;
+                }
                 let Ok(text) = std::str::from_utf8(&bytes) else {
+                    skipped.non_utf8 += 1;
                     continue;
                 };
                 for (index, line) in text.lines().enumerate() {
@@ -813,11 +859,20 @@ impl LocalDeveloper {
                     used += size;
                     matches.push(item);
                 }
+                files_searched += 1;
             }
         }
-        Ok(
-            json!({"query":a.query,"path":a.path,"matches":matches,"files_scanned":files,"truncated":truncated,"untrusted_data":true}),
-        )
+        Ok(json!({
+            "query":a.query,"path":a.path,"matches":matches,
+            // 兼容旧计数：进入读取候选的文件；完整搜索量由 coverage 单独给出。
+            "files_scanned":files,"truncated":truncated,"untrusted_data":true,
+            "coverage": {
+                "scope":"requested_directory", "complete":!truncated && skipped.total() == 0,
+                "directories_visited":directories_visited,"files_searched":files_searched,
+                "skipped_directories":skipped_directories,"skipped_entries":skipped,
+                "notice":"仅覆盖请求目录；计数不含跳过目录或链接内的未知内容，受保护路径不展示"
+            }
+        }))
     }
     async fn execute_inner(
         &self,
@@ -869,11 +924,11 @@ impl LocalDeveloper {
                 let expected = a
                     .expected_sha256
                     .as_deref()
-                    .ok_or_else(|| failed("缺少文件修订校验"))?;
+                    .ok_or_else(|| rejected("缺少文件修订校验"))?;
                 if old.as_ref().map(|b| hash(b)).as_deref().unwrap_or("") != expected {
-                    return Err(failed("文件已变化；重新读取后再修改，未覆盖"));
+                    return Err(rejected("文件已变化；重新读取后再修改，未覆盖"));
                 }
-                let content = a.content.ok_or_else(|| failed("缺少文件内容"))?;
+                let content = a.content.ok_or_else(|| rejected("缺少文件内容"))?;
                 self.replace_file(&path, expected, content.as_bytes(), None, context)?;
                 Ok(
                     json!({"success":true,"path":a.path,"sha256":hash(content.as_bytes()),"bytes":content.len()}),
@@ -890,14 +945,14 @@ impl LocalDeveloper {
                 }
                 let bytes = fs::read(&path).map_err(|_| failed("已有文件不可读取，未修改"))?;
                 if hash(&bytes) != a.expected_sha256 {
-                    return Err(failed("文件已变化；重新读取后再修改，未修改"));
+                    return Err(rejected("文件已变化；重新读取后再修改，未修改"));
                 }
                 let text =
                     std::str::from_utf8(&bytes).map_err(|_| failed("文件不是 UTF-8 文本"))?;
                 match occurrences(text, &a.old_string) {
-                    0 => return Err(failed("要替换的文本不存在，未修改")),
+                    0 => return Err(rejected("要替换的文本不存在，未修改")),
                     1 => {}
-                    _ => return Err(failed("要替换的文本出现多次；请提供更长的上下文，未修改")),
+                    _ => return Err(rejected("要替换的文本出现多次；请提供更长的上下文，未修改")),
                 }
                 let updated = text.replacen(&a.old_string, &a.new_string, 1);
                 self.replace_file(&path, &a.expected_sha256, updated.as_bytes(), None, context)?;

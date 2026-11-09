@@ -130,7 +130,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --stickers 开启表情包：开启识图时，从用户直接发来的图片里收集候选，经视觉模型审看为表情包后收下（其余删除）；对话中模型可用 send_sticker 按心情挑一张，跟在回复文字后面作为图片发出。runtime.stickers 可分别关闭收集与发送。
 --reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
 --background-tasks 让 Eve 在对话中把需要多步、较长时间的事派发到后台：执行器可用对话里的工具（不含派发与子代理），按步数预算（工具调用次数，默认 100，runtime.tasks 可调）独立完成，结束后私聊通知派发它的用户，发不出去时随下一条私聊回复附带；用户可以让 Eve 查看或取消任务。重启时执行中的任务记为中断，不自动重跑。
---subagents 让 Eve 在一轮回复中把可以独立完成的子任务委托给子代理并等它交回结果；子代理同样按步数预算执行，须在 runtime.tasks.subagent_timeout_ms（默认 3 分钟）内完成，不能再委托或派发。
+--subagents 让 Eve 在一轮回复中把可以独立完成的子任务委托给子代理并等它交回结果；前台默认共享 500 次工具调用，runtime.tasks.foreground_steps 可调，为主线程核验和交流预留最多 20 步；子代理不重复领取预算，默认不另加总时限，继承父期限和取消，不能再委托或派发。
 --goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
 --learning-stop 需同时 --interest-learning；兴趣学习目标的研究与实践次数都用完、也没有在问你或等你回复时，后台把它标为已取消并记下原因（目标的停止条件“学习预算耗尽”），兴趣本身保留；不开启时目标一直等待。无论是否开启，/interests 与议程上下文都会说明每个学习目标接下来会做什么、在等什么。
 --strategy-learning 需同时指定实践运行环境；从真实失败修正记录形成方法候选，经后续不同目标验证后自动启用，效果退化时回退；不新增模型请求或尝试次数。
@@ -1745,6 +1745,9 @@ async fn run_qqbot_composed(
             bootstrap.tools.push(Arc::new(qq_tasks::SubagentTool {
                 late: task_late.clone(),
             }));
+            bootstrap.tools.push(Arc::new(qq_tasks::ListRuns {
+                late: task_late.clone(),
+            }));
             for kind in 0..3 {
                 bootstrap
                     .tools
@@ -2084,7 +2087,8 @@ async fn run_qqbot_composed(
         }
         // 工具批次用尽时不让本轮失败：不再提供工具，模型依据已有结果作答并说明未核实部分。
         bootstrap.host_config.final_answer_on_round_limit = true;
-        bootstrap.host_config.max_tool_calls = 100;
+        bootstrap.host_config.max_tool_calls = qq_tasks::DEFAULT_FOREGROUND_STEPS as usize;
+        bootstrap.configured_foreground_steps = true;
         bootstrap.host_config.tool_progress_reports = true;
         let developer_settings = std::env::var_os("EVE_DEVELOPER_CONFIG")
             .map(std::fs::read)
@@ -2325,19 +2329,20 @@ async fn run_qqbot_composed(
             .chain(bootstrap.tools.iter().map(|tool| tool.definition())
                 .filter(|definition| !bootstrap.foreground_excluded_tools.contains(&definition.name)))
             .collect();
-        task_runtime_manifest.set(serde_json::json!({
+        let mut runtime_manifest = serde_json::json!({
             "tools": &tool_definitions,
             "worker_tools": &worker_tools,
             "environment_sha256": eve_task_api::task_strategy_digest(&std::env::vars().filter(|(key, _)| key.starts_with("EVE_") || key.starts_with("QQBOT_")).collect::<std::collections::BTreeMap<_, _>>()),
             "system_prompt": &worker_config.system_prompt,
             "output_format": &worker_config.output_format,
-            "max_tool_calls": worker_config.max_tool_calls,
+            // Worker 随任务再收窄预算，前台预算在配置服务就绪后单独写入。
+            "max_tool_calls": eve_task_api::MAX_STEPS,
             "max_tool_rounds": worker_config.max_tool_rounds,
             "max_parallel_tool_calls": worker_config.max_parallel_tool_calls,
             "subagents": options.subagents,
             "sleep": options.sleep,
             "triggers": options.triggers,
-        })).map_err(|_| "任务运行指纹已重复装配")?;
+        });
         let tools_registered = tool_definitions.len();
         let help_commands = crate::qq_help::Help::handler(tool_definitions.clone(), conversations.clone());
         let mut web_context: Arc<dyn ContextAssembler> = crate::services::default_context();
@@ -2406,6 +2411,12 @@ async fn run_qqbot_composed(
             options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
+        let task_settings = qq_tasks::current(qq_tasks::config_service(registry.as_ref())?.as_ref())?;
+        runtime_manifest["foreground_max_tool_calls"] = serde_json::json!(task_settings.foreground_limit());
+        runtime_manifest["task_default_steps"] = serde_json::json!(task_settings.default_steps);
+        runtime_manifest["task_max_steps"] = serde_json::json!(task_settings.max_steps);
+        runtime_manifest["parent_reserve_steps"] = serde_json::json!(task_settings.parent_reserve_steps);
+        task_runtime_manifest.set(runtime_manifest).map_err(|_| "任务运行指纹已重复装配")?;
         let model_commands = Arc::new(crate::qq_model::Commands {
             settings: qq_tasks::config_service(registry.as_ref())?,
             admin: Arc::new(model_settings_admin),
@@ -2720,6 +2731,7 @@ async fn run_qqbot_composed(
                     coding: observed("coding")?,
                 },
                 history_digests.clone(),
+                Arc::new(qq_tasks::SqliteRunStorage::open(&options.state_directory.join("subagent-runs.sqlite3"))?),
             )
             .await?;
             worker.authorize_with(qq_admin.clone());

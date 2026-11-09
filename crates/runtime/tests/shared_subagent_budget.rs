@@ -118,3 +118,116 @@ async fn resumed_parent_keeps_child_charges_and_refuses_a_batch_beyond_remaining
     assert!(provider.requests.lock().unwrap()[1].tools.is_empty());
     rig.stop().await;
 }
+
+#[tokio::test]
+async fn exhausted_delegate_stops_tools_while_parent_can_verify_with_reserved_steps() {
+    let valid_calls = |prefix: &str| {
+        Ok(ModelResponse::ToolCalls {
+            calls: (0..2)
+                .map(|index| ToolCall {
+                    id: format!("{prefix}-{index}"),
+                    name: "receipt".into(),
+                    arguments: json!({"text":format!("{prefix} 实际核验 {index}")}),
+                })
+                .collect(),
+        })
+    };
+    let child_provider = Provider::new(vec![
+        Step::new(valid_calls("child")),
+        Step::new(final_response("子任务交回真实结果")),
+    ]);
+    let config = LlmHostConfig {
+        max_tool_calls: 4,
+        max_tool_rounds: 0,
+        final_answer_on_round_limit: true,
+        ..LlmHostConfig::default()
+    };
+    let rig = Rig::new(
+        child_provider.clone(),
+        Arc::new(FaultStore::default()),
+        config.clone(),
+    )
+    .await;
+    let pool = SharedToolSteps::new(4).unwrap();
+    let make_host = |provider, steps| {
+        LlmHost::new(
+            provider,
+            rig.registry.clone(),
+            rig.kernel.clone(),
+            rig.permissions.clone(),
+            ContextBinding {
+                service_id: ServiceId::new(CONTEXT).unwrap(),
+                expected_owner: id(OWNER),
+            },
+            vec![ToolBinding {
+                name: "receipt".into(),
+                service_id: ServiceId::new(TOOL).unwrap(),
+                expected_owner: id(OWNER),
+            }],
+            config.clone(),
+        )
+        .unwrap()
+        .with_shared_steps(steps)
+    };
+    let child = make_host(child_provider.clone(), pool.with_parent_reserve(2));
+    let output = child
+        .run_scoped_turn_with_events(
+            TurnInput {
+                text: "执行子任务".into(),
+            },
+            None,
+            &DiscardTurnEvents,
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.diagnostics.calls.len(), 2);
+    assert_eq!(output.diagnostics.started_tools, 2);
+    assert!(
+        output
+            .diagnostics
+            .tool_results
+            .iter()
+            .all(|result| { matches!(result.output, ToolOutput::Success(_)) })
+    );
+    assert_eq!(rig.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(pool.remaining().unwrap(), 2);
+    {
+        let requests = child_provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].tools.is_empty());
+        assert!(requests[1].messages.iter().any(|m| {
+            m.text
+                .as_deref()
+                .is_some_and(|s| s.contains("本子任务可用工具额度已用尽"))
+        }));
+    }
+    let parent_provider = Provider::new(vec![
+        Step::new(valid_calls("parent")),
+        Step::new(final_response("主线程核验完毕")),
+    ]);
+    let parent = make_host(parent_provider.clone(), pool.clone());
+    let output = parent
+        .run_scoped_turn_with_events(
+            TurnInput {
+                text: "核验交付物".into(),
+            },
+            None,
+            &DiscardTurnEvents,
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.diagnostics.calls.len(), 2);
+    assert_eq!(output.diagnostics.started_tools, 2);
+    assert!(
+        output
+            .diagnostics
+            .tool_results
+            .iter()
+            .all(|result| { matches!(result.output, ToolOutput::Success(_)) })
+    );
+    assert_eq!(pool.usage().unwrap().tool_calls, 4);
+    assert_eq!(rig.starts.load(Ordering::SeqCst), 4);
+    assert!(!pool.reserve(1).unwrap());
+    assert!(parent_provider.requests.lock().unwrap()[1].tools.is_empty());
+    rig.stop().await;
+}

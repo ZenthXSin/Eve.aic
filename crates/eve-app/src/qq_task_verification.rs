@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const OBSERVATION_RULES: &str = "回执只接受宿主真实观察：read_file /sha256 为完整文件摘要；/content 精确全文须同参数配 /truncated=false 和该全文的 /sha256，offset 必须为0。path/cwd 可冻结工程相对路径或宿主绝对路径，实际执行仍须通过当前后端能力与身份授权。run_command 仅限固定cwd和参数的 cargo test/check/clippy、python3 -I -m unittest，检查 /exit_code=0，不接受stdout或任意脚本。send_message 须同参数配 /sent=true 与 /delivery_status=sent（仅当前活跃对话轮可用）；query_file_delivery 须按既有文件投递id配 /sent=true 与 /state=Sent。排队不代表送达，未知观察保留待验收。合同只证明明确覆盖的行为，不能将单项检查扩大为整个目标成功。";
+pub(crate) const OBSERVATION_RULES: &str = "回执只接受宿主真实观察：read_file /sha256 为完整文件摘要；/content 精确全文须同参数配 /truncated=false 和该全文的 /sha256，offset 必须为0。path/cwd 可冻结工程相对路径或宿主绝对路径，实际执行仍须通过当前后端能力与身份授权。run_command 接受固定cwd和参数的 cargo test/check/clippy、python3 -I -m unittest、node --test、npm test 或 npm run test，检查 /exit_code=0，不接受stdout或任意脚本。npm按工程实际测试脚本执行，退出码只证明这一固定调用的结果，不证明测试数量、覆盖率或脚本安全性；命令权限与身份授权仍由实际执行后端核验。send_message 须同参数配 /sent=true 与 /delivery_status=sent（仅当前活跃对话轮可用）；query_file_delivery 须按既有文件投递id配 /sent=true 与 /state=Sent。排队不代表送达，未知观察保留待验收。合同只证明明确覆盖的行为，不能将单项检查扩大为整个目标成功。";
 
 /// 只验证合同具有可信观察来源；实际结果、最后批次与无工具的文本交付由任务验收器核对。
 /// Unspecified 保留原目标为待验收，要求主动执行的入口可另外拒绝未指定合同。
@@ -204,8 +204,56 @@ fn verification_command(arguments: &Value) -> bool {
                                 .all(|b| b.is_ascii_alphanumeric() || b"_.".contains(&b)))
                 })
         }
+        "node" => node_verification(&command.args),
+        "npm" => npm_verification(&command.args),
         _ => false,
     }
+}
+
+fn javascript_test_file(argument: &str) -> bool {
+    observation_path(argument)
+        && !argument.starts_with('-')
+        && Path::new(argument)
+            .extension()
+            .is_some_and(|extension| matches!(extension.to_str(), Some("js" | "mjs" | "cjs")))
+}
+
+fn node_verification(arguments: &[String]) -> bool {
+    let Some((flag, rest)) = arguments.split_first() else {
+        return false;
+    };
+    if flag != "--test" {
+        return false;
+    }
+    let rest = match rest.split_first() {
+        Some((separator, files)) if separator == "--" => files,
+        _ => rest,
+    };
+    rest.iter().all(|argument| javascript_test_file(argument))
+}
+
+fn npm_verification(arguments: &[String]) -> bool {
+    // npm 运行的是工程已有的脚本。这里限定测试入口和明确转发的测试参数，
+    // 不把脚本名称当作安全证明，也不授予安装、任意脚本或更多命令权限。
+    let rest = match arguments {
+        [test, rest @ ..] if test == "test" => rest,
+        [run, test, rest @ ..] if run == "run" && test == "test" => rest,
+        _ => return false,
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some((separator, parameters)) = rest.split_first() else {
+        return false;
+    };
+    separator == "--"
+        && !parameters.is_empty()
+        && parameters.iter().all(|argument| {
+            matches!(
+                argument.as_str(),
+                "--runInBand" | "--watch=false" | "--watchAll=false"
+            ) || javascript_test_file(argument)
+        })
 }
 
 fn cargo_verification(arguments: &[String]) -> bool {
@@ -432,6 +480,184 @@ mod tests {
                     json!(0)
                 )]))
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_test_contracts_bind_real_exit_codes_without_accepting_other_commands() {
+        for (program, arguments) in [
+            ("node", json!(["--test"])),
+            (
+                "node",
+                json!(["--test", "tests/math.test.js", "tests/io.test.mjs"]),
+            ),
+            ("node", json!(["--test", "--", "tests/math.test.cjs"])),
+            ("npm", json!(["test"])),
+            ("npm", json!(["run", "test"])),
+            (
+                "npm",
+                json!(["test", "--", "--runInBand", "tests/math.test.js"]),
+            ),
+            ("npm", json!(["run", "test", "--", "--watch=false"])),
+        ] {
+            let contract = command(program, arguments);
+            let before = serde_json::to_value(&contract).unwrap();
+            assert!(validate_contract(&contract).is_ok(), "{program}");
+            assert_eq!(serde_json::to_value(contract).unwrap(), before);
+        }
+        for (program, arguments) in [
+            ("node", json!([])),
+            ("node", json!(["-e", "process.exit(0)"])),
+            ("node", json!(["--test", "--help"])),
+            ("node", json!(["--test", "--eval", "process.exit(0)"])),
+            ("node", json!(["--test", "--import", "./fixture.mjs"])),
+            ("node", json!(["--test", "../other.test.js"])),
+            ("node", json!(["--test", ".git/hooks/test.js"])),
+            ("node", json!(["--test", "tests/a.test.js\n"])),
+            ("npm", json!(["install"])),
+            (
+                "npm",
+                json!(["exec", "--", "node", "-e", "process.exit(0)"]),
+            ),
+            ("npm", json!(["run", "build"])),
+            ("npm", json!(["test", "--if-present"])),
+            ("npm", json!(["test", "--", "--help"])),
+            ("npm", json!(["test", "--", "--passWithNoTests"])),
+            ("npm", json!(["test", "--", "--listTests"])),
+            ("npm", json!(["test", "--", "--watch"])),
+            ("npm", json!(["run", "test", "--", "../other.test.js"])),
+        ] {
+            assert!(
+                validate_contract(&command(program, arguments)).is_err(),
+                "{program}"
+            );
+        }
+        for pointer in ["/stdout", "/success"] {
+            assert!(
+                validate_contract(&receipts(vec![check(
+                    "run_command",
+                    json!({"program":"npm","args":["test"],"cwd":"."}),
+                    pointer,
+                    json!("passed"),
+                )]))
+                .is_err()
+            );
+        }
+        assert!(
+            validate_contract(&receipts(vec![check(
+                "run_command",
+                json!({"program":"node","args":["--test"]}),
+                "/exit_code",
+                json!(0),
+            )]))
+            .is_err(),
+            "cwd must be frozen explicitly"
+        );
+    }
+
+    #[test]
+    fn javascript_test_completion_requires_the_frozen_call_and_actual_success_receipt() {
+        use eve_llm_api::{
+            ChatMessage, ChatRole, ToolCall, ToolFailureCode, ToolOutput, ToolResult,
+        };
+        use eve_task_api::TaskCompletionAssessment;
+
+        for (program, args) in [
+            ("node", json!(["--test", "tests/math.test.js"])),
+            ("npm", json!(["test"])),
+            ("npm", json!(["run", "test", "--", "--watch=false"])),
+        ] {
+            let arguments = json!({"program":program,"args":args,"cwd":"."});
+            let contract = receipts(vec![check(
+                "run_command",
+                arguments.clone(),
+                "/exit_code",
+                json!(0),
+            )]);
+            assert!(validate_contract(&contract).is_ok());
+            let user = ChatMessage::text(ChatRole::User, "执行固定测试并报告实际结果");
+            let call = |arguments| {
+                ChatMessage::assistant_tool_calls(vec![ToolCall {
+                    id: "test-command".into(),
+                    name: "run_command".into(),
+                    arguments,
+                }])
+                .unwrap()
+            };
+            let receipt = |output| {
+                ChatMessage::tool_results(vec![ToolResult {
+                    call_id: "test-command".into(),
+                    output,
+                }])
+                .unwrap()
+            };
+            let evaluate = |messages: &[ChatMessage]| {
+                eve_task_plugin::evaluate_completion_contract(
+                    &contract,
+                    messages,
+                    "模型声称测试通过",
+                    None,
+                )
+            };
+            for (output, expected) in [
+                (
+                    ToolOutput::Success(json!({"exit_code":0,"stdout":"actual output"})),
+                    TaskCompletionAssessment::Verified,
+                ),
+                (
+                    ToolOutput::Success(json!({"exit_code":1,"stdout":"passed"})),
+                    TaskCompletionAssessment::Mismatch {
+                        reason: "receipt_effect_mismatch".into(),
+                    },
+                ),
+                (
+                    ToolOutput::Success(json!({"stdout":"passed","success":true})),
+                    TaskCompletionAssessment::Mismatch {
+                        reason: "missing_verification_observation_field".into(),
+                    },
+                ),
+                (
+                    ToolOutput::Failure {
+                        code: ToolFailureCode::TimedOut,
+                        message: "测试进程结果未知".into(),
+                    },
+                    TaskCompletionAssessment::Unverifiable {
+                        reason: "unknown_tool_effect_not_replayed".into(),
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    evaluate(&[user.clone(), call(arguments.clone()), receipt(output)]),
+                    expected,
+                    "{program}"
+                );
+            }
+            assert_eq!(
+                evaluate(&[user.clone(), call(arguments.clone())]),
+                TaskCompletionAssessment::Unverifiable {
+                    reason: "missing_or_invalid_tool_receipts".into(),
+                }
+            );
+            assert_eq!(
+                evaluate(std::slice::from_ref(&user)),
+                TaskCompletionAssessment::Mismatch {
+                    reason: "no_verification_receipt".into(),
+                },
+                "final text alone is not command evidence"
+            );
+            let mut other_directory = arguments;
+            other_directory["cwd"] = json!("other-project");
+            assert_eq!(
+                evaluate(&[
+                    user,
+                    call(other_directory),
+                    receipt(ToolOutput::Success(json!({"exit_code":0}))),
+                ]),
+                TaskCompletionAssessment::Mismatch {
+                    reason: "unbound_final_batch".into(),
+                },
+                "a different cwd cannot satisfy the frozen test invocation"
             );
         }
     }

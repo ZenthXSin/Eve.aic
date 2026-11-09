@@ -390,6 +390,8 @@ pub async fn run_console(
 pub(crate) struct CoreBootstrap {
     tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     host_config: LlmHostConfig,
+    /// QQ 前台使用 runtime.tasks.foreground_steps；其他入口沿用各自工具预算。
+    configured_foreground_steps: bool,
     api_key: String,
     context: Option<Arc<dyn eve_llm_api::ContextAssembler>>,
     /// 宿主额外提供给对话模型的工具；名称不能与内置工具重复。
@@ -416,6 +418,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
     Ok(CoreBootstrap {
         tool_scope_policy: None,
         host_config,
+        configured_foreground_steps: false,
         api_key,
         context: None,
         tools: vec![],
@@ -567,7 +570,8 @@ async fn install_core_with_config(
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
     let CoreBootstrap {
         tool_scope_policy,
-        host_config,
+        mut host_config,
+        configured_foreground_steps,
         api_key,
         context,
         tools,
@@ -605,6 +609,10 @@ async fn install_core_with_config(
         .map_err(|_| "配置服务类型错误。")?;
     let request = settings.0.begin_request(LLM_NAMESPACE, 1)?;
     let runtime = LlmRuntimeConfig::try_from(&settings.0.read_request(&request)?)?;
+    if configured_foreground_steps {
+        let tasks = qq_tasks::current(settings.0.as_ref())?;
+        host_config.max_tool_calls = tasks.foreground_limit();
+    }
     if runtime.response_mode != "complete" {
         return Err(
             "核心入口当前使用非流式模式，请将 runtime.llm.response_mode 配为 complete。".into(),

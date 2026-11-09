@@ -46,7 +46,9 @@ use tokio::{
 
 mod action_capabilities;
 mod delegated_progress;
+mod subagent_journal;
 use delegated_progress::StopSignal;
+pub(crate) use subagent_journal::{ListRuns, RunStorage, SqliteRunStorage};
 #[cfg(test)]
 mod coding_tests;
 #[cfg(test)]
@@ -65,6 +67,7 @@ pub(crate) const ID_PREFIX: &str = "task-";
 pub(crate) const NAMESPACE: &str = "runtime.tasks";
 /// 模型用途：与健康记录、单次输出上限一致。
 pub(crate) const MODEL_USE: &str = "task";
+pub(crate) const DEFAULT_FOREGROUND_STEPS: u32 = 500;
 /// 子代理期限的配置上限；对话宿主据此放宽子代理工具的执行期限。
 pub(crate) const MAX_SUBAGENT_TIMEOUT_MS: u64 = 600_000;
 const CONTEXT_ID: &str = "eve.task.context";
@@ -114,6 +117,20 @@ pub(crate) fn schema() -> ConfigSchema {
                 field.environment = Some("EVE_TASK_AUTO_RECOVER_FAILURES".into());
                 field
             }),
+            ("foreground_steps".into(), {
+                let mut value = field(
+                    u64::from(DEFAULT_FOREGROUND_STEPS),
+                    i64::from(MIN_STEPS),
+                    i64::from(MAX_STEPS),
+                    "EVE_FOREGROUND_STEPS",
+                );
+                value.restart_required = true;
+                value
+            }),
+            (
+                "parent_reserve_steps".into(),
+                field(20, 0, i64::from(MAX_STEPS), "EVE_PARENT_RESERVE_STEPS"),
+            ),
             (
                 "default_steps".into(),
                 field(
@@ -154,9 +171,11 @@ pub(crate) fn schema() -> ConfigSchema {
     }
 }
 
-/// 步数默认值与上限、并发数和期限；保存后下一次派发或下一轮执行生效。
+/// 步数默认值与上限、并发数和期限；前台总额在宿主启动时读取，其余下次派发读取。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Settings {
+    pub(crate) foreground_steps: u32,
+    pub(crate) parent_reserve_steps: usize,
     pub(crate) default_steps: u32,
     pub(crate) max_steps: u32,
     pub(crate) max_running: usize,
@@ -165,9 +184,17 @@ pub(crate) struct Settings {
     pub(crate) subagent_concurrency: usize,
 }
 
+impl Settings {
+    pub(crate) fn foreground_limit(self) -> usize {
+        self.foreground_steps.min(self.max_steps) as usize
+    }
+}
+
 pub(crate) fn settings(snapshot: &ConfigSnapshot) -> Result<Settings, String> {
     let read = || -> Result<Settings, eve_config_api::ConfigError> {
         Ok(Settings {
+            foreground_steps: snapshot.get("foreground_steps")?,
+            parent_reserve_steps: snapshot.get("parent_reserve_steps")?,
             default_steps: snapshot.get("default_steps")?,
             max_steps: snapshot.get("max_steps")?,
             max_running: snapshot.get("max_running")?,
@@ -207,6 +234,8 @@ pub(crate) fn config_service(
 pub(crate) struct WorkerRun {
     pub(crate) end: TaskEnd,
     pub(crate) usage: TaskUsage,
+    /// 本次子代理的真实验收分类；结局和用量不代替验证结果。
+    pub(crate) verification: Option<eve_task_api::TaskCompletionAssessment>,
     retryable: bool,
 }
 
@@ -280,6 +309,7 @@ pub(crate) struct Worker {
     settings: Arc<dyn ConfigService>,
     resolver: Arc<dyn LlmModelResolver>,
     coding_resolver: Arc<dyn LlmModelResolver>,
+    runs: Arc<subagent_journal::RunStore>,
     host: LlmHost,
     leaf_host: LlmHost,
     pub(crate) leaf_tool_names: Vec<String>,
@@ -312,6 +342,7 @@ fn exploration_stopped(
             reason: reason.into(),
         },
         usage: observed_usage,
+        verification: None,
         retryable: false,
     };
     let checkpoint = match journal.map(|journal| journal.load()).transpose() {
@@ -336,6 +367,7 @@ fn exploration_stopped(
                 .used_tool_calls
                 .saturating_add(checkpoint.delegated_tool_calls),
         ),
+        verification: None,
         retryable: false,
     }
 }
@@ -387,6 +419,7 @@ fn failure_reason(error: &LlmError) -> String {
 }
 
 impl Worker {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn install(
         kernel: &Kernel,
         registry: Arc<dyn ServiceRegistry>,
@@ -395,6 +428,7 @@ impl Worker {
         mut host_config: LlmHostConfig,
         models: WorkerModels,
         digests: Arc<dyn eve_llm_api::HistoryDigests>,
+        run_storage: Arc<dyn RunStorage>,
     ) -> Result<Arc<Self>, AppError> {
         let WorkerModels {
             task: resolver,
@@ -402,6 +436,7 @@ impl Worker {
         } = models;
         let settings = config_service(registry.as_ref())?;
         let history = Arc::new(crate::history::ConfiguredHistory(settings.clone()));
+        let runs = subagent_journal::RunStore::open(run_storage);
         kernel.register(Box::new(ContextPlugin(PluginManifest::new(
             CONTEXT_ID,
             env!("CARGO_PKG_VERSION"),
@@ -481,6 +516,7 @@ impl Worker {
             settings,
             resolver,
             coding_resolver,
+            runs,
             leaf_host,
             leaf_tool_names,
             host,
@@ -525,6 +561,7 @@ impl Worker {
                     reason: "后台任务执行前授权已失效；未请求模型、未执行工具".into(),
                 },
                 usage: TaskUsage::default(),
+                verification: None,
                 retryable: false,
             };
         }
@@ -539,6 +576,7 @@ impl Worker {
                             reason: "共享步数无效".into(),
                         },
                         usage: TaskUsage::default(),
+                        verification: None,
                         retryable: false,
                     };
                 }
@@ -581,6 +619,7 @@ impl Worker {
                             reason: "探索工具目录暂不可用；未把读取失败当作没有工具".into(),
                         },
                         usage: TaskUsage::default(),
+                        verification: None,
                         retryable: false,
                     };
                 }
@@ -614,6 +653,7 @@ impl Worker {
                         reason: "步数预算无效".into(),
                     },
                     usage: TaskUsage::default(),
+                    verification: None,
                     retryable: false,
                 };
             }
@@ -640,6 +680,7 @@ impl Worker {
                             reason: "委派资料无效或身份不符；未请求模型、未执行工具".into(),
                         },
                         usage: TaskUsage::default(),
+                        verification: None,
                         retryable: false,
                     };
                 }
@@ -669,6 +710,7 @@ impl Worker {
                             reason: "后台任务缺少有效模型会话绑定；未请求模型".into(),
                         },
                         usage: TaskUsage::default(),
+                        verification: None,
                         retryable: false,
                     };
                 }
@@ -679,6 +721,7 @@ impl Worker {
                     reason: "独立执行缺少模型会话绑定；未请求模型".into(),
                 },
                 usage: TaskUsage::default(),
+                verification: None,
                 retryable: false,
             };
         };
@@ -694,6 +737,7 @@ impl Worker {
                         reason: "后台授权证据与原身份无法绑定；未请求模型、未执行工具".into(),
                     },
                     usage: TaskUsage::default(),
+                    verification: None,
                     retryable: false,
                 };
             }
@@ -714,7 +758,11 @@ impl Worker {
             }
         };
         let host = if let Some(journal) = journal.clone() {
-            host.with_turn_journal(journal)
+            if child {
+                host.with_leaf_turn_journal(journal)
+            } else {
+                host.with_turn_journal(journal)
+            }
         } else {
             host
         };
@@ -727,6 +775,7 @@ impl Worker {
                         reason: "空闲回顾缺少可信冻结经历；未请求模型".into(),
                     },
                     usage: TaskUsage::default(),
+                    verification: None,
                     retryable: false,
                 };
             };
@@ -754,51 +803,60 @@ impl Worker {
                 text,
                 diagnostics,
                 transcript,
-            })) => WorkerRun {
-                end: if idle_review
-                    && original_idle_input
-                        .as_deref()
-                        .is_none_or(|input| crate::idle_loop::decode(input, &text).is_err())
-                {
-                    TaskEnd::Failed { reason: "空闲回顾结构、来源或判断修订检查失败；原模型结果保留在执行检查点，未派发行动".into() }
-                } else if exploration {
-                    TaskEnd::SessionEnded { result: text }
-                } else if text.trim().is_empty() {
-                    TaskEnd::Failed {
-                        reason: "执行器没有给出结果".into(),
+            })) => {
+                let verification = child.then(|| {
+                    if let Some(reason) = eve_task_api::blocked_progress(&transcript) {
+                        return eve_task_api::TaskCompletionAssessment::Blocked {
+                            reason: reason.into(),
+                        };
                     }
-                } else if subject_plan.as_ref().is_some_and(|task| {
-                    crate::qq_subject::validate_plan_result(task, &text).is_err()
-                }) {
-                    TaskEnd::Failed {
-                        reason:
-                            "持续目标规划的结构、范围或验收条件不符；已保存模型结果，未创建行动任务"
-                                .into(),
-                    }
-                } else if eve_task_api::blocked_progress(&transcript).is_some() {
-                    TaskEnd::Blocked { result: text }
-                } else if child {
-                    match eve_task_plugin::evaluate_completion_contract(
+                    eve_task_plugin::evaluate_completion_contract(
                         completion_contract
                             .as_ref()
                             .unwrap_or(&TaskCompletionContract::Unspecified),
                         &transcript,
                         &text,
                         None,
-                    ) {
-                        eve_task_api::TaskCompletionAssessment::Verified => {
-                            TaskEnd::Completed { result: text }
+                    )
+                });
+                WorkerRun {
+                    end: if idle_review
+                        && original_idle_input
+                            .as_deref()
+                            .is_none_or(|input| crate::idle_loop::decode(input, &text).is_err())
+                    {
+                        TaskEnd::Failed { reason: "空闲回顾结构、来源或判断修订检查失败；原模型结果保留在执行检查点，未派发行动".into() }
+                    } else if exploration {
+                        TaskEnd::SessionEnded { result: text }
+                    } else if text.trim().is_empty() {
+                        TaskEnd::Failed {
+                            reason: "执行器没有给出结果".into(),
                         }
-                        assessment => TaskEnd::Blocked {
-                            result: format!("{}\n\n宿主验收未通过：{}", text, assessment.reason()),
-                        },
+                    } else if subject_plan.as_ref().is_some_and(|task| {
+                        crate::qq_subject::validate_plan_result(task, &text).is_err()
+                    }) {
+                        TaskEnd::Failed {
+                        reason:
+                            "持续目标规划的结构、范围或验收条件不符；已保存模型结果，未创建行动任务"
+                                .into(),
                     }
-                } else {
-                    TaskEnd::Completed { result: text }
-                },
-                usage: usage(diagnostics.provider_requests, diagnostics.calls.len()),
-                retryable: false,
-            },
+                    } else if eve_task_api::blocked_progress(&transcript).is_some() {
+                        TaskEnd::Blocked { result: text }
+                    } else if child {
+                        match verification.as_ref() {
+                            Some(eve_task_api::TaskCompletionAssessment::Verified) => {
+                                TaskEnd::Completed { result: text }
+                            }
+                            _ => TaskEnd::Blocked { result: text },
+                        }
+                    } else {
+                        TaskEnd::Completed { result: text }
+                    },
+                    usage: usage(diagnostics.provider_requests, diagnostics.calls.len()),
+                    verification,
+                    retryable: false,
+                }
+            }
             Ok(Err(TurnFailure { error, diagnostics })) => {
                 let end = if error == LlmError::Cancelled && *stop.borrow() {
                     TaskEnd::Cancelled
@@ -827,6 +885,7 @@ impl Worker {
                     WorkerRun {
                         end,
                         usage: observed_usage,
+                        verification: None,
                         retryable: retryable_model_failure(&error),
                     }
                 }
@@ -858,6 +917,7 @@ impl Worker {
                             ),
                         },
                         usage: usage(0, 0),
+                        verification: None,
                         retryable: false,
                     }
                 }
@@ -1167,6 +1227,17 @@ fn resolve_steps(arguments: &Value, settings: &Settings) -> Result<u32, ToolExec
         )));
     }
     Ok(steps)
+}
+
+fn delegated_steps(
+    pool: &eve_llm_api::SharedToolSteps,
+    configured_reserve: usize,
+) -> eve_llm_api::SharedToolSteps {
+    // 小预算最多留五分之一（至少一步，且不占满总额）；旧任务保留原总额度。
+    let reserve = configured_reserve
+        .min((pool.limit() / 5).max(1))
+        .min(pool.limit().saturating_sub(1));
+    pool.with_parent_reserve(reserve)
 }
 
 fn invalid(message: &str) -> ToolValidationError {
@@ -1555,7 +1626,7 @@ impl Tool for SubagentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: SUBAGENT_TOOL.into(),
-            description: "委托独立子任务并等待真实结果后继续本轮。简单任务直接完成，不使用子代理；中等及以上、需要持续多步实现与验证的编程任务使用 agent_id=coding，如跨模块改动或复杂故障定位。结合上下文判断复杂度，不仅凭关键词、消息长短或文件数量，也不为分级额外调用模型；推进中变复杂时再委派，交接已有结果，不从头重做。委派时用 include_context=true 提供当前上下文；主线程保留对话、协调和结果整合。task 写清问题、范围、已有结果与交付物；verification 与后台相同，在执行前冻结工具回执或零工具纯文本验收，全部匹配才 completed=true，缺少或不符返回待核验，主执行者负责核对整合。include_context=true 携带当前冻结历史，真实授权原话独立继承，均不扩大权限。max_steps 只收窄子代理上限；与父任务共享原子工具预算和原期限，失败与并行同样扣减。agent_id 选 general、coding、research、review 或已保存角色。coding 使用其独立配置的模型，失败如实返回，不自动切换模型重做。可独立拆分的编程子任务默认在同一工具批次并行调用多个 run_subagent，均指定 agent_id=coding；每项写清文件分工，不让多个执行者同时修改同一文件或替换运行版本。不为并行制造重复工作；不可拆分的任务只委派一个，有依赖的步骤等前一步结果后顺序推进。实际并发受宿主子代理槽位、模型并发、共享剩余步数与父期限约束；更长任务可用后台。".into(),
+            description: "委托独立子任务并等待真实结果后继续本轮。简单任务直接完成，不使用子代理；中等及以上、需要持续多步实现与验证的编程任务使用 agent_id=coding，如跨模块改动或复杂故障定位。结合上下文判断复杂度，不仅凭关键词、消息长短或文件数量，也不为分级额外调用模型；推进中变复杂时再委派，交接已有结果，不从头重做。委派时用 include_context=true 提供当前上下文；主线程保留对话、协调和结果整合。task 写清问题、范围、已有结果与交付物；verification 与后台相同，在执行前冻结工具回执或零工具纯文本验收，全部匹配才 completed=true，未指定或无法核验时返回status=returned_pending_verification、completed=false、blocked=false；合同失配为verification_mismatch，只有实际剩余工作或明确阻塞才blocked=true。verification携带真实分类与原因，原结果和回执保留，主执行者负责核对整合，不能把待核验当作完成。include_context=true 携带当前冻结历史，真实授权原话独立继承，均不扩大权限。max_steps 只收窄子代理上限；与父任务共享原子工具预算和原期限，失败与并行同样扣减。agent_id 选 general、coding、research、review 或已保存角色。coding 使用其独立配置的模型，失败如实返回，不自动切换模型重做。可独立拆分的编程子任务默认在同一工具批次并行调用多个 run_subagent，均指定 agent_id=coding；每项写清文件分工，不让多个执行者同时修改同一文件或替换运行版本。不为并行制造重复工作；不可拆分的任务只委派一个，有依赖的步骤等前一步结果后顺序推进。实际并发受宿主子代理槽位、模型并发、共享剩余步数与父期限约束；更长任务可用后台。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1605,7 +1676,8 @@ impl Tool for SubagentTool {
                 .shared_steps()
                 .cloned()
                 .unwrap_or(eve_llm_api::SharedToolSteps::new(requested as usize).map_err(failed)?);
-            let remaining = pool.remaining().map_err(failed)?;
+            let child_pool = delegated_steps(&pool, settings.parent_reserve_steps);
+            let remaining = child_pool.remaining().map_err(failed)?;
             let steps = if call.arguments.get("max_steps").is_some() {
                 remaining.min(requested as usize)
             } else {
@@ -1613,7 +1685,9 @@ impl Tool for SubagentTool {
             };
             let steps = u32::try_from(steps).map_err(failed)?;
             if steps == 0 {
-                return Err(failed("主任务与子代理的共享步数已用尽；未启动子代理"));
+                return Err(failed(
+                    "子代理可用步数已用尽；保留主线程核验、收尾与交流额度，未启动子代理",
+                ));
             }
             let profile_id = call
                 .arguments
@@ -1653,9 +1727,11 @@ impl Tool for SubagentTool {
                 .acquire_subagent(settings.subagent_concurrency, &context)
                 .await?;
             let steps =
-                steps.min(u32::try_from(pool.remaining().map_err(failed)?).map_err(failed)?);
+                steps.min(u32::try_from(child_pool.remaining().map_err(failed)?).map_err(failed)?);
             if steps == 0 {
-                return Err(failed("排队期间主任务共享步数已用尽；未启动模型"));
+                return Err(failed(
+                    "排队期间子代理可用步数已用尽；保留主线程收尾额度，未启动模型",
+                ));
             }
             let snapshot = capture_context(&call.arguments, &context)?;
             let contract = completion_contract(&call.arguments)?;
@@ -1675,24 +1751,39 @@ impl Tool for SubagentTool {
             if timeout.is_some_and(|timeout| timeout.is_zero()) {
                 return Err(failed("等待并发槽已耗尽子代理期限；未启动模型"));
             }
+            // 原父模型会话 + 父轮次 + 可信调用 ID 固定本次子代理身份。
+            let parent = context
+                .model_session()
+                .ok_or_else(|| failed("子代理缺少可信父模型会话"))?;
+            let turn = parent
+                .turn_id()
+                .ok_or_else(|| failed("子代理缺少可信父轮次"))?;
+            let call_id = context
+                .call_id()
+                .ok_or_else(|| failed("子代理缺少宿主工具调用编号"))?;
+            let model_session = parent
+                .fork("subagent", Some(&format!("{turn}:{call_id}")))
+                .map_err(failed)?;
+            let journal = worker
+                .runs
+                .begin(subagent_journal::FrozenRun {
+                    owner: owner.clone(),
+                    model_session: model_session.clone(),
+                    parent_call_id: call_id.into(),
+                    profile: profile.clone(),
+                    instructions: instructions.clone(),
+                    context: snapshot.clone(),
+                    review_messages: review_messages.clone(),
+                    verification: contract.clone(),
+                    steps,
+                    deadline_at_ms: timeout
+                        .map(|timeout| now_ms().saturating_add(timeout.as_millis() as u64)),
+                })
+                .map_err(failed)?;
+            let run_id = journal.id.clone();
             let running = worker.run_request(WorkerRequest {
                 exploration: false,
-                // call ID 来自当前执行器绑定，不采用工具参数中的 agent_id 当会话标识。
-                // 父轮次和 call ID 合起来是该独立子代理的稳定锚点。
-                model_session: Some({
-                    let parent = context
-                        .model_session()
-                        .ok_or_else(|| failed("子代理缺少可信父模型会话"))?;
-                    let turn = parent
-                        .turn_id()
-                        .ok_or_else(|| failed("子代理缺少可信父轮次"))?;
-                    let call_id = context
-                        .call_id()
-                        .ok_or_else(|| failed("子代理缺少宿主工具调用编号"))?;
-                    parent
-                        .fork("subagent", Some(&format!("{turn}:{call_id}")))
-                        .map_err(failed)?
-                }),
+                model_session: Some(model_session),
                 idle_review: false,
                 idle_input: None,
                 instructions,
@@ -1702,8 +1793,8 @@ impl Tool for SubagentTool {
                 timeout,
                 stop: stopped,
                 progress: context.delegated_progress().cloned(),
-                journal: None,
-                shared_steps: Some(pool.clone()),
+                journal: Some(journal.clone()),
+                shared_steps: Some(child_pool.clone()),
                 profile: Some(profile.clone()),
                 review_messages,
                 completion_contract: Some(contract),
@@ -1711,7 +1802,7 @@ impl Tool for SubagentTool {
                 background_task_id: None,
             });
             tokio::pin!(running);
-            let run = loop {
+            let mut run = loop {
                 tokio::select! {
                     run = &mut running => break run,
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -1721,29 +1812,67 @@ impl Tool for SubagentTool {
                     }
                 }
             };
+            journal.finish(&mut run).map_err(failed)?;
             let used = json!({
+                "run_id": run_id,
                 "steps_used": run.usage.tool_calls,
                 "max_steps": steps,
                 "model_requests": run.usage.model_requests,
                 "shared_steps_used":pool.usage().map_err(failed)?.tool_calls,
                 "shared_steps_remaining":pool.remaining().map_err(failed)?,
+                "delegated_steps_remaining":child_pool.remaining().map_err(failed)?,
+                "parent_reserved_steps":child_pool.parent_reserve(),
                 "agent_id":profile.id,
             });
-            match run.end {
-                TaskEnd::SessionEnded { .. } => Err(failed("子代理执行模式不匹配")),
-                TaskEnd::Blocked { result } => Ok(
-                    json!({"completed":false,"blocked":true,"result":result,"usage":used,"include_context":snapshot.is_some()}),
-                ),
-                TaskEnd::Completed { result } => Ok(
-                    json!({"completed": true, "result": result, "usage": used, "include_context": snapshot.is_some()}),
-                ),
-                TaskEnd::Cancelled => Err(ToolExecutionError::Cancelled(
-                    "本轮已取消，子代理已停止".into(),
-                )),
-                TaskEnd::Failed { reason } => Err(failed(format!("子代理没有完成：{reason}"))),
-            }
+            subagent_result(run.end, run.verification, used, snapshot.is_some())
         })
     }
+}
+
+/// 执行已返回、未核验和真正阻塞分别表达，不能由内部停止态猜测目标成功。
+fn subagent_result(
+    end: TaskEnd,
+    verification: Option<eve_task_api::TaskCompletionAssessment>,
+    usage: Value,
+    include_context: bool,
+) -> Result<Value, ToolExecutionError> {
+    use eve_task_api::TaskCompletionAssessment;
+    let (result, status, completed, blocked) = match end {
+        TaskEnd::Completed { result }
+            if matches!(
+                verification.as_ref(),
+                Some(TaskCompletionAssessment::Verified)
+            ) =>
+        {
+            (result, "completed", true, false)
+        }
+        TaskEnd::Completed { .. } => return Err(failed("子代理完成结局缺少匹配的真实验收记录")),
+        TaskEnd::Blocked { result } => match verification.as_ref() {
+            Some(TaskCompletionAssessment::Unverifiable { .. }) => {
+                (result, "returned_pending_verification", false, false)
+            }
+            Some(TaskCompletionAssessment::Mismatch { .. }) => {
+                (result, "verification_mismatch", false, false)
+            }
+            Some(TaskCompletionAssessment::Blocked { .. }) | None => {
+                (result, "blocked", false, true)
+            }
+            Some(TaskCompletionAssessment::Verified) => {
+                return Err(failed("子代理阻塞结局与真实验收记录不一致"));
+            }
+        },
+        TaskEnd::SessionEnded { .. } => return Err(failed("子代理执行模式不匹配")),
+        TaskEnd::Cancelled => {
+            return Err(ToolExecutionError::Cancelled(
+                "本轮已取消，子代理已停止".into(),
+            ));
+        }
+        TaskEnd::Failed { reason } => return Err(failed(format!("子代理没有完成：{reason}"))),
+    };
+    Ok(json!({
+        "status":status,"completed":completed,"blocked":blocked,
+        "verification":verification,"result":result,"usage":usage,"include_context":include_context,
+    }))
 }
 
 /// 把这位用户最近的后台任务作为数据交给对话；只读任务账本。
@@ -2460,6 +2589,7 @@ async fn run(
                                 reason: "委派上下文无效；未请求模型、未执行工具".into(),
                             },
                             usage: TaskUsage::default(),
+                            verification: None,
                             retryable: false,
                         },
                     };
@@ -3113,6 +3243,22 @@ mod tests {
         let defaults = settings(&snapshot(&values)).unwrap();
         assert_eq!(defaults.default_steps, 100);
         assert_eq!(defaults.max_steps, 5000);
+        assert_eq!(defaults.foreground_steps, 500);
+        assert_eq!(defaults.parent_reserve_steps, 20);
+        assert!(schema.fields["foreground_steps"].restart_required);
+        assert_eq!(defaults.foreground_limit(), 500);
+        values.insert("foreground_steps".into(), json!(100));
+        assert_eq!(
+            settings(&snapshot(&values)).unwrap().foreground_limit(),
+            100
+        );
+        values.insert("foreground_steps".into(), json!(500));
+        values.insert("max_steps".into(), json!(100));
+        assert_eq!(
+            settings(&snapshot(&values)).unwrap().foreground_limit(),
+            100
+        );
+        values.insert("max_steps".into(), json!(5000));
         assert_eq!(defaults.subagent_timeout, Duration::ZERO);
         assert_eq!(defaults.task_timeout, Duration::ZERO);
         values.insert("default_steps".into(), json!(5001));
@@ -3122,6 +3268,8 @@ mod tests {
     #[test]
     fn steps_default_to_the_configured_value_and_respect_the_cap() {
         let settings = Settings {
+            foreground_steps: 100,
+            parent_reserve_steps: 20,
             default_steps: 50,
             max_steps: 120,
             max_running: 2,
@@ -3135,6 +3283,26 @@ mod tests {
             80
         );
         assert!(resolve_steps(&json!({"max_steps": 121}), &settings).is_err());
+    }
+    #[test]
+    fn delegation_keeps_small_explicit_budgets_usable_without_granting_more_steps() {
+        for (total, expected_reserve) in [(1, 0), (2, 1), (10, 2), (100, 20), (500, 20)] {
+            let parent = eve_llm_api::SharedToolSteps::new(total).unwrap();
+            let child = delegated_steps(&parent, 20);
+            assert_eq!(child.limit(), total);
+            assert_eq!(child.parent_reserve(), expected_reserve);
+            assert!(child.remaining().unwrap() > 0);
+            assert!(child.reserve(total - expected_reserve).unwrap());
+            assert_eq!(parent.remaining().unwrap(), expected_reserve);
+            assert!(!child.reserve(1).unwrap());
+        }
+        let parent = eve_llm_api::SharedToolSteps::new(100).unwrap();
+        let child = delegated_steps(&parent, 20);
+        assert!(parent.reserve(79).unwrap());
+        assert_eq!(child.remaining().unwrap(), 1);
+        assert!(parent.reserve(1).unwrap());
+        assert_eq!(child.remaining().unwrap(), 0);
+        assert_eq!(parent.remaining().unwrap(), 20);
     }
     #[tokio::test]
     async fn ten_subagents_can_enter_and_the_eleventh_waits_until_a_slot_is_released() {

@@ -521,6 +521,7 @@ pub struct LlmHost {
     model_session: Option<eve_llm_api::ModelSession>,
     run_deadline: Option<std::time::Instant>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
+    leaf_journal: bool,
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
     steering: Option<Arc<dyn eve_llm_api::TurnSteeringSource>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
@@ -591,6 +592,7 @@ impl LlmHost {
             model_session: None,
             run_deadline: None,
             journal: None,
+            leaf_journal: false,
             image_source: None,
             steering: None,
             registry,
@@ -959,6 +961,14 @@ impl LlmHost {
         self
     }
 
+    /// 叶子子代理记录自己的调用，不能把父/兄弟的共享用量当成它的调用计数。
+    /// 当前只保存与查询，不自动接续旧叶子检查点或重置活动父任务预算。
+    pub fn with_leaf_turn_journal(mut self, journal: Arc<dyn eve_llm_api::TurnJournal>) -> Self {
+        self.journal = Some(journal);
+        self.leaf_journal = true;
+        self
+    }
+
     /// 本次执行的工具调用总数上限（如后台任务的步数预算）；用尽后按 `final_answer_on_round_limit` 收尾。
     /// 克隆继续共享工具槽位和串行队列。
     pub fn with_tool_call_limit(&self, limit: usize) -> Result<Self, LlmError> {
@@ -1181,6 +1191,12 @@ impl LlmHost {
                     )
                 })?
                 .map_err(|error| fail(error, diagnostics.clone()))?;
+            if self.leaf_journal && loaded.is_some() {
+                return Err(fail(
+                    LlmError::Context("叶子子代理旧执行记录只读保留；未恢复预算或重放操作".into()),
+                    diagnostics,
+                ));
+            }
             if let Some(frame) = &loaded {
                 frame
                     .validate(self.config.max_tool_calls)
@@ -1492,7 +1508,9 @@ impl LlmHost {
                     )
                 })?;
             continuation_checks = frame.continuation_checks;
-            if let Some(steps) = &self.shared_steps {
+            if !self.leaf_journal
+                && let Some(steps) = &self.shared_steps
+            {
                 steps
                     .restore(eve_llm_api::SharedStepUsage {
                         tool_calls: frame.used_tool_calls + frame.delegated_tool_calls,
@@ -1868,6 +1886,12 @@ impl LlmHost {
                     .config
                     .max_tool_calls
                     .saturating_sub(diagnostics.calls.len());
+            let shared_remaining = self
+                .shared_steps
+                .as_ref()
+                .map(|steps| steps.remaining())
+                .transpose()
+                .map_err(|error| fail(error, diagnostics.clone()))?;
             let closing_expression = closing
                 && !reporting
                 && expression.is_some()
@@ -1877,10 +1901,18 @@ impl LlmHost {
             let reserve_expression = !closing
                 && expression.is_some()
                 && calls.len()
-                    >= self
-                        .config
-                        .max_tool_calls
-                        .saturating_sub(diagnostics.calls.len())
+                    >= shared_remaining.map_or(
+                        self.config
+                            .max_tool_calls
+                            .saturating_sub(diagnostics.calls.len()),
+                        |remaining| {
+                            remaining.min(
+                                self.config
+                                    .max_tool_calls
+                                    .saturating_sub(diagnostics.calls.len()),
+                            )
+                        },
+                    )
                 && !calls.iter().any(|c| c.name == "send_message");
             if (closing && !closing_expression)
                 || calls_exhausted
@@ -2108,10 +2140,10 @@ impl LlmHost {
                         .max_tool_calls
                         .saturating_sub(diagnostics.calls.len())
                         == 1
-                || self
-                    .shared_steps
-                    .as_ref()
-                    .is_some_and(|s| s.remaining().is_ok_and(|n| n == 0)))
+                || self.shared_steps.as_ref().is_some_and(|s| {
+                    s.remaining()
+                        .is_ok_and(|n| n == 0 || expression.is_some() && n == 1)
+                }))
                 && self.config.final_answer_on_round_limit
             {
                 closing = true;
@@ -2142,6 +2174,11 @@ impl LlmHost {
                 "本轮已没有可用工具额度，包括发言工具。只依据已有回执保存内部结束记录，区分已完成、失败和未完成，不宣称本轮还会继续。普通 assistant 文本不会发给对方，不能把这份记录当作已经通知或交付。".into()
             };
         }
+        if self.shared_steps.as_ref().is_some_and(|steps| {
+            steps.parent_reserve() > 0 && steps.remaining().is_ok_and(|n| n == 0)
+        }) {
+            return "本子任务可用工具额度已用尽，根任务仍为主执行者保留核验、整合和交流额度；这些额度不可由子代理消费。只依据已有回执交回已完成内容、未完成事项及证据，不再调用工具，不宣称总任务已完成。".into();
+        }
         if self.shared_steps.as_ref().is_some_and(|s| {
             s.remaining().is_ok_and(|n| n == 0)
                 && s.usage().is_ok_and(|u| u.tool_calls > local_used)
@@ -2159,7 +2196,9 @@ impl LlmHost {
         continuation: &eve_llm_api::TaskContinuation,
     ) -> Result<(), LlmError> {
         frame.used_tool_calls = diagnostics.calls.len();
-        if let Some(steps) = &self.shared_steps {
+        if !self.leaf_journal
+            && let Some(steps) = &self.shared_steps
+        {
             let usage = steps.usage()?;
             frame.delegated_tool_calls = usage
                 .tool_calls
@@ -2284,6 +2323,25 @@ impl LlmHost {
                     .messages
                     .insert(0, ChatMessage::text(ChatRole::System, choice));
             }
+        }
+        if let Some(steps) = &self.shared_steps
+            && (steps.parent_reserve() > 0
+                || request.tools.iter().any(|tool| tool.name == "run_subagent"))
+        {
+            let used = steps.usage()?.tool_calls;
+            let available = steps.remaining()?.min(
+                self.config
+                    .max_tool_calls
+                    .saturating_sub(diagnostics.calls.len()),
+            );
+            // 变化的余额放在请求末尾，固定提示和历史前缀不因每一步计数改写。
+            request.messages.push(ChatMessage::text(
+                ChatRole::System,
+                format!(
+                    "宿主当前执行预算（只描述本次额度，不新增任务或授权）：根任务工具总额 {}，父线程及全部子代理合计已用 {}，本执行者当前最多可用 {}，本执行者不可消费的父线程保留额度为 {}。所有并行调用共享余额，排队后可能减少；max_steps 不会重领额度。父线程仍可使用留给自己的额度完成核验、整合和交流。按工作需要使用，完成即停，不必用满；不足时交回实际成果和剩余工作。",
+                    steps.limit(), used, available, steps.parent_reserve(),
+                ),
+            ));
         }
         request.validate()?;
         if let Some(budget) = &self.execution_budget {

@@ -698,7 +698,7 @@ async fn edit_replaces_one_exact_occurrence_and_refuses_stale_missing_or_ambiguo
         expected_sha256: sha.into(),
     };
     let refused = |result: Result<Value, ToolExecutionError>| match result {
-        Err(ToolExecutionError::Failed(message)) => message,
+        Err(ToolExecutionError::Rejected(message)) => message,
         Err(_) => panic!("拒绝类型不符"),
         Ok(_) => panic!("应当拒绝却成功"),
     };
@@ -712,6 +712,10 @@ async fn edit_replaces_one_exact_occurrence_and_refuses_stale_missing_or_ambiguo
             .await,
     );
     assert!(stale.contains("文件已变化"));
+    assert_eq!(
+        std::fs::read(root.path().join("notes.txt")).unwrap(),
+        b"one\ntwo\nthree\n"
+    );
     let missing = refused(
         backend
             .execute(
@@ -721,6 +725,10 @@ async fn edit_replaces_one_exact_occurrence_and_refuses_stale_missing_or_ambiguo
             .await,
     );
     assert!(missing.contains("不存在"));
+    assert_eq!(
+        std::fs::read(root.path().join("notes.txt")).unwrap(),
+        b"one\ntwo\nthree\n"
+    );
     // 重叠出现也算多处：aa 在 aaa 中出现两次，不能任选一处替换。
     let mut overlap = file("overlap.txt");
     overlap.content = Some("aaa".into());
@@ -771,18 +779,123 @@ async fn edit_replaces_one_exact_occurrence_and_refuses_stale_missing_or_ambiguo
             .await,
     );
     assert!(replay.contains("文件已变化"));
-    let foreign = refused(
-        backend
-            .execute(
-                DeveloperOperation::Edit(edit("notes.txt", "2", "x", &hash(updated.as_bytes()))),
-                context("foreign"),
-            )
-            .await,
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+        updated
     );
-    assert!(foreign.contains("仅供宿主配置的操作者"));
+    let foreign = backend
+        .execute(
+            DeveloperOperation::Edit(edit("notes.txt", "2", "x", &hash(updated.as_bytes()))),
+            context("foreign"),
+        )
+        .await;
+    assert!(
+        matches!(foreign, Err(ToolExecutionError::Failed(message)) if message.contains("仅供宿主配置的操作者"))
+    );
     let journal = std::fs::read_to_string(ledger.path().join("operations.jsonl")).unwrap();
     assert!(journal.contains("\"kind\":\"edit\",\"state\":\"started\""));
     assert!(journal.contains("\"kind\":\"edit\",\"state\":\"finished\""));
+    let rows: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let rejected: Vec<_> = rows
+        .iter()
+        .filter(|row| row["kind"] == "edit" && row["failure_kind"] == "rejected")
+        .collect();
+    assert_eq!(rejected.len(), 4);
+    assert!(
+        rejected
+            .iter()
+            .all(|row| row["decision"] == "execution_rejected"
+                && row["recovery_action"] == "correct_request_before_retry")
+    );
+}
+
+#[tokio::test]
+async fn write_preconditions_are_rejected_without_creating_or_overwriting_files() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None).unwrap();
+    let original = b"keep original bytes";
+    std::fs::write(root.path().join("existing.txt"), original).unwrap();
+    let sha = hash(original);
+    for (path, expected, content, message) in [
+        (
+            "existing.txt",
+            Some(hash(b"stale")),
+            Some("new"),
+            "文件已变化",
+        ),
+        (
+            "existing.txt",
+            Some(String::new()),
+            Some("new"),
+            "文件已变化",
+        ),
+        ("new.txt", Some(sha.clone()), Some("new"), "文件已变化"),
+        ("existing.txt", None, Some("new"), "缺少文件修订校验"),
+        ("existing.txt", Some(sha.clone()), None, "缺少文件内容"),
+        ("new.txt", Some(String::new()), None, "缺少文件内容"),
+    ] {
+        let mut arguments = file(path);
+        arguments.expected_sha256 = expected;
+        arguments.content = content.map(str::to_string);
+        let result = backend
+            .execute(DeveloperOperation::Write(arguments), context("owner"))
+            .await;
+        assert!(
+            matches!(result, Err(ToolExecutionError::Rejected(text)) if text.contains(message))
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("existing.txt")).unwrap(),
+            original
+        );
+        assert!(!root.path().join("new.txt").exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        let journal = std::fs::read_to_string(ledger.path().join("operations.jsonl")).unwrap();
+        let last: Value = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+        assert_eq!(last["failure_kind"], "rejected");
+        assert_eq!(last["decision"], "execution_rejected");
+        assert_eq!(last["recovery_action"], "correct_request_before_retry");
+    }
+    let mut corrected = file("existing.txt");
+    corrected.expected_sha256 = Some(sha);
+    corrected.content = Some("corrected write".into());
+    let result = backend
+        .execute(DeveloperOperation::Write(corrected), context("owner"))
+        .await
+        .unwrap();
+    assert_eq!(result["success"], true);
+    assert_eq!(
+        std::fs::read(root.path().join("existing.txt")).unwrap(),
+        b"corrected write"
+    );
+}
+
+#[test]
+fn commit_path_failures_are_not_downgraded_to_preflight_rejections() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None).unwrap();
+    let path = root.path().join("existing.txt");
+    std::fs::write(&path, b"external edit").unwrap();
+    let result = backend.replace_file(&path, &hash(b"old"), b"new", None, &context("owner"));
+    assert!(
+        matches!(result, Err(ToolExecutionError::Failed(message)) if message.contains("提交前变化"))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"external edit");
+    let result = backend.replace_file(
+        &root.path().join("missing-parent/new.txt"),
+        "",
+        b"new",
+        None,
+        &context("owner"),
+    );
+    assert!(
+        matches!(result, Err(ToolExecutionError::Failed(message)) if message.contains("临时文件不可创建"))
+    );
+    assert!(!root.path().join("missing-parent").exists());
 }
 
 #[tokio::test]
@@ -849,6 +962,10 @@ async fn search_is_literal_bounded_redacted_and_skips_version_control_build_and_
         ]
     );
     assert_eq!(all["truncated"], false);
+    assert_eq!(all["coverage"]["complete"], false);
+    assert_eq!(all["coverage"]["files_searched"], 3);
+    assert_eq!(all["coverage"]["skipped_entries"]["non_utf8"], 1);
+    assert_eq!(all["coverage"]["skipped_directories"], 2);
     assert_eq!(all["untrusted_data"], true);
     assert!(
         all["matches"][3]["text"]
@@ -888,6 +1005,8 @@ async fn search_is_literal_bounded_redacted_and_skips_version_control_build_and_
     assert_eq!(nested["matches"].as_array().unwrap().len(), 2);
     assert_eq!(nested["matches"][0]["path"], "src/nested/b.txt");
     assert_eq!(nested["matches"][1]["path"], "src/nested/c.txt");
+    assert_eq!(nested["coverage"]["complete"], true);
+    assert_eq!(nested["coverage"]["files_searched"], 2);
 
     // 输出总量有上限：即使调用方要求很多，也在约 32 KiB 内截断。
     let mut many = String::new();
@@ -922,6 +1041,56 @@ async fn search_is_literal_bounded_redacted_and_skips_version_control_build_and_
         )
         .await;
     assert!(escape.is_err());
+}
+
+#[tokio::test]
+async fn empty_search_reports_omitted_directories_and_large_files_without_disclosing_paths() {
+    struct Access;
+    impl DeveloperAuthorization for Access {
+        fn is_operator(&self, _: &ContextScope) -> bool {
+            true
+        }
+        fn permits_file(&self, _: &ContextScope, path: &Path, _: bool) -> bool {
+            !path.ends_with("private-vault")
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    for dir in ["target", "private-vault"] {
+        std::fs::create_dir(root.path().join(dir)).unwrap();
+        std::fs::write(root.path().join(dir).join("smtp-hidden.txt"), "SMTP").unwrap();
+    }
+    std::fs::write(root.path().join("visible.txt"), "unrelated text").unwrap();
+    let mut large = std::fs::File::create(root.path().join("large.txt")).unwrap();
+    large.write_all(b"SMTP").unwrap();
+    large.set_len(MAX_FILE as u64 + 1).unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
+        .unwrap()
+        .with_authorization(Arc::new(Access));
+    let result = backend
+        .execute(
+            DeveloperOperation::Search(SearchArguments {
+                path: ".".into(),
+                query: "SMTP".into(),
+                max_results: 50,
+            }),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    assert!(result["matches"].as_array().unwrap().is_empty());
+    assert_eq!(result["truncated"], false);
+    assert_eq!(result["files_scanned"], 2);
+    assert_eq!(result["coverage"]["complete"], false);
+    assert_eq!(result["coverage"]["files_searched"], 1);
+    assert_eq!(result["coverage"]["directories_visited"], 1);
+    assert_eq!(result["coverage"]["skipped_directories"], 2);
+    assert_eq!(result["coverage"]["skipped_entries"]["too_large"], 1);
+    assert_eq!(result["coverage"]["skipped_entries"]["protected"], 1);
+    assert_eq!(result["coverage"]["skipped_entries"]["excluded_name"], 1);
+    for private in ["private-vault", "smtp-hidden.txt"] {
+        assert!(!result.to_string().contains(private));
+    }
 }
 #[cfg(unix)]
 #[tokio::test]

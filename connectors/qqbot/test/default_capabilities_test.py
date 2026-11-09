@@ -34,7 +34,7 @@ DEFAULT_TOOLS = {
     "list_interests", "list_goals", "manage_goal", "list_skills", "list_forged_tools",
     "manage_skill", "manage_forged_tool", "set_reminder", "cancel_reminder",
     "dispatch_background_task", "list_background_tasks", "cancel_background_task",
-    "run_subagent", "create_subagent", "list_subagents", "delete_subagent",
+    "run_subagent", "list_subagent_runs", "create_subagent", "list_subagents", "delete_subagent",
     "set_wakeup_trigger", "list_wakeup_triggers", "cancel_wakeup_trigger",
     "sleep", "task_progress", "save_workflow_tool", "list_workflow_tools",
     "run_workflow_tool", "inspect_runtime_health", "send_message",

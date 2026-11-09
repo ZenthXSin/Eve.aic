@@ -2061,6 +2061,48 @@ async fn an_oversized_work_batch_does_not_spend_the_last_expression_choice() {
     assert_eq!(send.starts.lock().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn child_charges_cannot_consume_the_parents_last_expression_choice() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("work", "echo", json!({}))]),
+        tool_response(vec![call(
+            "say",
+            "send_message",
+            json!({"text":"保留真实收尾"}),
+        )]),
+        final_response("内部结束"),
+    ]);
+    let work = Arc::new(TestTool::new("echo", None, ToolMode::Echo));
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![work.clone(), send.clone()],
+        LlmHostConfig {
+            max_tool_calls: 10,
+            max_tool_rounds: 0,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pool = eve_llm_api::SharedToolSteps::new(10).unwrap();
+    let child = pool.with_parent_reserve(1);
+    assert!(child.reserve(9).unwrap());
+    let output = host
+        .with_shared_steps(pool.clone())
+        .run_turn(turn())
+        .await
+        .unwrap();
+    assert_eq!(output.diagnostics.started_tools, 1);
+    assert!(work.starts.lock().unwrap().is_empty());
+    assert_eq!(send.starts.lock().unwrap().len(), 1);
+    assert_eq!(pool.usage().unwrap().tool_calls, 10);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests[1].tools.len(), 1);
+    assert_eq!(requests[1].tools[0].name, "send_message");
+    assert!(requests[2].tools.is_empty());
+}
+
 fn final_response(text: &str) -> Result<ModelResponse, LlmError> {
     Ok(ModelResponse::Final { text: text.into() })
 }
@@ -4132,4 +4174,75 @@ async fn delegated_history_compacts_outside_current_input_and_restores_legacy_ch
             .collect::<Vec<_>>(),
         ["done-once"]
     );
+}
+
+#[tokio::test]
+async fn leaf_journal_records_own_calls_without_resetting_parent_budget_and_refuses_replay() {
+    for fail_before_tools in [false, true] {
+        let scope = eve_llm_api::ContextScope {
+            session_id: "parent".into(),
+            user_id: "owner".into(),
+        };
+        let session = ModelSession::scoped("main", &scope)
+            .unwrap()
+            .with_turn("one")
+            .unwrap()
+            .fork("subagent", Some("one:code"))
+            .unwrap();
+        let pool = eve_llm_api::SharedToolSteps::new(10).unwrap();
+        assert!(pool.reserve(4).unwrap());
+        pool.record_model_request().unwrap();
+        pool.record_model_request().unwrap();
+        let journal = Arc::new(MemoryJournal::default());
+        journal
+            .fail_before_tools
+            .store(fail_before_tools, Ordering::SeqCst);
+        let provider = RecordingProvider::scripted(vec![
+            tool_response(vec![call("leaf-once", "echo", json!({}))]),
+            final_response("真实结果"),
+        ]);
+        let tool = Arc::new(TestTool::new(
+            "echo",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Echo,
+        ));
+        let config = LlmHostConfig {
+            max_tool_calls: 2,
+            ..Default::default()
+        };
+        let (host, _, _) = make_host(provider.clone(), vec![tool.clone()], config.clone()).await;
+        let result = host
+            .with_shared_steps(pool.clone())
+            .with_model_session(session.clone())
+            .with_leaf_turn_journal(journal.clone())
+            .run_scoped_turn_with_events(turn(), Some(scope.clone()), &ProgressRecorder::default())
+            .await;
+        if fail_before_tools {
+            assert!(result.is_err());
+            assert!(tool.starts.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(result.unwrap().text, "真实结果");
+            assert_eq!(*tool.starts.lock().unwrap(), ["leaf-once"]);
+            let saved = journal.frame.lock().unwrap().clone().unwrap();
+            saved.validate(2).unwrap();
+            assert_eq!(saved.used_tool_calls, 1);
+            assert_eq!(saved.delegated_tool_calls, 0);
+            assert_eq!(saved.delegated_model_requests, 0);
+            assert_eq!(saved.provider_requests, 2);
+        }
+        assert_eq!(pool.usage().unwrap().tool_calls, 5);
+        let before = pool.usage().unwrap();
+        let replay = RecordingProvider::scripted(vec![]);
+        let (host, _, _) = make_host(replay.clone(), vec![tool], config).await;
+        assert!(
+            host.with_shared_steps(pool.clone())
+                .with_model_session(session)
+                .with_leaf_turn_journal(journal)
+                .run_scoped_turn_with_events(turn(), Some(scope), &ProgressRecorder::default())
+                .await
+                .is_err()
+        );
+        assert!(replay.requests.lock().unwrap().is_empty());
+        assert_eq!(pool.usage().unwrap(), before);
+    }
 }
