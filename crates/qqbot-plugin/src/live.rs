@@ -288,6 +288,29 @@ impl LiveDialogue {
         handoff: InputReplyHandoff,
         persist: impl FnOnce() -> PluginResult<bool>,
     ) -> PluginResult<Option<ClaimedInputReply>> {
+        self.claim_progress(scope, turn_id, handoff, false, persist)
+    }
+
+    /// 同一最新待消费原话的新进度；锁内核对锚点和原话，不消费或重复登记用户输入。
+    /// persist 仍须复核真实控制代、工具批次及取消，先保存 sending 再交接。
+    pub(crate) fn claim_pending_progress_reply(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        handoff: InputReplyHandoff,
+        persist: impl FnOnce() -> PluginResult<bool>,
+    ) -> PluginResult<Option<ClaimedInputReply>> {
+        self.claim_progress(scope, turn_id, handoff, true, persist)
+    }
+
+    fn claim_progress(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        handoff: InputReplyHandoff,
+        pending: bool,
+        persist: impl FnOnce() -> PluginResult<bool>,
+    ) -> PluginResult<Option<ClaimedInputReply>> {
         if handoff.kind != InputReplyKind::Progress
             || handoff.delivery != InputReplyDelivery::Sending
         {
@@ -312,8 +335,16 @@ impl LiveDialogue {
         let bytes = serde_json::to_vec(&handoff)
             .map_err(|_| PluginError::Task("交流交接事实无法序列化".into()))?
             .len();
+        let input_matches = if pending {
+            input.messages.last().is_some_and(|(text, anchor)| {
+                anchor.as_deref() == Some(handoff.input_message_id.as_str())
+                    && text == &handoff.input_text
+            })
+        } else {
+            input.messages.is_empty()
+        };
         if !input.accepting
-            || !input.messages.is_empty()
+            || !input_matches
             || input.replies.contains_key(&handoff.event_id)
             || input.replies.len() >= 64
             || input.reply_bytes.saturating_add(bytes) > 256 * 1024
@@ -345,6 +376,16 @@ impl LiveDialogue {
                     .lock()
                     .is_ok_and(|input| input.accepting && input.messages.is_empty())
             })
+    }
+
+    /// 待消费进度只绑定最后一条原话；消费或新消息到来立即撤销未认领资格。
+    pub(crate) fn pending_progress_is_current(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        anchor: &str,
+    ) -> bool {
+        self.pending_anchor(scope, turn_id).as_deref() == Some(anchor)
     }
 
     /// 持有入口锁时先保存平台回执，成功后才让运行时看见正文。
@@ -1560,6 +1601,225 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pending_progress_claim_requires_exact_unconsumed_input_and_preserves_unknown() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        let fact = |event: &str| InputReplyHandoff {
+            kind: InputReplyKind::Progress,
+            input_message_id: "pending".into(),
+            input_text: "继续核对".into(),
+            event_id: event.into(),
+            reply_text: "第一步返回了，下一步还在运行".into(),
+            delivery: InputReplyDelivery::Sending,
+        };
+        assert!(!live.pending_progress_is_current(&scope, 1, "pending"));
+        assert!(
+            live.claim_pending_progress_reply(&scope, 1, fact("empty"), || panic!(
+                "无输入不可领取"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        live.steer_anchored(
+            &scope,
+            1,
+            "继续核对".into(),
+            Some("pending".into()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(live.pending_progress_is_current(&scope, 1, "pending"));
+        assert!(
+            !live.progress_is_current(&scope, 1),
+            "普通进度的空输入合同保留"
+        );
+        assert!(
+            live.claim_progress_reply(&scope, 1, fact("ordinary"), || panic!(
+                "普通入口不得领取pending"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        let foreign = ContextScope {
+            user_id: "other".into(),
+            ..scope.clone()
+        };
+        for (candidate, id) in [(&foreign, 1), (&scope, 2)] {
+            assert!(!live.pending_progress_is_current(candidate, id, "pending"));
+            assert!(
+                live.claim_pending_progress_reply(candidate, id, fact("foreign"), || panic!(
+                    "跨身份或轮次"
+                ))
+                .unwrap()
+                .is_none()
+            );
+        }
+        let mut changed = fact("changed");
+        changed.input_text = "伪造原话".into();
+        assert!(
+            live.claim_pending_progress_reply(&scope, 1, changed, || panic!("原话不匹配"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            live.claim_pending_progress_reply(&scope, 1, fact("cancelled"), || Ok(false))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            live.claim_pending_progress_reply(&scope, 1, fact("save-error"), || Err(
+                PluginError::State("保存失败".into())
+            ))
+            .is_err()
+        );
+        let claim = live
+            .claim_pending_progress_reply(&scope, 1, fact("sent-once"), || Ok(true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.pending_anchor(&scope, 1).as_deref(),
+            Some("pending"),
+            "领取不消费业务输入"
+        );
+        claim.complete(InputReplyDelivery::Unknown).unwrap();
+        assert!(
+            live.claim_pending_progress_reply(&scope, 1, fact("sent-once"), || panic!(
+                "unknown不得重放"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        live.steer_anchored(
+            &scope,
+            1,
+            "补充新问题".into(),
+            Some("newer".into()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!live.pending_progress_is_current(&scope, 1, "pending"));
+        assert!(
+            live.claim_pending_progress_reply(&scope, 1, fact("old-anchor"), || panic!(
+                "新消息撤销旧锚点"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        let update = turn.take_update(false).unwrap();
+        assert_eq!(update.batch.messages, ["继续核对", "补充新问题"]);
+        assert_eq!(update.batch.review_anchor.as_deref(), Some("newer"));
+        assert_eq!(update.input_replies.len(), 1);
+        assert_eq!(update.input_replies[0].kind, InputReplyKind::Progress);
+        assert_eq!(
+            update.input_replies[0].delivery,
+            InputReplyDelivery::Unknown
+        );
+        assert!(!live.pending_progress_is_current(&scope, 1, "newer"));
+        let consumed = InputReplyHandoff {
+            input_message_id: "newer".into(),
+            input_text: "补充新问题".into(),
+            ..fact("consumed")
+        };
+        assert!(
+            live.claim_pending_progress_reply(&scope, 1, consumed, || panic!("已消费不能发送"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(turn.take_update(true).unwrap(), SteeringUpdate::default());
+    }
+
+    #[test]
+    fn pending_progress_claim_and_input_consumption_share_the_persistence_boundary() {
+        use std::{sync::mpsc, thread};
+        let live = Arc::new(LiveDialogue::default());
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        live.steer_anchored(
+            &scope,
+            1,
+            "继续核对".into(),
+            Some("pending".into()),
+            || Ok(()),
+        )
+        .unwrap();
+        let (saving, saved) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let claimant = {
+            let live = live.clone();
+            let scope = scope.clone();
+            thread::spawn(move || {
+                live.claim_pending_progress_reply(
+                    &scope,
+                    1,
+                    InputReplyHandoff {
+                        kind: InputReplyKind::Progress,
+                        input_message_id: "pending".into(),
+                        input_text: "继续核对".into(),
+                        event_id: "new-revision".into(),
+                        reply_text: "第一步返回了".into(),
+                        delivery: InputReplyDelivery::Sending,
+                    },
+                    || {
+                        saving.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(3)).unwrap();
+                        Ok(true)
+                    },
+                )
+                .unwrap()
+                .unwrap()
+            })
+        };
+        saved.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (started, starting) = mpsc::channel();
+        let (consumed, consumption) = mpsc::channel();
+        let consumer = {
+            let turn = turn.clone();
+            thread::spawn(move || {
+                started.send(()).unwrap();
+                consumed.send(turn.take_update(false).unwrap()).unwrap();
+            })
+        };
+        starting.recv_timeout(Duration::from_secs(3)).unwrap();
+        let blocked = consumption.recv_timeout(Duration::from_millis(30));
+        release.send(()).unwrap();
+        let claim = claimant.join().unwrap();
+        consumer.join().unwrap();
+        assert!(
+            matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)),
+            "不得消费半份持久化交接"
+        );
+        let update = consumption.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(update.batch.messages, ["继续核对"]);
+        assert_eq!(update.input_replies.len(), 1);
+        assert_eq!(update.input_replies[0].kind, InputReplyKind::Progress);
+        assert_eq!(
+            update.input_replies[0].delivery,
+            InputReplyDelivery::Sending
+        );
+        claim
+            .complete(InputReplyDelivery::Sent {
+                platform_message_id: "platform-1".into(),
+            })
+            .unwrap();
+        let final_update = turn.take_update(false).unwrap();
+        assert_eq!(final_update.batch, SteeringBatch::default());
+        assert_eq!(
+            final_update.input_replies[0].delivery,
+            InputReplyDelivery::Sent {
+                platform_message_id: "platform-1".into()
+            }
+        );
+        assert_eq!(turn.take_update(false).unwrap(), SteeringUpdate::default());
     }
 
     #[test]

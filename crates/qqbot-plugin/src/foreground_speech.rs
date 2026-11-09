@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, sync::Mutex};
 use tokio::time::Instant;
 
 type ScopeKey = (String, String);
+const DELEGATED_RESULTS_MEANING: &str = "submitted仅表示交付执行器，仍可能校验或排队；returned是收到工具回执且包括失败，failed/unknown是失败及副作用未确认的计数，不能据此推断编译或业务完成";
 fn scope_key(key: &GenerationKey) -> ScopeKey {
     (key.session.session_id.clone(), key.session.user_id.clone())
 }
@@ -135,6 +136,25 @@ impl ForegroundActivity {
     /// 慢工具及之后实际变化的子代理阶段各提供一次交流机会；同代最多三次、至少间隔一分钟。
     /// 这里限制的是观察与模型判断，不自动发消息，不重建已消失的批次。
     pub(super) fn progress_candidate(&self, key: &GenerationKey, turn_id: u64) -> Option<Batch> {
+        self.candidate(key, turn_id, None)
+    }
+
+    /// 待消费原话的首次交流已结束后，仅同批新的委派事实可再获得进度机会。
+    pub(super) fn pending_progress_candidate(
+        &self,
+        key: &GenerationKey,
+        turn_id: u64,
+        previous: &ForegroundInput,
+    ) -> Option<Batch> {
+        self.candidate(key, turn_id, Some(previous))
+    }
+
+    fn candidate(
+        &self,
+        key: &GenerationKey,
+        turn_id: u64,
+        pending: Option<&ForegroundInput>,
+    ) -> Option<Batch> {
         let mut state = self.0.lock().ok()?;
         let scope = scope_key(key);
         let batch = state.batches.get(&scope)?;
@@ -143,6 +163,17 @@ impl ForegroundActivity {
             || (batch.progress_observed && batch.observed_revision == batch.progress_revision)
             || batch.since.elapsed() < std::time::Duration::from_secs(8)
         {
+            return None;
+        }
+        if pending.is_some_and(|previous| {
+            previous.key != *key
+                || previous.turn_id != turn_id
+                || previous.batch != batch.version
+                || !previous.resolved
+                || !previous.decision_started
+                || (previous.progress && !previous.pending_progress)
+                || batch.progress_revision <= previous.progress_revision
+        }) {
             return None;
         }
         if state.progress.get(&scope).is_some_and(|budget| {
@@ -233,6 +264,7 @@ pub(super) struct ForegroundInput {
     pub(super) next: Instant,
     batch: u64,
     pub(super) progress: bool,
+    pub(super) pending_progress: bool,
     proactive_at: Option<Instant>,
     decision_started: bool,
     progress_revision: u64,
@@ -254,9 +286,12 @@ impl ForegroundInput {
                 facts: json!({"kind":"foreground_input_pending", "phase":"tools", "tool_state":"awaiting_results",
                     "activity":batch.activity,"turn_id":batch.turn_id,"observed_at_ms":now_ms(),
                     "tools_elapsed_ms_at_input":batch.since.elapsed().as_millis() as u64,
+                    "delegated_tools":batch.delegated.values().collect::<Vec<_>>(),
+                    "delegated_results_meaning":DELEGATED_RESULTS_MEANING,
                     "input_pending":true,"business_action":"continues_in_original_turn"}),
             },
             progress: false,
+            pending_progress: false,
             proactive_at: None,
             decision_started: false,
             progress_revision: batch.progress_revision,
@@ -301,24 +336,36 @@ impl ForegroundInput {
         self.proactive_at = None;
     }
 
+    pub(super) fn pending_progress(batch: Batch, anchor: String, started: Instant) -> Self {
+        let mut value = Self::progress(batch, anchor, started);
+        value.pending_progress = true;
+        value.event.facts["input_pending"] = json!(true);
+        value.use_merged_window();
+        value
+    }
+
     pub(super) fn proactive(&self, now: Instant) -> bool {
         self.progress && self.proactive_at.is_some_and(|at| now >= at)
     }
 
     /// 只在首次决策前冻结最新只读进展；之后同 event 的事实不变，缓存决定不再次调用模型。
     pub(super) fn prepare_decision(&mut self, activity: &ForegroundActivity) {
-        if !self.progress || self.decision_started {
+        if self.decision_started {
+            return;
+        }
+        if !self.progress {
+            // 输入事实已在入站时保存；不能复用同 event 改写已持久化快照。
+            self.decision_started = true;
             return;
         }
         if let Some(batch) = activity.observed_latest(&self.key, self.turn_id, self.batch) {
+            self.progress_revision = batch.progress_revision;
             self.event.facts["activity"] = json!(batch.activity);
             self.event.facts["tools_elapsed_ms"] = json!(batch.since.elapsed().as_millis() as u64);
             self.event.facts["observed_at_ms"] = json!(now_ms());
             self.event.facts["delegated_tools"] =
                 json!(batch.delegated.values().collect::<Vec<_>>());
-            self.event.facts["delegated_results_meaning"] = json!(
-                "submitted仅表示交付执行器，仍可能校验或排队；returned是收到工具回执且包括失败，failed/unknown是失败及副作用未确认的计数，不能据此推断编译或业务完成"
-            );
+            self.event.facts["delegated_results_meaning"] = json!(DELEGATED_RESULTS_MEANING);
         }
         self.decision_started = true;
     }
@@ -334,7 +381,9 @@ impl ForegroundInput {
             user_id: self.key.session.user_id.clone(),
         };
         self.activity_is_current(activity, control)
-            && if self.progress {
+            && if self.pending_progress {
+                live.pending_progress_is_current(&scope, self.turn_id, &self.event.anchor)
+            } else if self.progress {
                 live.progress_is_current(&scope, self.turn_id)
             } else {
                 live.pending_anchor(&scope, self.turn_id).as_deref() == Some(&self.event.anchor)
@@ -524,6 +573,158 @@ mod tests {
         assert!(
             activity.progress_candidate(&key, 3).is_none(),
             "工具结束不恢复旧批次"
+        );
+    }
+
+    #[test]
+    fn pending_progress_requires_finished_input_and_a_new_revision_in_the_same_batch() {
+        let activity = ForegroundActivity::default();
+        let key = GenerationKey {
+            session: SessionKey::new("session", "owner").unwrap(),
+            task_id: "task".into(),
+            controller_epoch: [1; 16],
+            generation: 1,
+        };
+        let start = || {
+            event(
+                &key,
+                TurnEventKind::ToolBatchStarted {
+                    calls: vec![ToolCall {
+                        id: "coding".into(),
+                        name: "run_subagent".into(),
+                        arguments: json!({}),
+                    }],
+                },
+            )
+        };
+        let update = |submitted| {
+            event(
+                &key,
+                TurnEventKind::DelegatedToolProgress {
+                    parent_call_id: "coding".into(),
+                    progress: eve_llm_api::DelegatedToolProgress {
+                        submitted_calls: submitted,
+                        pending_tool_names: vec!["run_command".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+        };
+        activity.observe(&start());
+        activity.observe(&update(1));
+        activity
+            .0
+            .lock()
+            .unwrap()
+            .batches
+            .get_mut(&scope_key(&key))
+            .unwrap()
+            .since -= std::time::Duration::from_secs(9);
+        let original = activity.progress_candidate(&key, 3).unwrap();
+        let mut input = ForegroundInput::new(original, "pending".into());
+        let frozen_input = input.event.clone();
+        activity.observe(&update(2));
+        assert!(
+            activity
+                .pending_progress_candidate(&key, 3, &input)
+                .is_none(),
+            "输入判断还未开始"
+        );
+        input.prepare_decision(&activity);
+        assert_eq!(input.event, frozen_input, "已在入站保存的事实不能改写");
+        assert!(
+            activity
+                .pending_progress_candidate(&key, 3, &input)
+                .is_none(),
+            "输入判断还未结束"
+        );
+        input.resolved = true;
+        assert!(
+            activity
+                .pending_progress_candidate(&key, 3, &input)
+                .is_none(),
+            "同代仍有一分钟冷却"
+        );
+        let cool = || {
+            activity
+                .0
+                .lock()
+                .unwrap()
+                .progress
+                .get_mut(&scope_key(&key))
+                .unwrap()
+                .last -= std::time::Duration::from_secs(61);
+        };
+        cool();
+        let mut foreign = key.clone();
+        foreign.generation += 1;
+        assert!(
+            activity
+                .pending_progress_candidate(&foreign, 3, &input)
+                .is_none()
+        );
+        assert!(
+            activity
+                .pending_progress_candidate(&key, 4, &input)
+                .is_none()
+        );
+        let candidate = activity
+            .pending_progress_candidate(&key, 3, &input)
+            .unwrap();
+        let mut pending =
+            ForegroundInput::pending_progress(candidate, "pending".into(), Instant::now());
+        assert_eq!(pending.event.facts["input_pending"], true);
+        assert!(pending.event.id.starts_with("foreground-progress:"));
+        assert!(!pending.proactive(Instant::now() + std::time::Duration::from_secs(1000)));
+        // 开窗期间又有修订，首次真正判断冻结最新；此修订不能再触发一次。
+        activity.observe(&update(3));
+        pending.prepare_decision(&activity);
+        assert_eq!(
+            pending.event.facts["delegated_tools"][0]["submitted_calls"],
+            3
+        );
+        let frozen_progress = pending.event.clone();
+        pending.resolved = true;
+        cool();
+        assert!(
+            activity
+                .pending_progress_candidate(&key, 3, &pending)
+                .is_none(),
+            "冻结过的修订不能再次判断"
+        );
+        activity.observe(&update(4));
+        pending.prepare_decision(&activity);
+        assert_eq!(pending.event, frozen_progress, "重试同一事件不刷新事实");
+        let last = activity
+            .pending_progress_candidate(&key, 3, &pending)
+            .unwrap();
+        let mut last = ForegroundInput::pending_progress(last, "pending".into(), Instant::now());
+        last.prepare_decision(&activity);
+        last.resolved = true;
+        cool();
+        activity.observe(&update(5));
+        assert!(
+            activity
+                .pending_progress_candidate(&key, 3, &last)
+                .is_none(),
+            "pending也不能绕过每代三次额度"
+        );
+        activity.observe(&start());
+        activity.observe(&update(6));
+        activity
+            .0
+            .lock()
+            .unwrap()
+            .batches
+            .get_mut(&scope_key(&key))
+            .unwrap()
+            .since -= std::time::Duration::from_secs(9);
+        activity.0.lock().unwrap().progress.remove(&scope_key(&key));
+        assert!(
+            activity
+                .pending_progress_candidate(&key, 3, &last)
+                .is_none(),
+            "新批次不能继承旧pending判断"
         );
     }
 
