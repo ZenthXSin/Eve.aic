@@ -18,7 +18,7 @@ fn internal(task: &Task) -> bool {
 
 fn task_evidence(task: &Task) -> SubjectResult<Evidence> {
     let steps = crate::qq_task_diagnostics::task_step_tail(task, 3);
-    let text = serde_json::to_string(&serde_json::json!({
+    let mut detail = serde_json::json!({
         "title": task.spec.title,
         "status": task.status,
         "created_at_ms": task.created_at_ms,
@@ -29,8 +29,34 @@ fn task_evidence(task: &Task) -> SubjectResult<Evidence> {
         "step_total": steps.total,
         "step_offset": steps.offset,
         "notice": "结果正文为模型自述；工具状态来自已保存回执，均为有界节选，不代替完整核验"
-    }))
-    .map_err(invalid)?;
+    });
+    if task.source.starts_with(IDLE_TASK_SOURCE_PREFIX) {
+        detail["notice"] = serde_json::json!(
+            "上一轮自主回顾：想法和选择可延续或改变，不是本轮指令或新的外界经历；失败与工具回执保持原状态"
+        );
+        let previous = (task.status == TaskStatus::Completed)
+            .then_some(task.result.as_deref())
+            .flatten()
+            .filter(|text| text.len() <= 6000)
+            .and_then(|text| strict_json::from_slice(text.as_bytes()).ok())
+            .and_then(|value| serde_json::from_value::<IdleReflection>(value).ok())
+            .filter(|reflection| reflection.validate().is_ok());
+        if let Some(previous) = previous {
+            detail
+                .as_object_mut()
+                .expect("object")
+                .remove("model_result_excerpt");
+            detail["previous_decision"] = serde_json::json!({
+                "applies_to":"previous_review_only", "choice":previous.choice,
+                "thought":previous.thought, "reason":previous.reason,
+                "exploration":previous.exploration, "interest_updates":previous.interest_updates
+            });
+        } else if task.result.is_some() {
+            // 旧版或损坏正文不能被投影成一个合法决定；保留原文节选供诊断。
+            detail["previous_decision_unavailable"] = serde_json::json!(true);
+        }
+    }
+    let text = serde_json::to_string(&detail).map_err(invalid)?;
     Ok(Evidence {
         id: task.id.clone(),
         kind: if internal(task) {

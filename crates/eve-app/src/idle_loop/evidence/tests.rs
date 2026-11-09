@@ -175,6 +175,63 @@ fn old_focus_saturation_preserves_recent_conversation_exploration_and_all_task_o
 }
 
 #[test]
+fn previous_idle_choice_is_historical_and_keeps_personal_thoughts_and_interest_text() {
+    let mut review = task(
+        "previous-review",
+        IDLE_TASK_SOURCE_PREFIX,
+        TaskStatus::Completed,
+        4,
+    );
+    let thought = "想看看陌生的旋律。".repeat(35);
+    let result = json!({
+        "choice":"wait", "thought":thought, "reason":"现在想休息，之前没有明确工程目标",
+        "judgments":[], "action":null, "revisit_after_minutes":30,
+        "interest_updates":[{"key":"melody","topic":"旋律","phase":"curious","strength":40,
+            "reason":"先前听到的变化让我好奇","want_to_try":"比较两段旋律","evidence":["source-task"]}]
+    });
+    review.failure = None;
+    review.result = Some(result.to_string());
+    let before = serde_json::to_vec(&review).unwrap();
+    let observed = observe(vec![], std::slice::from_ref(&review), None, vec![]).unwrap();
+    observed.validate().unwrap();
+    let evidence = &observed.evidence[0];
+    let detail: serde_json::Value = serde_json::from_str(&evidence.text).unwrap();
+    assert_eq!(evidence.kind, "self_reflection");
+    assert_eq!(
+        detail["previous_decision"]["applies_to"],
+        "previous_review_only"
+    );
+    assert_eq!(detail["previous_decision"]["choice"], "wait");
+    assert_eq!(detail["previous_decision"]["thought"], thought);
+    assert_eq!(detail["previous_decision"]["reason"], result["reason"]);
+    assert_eq!(
+        detail["previous_decision"]["interest_updates"],
+        result["interest_updates"]
+    );
+    assert!(detail.get("model_result_excerpt").is_none());
+    assert!(detail["notice"].as_str().unwrap().contains("不是本轮指令"));
+    assert_eq!(serde_json::to_vec(&review).unwrap(), before);
+}
+
+#[test]
+fn malformed_or_unfinished_idle_results_remain_unknown_with_original_failure() {
+    for status in [TaskStatus::Completed, TaskStatus::Interrupted] {
+        let mut review = task("broken-review", IDLE_TASK_SOURCE_PREFIX, status, 4);
+        review.result = Some("{不完整的原回顾".into());
+        let detail: serde_json::Value =
+            serde_json::from_str(&task_evidence(&review).unwrap().text).unwrap();
+        assert_eq!(detail["model_result_excerpt"], "{不完整的原回顾");
+        assert_eq!(detail["failure_excerpt"], "原失败记录");
+        assert_eq!(detail["previous_decision_unavailable"], true);
+        assert!(detail.get("previous_decision").is_none());
+        assert_eq!(
+            detail["status"],
+            serde_json::to_value(review.status).unwrap()
+        );
+    }
+}
+
+#[test]
 fn only_explicit_links_to_selected_task_results_remove_duplicate_focus_views() {
     let mut tasks: Vec<_> = (0..5)
         .map(|index| {

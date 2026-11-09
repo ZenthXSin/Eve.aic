@@ -1676,6 +1676,11 @@ impl LlmHost {
                     },
                 }
             };
+            crate::turn_continuity::project(
+                &mut request,
+                &transcript,
+                continuation.remaining().as_deref(),
+            );
             request.session = model_session.clone();
             let request_fingerprint =
                 if self.journal.is_some() || self.config.deferred_reply.is_some() {
