@@ -188,6 +188,51 @@ class NaturalProgressAcceptance(live.LiveToolAcceptance):
         self.assertEqual(len(self.progress_rows()), 1)
         self.assertEqual(len(self.speech_requests), 1, '同一批工具不得不断触发发言判断')
 
+    def test_slow_preparation_past_passive_window_still_allows_actual_progress(self):
+        self.install_task(expected_delivery='sent')
+        task_response = self.callback
+        first = True
+
+        def slow_preparation(body):
+            nonlocal first
+            if first:
+                first = False
+                # 真实等待跨越平台被动窗口；生产没有测试专用时钟或放宽窗口开关。
+                self.assertFalse(self.run_release.wait(241))
+            return task_response(body)
+
+        self.callback = slow_preparation
+        self.speech_callback = self.decide
+
+        def progress_after_window():
+            deadline = time.monotonic() + 270
+            while not self.tool_started.exists():
+                self.assertLess(time.monotonic(), deadline, '长准备后工具未启动')
+                self.assertFalse(self.run_release.wait(.05))
+            self.wait_progress('sent')
+            self.assertFalse(self.executions.exists())
+            self.assertEqual(len(self.main_requests), 1)
+            events = [json.loads(line) for line in
+                      (self.work / f'events-{self.runs}.jsonl').read_text().splitlines()]
+            outputs = [event for event in events if event.get('direction') == 'out'
+                       and event.get('type') in ('push', 'passive_push')]
+            self.assertEqual([event['type'] for event in outputs], ['push'],
+                             '过期后应走独立主动通道，不能延长或伪造原被动窗口')
+            self.assertEqual(outputs[0]['based_on_message_id'], 'working')
+            self.assertEqual(outputs[0]['text'], PROGRESS_TEXT)
+            self.assertEqual(len(self.speech_requests), 1)
+
+        self.run_natural([
+            {'send': self.message('working', INITIAL)},
+            *self.checkpoint('prepared-after-window'), {'touch': str(self.release_tool)},
+            self.wait_receipt('working'), self.wait_command('working', 'finish'),
+        ], checkpoints={'prepared-after-window': progress_after_window}, timeout=290,
+            env_extra={'EVE_OPENAI_TIMEOUT_SECONDS': '270', 'EVE_MODELS_PRIMARY_TIMEOUT_MS': '270000'})
+        self.assertIsNotNone(self.completed_main)
+        self.assertEqual(self.executions.read_text(), 'x')
+        self.assertEqual(len(self.progress_rows()), 1)
+        self.assertEqual(len(self.speech_requests), 1)
+
     def test_delayed_speak_uses_the_saved_decision_once_without_new_input(self):
         self.install_task(expected_delivery='sent')
         self.speech_callback = lambda facts: self.decide(facts, after_ms=2500)
@@ -247,6 +292,36 @@ class NaturalProgressAcceptance(live.LiveToolAcceptance):
         self.assertEqual(self.executions.read_text(), 'x')
         self.assertEqual(len(self.main_requests), 2)
         self.assertEqual(len(self.speech_requests), 1)
+        self.assertFalse(self.outbound_progress())
+
+    def test_explicit_quiet_request_keeps_work_running_without_progress_judgment(self):
+        def respond(body):
+            self.main_requests.append(body)
+            results = self.all_results(body)
+            if not results:
+                return self.choose('run_command', self.command)
+            self.assertTrue(results[-1]['success'], results[-1])
+            self.assertEqual(self.executions.read_text(), 'x')
+            return dialogue.text_response('已完成内部核对，保持安静。')
+
+        self.callback = respond
+        self.speech_callback = self.decide
+
+        def quiet_while_working():
+            self.assertFalse(self.run_release.wait(11))
+            self.assertFalse(self.executions.exists())
+            self.assertEqual(len(self.main_requests), 1)
+            self.assertEqual(self.speech_requests, [])
+            self.assertEqual(self.progress_rows(), [])
+
+        self.run_natural([
+            {'send': self.message('working', '执行隔离检查，保持安静，不用汇报。')},
+            {'wait_file': str(self.tool_started)}, *self.checkpoint('quiet-while-working'),
+            {'touch': str(self.release_tool)}, self.wait_receipt('working'),
+            self.wait_command('working', 'finish'),
+        ], checkpoints={'quiet-while-working': quiet_while_working})
+        self.assertEqual(len(self.main_requests), 2)
+        self.assertEqual(self.speech_requests, [])
         self.assertFalse(self.outbound_progress())
 
     def test_new_input_retires_a_delayed_progress_decision_and_the_tool_runs_once(self):

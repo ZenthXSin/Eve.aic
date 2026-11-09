@@ -1491,6 +1491,82 @@ test("前台窗口新输入和重启失效，未知投递不重试或变成主�
 
 const openForeground = {version:1,type:"open_foreground",id:"in-1"};
 const foregroundPush = id => ({...passiveFrame(id),foreground:true});
+const proactiveForegroundPush = id => ({...foregroundPush(id),type:"push"});
+
+test("慢工具主动发言身份可在四分钟后建立，不延长被动窗口或消费被动额度",async()=>{
+  let now=0;const f=fixture({now:()=>now});f.message();
+  now=PASSIVE_REPLY_WINDOW_MS+1000;
+  await f.bridge.command(openForeground);
+  assert.equal(f.frames.some(x=>x.type==="foreground_window"),false);
+  await f.bridge.command(proactiveForegroundPush("late-progress"));
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.deepEqual(f.sent.map(x=>x.target),[{scope:"c2c",targetId:"user-1"}]);
+  await f.bridge.command(foregroundPush("expired-passive"));
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  const early=fixture();early.message();await early.bridge.command(openForeground);
+  const remaining=early.frames.at(-1).remaining;
+  await early.bridge.command(proactiveForegroundPush("independent-quota"));
+  await early.bridge.command(openForeground);
+  assert.equal(early.frames.at(-1).remaining,remaining);
+});
+
+test("慢工具主动发言在 SDK 前核对可关闭身份，关闭或 finish 无需新 QQ 消息即可撤销",async()=>{
+  for (const mode of ["close_foreground","finish","new-input","stop","close-reopen"]) {
+    let now=0;const f=fixture({now:()=>now});f.message();
+    now=PASSIVE_REPLY_WINDOW_MS+1000;await f.bridge.command(openForeground);
+    const sending=f.bridge.command(proactiveForegroundPush("queued-proactive"));
+    let closing;
+    if (mode==="new-input") f.message("c2c","new-input");
+    else if (mode==="stop") f.bridge.stop();
+    else {
+      closing=f.bridge.command({version:1,type:mode==="close-reopen"?"close_foreground":mode,id:"in-1"});
+      if (mode==="close-reopen") await f.bridge.command(openForeground);
+    }
+    await closing;await sending;
+    assert.deepEqual(f.sent,[],mode);
+    if (mode!=="stop") assert.equal(f.frames.at(-1).failure_kind,"stale_decision",mode);
+    if (mode==="close_foreground" || mode==="close-reopen") {
+      await f.bridge.command(openForeground);
+      await f.bridge.command(proactiveForegroundPush("fresh-proactive"));
+      assert.equal(f.sent.length,1,"原轮仍有效时，新开身份可发送新决定");
+      assert.equal(f.frames.at(-1).ok,true);
+    }
+  }
+});
+
+test("慢工具主动发言不能只靠恢复锚点或别人的路由取得已结束前台身份",async()=>{
+  for (const mode of ["unopened","finished","missing","other-user","other-target","group"]) {
+    const f=fixture();if (mode!=="missing") f.message(mode==="group"?"group":"c2c");
+    if (mode!=="unopened") await f.bridge.command(openForeground);
+    if (mode==="finished") await f.bridge.command({version:1,type:"finish",id:"in-1"});
+    await f.bridge.command({version:1,type:"restore_anchor",scope:"c2c",target_id:"user-1",sender_id:"user-1",message_id:"in-1"});
+    await f.bridge.command({...proactiveForegroundPush("invalid-claim"),
+      ...(mode==="other-user"?{sender_id:"other-user"}:{}),...(mode==="other-target"?{target_id:"other-target"}:{})});
+    assert.deepEqual(f.sent,[],mode);
+    assert.equal(f.frames.at(-1).failure_kind,"stale_decision",mode);
+  }
+});
+
+test("慢工具主动发言失败或未知后关闭重开不重放，父轮写出仍互斥",async()=>{
+  for (const textResult of [{}, {id:"valid-result"}]) {
+    const f=fixture({textResult,fail:!!textResult.id});f.message();await f.bridge.command(openForeground);
+    await f.bridge.command(proactiveForegroundPush("attempt-once"));
+    assert.equal(f.frames.at(-1).ok,false);
+    await f.bridge.command({version:1,type:"close_foreground",id:"in-1"});
+    await f.bridge.command(openForeground);
+    await f.bridge.command(proactiveForegroundPush("attempt-once"));
+    assert.equal(f.sent.length,1);
+  }
+  const held=deferred();const f=fixture({hold:held.promise});f.message();await f.bridge.command(openForeground);
+  const sending=f.bridge.command(proactiveForegroundPush("held-proactive"));
+  await new Promise(setImmediate);
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"同一轮不能并发发送",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.sent.length,1);
+  held.resolve();await sending;
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"继续处理",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.sent.length,2);
+  assert.equal(f.frames.at(-1).ok,true);
+});
 
 test("原消息慢工具发言开窗保留主轮，共享已消费额度和原接收年龄",async()=>{
   let now=0;const f=fixture({now:()=>now});f.message();
