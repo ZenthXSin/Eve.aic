@@ -657,6 +657,37 @@ impl Drop for EvaluationGuard<'_> {
     }
 }
 
+/// 召回使用同范围原话与有界事件主题；不把后台的旧原话伪装成本轮新输入。
+fn recall_input(event: &QqSpeechEvent, current_text: &str) -> TurnInput {
+    fn bounded(text: &str, bytes: usize) -> &str {
+        let mut end = text.len().min(bytes);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+    let responding = event.id.starts_with("foreground-input:")
+        || event.id.strip_prefix("host-reply:") == Some(event.anchor.as_str());
+    let mut text = format!(
+        "{}：{}",
+        if responding {
+            "当前原话"
+        } else {
+            "此前最后原话，仅作语境"
+        },
+        bounded(current_text, 2048)
+    );
+    text.push_str("\n当前宿主事实主题：");
+    for field in ["kind", "activity", "phase", "user_text", "status"] {
+        if let Some(value) = event.facts.get(field).and_then(Value::as_str) {
+            text.push_str(&format!("\n{field}: {}", bounded(value, 384)));
+        }
+    }
+    TurnInput {
+        text: bounded(&text, 4096).into(),
+    }
+}
+
 impl Speech {
     async fn decide(&self, event: &QqSpeechEvent) -> Result<QqSpeechDecision, LlmError> {
         let scope = ContextScope {
@@ -672,9 +703,7 @@ impl Speech {
         let context = self
             .context
             .assemble_with_model_session(
-                TurnInput {
-                    text: "审视刚发生的宿主事实，自己决定是否开口。".into(),
-                },
+                recall_input(event, &current_text),
                 Some(scope.clone()),
                 Some(model_session.clone()),
             )

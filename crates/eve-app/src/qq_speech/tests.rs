@@ -21,6 +21,22 @@ fn speak() -> QqSpeechDecision {
 }
 
 #[test]
+fn speech_recall_uses_bounded_original_and_event_topic_without_routing_or_tool_arguments() {
+    let mut input = event("foreground-input:current");
+    input.facts = json!({"kind":"foreground_input_pending", "activity":"检查探索笔记", "phase":"tools",
+        "tool_arguments":{"credential":"not-a-recall-query"},"sender_id":"not-a-recall-query"});
+    let query = recall_input(&input, "继续研究昨天的星图");
+    assert!(query.text.starts_with("当前原话：继续研究昨天的星图"));
+    assert!(query.text.contains("检查探索笔记"));
+    assert!(!query.text.contains("not-a-recall-query"));
+    input.id = "foreground-progress:later".into();
+    let query = recall_input(&input, &"星图".repeat(4096));
+    assert!(query.text.starts_with("此前最后原话，仅作语境："));
+    assert!(query.text.contains("检查探索笔记"));
+    assert!(query.text.len() <= 4096);
+}
+
+#[test]
 fn new_facts_preserve_rules_pinned_and_history_before_dynamic_speech_context() {
     let context = ContextSnapshot {
         pinned: vec!["固定身份与宿主工具事实".into()],

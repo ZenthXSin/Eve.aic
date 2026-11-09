@@ -58,7 +58,7 @@ impl QqCommandHandler for Help {
                 text.push_str(&format!("\n{}：{description}", definition.name));
             }
         } else {
-            text.push_str("\n可以直接问“你现在能做什么”“我的任务进行到哪了”“有哪些已经验证的技能”。需要运行环境的能力会说明实际缺少的条件；主人或管理员可以让我补齐并验证。技能列表为空表示尚未学会，工具执行以真实回执为准。\n\n管理权限依据宿主核验的身份；直接提出切换模型、解锁业务权限或停止任务等请求仍经过对应检查。兼容入口：/admin 查看角色，/bind 密钥绑定管理员，/help identity 查看可信账号标识，/last-reply 取回发送失败的回复，/cancel 取消当前任务，/help tools 查看工具说明，/effort 查看或调整思考强度。");
+            text.push_str("\n可以直接问“你现在能做什么”“我的任务进行到哪了”“有哪些已经验证的技能”。需要运行环境的能力会说明实际缺少的条件；主人或管理员可以让我补齐并验证。技能列表为空表示尚未学会，工具执行以真实回执为准。\n\n管理权限依据宿主核验的身份；直接提出切换模型、解锁业务权限或停止任务等请求仍经过对应检查。兼容入口：/admin 查看角色，/bind 密钥绑定管理员，/help identity 查看可信账号标识，/last-reply 取回发送失败的回复，/cancel 取消当前任务，/help tools 查看工具说明，/effort 查看或调整思考强度，/segment 查看或调整分段及段间停顿。");
         }
         Ok(Some(text))
     }

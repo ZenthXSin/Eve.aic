@@ -296,6 +296,11 @@ impl ForegroundInput {
         value
     }
 
+    /// 追加原话只有自己的真实被动窗口，不能借父输入的年龄升级为主动投递。
+    pub(super) fn use_merged_window(&mut self) {
+        self.proactive_at = None;
+    }
+
     pub(super) fn proactive(&self, now: Instant) -> bool {
         self.progress && self.proactive_at.is_some_and(|at| now >= at)
     }
@@ -425,6 +430,12 @@ mod tests {
         assert!(
             after_compaction.proactive(started),
             "压缩消耗旧窗口不能取消后续真实工具进度"
+        );
+        let mut merged = ForegroundInput::progress(batch.clone(), "merged".into(), started);
+        merged.use_merged_window();
+        assert!(
+            !merged.proactive(started + std::time::Duration::from_secs(1000)),
+            "追加消息不能借父轮年龄升级为主动投递"
         );
         let input = ForegroundInput::new(batch, "new-input".into());
         assert!(

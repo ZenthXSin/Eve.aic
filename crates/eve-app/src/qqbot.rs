@@ -3145,6 +3145,10 @@ async fn run_qqbot_composed(
                 inner,
             }) as Arc<dyn SegmentPreferences>
         });
+        // 实时发送与普通回复共用最终偏好：手动选择、当前学习结果及插件开关均在发送时读取。
+        if let Some(live) = &live_dialogue {
+            live.configure_segmentation(segment_preferences.clone(), QQ_SEGMENT_POLICY)?;
+        }
         let segment_commands = segment_preferences.clone().map_or_else(
             segment_commands::QqCommands::disabled,
             |store| match &memory {

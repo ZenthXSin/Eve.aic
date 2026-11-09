@@ -82,7 +82,7 @@ fn seconds(ms: u64) -> String {
 }
 fn help(policy: &SegmentPolicy) -> String {
     format!(
-        "分段命令：/segment 查看；/segment on 开启；/segment off 整条发送；/segment parts 段数（{MIN_PREFERRED_SEGMENTS} 至 {}，默认 {}）；/segment pace 百分比（0 至 {MAX_PAUSE_PERCENT}，默认 {DEFAULT_PAUSE_PERCENT}，0 为不停顿）；/segment reset 恢复默认；QQ 开启记忆后用 /segment suggestions [页码] 查看建议，/segment adopt 偏好ID 版本 明确采用。只影响本会话，从下一条回复生效。",
+        "分段命令：/segment 查看；/segment on 开启；/segment off 整条发送；/segment parts 段数（{MIN_PREFERRED_SEGMENTS} 至 {}，默认 {}）；/segment pace 百分比（0 至 {MAX_PAUSE_PERCENT}，默认 {DEFAULT_PAUSE_PERCENT}，0 为不停顿）；/segment reset 恢复默认；QQ 开启记忆后用 /segment suggestions [页码] 查看建议，/segment adopt 偏好ID 版本 明确采用。开启后按表达需要分段，单条消息仍可整条发送；停顿比例只调整已选择的段间停顿。只影响本会话，从下一条回复生效。",
         policy.max_segments, policy.defaults.max_segments
     )
 }
@@ -159,7 +159,7 @@ pub(crate) fn execute(
     let off = if effective.enabled { "" } else { OFF_NOTE };
     Ok(match change {
         SegmentChange::Enabled(true) => format!(
-            "已开启本会话分段：下一条回复起按自然段至多 {} 段发送。",
+            "已开启本会话分段：下一条回复起可按表达需要分成至多 {} 段，单条消息仍可整条发送。",
             effective.limits.max_segments
         ),
         SegmentChange::Enabled(false) => {
@@ -365,7 +365,7 @@ mod tests {
         );
         assert_eq!(
             run(&store, "/segment on").unwrap(),
-            "已开启本会话分段：下一条回复起按自然段至多 5 段发送。"
+            "已开启本会话分段：下一条回复起可按表达需要分成至多 5 段，单条消息仍可整条发送。"
         );
         assert_eq!(
             run(&store, "/segment pace 200").unwrap(),

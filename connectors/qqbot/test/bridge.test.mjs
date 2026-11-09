@@ -1950,3 +1950,129 @@ test("同一 JSONL 块先保留群新窗口再发送，使用新路由且父 fin
   assert.equal(f.sent[0].target.msgId,"live-child");
   assert.equal(f.frames.filter(x=>x.type==="delivery" && x.progress).length,1);
 });
+
+
+test("合并输入跨工具批次重报原窗口，不恢复额度、年龄或未知投递",async()=>{
+  let now=0;const f=fixture({now:()=>now,textResult:{}});f.message();
+  now=2000;await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+  await f.bridge.command({...passiveFrame("attempt-once"),foreground:true});
+  assert.equal(f.frames.at(-1).failure_kind,"transport_unknown");
+  now=62000;await f.bridge.command(openForeground);
+  assert.deepEqual(f.frames.at(-1),{version:1,type:"foreground_window",id:"in-1",remaining_ms:178000,remaining:3});
+  await f.bridge.command({...passiveFrame("attempt-once"),foreground:true});
+  assert.equal(f.sent.length,1,"重报窗口不得重放未知投递");
+  now=PASSIVE_REPLY_WINDOW_MS;
+  const windows=f.frames.filter(x=>x.type==="foreground_window").length;
+  await f.bridge.command(openForeground);
+  assert.equal(f.frames.filter(x=>x.type==="foreground_window").length,windows);
+  await f.bridge.command({...passiveFrame("too-late"),foreground:true});
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_elapsed");
+  assert.equal(f.sent.length,1);
+});
+
+test("合并窗口重报后新原话或取消仍在SDK前撤销旧决定",async()=>{
+  for(const mode of ["new-input","cancel"]){
+    const f=fixture();f.message();
+    await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+    await f.bridge.command(openForeground);
+    const pending=f.bridge.command({...passiveFrame("stale-after-reopen"),foreground:true});
+    if(mode==="new-input")f.message("c2c","next");
+    else await f.bridge.command({version:1,type:"close_foreground",id:"in-1"});
+    await pending;
+    assert.deepEqual(f.sent,[],mode);
+    assert.equal(f.frames.at(-1).failure_kind,"stale_decision",mode);
+    const windows=f.frames.filter(x=>x.type==="foreground_window").length;
+    await f.bridge.command(openForeground);
+    assert.equal(f.frames.filter(x=>x.type==="foreground_window").length,windows,mode);
+  }
+});
+
+
+test("保留合并窗口额度也撤销旧发送对象，再开窗不复活原决定",async()=>{
+  let now=0;const f=fixture({now:()=>now});f.message();
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+  const old=f.bridge.command({...passiveFrame("old-decision"),foreground:true});
+  await f.bridge.command({version:1,type:"close_foreground",id:"in-1",keep_window:true});
+  await old;
+  assert.deepEqual(f.sent,[]);
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  await f.bridge.command({...passiveFrame("not-open"),foreground:true});
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  now=9000;await f.bridge.command(openForeground);
+  assert.equal(f.frames.at(-1).remaining,3);
+  assert.equal(f.frames.at(-1).remaining_ms,231000);
+  await f.bridge.command({...passiveFrame("old-decision"),foreground:true});
+  assert.equal(f.sent.length,0);
+  await f.bridge.command({...passiveFrame("new-decision"),foreground:true});
+  assert.equal(f.sent.length,1);
+});
+
+
+test("保留合并窗口等待实际SDK结束，超时也不释放同窗口在途所有权",async()=>{
+  for (const timeoutFirst of [false,true]) {
+    let now=0, timeout;
+    const held=deferred();
+    const f=fixture({now:()=>now,hold:held.promise,
+      timers:{setTimeout(callback){timeout=callback;return callback;},clearTimeout(){}}});
+    f.message();
+    await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+    const first=f.bridge.command({...passiveFrame("sdk-held"),foreground:true});
+    await new Promise(setImmediate);
+    assert.equal(f.sent.length,1,"必须确认旧发送已进入SDK");
+    if(timeoutFirst){
+      timeout();await first;
+      assert.equal(f.frames.at(-1).failure_kind,"timeout");
+    }
+    await f.bridge.command({version:1,type:"close_foreground",id:"in-1",keep_window:true});
+    const windows=f.frames.filter(x=>x.type==="foreground_window").length;
+    await f.bridge.command(openForeground);
+    assert.equal(f.frames.filter(x=>x.type==="foreground_window").length,windows,
+      "在途SDK结束前不能重开窗口");
+    await f.bridge.command({...passiveFrame("second-before-settle"),foreground:true});
+    assert.equal(f.sent.length,1,"不能与旧SDK并发");
+    held.resolve();await first;await new Promise(setImmediate);
+    now=17000;await f.bridge.command(openForeground);
+    assert.equal(f.frames.at(-1).remaining,3,"超时/完成不回补旧尝试额度");
+    assert.equal(f.frames.at(-1).remaining_ms,223000);
+    await f.bridge.command({...passiveFrame("sdk-held"),foreground:true});
+    assert.equal(f.sent.length,1,"旧尝试ID仍不能重放");
+    await f.bridge.command({...passiveFrame("second-after-settle"),foreground:true});
+    assert.equal(f.sent.length,2);
+    assert.equal(f.frames.at(-1).ok,true);
+  }
+});
+
+
+test("SDK未结束时重开意图在结束后确认，取消新输入与过期都撤销旧意图",async()=>{
+  for (const mode of ["resume","close","close-keep","new-input","expired"]) {
+    let now=0, timeout;
+    const held=deferred();
+    const f=fixture({now:()=>now,hold:held.promise,
+      timers:{setTimeout(callback){timeout=callback;return callback;},clearTimeout(){}}});
+    f.message();
+    await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+    const first=f.bridge.command({...passiveFrame("first-unknown"),foreground:true});
+    await new Promise(setImmediate);
+    assert.equal(f.sent.length,1);
+    timeout();await first;
+    await f.bridge.command({version:1,type:"close_foreground",id:"in-1",keep_window:true});
+    const windows=f.frames.filter(x=>x.type==="foreground_window").length;
+    await f.bridge.command(openForeground);
+    assert.equal(f.frames.filter(x=>x.type==="foreground_window").length,windows);
+    if(mode==="close"||mode==="close-keep")
+      await f.bridge.command({version:1,type:"close_foreground",id:"in-1",keep_window:mode==="close-keep"});
+    if(mode==="new-input")f.message("c2c","new-input");
+    now=mode==="expired" ? PASSIVE_REPLY_WINDOW_MS : 21000;
+    held.resolve();await new Promise(setImmediate);
+    assert.equal(f.frames.filter(x=>x.type==="foreground_window").length,windows+(mode==="resume"?1:0),mode);
+    assert.equal(f.sent.length,1,"处理重开意图本身不发送任何文本");
+    if(mode==="resume") {
+      assert.deepEqual(f.frames.at(-1),{version:1,type:"foreground_window",id:"in-1",remaining_ms:219000,remaining:3});
+      await f.bridge.command({...passiveFrame("newly-decided"),foreground:true});
+      assert.equal(f.sent.length,2,"不需要第二次open或重新请求模型才能发送新决定");
+      assert.equal(f.frames.at(-1).ok,true);
+      await f.bridge.command({...passiveFrame("first-unknown"),foreground:true});
+      assert.equal(f.sent.length,2,"旧未知尝试仍不可重放");
+    }
+  }
+});

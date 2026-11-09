@@ -256,6 +256,35 @@ fn live_group_reply_anchor(
     }
     Ok(Some(latest.into()))
 }
+/// 自然进度只续接已持久并入当前业务轮的最新私聊输入；不借用别人的窗口。
+fn live_progress_anchor(
+    ledger: &Ledger,
+    app: &str,
+    parent: &Message,
+    session: &SessionKey,
+    latest: Option<&str>,
+) -> Option<String> {
+    let latest = latest.filter(|id| valid_message_id(id))?;
+    let original = &ledger.entries[ledger.find(app, &parent.id)?];
+    let same_route = |message: &Message| {
+        message.scope == "c2c"
+            && parent.scope == "c2c"
+            && message.target_id == parent.target_id
+            && message.user_id == parent.user_id
+            && message.session_key(app).is_ok_and(|key| &key == session)
+    };
+    if original.state != ReceiptState::Processing || !same_route(&original.message) {
+        return None;
+    }
+    if latest == parent.id {
+        return Some(latest.into());
+    }
+    let child = &ledger.entries[ledger.find(app, latest)?];
+    (child.state == ReceiptState::Merged
+        && child.merged_into.as_deref() == Some(parent.id.as_str())
+        && same_route(&child.message))
+    .then(|| latest.into())
+}
 /// 只有明确未进入 SDK 的窗口拒发，才允许模型在另一个真实窗口重新决定同文发送。
 fn duplicate_progress(
     entry: &Receipt,
@@ -268,6 +297,14 @@ fn duplicate_progress(
     entry.progress.iter().enumerate().any(|(part, previous)| {
         previous.text.trim() == text.trim()
             && previous.image_path.as_deref() == image_path
+            && !(previous.state == PartState::Sent
+                && previous
+                    .decision_id
+                    .as_deref()
+                    .zip(decision_id)
+                    .is_some_and(|(previous, current)| {
+                        crate::live::distinct_parts_of_same_send(previous, current)
+                    }))
             && !(previous.state == PartState::Failed
                 && reply_anchor.is_some()
                 && previous.reply_anchor.as_deref() != reply_anchor
@@ -1590,21 +1627,53 @@ pub(crate) async fn run(
             for anchor in stale_foreground {
                 let input=foreground_inputs.remove(&anchor).expect("已知前台输入");
                 if let Some(speaker)=&speech {speaker.retire(&input.event)?;}
-                foreground_windows.remove(&anchor);
+                // 并入输入的窗口拥有原接收时间和剩余额度；同轮进入下一批工具时仍可使用。
+                // 旧决定照常退役，窗口不是决定，也不会重新发送或延长期限。
+                let retained = foreground_windows.get(&anchor).is_some_and(|window| window.remaining > 0
+                    && tokio::time::Instant::now() < window.deadline)
+                    && active.iter().any(|current| current.key == input.key && current.message.id != anchor
+                        && foreground_speech::claimed_reply_is_current(control.as_ref(), &input.key, input.turn_id)
+                        && live_progress_anchor(&ledger,&config.app_id,&current.message,&current.key.session,
+                            conversations.latest_message_id(&current.key.session).ok().flatten().as_deref()).as_deref()==Some(&anchor));
                 if considering_foreground.as_ref().is_some_and(|c|c.event.id==input.event.id) {considering_foreground=None;}
                 if ready_foreground.as_ref().is_some_and(|c|c.event.id==input.event.id) {ready_foreground=None;}
+                if !retained { foreground_windows.remove(&anchor); }
+                // 即使保留剩余窗口，旧窗口对象也必须撤销，阻止排队的旧决定写进 SDK。
+                write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor,"keep_window":retained})).await?;
+            }
+            let closed_windows: Vec<_> = foreground_windows.iter().filter_map(|(anchor,window)| {
+                if foreground_inputs.contains_key(anchor) {return None;}
+                let current = window.remaining > 0 && tokio::time::Instant::now() < window.deadline
+                    && active.iter().any(|current| current.key.session == window.session
+                        && control.snapshot(&current.key.session).ok().flatten().is_some_and(|s|
+                            s.key==current.key && !s.cancel_requested && !s.events_retired
+                            && !matches!(s.phase,ControlPhase::Finished|ControlPhase::Blocked|ControlPhase::Cancelling))
+                        && live_progress_anchor(&ledger,&config.app_id,&current.message,&current.key.session,
+                            conversations.latest_message_id(&current.key.session).ok().flatten().as_deref()).as_deref()==Some(anchor));
+                (!current).then(|| anchor.clone())
+            }).collect();
+            for anchor in closed_windows {
+                foreground_windows.remove(&anchor);
                 write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor})).await?;
             }
             // 没有追加用户消息时，真正的慢工具也可获得一次自然交流机会。
             // 只向当前原消息的私聊发送；短工具、已排队表达和近期主动说话让步。
             let mut open_progress_windows = Vec::new();
-            if let (Some(speaker), Some(live)) = (&speech, &live_dialogue) {
+            if let (Some(speaker), Some(live)) = (&speech, &live_dialogue)
+                && pushing.is_none() && sending_file.is_none() && pending_file.is_none()
+                && delivering.is_empty() && progress_delivery.is_empty() {
                 for current in active.iter().filter(|current| current.message.scope == "c2c") {
-                    if host_progress::quiet_request(&current.message.text)
-                        || foreground_inputs.get(&current.message.id).is_some_and(|input| !input.resolved)
+                    let latest = conversations.latest_message_id(&current.key.session)?;
+                    let Some(anchor) = live_progress_anchor(&ledger,&config.app_id,&current.message,
+                        &current.key.session,latest.as_deref()) else {continue};
+                    let merged = anchor != current.message.id;
+                    let route = &ledger.entries[ledger.find(&config.app_id,&anchor).expect("已核对进度原话")].message;
+                    if host_progress::quiet_request(&current.message.text) || host_progress::quiet_request(&route.text)
+                        || foreground_inputs.get(&anchor).is_some_and(|input| !input.resolved)
                         || live.has_outgoing(&current.key.session)
                         || last_progress.get(&current.message.id).is_some_and(|last| last.elapsed() < Duration::from_secs(60))
-                        || conversations.latest_message_id(&current.key.session)?.as_deref() != Some(&current.message.id) {
+                        || (merged && !foreground_windows.get(&anchor).is_some_and(|window|
+                            window.remaining>0 && tokio::time::Instant::now()<window.deadline)) {
                         continue;
                     }
                     let Some(snapshot) = control.snapshot(&current.key.session).ok().flatten() else { continue };
@@ -1613,13 +1682,16 @@ pub(crate) async fn run(
                     if snapshot.key != current.key || snapshot.phase != ControlPhase::Tools || snapshot.cancel_requested
                         || snapshot.events_retired || !live.progress_is_current(&scope, turn_id) { continue; }
                     let Some(batch) = foreground_activity.progress_candidate(&current.key, turn_id) else { continue };
-                    let input = ForegroundInput::progress(batch, current.message.id.clone(), current.started);
+                    let mut input = ForegroundInput::progress(batch, anchor.clone(), current.started);
+                    if merged { input.use_merged_window(); }
                     // 开窗期间子工具仍可能推进，首次判断前才冻结并持久化事实。
-                    if let Some(previous) = foreground_inputs.insert(current.message.id.clone(), input) { speaker.retire(&previous.event)?; }
-                    open_progress_windows.push(current.message.id.clone());
+                    if let Some(previous) = foreground_inputs.insert(anchor.clone(), input) { speaker.retire(&previous.event)?; }
+                    open_progress_windows.push(anchor);
                 }
             }
             for id in open_progress_windows {
+                // 每次开窗都等 Node 核对实际剩余预算的回执；保留值不能当作重开成功。
+                foreground_windows.remove(&id);
                 write(&mut stdin, json!({"type":"open_foreground","version":1,"id":id})).await?;
             }
             let stages = slow_progress.as_ref().is_some_and(|p| p.stage_updates());
@@ -3066,8 +3138,11 @@ pub(crate) async fn run(
                             let Some(slots)=frame.get("remaining").and_then(Value::as_u64).filter(|n|(1..=4).contains(n)) else {continue};
                             let Some(index)=ledger.find(&config.app_id,id) else {continue};
                             let entry=&ledger.entries[index];
-                            let expected_state = if input.progress {ReceiptState::Processing} else {ReceiptState::Merged};
-                            if entry.state!=expected_state || entry.message.scope!="c2c"
+                            let valid_state = if input.progress {
+                                active.iter().any(|current| current.key==input.key
+                                    && live_progress_anchor(&ledger,&config.app_id,&current.message,&input.key.session,Some(id)).as_deref()==Some(id))
+                            } else {entry.state==ReceiptState::Merged};
+                            if !valid_state || entry.message.scope!="c2c"
                                 || entry.message.session_key(&config.app_id)?!=input.key.session
                                 || conversations.latest_message_id(&input.key.session)?.as_deref()!=Some(id) {continue;}
                             foreground_windows.insert(id.into(),PassiveWindow {
@@ -3684,6 +3759,50 @@ mod tests {
             );
         }
         ledger
+    }
+
+    #[test]
+    fn natural_progress_uses_only_the_current_turns_committed_private_anchor() {
+        let mut original = live_anchor_ledger();
+        for entry in &mut original.entries {
+            entry.message.scope = "c2c".into();
+            entry.message.target_id = "user".into();
+        }
+        let parent = original.entries[0].message.clone();
+        let session = parent.session_key("app").unwrap();
+        assert_eq!(
+            super::live_progress_anchor(&original, "app", &parent, &session, Some("parent")),
+            Some("parent".into())
+        );
+        assert_eq!(
+            super::live_progress_anchor(&original, "app", &parent, &session, Some("child")),
+            Some("child".into())
+        );
+        for field in [
+            "app", "scope", "target", "user", "state", "parent", "retired",
+        ] {
+            let mut ledger = live_anchor_ledger();
+            for entry in &mut ledger.entries {
+                entry.message.scope = "c2c".into();
+                entry.message.target_id = "user".into();
+            }
+            let child = &mut ledger.entries[1];
+            match field {
+                "app" => child.app_id = "other".into(),
+                "scope" => child.message.scope = "group".into(),
+                "target" => child.message.target_id = "other".into(),
+                "user" => child.message.user_id = "other".into(),
+                "state" => child.state = super::ReceiptState::Processing,
+                "parent" => child.merged_into = Some("other".into()),
+                "retired" => ledger.entries[0].state = super::ReceiptState::Handled,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                super::live_progress_anchor(&ledger, "app", &parent, &session, Some("child")),
+                None,
+                "{field}"
+            );
+        }
     }
 
     #[test]

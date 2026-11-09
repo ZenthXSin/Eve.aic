@@ -490,6 +490,77 @@ class NaturalProgressAcceptance(live.LiveToolAcceptance):
         self.assertFalse(self.outbound_progress(), '新原话必须使尚未发送的旧进度失效')
         self.assertTrue(all(state == 'stale' for _, state, _ in self.progress_rows()))
 
+    def test_consumed_followup_keeps_real_window_for_the_next_tool_batch(self):
+        followup = '去吧，继续把下一步也核对好。'
+        second_started = self.source / 'second-started'
+        second_release = self.source / 'second-release'
+        second_done = self.source / 'second-done'
+        (self.source / 'second-check.py').write_text(
+            "from pathlib import Path\nimport time\n"
+            "Path('second-started').touch()\n"
+            "deadline=time.monotonic()+100\n"
+            "while not Path('second-release').exists():\n"
+            "    assert time.monotonic()<deadline, 'second gate timed out'\n"
+            "    time.sleep(.01)\n"
+            "Path('second-done').write_text('once')\n", encoding='utf8')
+        decisions = []
+
+        def respond(body):
+            self.main_requests.append(body)
+            results = self.all_results(body)
+            if not results:
+                return self.choose('run_command', self.command)
+            self.assertIn(followup, self.users(body), '原业务轮必须真正消费追加输入')
+            if len(results) == 1:
+                self.assertEqual(self.executions.read_text(), 'x')
+                return self.choose('run_command', {'program': sys.executable, 'args': ['second-check.py'], 'timeout_ms': 100_000})
+            self.assertEqual(second_done.read_text(), 'once')
+            handoffs = self.handoffs(body)
+            self.assertEqual(handoffs[-1]['input_message_id'], 'continued')
+            self.assertEqual(handoffs[-1]['input_text'], followup)
+            self.assertEqual(handoffs[-1]['delivery']['state'], 'sent')
+            return dialogue.text_response('内部结束，不重复已发送的进展。')
+
+        def decide(facts):
+            if facts['host_event'].get('kind') != PROGRESS_KIND:
+                return {'action': 'silence'}
+            decisions.append(facts['event_id'])
+            if len(decisions) == 1:
+                return {'action': 'speak', 'text': '旧批次的待发决定', 'after_ms': 60000}
+            self.assertEqual(len(decisions), 2)
+            self.assertTrue(second_started.exists())
+            self.assertFalse(second_done.exists())
+            current = json.loads(self.speech_requests[-1]['messages'][4]['content'].split('：', 1)[1])
+            self.assertEqual(current['latest_user_message'], {'id': 'continued', 'text': followup})
+            return {'action': 'speak', 'text': '第一步已经核对，正在等下一步结果。', 'after_ms': 0}
+
+        def second_progress_sent():
+            deadline = time.monotonic() + 80
+            while not any(event['anchor'] == 'continued' and state == 'sent'
+                          for event, state, _ in self.progress_rows()):
+                self.assertLess(time.monotonic(), deadline, '追加输入消费后下一批工具没有进度机会')
+                self.assertFalse(self.run_release.wait(.02))
+            old = [state for event, state, _ in self.progress_rows() if event['id'] == decisions[0]]
+            self.assertEqual(old, ['stale'], '旧决定不能借新窗口复活')
+            self.assertFalse(second_done.exists())
+
+        self.callback = respond
+        self.speech_callback = decide
+        self.run_natural([
+            {'send': self.message('working', INITIAL)}, {'wait_file': str(self.tool_started)},
+            *self.checkpoint('old-decision-ready'),
+            {'send': self.message('continued', followup)}, self.wait_receipt('continued', 'Merged'),
+            {'touch': str(self.release_tool)}, {'wait_file': str(second_started)},
+            *self.checkpoint('second-progress-sent'), {'touch': str(second_release)},
+            self.wait_receipt('working'), self.wait_command('working', 'finish'),
+        ], checkpoints={'old-decision-ready': lambda: self.wait_progress('ready'),
+                        'second-progress-sent': second_progress_sent}, timeout=110)
+        self.assertEqual(self.executions.read_text(), 'x')
+        self.assertEqual(second_done.read_text(), 'once')
+        outputs = self.outbound_progress()
+        self.assertEqual([event['based_on_message_id'] for event in outputs], ['continued'])
+        self.assertEqual([event['text'] for event in outputs], ['第一步已经核对，正在等下一步结果。'])
+
     def test_cancel_retires_a_delayed_progress_decision_without_sending_it(self):
         self.install_task()
         self.speech_callback = lambda facts: self.decide(facts, after_ms=3000)
