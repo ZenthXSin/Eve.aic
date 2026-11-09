@@ -547,7 +547,18 @@ impl Tool for DialogueTool {
                         }));
                     }
                     let page = fetcher.fetch(policy, url).await.map_err(|error| {
-                        failed(format!("来源页面读取失败（{error:?}）；未自动重试"))
+                        let message = format!("来源页面读取失败（{error:?}）；未自动重试");
+                        // 只处理抓取器已返回的读取失败；外层中断与取消仍由执行器保守结算。
+                        // 这里没有写入知识或业务数据，不应把网页暂不可用当成未知写结果。
+                        if matches!(
+                            error,
+                            eve_knowledge_api::FetchFailure::Timeout
+                                | eve_knowledge_api::FetchFailure::Network
+                        ) {
+                            ToolExecutionError::Unavailable(message)
+                        } else {
+                            failed(message)
+                        }
                     })?;
                     page.validate(policy)
                         .map_err(|_| failed("来源响应不符合公开契约"))?;

@@ -1071,6 +1071,9 @@ impl std::error::Error for ToolValidationError {}
 pub enum ToolExecutionError {
     /// 已确认未产生业务副作用的拒绝；模型可以依据回执纠正输入，不能当作成功。
     Rejected(String),
+    /// 工具已返回，确认未留下未决业务副作用，但所需资源暂不可用。
+    /// 保留失败回执供模型决定后续动作；不自动重试。超时中断、取消或未知写结果不能使用。
+    Unavailable(String),
     Failed(String),
     Cancelled(String),
 }
@@ -1078,6 +1081,7 @@ impl fmt::Display for ToolExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rejected(s) => write!(f, "{s}"),
+            Self::Unavailable(s) => write!(f, "{s}"),
             Self::Failed(s) => write!(f, "{s}"),
             Self::Cancelled(s) => write!(f, "{s}"),
         }

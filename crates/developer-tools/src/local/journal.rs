@@ -508,7 +508,7 @@ pub(super) fn reject(
     entry.success = Some(false);
     entry.failure_kind = Some(match error {
         ToolExecutionError::Rejected(_) => FailureKind::Rejected,
-        ToolExecutionError::Failed(_) => FailureKind::Failed,
+        ToolExecutionError::Unavailable(_) | ToolExecutionError::Failed(_) => FailureKind::Failed,
         ToolExecutionError::Cancelled(_) => FailureKind::Cancelled,
     });
     entry.recovery_action = RecoveryAction::CorrectRequestBeforeRetry;
@@ -536,7 +536,9 @@ pub(super) fn finish(
     entry.at_ms = timestamp()?.max(entry.at_ms);
     let failure = match result {
         Err(ToolExecutionError::Rejected(_)) => Some(FailureKind::Rejected),
-        Err(ToolExecutionError::Failed(_)) => Some(FailureKind::Failed),
+        Err(ToolExecutionError::Unavailable(_) | ToolExecutionError::Failed(_)) => {
+            Some(FailureKind::Failed)
+        }
         Err(ToolExecutionError::Cancelled(_)) => Some(FailureKind::Cancelled),
         Ok(value) => match value.get("success") {
             Some(Value::Bool(false)) => Some(FailureKind::UnsuccessfulResult),
