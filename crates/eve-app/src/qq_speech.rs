@@ -699,21 +699,38 @@ fn recall_input(event: &QqSpeechEvent, current_text: &str) -> TurnInput {
     }
     let responding = event.id.starts_with("foreground-input:")
         || event.id.strip_prefix("host-reply:") == Some(event.anchor.as_str());
-    let mut text = format!(
-        "{}：{}",
-        if responding {
-            "当前原话"
-        } else {
-            "此前最后原话，仅作语境"
-        },
-        bounded(current_text, 2048)
-    );
-    text.push_str("\n当前宿主事实主题：");
-    for field in ["kind", "activity", "phase", "user_text", "status"] {
-        if let Some(value) = event.facts.get(field).and_then(Value::as_str) {
-            text.push_str(&format!("\n{field}: {}", bounded(value, 384)));
+    let fields: Vec<_> = ["kind", "activity", "phase", "user_text", "status"]
+        .into_iter()
+        .filter_map(|field| {
+            let value = event.facts.get(field)?.as_str()?.trim();
+            (!value.is_empty()).then_some((field, value))
+        })
+        .collect();
+    let mut text = String::new();
+    if !fields.is_empty() {
+        // 实际召回只取前 1024 字节；主题先占小块，留下原话语境。
+        // 完整装配仍保留原先 2048 字节原话，供画像中的短语匹配等使用。
+        const TOPIC_BYTES: usize = 320;
+        const HEADING: &str = "当前宿主事实主题：";
+        let label_bytes = HEADING.len()
+            + 1
+            + fields
+                .iter()
+                .map(|(field, _)| field.len() + 3)
+                .sum::<usize>();
+        let value_bytes = TOPIC_BYTES.saturating_sub(label_bytes) / fields.len();
+        text.push_str(HEADING);
+        for (field, value) in fields {
+            text.push_str(&format!("\n{field}: {}", bounded(value, value_bytes)));
         }
+        text.push('\n');
     }
+    text.push_str(if responding {
+        "当前原话："
+    } else {
+        "此前最后原话，仅作语境："
+    });
+    text.push_str(bounded(current_text, 2048));
     TurnInput {
         text: bounded(&text, 4096).into(),
     }

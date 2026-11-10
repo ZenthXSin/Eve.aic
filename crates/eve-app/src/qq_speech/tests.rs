@@ -1,4 +1,9 @@
 use super::*;
+use eve_memory_api::{
+    ExperienceHit, ExperienceReadContext, ExperienceRecall, MAX_RECALL_QUERY_BYTES,
+    MemoryRecallFactory, MemoryRecallRequest, MemoryRecallResponse, MemoryRecallService,
+    MemoryResult, MemoryScope,
+};
 use eve_session_api::SessionKey;
 
 fn event(id: &str) -> QqSpeechEvent {
@@ -26,14 +31,276 @@ fn speech_recall_uses_bounded_original_and_event_topic_without_routing_or_tool_a
     input.facts = json!({"kind":"foreground_input_pending", "activity":"检查探索笔记", "phase":"tools",
         "tool_arguments":{"credential":"not-a-recall-query"},"sender_id":"not-a-recall-query"});
     let query = recall_input(&input, "继续研究昨天的星图");
-    assert!(query.text.starts_with("当前原话：继续研究昨天的星图"));
+    assert!(query.text.contains("当前原话：继续研究昨天的星图"));
     assert!(query.text.contains("检查探索笔记"));
     assert!(!query.text.contains("not-a-recall-query"));
     input.id = "foreground-progress:later".into();
     let query = recall_input(&input, &"星图".repeat(4096));
-    assert!(query.text.starts_with("此前最后原话，仅作语境："));
+    assert!(query.text.contains("此前最后原话，仅作语境："));
     assert!(query.text.contains("检查探索笔记"));
     assert!(query.text.len() <= 4096);
+}
+
+struct SpeechContextRequest {
+    input: TurnInput,
+    scope: Option<ContextScope>,
+    model_session: Option<eve_llm_api::ModelSession>,
+}
+
+#[derive(Default)]
+struct SpeechRecallBase {
+    requests: Mutex<Vec<SpeechContextRequest>>,
+}
+
+fn speech_recall_base_snapshot() -> ContextSnapshot {
+    ContextSnapshot {
+        profile: "原有交流画像".into(),
+        memories: vec!["已有蒸馏经验".into()],
+        pinned: vec!["固定身份".into()],
+        ..Default::default()
+    }
+}
+
+impl ContextAssembler for SpeechRecallBase {
+    fn assemble(&self, input: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble_with_model_session(input, None, None)
+    }
+
+    fn assemble_with_model_session(
+        &self,
+        input: TurnInput,
+        scope: Option<ContextScope>,
+        model_session: Option<eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
+        self.requests.lock().unwrap().push(SpeechContextRequest {
+            input,
+            scope,
+            model_session,
+        });
+        Box::pin(async { Ok(speech_recall_base_snapshot()) })
+    }
+}
+
+struct SpeechExperienceRequest {
+    scope: MemoryScope,
+    principal: Option<String>,
+    query: String,
+    limit: usize,
+}
+
+#[derive(Clone)]
+struct SpeechRecallProbe {
+    scope: MemoryScope,
+    recalls: Arc<Mutex<Vec<MemoryRecallRequest>>>,
+    experiences: Arc<Mutex<Vec<SpeechExperienceRequest>>>,
+}
+
+impl MemoryRecallFactory for SpeechRecallProbe {
+    fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryRecallService>> {
+        assert!(scope == self.scope);
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+impl MemoryRecallService for SpeechRecallProbe {
+    fn recall(&self, request: &MemoryRecallRequest) -> MemoryResult<MemoryRecallResponse> {
+        request.validate()?;
+        self.recalls.lock().unwrap().push(request.clone());
+        Ok(MemoryRecallResponse {
+            scope: self.scope.clone(),
+            revision: 1,
+            hits: vec![],
+        })
+    }
+}
+
+impl ExperienceRecall for SpeechRecallProbe {
+    fn recall(
+        &self,
+        context: &ExperienceReadContext,
+        query: &str,
+        limit: usize,
+    ) -> MemoryResult<Vec<ExperienceHit>> {
+        self.experiences
+            .lock()
+            .unwrap()
+            .push(SpeechExperienceRequest {
+                scope: context.scope.clone(),
+                principal: context.principal.clone(),
+                query: query.into(),
+                limit,
+            });
+        Ok(vec![])
+    }
+}
+
+#[tokio::test]
+async fn speech_recall_keeps_event_topic_and_original_in_actual_memory_queries() {
+    let markers = [
+        "类型主题",
+        "行动主题",
+        "阶段主题",
+        "事件原话主题",
+        "状态主题",
+    ];
+    for id in [
+        "foreground-input:current",
+        "host-reply:input-1",
+        "foreground-progress:later",
+    ] {
+        let mut input_event = event(id);
+        for (field, marker) in ["kind", "activity", "phase", "user_text", "status"]
+            .into_iter()
+            .zip(markers)
+        {
+            input_event.facts[field] = json!(format!("{marker}{}", "𐐷".repeat(256)));
+        }
+        input_event.facts["tool_arguments"] = json!({"credential":"forbidden-recall-value"});
+        input_event.facts["sender_id"] = json!("forbidden-recall-value");
+        input_event.facts["result"] = json!("forbidden-recall-value");
+        let original = format!(
+            "原话检索关键词 {} 原话远端匹配词 {}",
+            "旧".repeat(570),
+            "𐐷".repeat(2048)
+        );
+        let input = recall_input(&input_event, &original);
+        let original_label = if id == "foreground-progress:later" {
+            "此前最后原话，仅作语境："
+        } else {
+            "当前原话："
+        };
+        assert!(input.text.find(original_label).unwrap() <= 320);
+        let messages = decision_messages(
+            "Eve".into(),
+            speech_recall_base_snapshot(),
+            json!({}),
+            vec![],
+            &input_event,
+            original.clone(),
+            100,
+        );
+        let dynamic: Value = serde_json::from_str(
+            messages[4]
+                .text
+                .as_deref()
+                .unwrap()
+                .split_once('：')
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        let decision: Value = serde_json::from_str(messages[6].text.as_deref().unwrap()).unwrap();
+        assert_eq!(dynamic["latest_user_message"]["text"], original);
+        assert_eq!(decision["host_event"], input_event.facts);
+        if id == "foreground-progress:later" {
+            assert_eq!(decision["trigger"], "background_event");
+            assert!(decision.get("current_user_message").is_none());
+        } else {
+            assert_eq!(decision["trigger"], "user_input");
+            assert_eq!(decision["current_user_message"]["text"], original);
+        }
+        let scope = ContextScope {
+            session_id: input_event.session.session_id.clone(),
+            user_id: input_event.session.user_id.clone(),
+        };
+        let model_session = eve_llm_api::ModelSession::scoped("speech", &scope)
+            .unwrap()
+            .with_turn(id)
+            .unwrap();
+        let probe = SpeechRecallProbe {
+            scope: MemoryScope {
+                channel: "qq".into(),
+                session_id: scope.session_id.clone(),
+                user_id: scope.user_id.clone(),
+            },
+            recalls: Arc::default(),
+            experiences: Arc::default(),
+        };
+        let base = Arc::new(SpeechRecallBase::default());
+        let memory = eve_memory_plugin::MemoryRecallContext::new(
+            "qq",
+            Arc::new(probe.clone()),
+            base.clone(),
+        )
+        .unwrap();
+        let context = crate::subject_memory::ExperienceContext::new(
+            "qq",
+            Arc::new(probe.clone()),
+            Arc::new(memory),
+        )
+        .unwrap();
+        let snapshot = context
+            .assemble_with_model_session(
+                input.clone(),
+                Some(scope.clone()),
+                Some(model_session.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot, speech_recall_base_snapshot());
+        let base_requests = base.requests.lock().unwrap();
+        assert_eq!(base_requests.len(), 1);
+        assert_eq!(base_requests[0].input, input);
+        assert_eq!(base_requests[0].scope, Some(scope));
+        assert_eq!(base_requests[0].model_session, Some(model_session));
+        // TrainingContext 等接收完整 TurnInput，仍可匹配原来 2048 字节内的远端原话。
+        assert!(base_requests[0].input.text.contains("原话远端匹配词"));
+        let recalls = probe.recalls.lock().unwrap();
+        let experiences = probe.experiences.lock().unwrap();
+        assert_eq!(recalls.len(), 1);
+        assert_eq!(experiences.len(), 1);
+        assert!(experiences[0].scope == probe.scope);
+        assert!(experiences[0].principal.is_none());
+        assert_eq!(recalls[0].limit, 3);
+        assert_eq!(experiences[0].limit, 3);
+        for query in [&recalls[0].query, &experiences[0].query] {
+            assert!(query.len() <= MAX_RECALL_QUERY_BYTES);
+            assert!(!query.chars().any(char::is_control));
+            assert!(query.contains("原话检索关键词"));
+            for marker in markers {
+                assert!(query.contains(marker), "{id} 的实际记忆查询丢失 {marker}");
+            }
+            assert!(!query.contains("forbidden-recall-value"));
+            if id == "foreground-progress:later" {
+                assert!(query.contains("此前最后原话，仅作语境："));
+                assert!(!query.contains("当前原话："));
+            } else {
+                assert!(query.contains("当前原话："));
+                assert!(!query.contains("此前最后原话，仅作语境："));
+            }
+        }
+    }
+}
+
+#[test]
+fn speech_recall_omits_empty_and_non_string_event_topics() {
+    let mut input = event("foreground-progress:later");
+    input.facts = json!({
+        "kind":"", "activity":" \n\t ", "phase":null, "user_text":42,
+        "status":"仍在核实", "details":"forbidden-recall-value"
+    });
+    let query = recall_input(&input, "短原话完整保留");
+    assert!(
+        query
+            .text
+            .contains("此前最后原话，仅作语境：短原话完整保留")
+    );
+    assert!(query.text.contains("status: 仍在核实"));
+    for omitted in [
+        "kind:",
+        "activity:",
+        "phase:",
+        "user_text:",
+        "forbidden-recall-value",
+    ] {
+        assert!(
+            !query.text.contains(omitted),
+            "空值或非白名单字段进入查询：{omitted}"
+        );
+    }
+    input.facts["status"] = json!("\t\n");
+    let query = recall_input(&input, "没有主题时原话完整保留");
+    assert_eq!(query.text, "此前最后原话，仅作语境：没有主题时原话完整保留");
 }
 
 #[test]
