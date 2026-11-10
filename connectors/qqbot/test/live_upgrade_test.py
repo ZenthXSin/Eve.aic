@@ -130,6 +130,9 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
                 self.assertEqual(receipt['state'],'Handled')
                 self.assertEqual(receipt['progress'][0]['state'],'Sent')
                 self.assertTrue(receipt['progress'][0]['platform_message_id'])
+                # restarted 先于请求归档发布；等待归档完成后再核对唯一性。
+                self.wait_until(lambda:any((queue/'history').glob('*-restarted.json')),
+                    'restart request was not archived',timeout=10)
                 self.assertEqual(len(list((queue/'history').glob('*-restarted.json'))),1)
                 child.send_signal(signal.SIGINT)
                 self.assertEqual(child.wait(timeout=15),0)
