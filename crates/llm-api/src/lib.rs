@@ -36,7 +36,10 @@ pub use image::{
     ImageInput, MAX_IMAGE_BYTES, MAX_TURN_IMAGES, TurnImageSource, TurnImages, sniff_image,
 };
 pub use journal::{MAX_CHECKPOINT_BYTES, TurnCheckpoint, TurnJournal};
-pub use progress::{DelegatedProgressObserver, DelegatedToolProgress};
+pub use progress::{
+    DelegatedProgressObserver, DelegatedTaskProgressReport, DelegatedTaskProgressStatus,
+    DelegatedToolProgress,
+};
 pub use protocol::ProtocolFailureKind;
 pub use request_fingerprint::ModelRequestFingerprint;
 use serde::{Deserialize, Serialize};

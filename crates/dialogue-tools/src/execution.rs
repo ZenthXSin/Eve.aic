@@ -47,13 +47,13 @@ impl Tool for SleepTool {
     }
 }
 
-/// 显式任务状态驱动宿主收尾；普通聊天无需登记。
+/// 显式任务状态驱动宿主收尾；普通聊天无需登记，委派观察可采用其自述。
 pub struct TaskProgressTool;
 impl Tool for TaskProgressTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name:"task_progress".into(),
-            description:"按需记录值得保留的任务阶段、恢复信息或实际阻塞，不要求每个多步任务固定登记开头和收尾。登记 in_progress 时写明真实剩余工作；采用后仍须继续推进，工作完成并验证后更新 completed，缺少权限、信息或确实无法继续时更新 blocked，说明已有成果、实际阻塞和需要的决定，不能把未完成事项标记 completed。后台 blocked 会保存已有成果并通知原用户；用户待决定或信息不全时保持阻塞。若已单独 register_task_wait 登记文件或进程技术条件，remaining 完整使用登记回执原文，随后结束本轮；宿主核对条件和真实回执后接续原任务，保留原授权、预算和期限。仍登记为 in_progress 而模型提前收尾时，宿主会继续本轮，最多纠正三次；不会增加工具预算。进度登记不代替冻结验收合同，普通聊天无需调用。".into(),
+            description:"按需记录值得保留的任务阶段、恢复信息或实际阻塞，不要求每个多步任务固定登记开头和收尾。登记 in_progress 时写明真实剩余工作；采用后仍须继续推进，工作完成并验证后更新 completed，缺少权限、信息或确实无法继续时更新 blocked，说明已有成果、实际阻塞和需要的决定，不能把未完成事项标记 completed。后台 blocked 会保存已有成果并通知原用户；用户待决定或信息不全时保持阻塞。若已单独 register_task_wait 登记文件或进程技术条件，remaining 完整使用登记回执原文，随后结束本轮；宿主核对条件和真实回执后接续原任务，保留原授权、预算和期限。仍登记为 in_progress 而模型提前收尾时，宿主会继续本轮，最多纠正三次；不会增加工具预算。进度登记不代替冻结验收合同，普通聊天无需调用。子代理可按需用它向原会话交回阶段说明；宿主仅转交为子代理自述，不代表已验证或已经向用户发送。".into(),
             argument_schema:json!({"type":"object","properties":{"status":{"type":"string","enum":["in_progress","completed","blocked"]},"remaining":{"type":"string","minLength":1,"maxLength":2048}},"required":["status","remaining"],"additionalProperties":false}),
             required_permissions:vec![], concurrency:Some(ToolConcurrency::Serial{scope:"eve.task-progress".into()}),
         }

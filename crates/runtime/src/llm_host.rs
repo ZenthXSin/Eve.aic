@@ -3353,14 +3353,31 @@ mod tests {
         };
         let progress = eve_llm_api::DelegatedToolProgress {
             submitted_calls: 1,
+            task_progress_report: Some(eve_llm_api::DelegatedTaskProgressReport {
+                call_id: "child-report".into(),
+                status: eve_llm_api::DelegatedTaskProgressStatus::InProgress,
+                remaining: "已读到差异，继续核验。".into(),
+            }),
             ..Default::default()
         };
+        let mut right_progress = progress.clone();
+        right_progress
+            .task_progress_report
+            .as_mut()
+            .unwrap()
+            .remaining = "另一子轮的剩余事项".into();
         left.observe(progress.clone());
-        right.observe(progress.clone());
+        right.observe(right_progress.clone());
         // 满队列不能阻塞工具，更不能重放操作。
         left.observe(progress.clone());
-        assert_eq!(receiver.try_recv().unwrap().0, "parent-left");
-        assert_eq!(receiver.try_recv().unwrap().0, "parent-right");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            ("parent-left".into(), progress.clone())
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            ("parent-right".into(), right_progress)
+        );
         first.cancel();
         left.observe(progress.clone());
         assert!(receiver.try_recv().is_err());

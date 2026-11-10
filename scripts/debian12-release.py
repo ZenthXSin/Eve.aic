@@ -37,6 +37,7 @@ SUITES = (
     ("business-restrictions", QQ + "business_restriction_ingress_test.py"),
     ("live-dialogue", QQ + "live_dialogue_test.py"),
     ("natural-progress", QQ + "natural_progress_test.py"),
+    ("delegated-progress-report", QQ + "delegated_progress_report_test.py"),
     ("natural-speech-parts", QQ + "natural_speech_parts_test.py"),
     ("subagent-records", QQ + "subagent_profiles_test.py"),
     ("conversation-learning", QQ + "conversation_learning_test.py"),
