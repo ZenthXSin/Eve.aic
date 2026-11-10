@@ -4,6 +4,8 @@ use eve_llm_api::{ModelSession, TurnCheckpoint, TurnJournal};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Mutex};
 
+#[cfg(test)]
+mod evidence_tests;
 mod sqlite;
 pub(crate) use sqlite::SqliteRunStorage;
 const MAX_RECORD_BYTES: usize = 34 * 1024 * 1024;
@@ -261,6 +263,77 @@ impl RunStore {
             id,
         }))
     }
+    /// 直接读取原持久回执；不结算任务、不重放调用，也不把历史匹配当作当前产物证明。
+    pub(super) fn evidence_view(&self, owner: &TaskOwner, id: &str) -> Result<Value, LlmError> {
+        let active = self.lock.lock().map_err(|_| storage())?;
+        let entries = self.backend.list(owner, Some(id), 0)?;
+        if entries.len() > 1 {
+            return Err(storage());
+        }
+        let Some(bytes) = entries.first() else {
+            return Ok(json!({"runs":[],"automatic_resume":false}));
+        };
+        let entry: Entry = serde_json::from_slice(bytes).map_err(|_| storage())?;
+        if entry.owner != *owner || entry.id != id {
+            return Err(storage());
+        }
+        let record = self.read(id)?.ok_or_else(storage)?;
+        if record.frozen.owner != *owner {
+            return Err(storage());
+        }
+        let frame = record.checkpoint.as_ref();
+        let run_status = match &record.end {
+            Some(End::Completed { .. }) => "completed",
+            Some(End::Blocked { .. }) => "blocked",
+            Some(End::Failed { .. }) => "failed",
+            Some(End::Cancelled) => "cancelled",
+            None if active.contains(id) => "running",
+            None if frame.is_some_and(|frame| !frame.resumable()) => "interrupted_unknown",
+            None if frame.is_some_and(|frame| frame.result.is_some()) => "result_saved_unsettled",
+            None => "interrupted_confirmed",
+        };
+        // 原验收原因可能包含 remaining 或模型文字；证据简表只显示固定状态。
+        let verification = record.verification.as_ref().map(|value| match value {
+            eve_task_api::TaskCompletionAssessment::Verified
+                if matches!(&record.end, Some(End::Completed { result })
+                    if frame.is_some_and(|frame| frame.resumable()
+                        && frame.result.as_ref() == Some(result)
+                        && frame.remaining.is_none())) =>
+            {
+                "verified"
+            }
+            eve_task_api::TaskCompletionAssessment::Verified => "inconsistent",
+            eve_task_api::TaskCompletionAssessment::Mismatch { .. } => "mismatch",
+            eve_task_api::TaskCompletionAssessment::Unverifiable { .. } => "unverifiable",
+            eve_task_api::TaskCompletionAssessment::Blocked { .. } => "blocked",
+        });
+        let (report, reason) = match (&record.frozen.verification, frame) {
+            (TaskCompletionContract::Receipts { contract }, Some(frame)) => (
+                Some(eve_task_plugin::select_task_receipt_evidence(
+                    contract,
+                    &frame.messages,
+                    &frame.pending_calls,
+                )),
+                None,
+            ),
+            (TaskCompletionContract::Receipts { .. }, None) => (None, Some("missing_checkpoint")),
+            _ => (None, Some("no_frozen_receipt_contract")),
+        };
+        let mut row = json!({
+            "run_id":id,
+            "run_status":run_status,
+            "evidence_kind":"historical_tool_receipts",
+            "current_artifact_validity":"not_checked",
+            "automatic_resume":false,
+            "effects_unknown":frame.is_some_and(|frame| !frame.resumable()),
+            "verification":verification,
+            "report":report,
+        });
+        if let Some(reason) = reason {
+            row["reason"] = json!(reason);
+        }
+        Ok(json!({"runs":[row],"automatic_resume":false}))
+    }
     fn views(&self, owner: &TaskOwner, id: Option<&str>, offset: usize) -> Result<Value, LlmError> {
         let active = self.lock.lock().map_err(|_| storage())?;
         let entries = self
@@ -414,21 +487,28 @@ pub(crate) struct ListRuns {
 }
 impl Tool for ListRuns {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition { name: LIST.into(), description: "读取当前会话子代理的持久记录；不传参数列最近20项，run_id读取原任务、结局和真实工具回执，offset用于列表按20条翻页、详情步骤按10条翻页。中断未知不重跑，本工具只读不会恢复执行或补发消息。".into(), argument_schema: json!({"type":"object","properties":{"run_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}), required_permissions: vec![], concurrency: Some(ToolConcurrency::ParallelSafe) }
+        ToolDefinition { name: LIST.into(), description: "读取当前会话子代理的持久记录；不传参数列最近20项，run_id读取原任务、结局和真实工具回执，offset用于列表按20条翻页、详情步骤按10条翻页。run_id配evidence=true只返回冻结验收项对应的历史回执简表，不传offset；它保留原调用编号与摘要，不含原文，也不证明当前源码、环境或整个目标已通过。中断未知不重跑，本工具只读不会恢复执行或补发消息。".into(), argument_schema: json!({"type":"object","properties":{"run_id":{"type":"string"},"offset":{"type":"integer","minimum":0},"evidence":{"type":"boolean"}},"additionalProperties":false}), required_permissions: vec![], concurrency: Some(ToolConcurrency::ParallelSafe) }
     }
     fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolValidationError> {
         let Some(object) = arguments.as_object() else {
             return Err(invalid("参数必须是对象"));
         };
-        if object.keys().any(|k| k != "run_id" && k != "offset")
+        if object
+            .keys()
+            .any(|k| !matches!(k.as_str(), "run_id" | "offset" | "evidence"))
             || object
                 .get("run_id")
                 .is_some_and(|v| v.as_str().is_none_or(|s| !valid_id(s)))
             || object
                 .get("offset")
                 .is_some_and(|v| v.as_u64().is_none_or(|n| n > 1_000_000))
+            || object.get("evidence").is_some_and(|v| !v.is_boolean())
+            || (object.get("evidence") == Some(&json!(true))
+                && (!object.contains_key("run_id") || object.contains_key("offset")))
         {
-            return Err(invalid("run_id须为有效记录ID，offset须为0至1000000整数"));
+            return Err(invalid(
+                "run_id须为有效记录ID，offset须为0至1000000整数；evidence=true须提供run_id且不传offset",
+            ));
         }
         Ok(())
     }
@@ -442,6 +522,12 @@ impl Tool for ListRuns {
                 .worker
                 .get()
                 .ok_or_else(|| failed("子代理执行器尚未就绪"))?;
+            if call.arguments.get("evidence") == Some(&json!(true)) {
+                let id = call.arguments["run_id"]
+                    .as_str()
+                    .ok_or_else(|| failed("缺少子代理记录ID"))?;
+                return worker.runs.evidence_view(&owner, id).map_err(failed);
+            }
             worker
                 .runs
                 .views(
@@ -462,10 +548,10 @@ mod tests {
     use super::*;
     use eve_llm_api::{ChatMessage, ChatRole, ToolResult};
 
-    fn open(path: &std::path::Path) -> Arc<RunStore> {
+    pub(super) fn open(path: &std::path::Path) -> Arc<RunStore> {
         RunStore::open(Arc::new(SqliteRunStorage::open(path).unwrap()))
     }
-    fn frozen() -> FrozenRun {
+    pub(super) fn frozen() -> FrozenRun {
         let scope = ContextScope {
             session_id: "session".into(),
             user_id: "owner".into(),
@@ -491,7 +577,7 @@ mod tests {
             deadline_at_ms: Some(u64::MAX),
         }
     }
-    fn frame(frozen: &FrozenRun, pending: bool) -> TurnCheckpoint {
+    pub(super) fn frame(frozen: &FrozenRun, pending: bool) -> TurnCheckpoint {
         let call = ToolCall {
             id: "once".into(),
             name: "read_file".into(),

@@ -1824,7 +1824,18 @@ impl Tool for SubagentTool {
                 "parent_reserved_steps":child_pool.parent_reserve(),
                 "agent_id":profile.id,
             });
-            subagent_result(run.end, run.verification, used, snapshot.is_some())
+            let mut result = subagent_result(run.end, run.verification, used, snapshot.is_some())?;
+            // 直接交回同一份持久历史证据，主线程无需为读取已完成检查再发一次查询。
+            // 这里只附历史观察；当前产物有效性与原完成状态不会被提升。
+            result["receipt_evidence"] = match worker.runs.evidence_view(&owner, &run_id) {
+                Ok(view) => view["runs"]
+                    .as_array()
+                    .and_then(|rows| rows.first())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"run_id":run_id,"automatic_resume":false,"report":null,"reason":"saved_evidence_unavailable","current_artifact_validity":"not_checked"})),
+                Err(_) => json!({"run_id":run_id,"automatic_resume":false,"report":null,"reason":"saved_evidence_unavailable","current_artifact_validity":"not_checked"}),
+            };
+            Ok(result)
         })
     }
 }

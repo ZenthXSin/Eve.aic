@@ -4,6 +4,8 @@ mod capacity;
 mod cold;
 mod completion;
 pub use completion::{evaluate_completion_contract, evaluate_task_completion};
+mod receipt_evidence;
+pub use receipt_evidence::select_task_receipt_evidence;
 mod progress;
 mod store;
 pub use archive::FileTaskArchive;

@@ -7,6 +7,8 @@ mod evidence;
 pub use evidence::{TaskEvidenceKey, TaskEvidenceReader, TaskEvidenceSnapshot};
 mod completion;
 pub use completion::*;
+mod receipt_evidence;
+pub use receipt_evidence::*;
 mod delivery;
 pub use delivery::{TaskDeliveryEntry, TaskDeliverySnapshot, validate_notice};
 mod profiles;

@@ -54,7 +54,29 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
             'tool': 'read_file', 'arguments': {'path': 'persistent-once.txt'},
             'output_pointer': '/sha256', 'expected': expected}], 'require_final_batch': True}}
         run_id = []
+        attached_evidence = []
         query_results = []
+        def assert_evidence(evidence):
+            self.assertFalse(evidence['automatic_resume'])
+            self.assertEqual(len(evidence['runs']), 1)
+            row = evidence['runs'][0]
+            self.assertEqual(row['run_id'], run_id[0])
+            self.assertEqual(row['evidence_kind'], 'historical_tool_receipts')
+            self.assertEqual(row['current_artifact_validity'], 'not_checked')
+            self.assertFalse(row['automatic_resume'])
+            self.assertFalse(row['effects_unknown'])
+            self.assertEqual(row['report']['status'], 'historical_match')
+            [check] = row['report']['checks']
+            self.assertEqual(check['check_index'], 0)
+            self.assertEqual(check['source']['call_id'], 'persistent-read')
+            self.assertEqual(check['source']['batch_ordinal'], 5)
+            self.assertEqual(check['source']['tool'], 'read_file')
+            for key in ('arguments_sha256', 'receipt_sha256'):
+                self.assertRegex(check['source'][key], r'^[0-9a-f]{64}$')
+            serialized = json.dumps(evidence, ensure_ascii=False)
+            for private in (original, 'persistent-once.txt', 'PERSISTED_ONCE_RECEIPT',
+                            '持久结果已读取核验', expected):
+                self.assertNotIn(private, serialized, '历史证据简表不能投影原文或实际观察内容')
         def respond(body):
             results = self.results(body)
             if self.leaf(body):
@@ -84,12 +106,24 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
                         'agent_id': 'general', 'task': original, 'include_context': True,
                         'max_steps': 5, 'verification': contract}))
                 self.assertTrue(results[0]['completed'], results[0])
-                run_id.append(results[0]['usage']['run_id'])
+                if len(results) == 1:
+                    run_id.append(results[0]['usage']['run_id'])
+                    attached_evidence.append(results[0]['receipt_evidence'])
+                    assert_evidence({'runs': attached_evidence, 'automatic_resume': False})
+                    self.assertEqual(attached_evidence[0]['verification'], 'verified')
+                    return calls(('persistent-evidence', 'list_subagent_runs', {
+                        'run_id': run_id[0], 'evidence': True}))
+                self.assertEqual(len(results), 2)
+                assert_evidence(results[1])
+                self.assertEqual(results[1]['runs'][0], attached_evidence[0],
+                                 '原委派返回与显式只读查询必须引用同一份持久证据')
                 return text_response('首次子代理已完成')
             self.assertIn('list_subagent_runs', self.definitions(body))
             if not results:
                 return calls(('persistent-list', 'list_subagent_runs', {}),
-                             ('persistent-detail', 'list_subagent_runs', {'run_id': run_id[0]}))
+                             ('persistent-detail', 'list_subagent_runs', {'run_id': run_id[0]}),
+                             ('persistent-evidence-query', 'list_subagent_runs', {
+                                 'run_id': run_id[0], 'evidence': True}))
             query_results.append(results)
             return text_response('持久记录只读查询完成')
         self.callback = respond
@@ -107,10 +141,17 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(frame['model_session'], frozen['model_session'])
         self.assertEqual(frame['pending_calls'], [])
         self.assertIn('持久结果已读取核验', frame['result'])
+        receipt = next(receipt for message in frame['messages']
+                       for receipt in message.get('tool_results', [])
+                       if receipt['call_id'] == 'persistent-read')
+        receipt_digest = hashlib.sha256(json.dumps(
+            receipt, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(attached_evidence[0]['report']['checks'][0]['source']['receipt_sha256'],
+                         receipt_digest, '证据摘要必须绑定 SQLite 中同一原始工具回执')
         self.assertEqual((self.source / 'persistent-once.txt').read_text(), content)
         leaf_before = sum(self.leaf(r['body']) for r in self.kind('chat'))
         self.enabled(self.send(self.message('persistent-restart-query', '只读查询记录', expected='持久记录只读查询完成')))
-        [listed, detail] = query_results[-1]
+        [listed, detail, evidence] = query_results[-1]
         self.assertFalse(listed['automatic_resume'])
         self.assertEqual([r['run_id'] for r in listed['runs']], run_id)
         row = detail['runs'][0]
@@ -118,6 +159,8 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
         self.assertEqual((row['tool_calls'], row['model_requests']), (5, 6))
         self.assertEqual([s['tool'] for s in row['steps']], ['run_command', 'edit_file', 'read_file', 'edit_file', 'read_file'])
         self.assertTrue(all(s['confirmed'] for s in row['steps']))
+        assert_evidence(evidence)
+        self.assertEqual(evidence['runs'][0], attached_evidence[0], '重启不能改变原回执引用或扩大已验证范围')
         self.assertEqual(self.persisted_run_rows(), [(identifier, frozen_bytes, state_bytes)], '只读查询不能改变子代理库')
         self.enabled(self.send(self.message('persistent-other-scope', '其他身份只读查询', user='user-2', expected='持久记录只读查询完成')))
         self.assertTrue(all(result.get('runs') == [] for result in query_results[-1]),
@@ -134,6 +177,11 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
         self.assertIn('持久结果已读取核验', row['saved_result'])
         self.assertFalse(row['automatic_resume'])
         self.assertFalse(row['effects_unknown'])
+        unsettled_evidence = query_results[-1][2]
+        assert_evidence(unsettled_evidence)
+        self.assertEqual(unsettled_evidence['runs'][0]['run_status'], 'result_saved_unsettled')
+        self.assertIsNone(unsettled_evidence['runs'][0]['verification'])
+        self.assertEqual(unsettled_evidence['runs'][0]['report'], attached_evidence[0]['report'])
         self.assertEqual(self.persisted_run_rows(), unsettled_rows)
         self.assertEqual(sum(self.leaf(r['body']) for r in self.kind('chat')), leaf_before)
         self.assertEqual((self.source / 'persistent-once.txt').read_text(), content, '重启和查询不能重跑命令')
