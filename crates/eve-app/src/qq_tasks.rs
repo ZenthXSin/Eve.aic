@@ -48,6 +48,8 @@ mod action_capabilities;
 mod delegated_progress;
 pub(crate) mod frozen_node;
 mod subagent_journal;
+pub(crate) mod workspace_node;
+pub(crate) mod workspace_node_config;
 use delegated_progress::StopSignal;
 pub(crate) use subagent_journal::{ListRuns, RunStorage, SqliteRunStorage};
 #[cfg(test)]
@@ -311,6 +313,7 @@ pub(crate) struct Worker {
     resolver: Arc<dyn LlmModelResolver>,
     coding_resolver: Arc<dyn LlmModelResolver>,
     runs: Arc<subagent_journal::RunStore>,
+    workspace_node: Option<Arc<workspace_node::WorkspaceNodeAdapter>>,
     host: LlmHost,
     leaf_host: LlmHost,
     pub(crate) leaf_tool_names: Vec<String>,
@@ -430,6 +433,7 @@ impl Worker {
         models: WorkerModels,
         digests: Arc<dyn eve_llm_api::HistoryDigests>,
         run_storage: Arc<dyn RunStorage>,
+        workspace_node: Option<Arc<workspace_node::WorkspaceNodeAdapter>>,
     ) -> Result<Arc<Self>, AppError> {
         let WorkerModels {
             task: resolver,
@@ -437,7 +441,13 @@ impl Worker {
         } = models;
         let settings = config_service(registry.as_ref())?;
         let history = Arc::new(crate::history::ConfiguredHistory(settings.clone()));
-        let runs = subagent_journal::RunStore::open(run_storage);
+        let runs = subagent_journal::RunStore::open_with_workspace_evidence(
+            run_storage,
+            None,
+            workspace_node
+                .clone()
+                .map(|source| source as Arc<dyn eve_task_api::WorkspaceNodeEvidenceSource>),
+        );
         kernel.register(Box::new(ContextPlugin(PluginManifest::new(
             CONTEXT_ID,
             env!("CARGO_PKG_VERSION"),
@@ -518,6 +528,7 @@ impl Worker {
             resolver,
             coding_resolver,
             runs,
+            workspace_node,
             leaf_host,
             leaf_tool_names,
             host,
@@ -809,7 +820,10 @@ impl Worker {
                 let frozen_node_candidate = child
                     && matches!(
                         completion_contract.as_ref(),
-                        Some(TaskCompletionContract::FrozenNodeTest { .. })
+                        Some(
+                            TaskCompletionContract::FrozenNodeTest { .. }
+                                | TaskCompletionContract::WorkspaceNodeTest { .. }
+                        )
                     );
                 let verification = (child && !frozen_node_candidate).then(|| {
                     if let Some(reason) = eve_task_api::blocked_progress(&transcript) {
@@ -968,6 +982,7 @@ impl Plugin for ContextPlugin {
 /// 执行器与配置服务在核心装配之后才可用；工具在那之前注册，经这个句柄延后取得。
 #[derive(Default)]
 pub(crate) struct Late {
+    pub(crate) workspace_node: OnceLock<Arc<workspace_node::WorkspaceNodeAdapter>>,
     pub(crate) admission: OnceLock<Arc<crate::qq_subject_admission::Admission>>,
     pub(crate) worker: OnceLock<Arc<Worker>>,
     pub(crate) config: OnceLock<Arc<dyn ConfigService>>,
@@ -1299,6 +1314,69 @@ fn verification_schema() -> Value {
         {"type":"object","properties":{"kind":{"const":"text"},"required_fragments":{"type":"array","items":{"type":"string"}},"json_equals":{},"valid_json":{"type":"boolean"},"json_required_pointers":{"type":"array","items":{"type":"string"}}},
             "required":["kind","required_fragments"],"additionalProperties":false}
     ]})
+}
+
+fn subagent_verification_schema(workspace_enabled: bool) -> Value {
+    let mut schema = verification_schema();
+    if workspace_enabled {
+        schema["oneOf"].as_array_mut().expect("verification alternatives").push(json!({
+            "type":"object", "properties": {
+                "kind":{"const":"workspace_node_test"},
+                "directory":{"type":"string","default":"."},
+                "entry":{"type":"string"},
+                "args":{"type":"array","items":{"type":"string"}}
+            }, "required":["kind","entry"], "additionalProperties":false,
+            "description":"在本会话现有目录实现并验证小型纯JavaScript项目。目录、入口和参数在派发时固定；宿主在实际测试时固定输入，收尾只核对同一输入仍匹配，不因进度登记重跑。不能填摘要。仅此编程验证项，不证明上线或其他交付。"
+        }));
+    }
+    schema
+}
+
+fn workspace_verification_request(
+    arguments: &Value,
+) -> Result<Option<workspace_node::WorkspaceNodeRequest>, ToolExecutionError> {
+    let Some(value) = arguments
+        .get("verification")
+        .filter(|value| value["kind"] == "workspace_node_test")
+    else {
+        return Ok(None);
+    };
+    let mut request = value.clone();
+    request
+        .as_object_mut()
+        .ok_or_else(|| failed("工作区测试参数必须为对象"))?
+        .remove("kind");
+    let request: workspace_node::WorkspaceNodeRequest = serde_json::from_value(request)
+        .map_err(|_| failed("工作区测试只接受 directory、entry 和 args；摘要由宿主绑定"))?;
+    eve_task_api::validate_workspace_node_selector(
+        &request.directory,
+        &request.entry,
+        &request.args,
+    )
+    .map_err(|_| failed("工作区测试目录、入口或参数无效"))?;
+    Ok(Some(request))
+}
+
+fn validate_subagent_steps(
+    object: &serde_json::Map<String, Value>,
+    workspace_enabled: bool,
+) -> Result<(), ToolValidationError> {
+    if object
+        .get("verification")
+        .is_some_and(|value| value["kind"] == "workspace_node_test")
+    {
+        if !workspace_enabled {
+            return Err(invalid("工作区冻结测试未配置，不能派发此合同"));
+        }
+        workspace_verification_request(&Value::Object(object.clone())).map_err(|_| {
+            invalid("工作区测试只接受有效的 directory、entry 和 args，不接受自报摘要")
+        })?;
+        let mut ordinary = object.clone();
+        ordinary.remove("verification");
+        validate_steps(&ordinary)
+    } else {
+        validate_steps(object)
+    }
 }
 
 fn instructions_with_verification(
@@ -1635,7 +1713,7 @@ impl Tool for SubagentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: SUBAGENT_TOOL.into(),
-            description: "委托独立子任务，等待真实结果后继续本轮。简单任务通常直接完成；编程工作需要分工且能提高质量或效率时可选 agent_id=coding，不为复杂度分级额外请求模型。task 交接问题、范围、已有结果和交付物；主线程负责对话、协调和结果整合。需要完整历史时再设 include_context=true，资料是派发时冻结的历史；真实授权原话始终独立继承，均不扩大权限。独立工作适合并行时可在同批调用多个 run_subagent，明确修改范围，避免重复工作和文件冲突；有依赖先等待真实结果。verification 与后台相同，执行前冻结条件：receipts 仍按 require_final_batch 核对最后工具批次的参数与真实回执；text 只交付文本且不调用工具。全部匹配才 completed=true；未指定或无法核验时 status=returned_pending_verification、completed=false、blocked=false，合同失配为 verification_mismatch，实际剩余工作或明确阻塞才 blocked=true。verification 和 receipt_evidence 保留真实分类及历史回执引用，不自动证明当前产物有效，不把待核验当作完成。max_steps 只收窄子代理上限；共享原子工具预算和父期限，失败与并行同样扣减，实际并发受宿主槽位与模型并发约束。agent_id 可选 general、coding、research、review 或已保存角色。coding 使用独立配置模型，失败如实返回，不自动切换模型重做；更长任务可按需转后台。".into(),
+            description: "委托独立子任务，等待真实结果后继续本轮。简单任务通常直接完成；编程工作需要分工且能提高质量或效率时可选 agent_id=coding，不为复杂度分级额外请求模型。task 交接问题、范围、已有结果和交付物；主线程负责对话、协调和结果整合。需要完整历史时再设 include_context=true，资料是派发时冻结的历史；真实授权原话始终独立继承，均不扩大权限。独立工作适合并行时可在同批调用多个 run_subagent，明确修改范围，避免重复工作和文件冲突；有依赖先等待真实结果。verification 执行前冻结条件：已装配时 workspace_node_test 只填 directory、entry、args，宿主采集实际输入并在收尾核对匹配，不要求最后批次；该项只证明对应纯 JS 测试，后台尚不接受。receipts 仍按 require_final_batch 核对最后工具批次的参数与真实回执；text 只交付文本且不调用工具。全部匹配才 completed=true；未指定或无法核验时 status=returned_pending_verification、completed=false、blocked=false，合同失配为 verification_mismatch，实际剩余工作或明确阻塞才 blocked=true。verification 和 receipt_evidence 保留真实分类及历史回执引用，不自动证明当前产物有效，不把待核验当作完成。max_steps 只收窄子代理上限；共享原子工具预算和父期限，失败与并行同样扣减，实际并发受宿主槽位与模型并发约束。agent_id 可选 general、coding、research、review 或已保存角色。coding 使用独立配置模型，失败如实返回，不自动切换模型重做；更长任务可按需转后台。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1643,7 +1721,7 @@ impl Tool for SubagentTool {
                     "agent_id": {"type":"string"},
                     "include_context": {"type": "boolean", "default": false},
                     "max_steps": {"type": "integer", "minimum": MIN_STEPS, "maximum": MAX_STEPS},
-                    "verification": verification_schema()
+                    "verification": subagent_verification_schema(self.late.workspace_node.get().is_some())
                 },
                 "required": ["task"],
                 "additionalProperties": false
@@ -1673,7 +1751,7 @@ impl Tool for SubagentTool {
             return Err(invalid("agent_id 须为当前可用角色 ID"));
         }
         validate_instructions(object.get("task"))?;
-        validate_steps(object)
+        validate_subagent_steps(object, self.late.workspace_node.get().is_some())
     }
 
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
@@ -1743,7 +1821,21 @@ impl Tool for SubagentTool {
                 ));
             }
             let snapshot = capture_context(&call.arguments, &context)?;
-            let contract = completion_contract(&call.arguments)?;
+            let contract = if let Some(request) = workspace_verification_request(&call.arguments)? {
+                worker
+                    .workspace_node
+                    .as_ref()
+                    .ok_or_else(|| failed("工作区冻结测试运行器未装配；未派发"))?
+                    .prepare_contract(
+                        &request.directory,
+                        &request.entry,
+                        &request.args,
+                        context.clone(),
+                    )
+                    .await?
+            } else {
+                completion_contract(&call.arguments)?
+            };
             let review_messages = crate::qq_task_review::capture(&context, &owner)?;
             let instructions = instructions_with_context(
                 instructions_with_verification(
@@ -1821,7 +1913,60 @@ impl Tool for SubagentTool {
                     }
                 }
             };
-            journal.finish(&mut run).map_err(failed)?;
+            if matches!(run.end, TaskEnd::Completed { .. }) {
+                if let Some(target) = journal.workspace_observation_target().map_err(failed)? {
+                    let observation = if !context.is_cancel_requested() {
+                        match worker.workspace_node.as_ref() {
+                            Some(adapter) => match adapter
+                                .observe_current(
+                                    &target.contract,
+                                    &target.owner,
+                                    &target.model_session,
+                                    &target.checkpoint_sha256,
+                                    context
+                                        .clone()
+                                        .with_model_session(target.model_session.clone()),
+                                )
+                                .await
+                            {
+                                Ok(observation) => Some(observation),
+                                Err(error) => {
+                                    let category = match error {
+                                        ToolExecutionError::Cancelled(_) => "cancelled",
+                                        ToolExecutionError::Rejected(_) => "rejected",
+                                        _ => "unavailable",
+                                    };
+                                    eprintln!(
+                                        "EVE_WORKSPACE_NODE_OBSERVATION result={category} observation_saved=false"
+                                    );
+                                    None
+                                }
+                            },
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if context.is_cancel_requested()
+                        || context
+                            .deadline()
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        run.end = TaskEnd::Cancelled;
+                    }
+                    journal
+                        .finish_with_workspace_observation(
+                            &mut run,
+                            &target.checkpoint_sha256,
+                            observation,
+                        )
+                        .map_err(failed)?;
+                } else {
+                    journal.finish(&mut run).map_err(failed)?;
+                }
+            } else {
+                journal.finish(&mut run).map_err(failed)?;
+            }
             let used = json!({
                 "run_id": run_id,
                 "steps_used": run.usage.tool_calls,

@@ -18,6 +18,16 @@ pub enum TaskCompletionContract {
         runtime_sha256: String,
         command_sha256: String,
     },
+    /// 固定工作区与测试选择器；执行时冻结输入，收尾观察必须仍与测试输入一致。
+    /// 仅证明该目录在收尾观察时与通过测试的包一致，不证明外部交付或以后不再改变。
+    WorkspaceNodeTest {
+        workspace_sha256: String,
+        directory: String,
+        entry: String,
+        args: Vec<String>,
+        runtime_sha256: String,
+        command_sha256: String,
+    },
     /// 仅用于没有调用任何工具的纯文本交付物，不能证明外部动作已发生。
     Text {
         #[serde(default)]
@@ -49,6 +59,24 @@ impl TaskCompletionContract {
                 command_sha256,
             } => {
                 if [input_sha256, runtime_sha256, command_sha256]
+                    .into_iter()
+                    .all(|value| crate::valid_strategy_digest(value))
+                {
+                    Ok(())
+                } else {
+                    Err(TaskError::InvalidInput)
+                }
+            }
+            Self::WorkspaceNodeTest {
+                workspace_sha256,
+                directory,
+                entry,
+                args,
+                runtime_sha256,
+                command_sha256,
+            } => {
+                crate::validate_workspace_node_selector(directory, entry, args)?;
+                if [workspace_sha256, runtime_sha256, command_sha256]
                     .into_iter()
                     .all(|value| crate::valid_strategy_digest(value))
                 {

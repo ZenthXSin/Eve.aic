@@ -356,6 +356,154 @@ async fn default_root_still_works_and_relative_protected_files_never_reach_revie
     assert_eq!(fs::read_to_string(protected).unwrap(), "protected needle\n");
 }
 
+#[tokio::test]
+async fn protected_runtime_paths_apply_without_host_access_in_selected_workspaces() {
+    struct MemberAccess;
+    impl DeveloperAuthorization for MemberAccess {
+        fn is_operator(&self, scope: &ContextScope) -> bool {
+            scope.user_id == "owner"
+        }
+        fn allows_workspace_development(&self, _: &ContextScope) -> bool {
+            true
+        }
+    }
+    // 实际成员后端与会话切换后的 at_root 后端都继承同一保护集合。
+    for selection in ["ordinary", "member", "session"] {
+        let project = tempfile::tempdir().unwrap();
+        let journal = tempfile::tempdir().unwrap();
+        let user = if selection == "member" {
+            "guest"
+        } else {
+            "owner"
+        };
+        let ctx = context(user);
+        let selected = match selection {
+            "member" => member_workspace(project.path(), ctx.scope().unwrap()),
+            "session" => project.path().join("private-session"),
+            _ => project.path().to_path_buf(),
+        };
+        fs::create_dir_all(selected.join("runtime")).unwrap();
+        let protected = selected.join("runtime");
+        fs::write(protected.join("node"), "protected runtime needle\n").unwrap();
+        fs::write(selected.join("visible.txt"), "visible needle\n").unwrap();
+        let mut settings = config(project.path());
+        settings.host_filesystem = false;
+        settings.protected_paths.insert(protected.clone());
+        let original = LocalDeveloper::new(settings, journal.path().into(), None).unwrap();
+        let backend = match selection {
+            "member" => original
+                .with_authorization(Arc::new(MemberAccess))
+                .with_member_runtime(MemberRuntime::default()),
+            "session" => original.at_root(selected.clone()),
+            _ => original,
+        };
+        let visible = backend
+            .execute(
+                DeveloperOperation::Read(file(Path::new("visible.txt"))),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible["content"], "visible needle\n", "{selection}");
+        for operation in [
+            DeveloperOperation::Read(file(Path::new("runtime/node"))),
+            DeveloperOperation::List(file(Path::new("runtime"))),
+            write(Path::new("runtime/new-file"), "must remain absent"),
+            DeveloperOperation::Write(FileArguments {
+                path: "runtime/node".into(),
+                content: Some("changed".into()),
+                expected_sha256: Some(hash(b"protected runtime needle\n")),
+                offset: 0,
+            }),
+            DeveloperOperation::Edit(EditArguments {
+                path: "runtime/node".into(),
+                old_string: "protected".into(),
+                new_string: "changed".into(),
+                expected_sha256: hash(b"protected runtime needle\n"),
+            }),
+            DeveloperOperation::Patch(PatchArguments {
+                patch: "*** Begin Patch\n*** Update File: visible.txt\n*** Move to: runtime/moved\n@@\n-visible needle\n+changed\n*** End Patch".into(),
+            }),
+        ] {
+            assert!(backend.execute(operation, ctx.clone()).await.is_err(), "{selection}");
+        }
+        let search = backend
+            .execute(
+                DeveloperOperation::Search(SearchArguments {
+                    path: ".".into(),
+                    query: "needle".into(),
+                    max_results: 10,
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search["matches"].as_array().unwrap().len(),
+            1,
+            "{selection}"
+        );
+        assert_eq!(
+            fs::read_to_string(protected.join("node")).unwrap(),
+            "protected runtime needle\n"
+        );
+        assert!(!protected.join("new-file").exists());
+        assert!(!protected.join("moved").exists());
+        backend
+            .execute(write(Path::new("allowed.txt"), "still allowed"), ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(selected.join("allowed.txt")).unwrap(),
+            "still allowed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn trusted_candidate_path_resolution_does_not_grant_model_file_access() {
+    let project = tempfile::tempdir().unwrap();
+    let journal = tempfile::tempdir().unwrap();
+    let candidate = journal.path().join("source-snapshots/frozen/source");
+    fs::create_dir_all(&candidate).unwrap();
+    fs::write(candidate.join("source.txt"), "frozen source\n").unwrap();
+    for host_filesystem in [false, true] {
+        let mut settings = config(project.path());
+        settings.host_filesystem = host_filesystem;
+        let backend = LocalDeveloper::new(settings, journal.path().into(), None).unwrap();
+        let snapshot = backend.at_root(candidate.clone());
+        // 宿主源码指纹/升级流程使用普通工程解析；模型边界仍核对保护集合。
+        assert_eq!(
+            snapshot.path("source.txt", false).unwrap(),
+            candidate.join("source.txt")
+        );
+        assert!(snapshot.model_file_path("source.txt", false).is_err());
+        assert!(
+            snapshot
+                .execute(
+                    DeveloperOperation::Read(file(Path::new("source.txt"))),
+                    context("owner"),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            snapshot
+                .execute(
+                    write(Path::new("new.txt"), "must stay absent"),
+                    context("owner"),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(candidate.join("source.txt")).unwrap(),
+            "frozen source\n"
+        );
+        assert!(!candidate.join("new.txt").exists());
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn canonical_file_authorization_cannot_be_bypassed_with_aliases() {

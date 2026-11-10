@@ -2051,6 +2051,7 @@ dependencies = [
  "eve-command-policy",
  "eve-developer-api",
  "eve-llm-api",
+ "libc",
  "reqwest",
  "ring",
  "serde",

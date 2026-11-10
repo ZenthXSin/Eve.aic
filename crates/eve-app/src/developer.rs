@@ -82,6 +82,27 @@ pub(crate) fn install_with_member_runtime_backend_profile(
     reviewer: Option<Arc<dyn ActionReviewer>>,
     automatic_capabilities: bool,
 ) -> Result<Option<Arc<dyn eve_developer_api::DeveloperBackend>>, AppError> {
+    install_with_member_runtime_backend_protected(
+        bootstrap,
+        state,
+        authorization,
+        member_runtime,
+        reviewer,
+        automatic_capabilities,
+        &BTreeSet::new(),
+    )
+}
+
+/// 可信宿主在开发后端创建前加入已冻结运行时的保护范围。
+pub(crate) fn install_with_member_runtime_backend_protected(
+    bootstrap: &mut CoreBootstrap,
+    state: &Path,
+    authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
+    member_runtime: Option<eve_developer_api::MemberRuntime>,
+    reviewer: Option<Arc<dyn ActionReviewer>>,
+    automatic_capabilities: bool,
+    protected_paths: &BTreeSet<std::path::PathBuf>,
+) -> Result<Option<Arc<dyn eve_developer_api::DeveloperBackend>>, AppError> {
     let mut config: DeveloperConfig = if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
         let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
         if bytes.len() > 32 * 1024 {
@@ -119,6 +140,9 @@ pub(crate) fn install_with_member_runtime_backend_profile(
     } else {
         return Ok(None);
     };
+    config
+        .protected_paths
+        .extend(protected_paths.iter().cloned());
     config.validate()?;
     // 开发配置本身定义宿主权限，不能通过文件工具改写自己的能力边界。
     if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {

@@ -91,6 +91,11 @@ jobs:
         env:
           EVE_QQBOT_BINARY: target/debug/eve-qqbot
         run: python3 connectors/qqbot/test/free_exploration_test.py
+      - name: 验证工作区测试证据复用与重启不重跑
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        env:
+          EVE_QQBOT_BINARY: target/debug/eve-qqbot
+        run: python3 -B connectors/qqbot/test/workspace_node_test.py
       - name: 实际恢复检查点、入站屏障与完整最小组合验收
         if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         env:

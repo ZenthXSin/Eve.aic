@@ -21,8 +21,8 @@ pub use cold::VersionSummary;
 pub use container::ContainerSandbox;
 pub use dispatch::{AuthorizedToolDispatch, CheckedTools, ToolAuthorizer};
 pub use frozen_node::{
-    FrozenNodeOutcome, FrozenNodeRuntime, FrozenNodeTestBundle, FrozenNodeTestReceipt,
-    FrozenNodeTestRunner,
+    FrozenNodeInputContents, FrozenNodeInputEntry, FrozenNodeOutcome, FrozenNodeRuntime,
+    FrozenNodeTestBundle, FrozenNodeTestReceipt, FrozenNodeTestRunner,
 };
 pub use model::*;
 pub use runtime::{BoundVersion, ScriptRuntime};

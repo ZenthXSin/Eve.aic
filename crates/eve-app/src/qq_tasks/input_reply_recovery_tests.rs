@@ -414,6 +414,7 @@ async fn failure_handoff_survives_archive_and_task_restart_then_executes_followu
             Arc::new(
                 SqliteRunStorage::open(&directory.path().join("subagent-runs.sqlite3")).unwrap(),
             ),
+            None,
         )
         .await
         .unwrap();

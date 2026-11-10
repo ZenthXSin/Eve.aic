@@ -3,6 +3,7 @@ use super::*;
 use eve_llm_api::{ModelSession, TurnCheckpoint, TurnJournal};
 use eve_task_api::{
     TaskCompletionAssessment, TaskCompletionEvidenceSource, TaskFrozenNodeEvidence,
+    WorkspaceNodeEvidence, WorkspaceNodeEvidenceSource, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Mutex};
@@ -12,6 +13,8 @@ mod evidence_tests;
 #[cfg(test)]
 mod frozen_node_tests;
 mod sqlite;
+#[cfg(test)]
+mod workspace_node_tests;
 pub(crate) use sqlite::SqliteRunStorage;
 const MAX_RECORD_BYTES: usize = 34 * 1024 * 1024;
 pub(crate) const LIST: &str = "list_subagent_runs";
@@ -88,6 +91,10 @@ struct Record {
     checkpoint: Option<TurnCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     frozen_node_evidence: Vec<TaskFrozenNodeEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workspace_node_evidence: Vec<WorkspaceNodeEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_observation: Option<WorkspaceObservation>,
     end: Option<End>,
     usage: Option<TaskUsage>,
     verification: Option<eve_task_api::TaskCompletionAssessment>,
@@ -136,7 +143,20 @@ impl Record {
                 &self.frozen_node_evidence,
             )
             .map_err(|_| storage())?;
-        } else if !self.frozen_node_evidence.is_empty() {
+            eve_task_api::validate_workspace_node_evidence(
+                &f.owner,
+                frame,
+                &self.workspace_node_evidence,
+            )
+            .map_err(|_| storage())?;
+            if let Some(current) = &self.workspace_observation {
+                eve_task_api::validate_workspace_observation(&f.owner, frame, current)
+                    .map_err(|_| storage())?;
+            }
+        } else if !self.frozen_node_evidence.is_empty()
+            || !self.workspace_node_evidence.is_empty()
+            || self.workspace_observation.is_some()
+        {
             return Err(storage());
         }
         if !self.frozen_node_evidence.is_empty()
@@ -144,6 +164,15 @@ impl Record {
                 f.verification,
                 TaskCompletionContract::FrozenNodeTest { .. }
             )
+        {
+            return Err(storage());
+        }
+        if ((!self.workspace_node_evidence.is_empty() || self.workspace_observation.is_some())
+            && !matches!(
+                f.verification,
+                TaskCompletionContract::WorkspaceNodeTest { .. }
+            ))
+            || (self.workspace_observation.is_some() && self.end.is_none())
         {
             return Err(storage());
         }
@@ -159,6 +188,26 @@ impl Record {
                     f.steps as usize,
                     result,
                     &self.frozen_node_evidence,
+                )
+                .verified()
+                || self.usage != Some(usage_of(frame.provider_requests, frame.used_tool_calls))
+            {
+                return Err(storage());
+            }
+        }
+        if let (TaskCompletionContract::WorkspaceNodeTest { .. }, Some(End::Completed { result })) =
+            (&f.verification, &self.end)
+        {
+            let frame = self.checkpoint.as_ref().ok_or_else(storage)?;
+            if self.verification != Some(TaskCompletionAssessment::Verified)
+                || !eve_task_plugin::evaluate_workspace_node_completion(
+                    &f.verification,
+                    &f.owner,
+                    frame,
+                    f.steps as usize,
+                    result,
+                    &self.workspace_node_evidence,
+                    self.workspace_observation.as_ref(),
                 )
                 .verified()
                 || self.usage != Some(usage_of(frame.provider_requests, frame.used_tool_calls))
@@ -197,6 +246,10 @@ struct SavedState {
     checkpoint: Option<TurnCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     frozen_node_evidence: Vec<TaskFrozenNodeEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workspace_node_evidence: Vec<WorkspaceNodeEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_observation: Option<WorkspaceObservation>,
     end: Option<End>,
     usage: Option<TaskUsage>,
     verification: Option<eve_task_api::TaskCompletionAssessment>,
@@ -207,6 +260,8 @@ fn state_bytes(record: &Record) -> Result<Vec<u8>, LlmError> {
         version: record.version,
         checkpoint: record.checkpoint.clone(),
         frozen_node_evidence: record.frozen_node_evidence.clone(),
+        workspace_node_evidence: record.workspace_node_evidence.clone(),
+        workspace_observation: record.workspace_observation.clone(),
         end: record.end.clone(),
         usage: record.usage,
         verification: record.verification.clone(),
@@ -217,19 +272,30 @@ fn state_bytes(record: &Record) -> Result<Vec<u8>, LlmError> {
 pub(super) struct RunStore {
     backend: Arc<dyn RunStorage>,
     completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
+    workspace_evidence: Option<Arc<dyn WorkspaceNodeEvidenceSource>>,
     lock: Mutex<HashSet<String>>,
 }
 impl RunStore {
+    #[cfg(test)]
     pub(super) fn open(backend: Arc<dyn RunStorage>) -> Arc<Self> {
         Self::open_with_completion_evidence(backend, None)
     }
+    #[cfg(test)]
     pub(super) fn open_with_completion_evidence(
         backend: Arc<dyn RunStorage>,
         completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
     ) -> Arc<Self> {
+        Self::open_with_workspace_evidence(backend, completion_evidence, None)
+    }
+    pub(super) fn open_with_workspace_evidence(
+        backend: Arc<dyn RunStorage>,
+        completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
+        workspace_evidence: Option<Arc<dyn WorkspaceNodeEvidenceSource>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             backend,
             completion_evidence,
+            workspace_evidence,
             lock: Mutex::new(HashSet::new()),
         })
     }
@@ -250,6 +316,8 @@ impl RunStore {
                     frozen,
                     checkpoint: state.checkpoint,
                     frozen_node_evidence: state.frozen_node_evidence,
+                    workspace_node_evidence: state.workspace_node_evidence,
+                    workspace_observation: state.workspace_observation,
                     end: state.end,
                     usage: state.usage,
                     verification: state.verification,
@@ -288,11 +356,22 @@ impl RunStore {
                 "冻结测试证据来源未就绪，未启动子代理".into(),
             ));
         }
+        if matches!(
+            frozen.verification,
+            TaskCompletionContract::WorkspaceNodeTest { .. }
+        ) && self.workspace_evidence.is_none()
+        {
+            return Err(LlmError::Context(
+                "工作区测试证据来源未就绪，未启动子代理".into(),
+            ));
+        }
         let record = Record {
             version: 1,
             frozen,
             checkpoint: None,
             frozen_node_evidence: vec![],
+            workspace_node_evidence: vec![],
+            workspace_observation: None,
             end: None,
             usage: None,
             verification: None,
@@ -396,6 +475,40 @@ impl RunStore {
         if let Some(reason) = reason {
             row["reason"] = json!(reason);
         }
+        if matches!(
+            record.frozen.verification,
+            TaskCompletionContract::WorkspaceNodeTest { .. }
+        ) {
+            row["evidence_kind"] = json!("historical_workspace_node_test");
+            row.as_object_mut().ok_or_else(storage)?.remove("reason");
+            row["report"] = json!({
+                "contract_sha256":eve_task_api::task_strategy_digest(&record.frozen.verification),
+                "checkpoint_sha256":frame.map(eve_task_api::workspace_node_checkpoint_sha256),
+                "test_evidence":record.workspace_node_evidence.iter().map(|evidence| json!({
+                    "call_id":evidence.call_id,
+                    "arguments_sha256":evidence.arguments_sha256,
+                    "tool_result_sha256":evidence.tool_result_sha256,
+                    "workspace_sha256":evidence.workspace_sha256,
+                    "input_sha256":evidence.input_sha256,
+                    "runtime_sha256":evidence.runtime_sha256,
+                    "command_sha256":evidence.command_sha256,
+                    "outcome":evidence.outcome,
+                    "matches_input_at_settlement":record.workspace_observation.as_ref().map(|current|
+                        current.workspace_sha256 == evidence.workspace_sha256
+                        && current.directory == evidence.directory
+                        && current.entry == evidence.entry
+                        && current.args == evidence.args
+                        && current.input_sha256 == evidence.input_sha256),
+                })).collect::<Vec<_>>(),
+                "settlement_observation":record.workspace_observation.as_ref().map(|current| json!({
+                    "checkpoint_sha256":current.checkpoint_sha256,
+                    "workspace_sha256":current.workspace_sha256,
+                    "input_sha256":current.input_sha256,
+                    "observed_at_ms":current.observed_at_ms,
+                })),
+                "verified_at_settlement":verification == Some("verified"),
+            });
+        }
         Ok(json!({"runs":[row],"automatic_resume":false}))
     }
     fn views(&self, owner: &TaskOwner, id: Option<&str>, offset: usize) -> Result<Value, LlmError> {
@@ -493,12 +606,84 @@ pub(super) struct RunJournal {
     store: Arc<RunStore>,
     pub(super) id: String,
 }
+/// 从原持久记录复制的观察目标；调用者可在不持有账本锁时采集当前工作区。
+pub(super) struct WorkspaceObservationTarget {
+    pub contract: TaskCompletionContract,
+    pub owner: TaskOwner,
+    pub model_session: ModelSession,
+    pub checkpoint_sha256: String,
+}
 impl RunJournal {
+    pub(super) fn workspace_observation_target(
+        &self,
+    ) -> Result<Option<WorkspaceObservationTarget>, LlmError> {
+        let _lock = self.store.lock.lock().map_err(|_| storage())?;
+        let record = self.store.read(&self.id)?.ok_or_else(storage)?;
+        if record.end.is_some() {
+            return Err(storage());
+        }
+        if !matches!(
+            record.frozen.verification,
+            TaskCompletionContract::WorkspaceNodeTest { .. }
+        ) {
+            return Ok(None);
+        }
+        let Some(frame) = &record.checkpoint else {
+            return Ok(None);
+        };
+        if !frame.resumable()
+            || frame.remaining.is_some()
+            || frame
+                .result
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        Ok(Some(WorkspaceObservationTarget {
+            contract: record.frozen.verification,
+            owner: record.frozen.owner,
+            model_session: record.frozen.model_session,
+            checkpoint_sha256: eve_task_api::workspace_node_checkpoint_sha256(frame),
+        }))
+    }
     pub(super) fn finish(&self, run: &mut WorkerRun) -> Result<(), LlmError> {
+        self.finish_inner(run, None, None)
+    }
+    /// 观察与结局一次提交；若采集期间检查点改变，拒绝借用旧观察。
+    pub(super) fn finish_with_workspace_observation(
+        &self,
+        run: &mut WorkerRun,
+        expected_checkpoint_sha256: &str,
+        current: Option<WorkspaceObservation>,
+    ) -> Result<(), LlmError> {
+        self.finish_inner(run, Some(expected_checkpoint_sha256), current)
+    }
+    fn finish_inner(
+        &self,
+        run: &mut WorkerRun,
+        expected_checkpoint_sha256: Option<&str>,
+        current: Option<WorkspaceObservation>,
+    ) -> Result<(), LlmError> {
         let mut active = self.store.lock.lock().map_err(|_| storage())?;
         let mut record = self.store.read(&self.id)?.ok_or_else(storage)?;
         if record.end.is_some() {
             return Err(storage());
+        }
+        if let Some(expected) = expected_checkpoint_sha256
+            && (!matches!(
+                record.frozen.verification,
+                TaskCompletionContract::WorkspaceNodeTest { .. }
+            ) || record.checkpoint.as_ref().is_none_or(|frame| {
+                eve_task_api::workspace_node_checkpoint_sha256(frame) != expected
+            }))
+        {
+            return Err(storage());
+        }
+        if let Some(current) = &current {
+            let frame = record.checkpoint.as_ref().ok_or_else(storage)?;
+            eve_task_api::validate_workspace_observation(&record.frozen.owner, frame, current)
+                .map_err(|_| storage())?;
         }
         if let Some(checkpoint) = &record.checkpoint {
             let persisted = usage_of(checkpoint.provider_requests, checkpoint.used_tool_calls);
@@ -508,6 +693,7 @@ impl RunJournal {
         if matches!(
             record.frozen.verification,
             TaskCompletionContract::FrozenNodeTest { .. }
+                | TaskCompletionContract::WorkspaceNodeTest { .. }
         ) {
             let verification = match &run.end {
                 TaskEnd::Completed { result } => match &record.checkpoint {
@@ -515,14 +701,29 @@ impl RunJournal {
                         if run.usage
                             == usage_of(frame.provider_requests, frame.used_tool_calls) =>
                     {
-                        eve_task_plugin::evaluate_checkpoint_completion(
-                            &record.frozen.verification,
-                            &record.frozen.owner,
-                            frame,
-                            record.frozen.steps as usize,
-                            result,
-                            &record.frozen_node_evidence,
-                        )
+                        if matches!(
+                            record.frozen.verification,
+                            TaskCompletionContract::WorkspaceNodeTest { .. }
+                        ) {
+                            eve_task_plugin::evaluate_workspace_node_completion(
+                                &record.frozen.verification,
+                                &record.frozen.owner,
+                                frame,
+                                record.frozen.steps as usize,
+                                result,
+                                &record.workspace_node_evidence,
+                                current.as_ref(),
+                            )
+                        } else {
+                            eve_task_plugin::evaluate_checkpoint_completion(
+                                &record.frozen.verification,
+                                &record.frozen.owner,
+                                frame,
+                                record.frozen.steps as usize,
+                                result,
+                                &record.frozen_node_evidence,
+                            )
+                        }
                     }
                     Some(_) => TaskCompletionAssessment::Unverifiable {
                         reason: "uncheckpointed_execution_usage".into(),
@@ -553,6 +754,7 @@ impl RunJournal {
             run.verification = Some(verification);
         }
         record.end = Some(End::capture(&run.end)?);
+        record.workspace_observation = current;
         record.usage = Some(run.usage);
         record.verification = run.verification.clone();
         record.finished_at_ms = Some(now_ms());
@@ -587,6 +789,7 @@ impl TurnJournal for RunJournal {
                     || (matches!(
                         record.frozen.verification,
                         TaskCompletionContract::FrozenNodeTest { .. }
+                            | TaskCompletionContract::WorkspaceNodeTest { .. }
                     ) && old.result.is_some())
             })
         {
@@ -611,6 +814,27 @@ impl TurnJournal for RunJournal {
                 &record.frozen.owner,
                 checkpoint,
                 &record.frozen_node_evidence,
+                captured,
+            )
+            .map_err(|_| storage())?;
+        }
+        if matches!(
+            record.frozen.verification,
+            TaskCompletionContract::WorkspaceNodeTest { .. }
+        ) {
+            record.validate()?;
+            let captured = self
+                .store
+                .workspace_evidence
+                .as_ref()
+                .map(|source| source.capture(&record.frozen.owner, checkpoint))
+                .transpose()
+                .map_err(|_| storage())?
+                .unwrap_or_default();
+            record.workspace_node_evidence = eve_task_api::merge_workspace_node_evidence(
+                &record.frozen.owner,
+                checkpoint,
+                &record.workspace_node_evidence,
                 captured,
             )
             .map_err(|_| storage())?;

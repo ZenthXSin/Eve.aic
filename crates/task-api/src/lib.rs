@@ -7,6 +7,8 @@ mod evidence;
 pub use evidence::{TaskEvidenceKey, TaskEvidenceReader, TaskEvidenceSnapshot};
 mod frozen_node;
 pub use frozen_node::*;
+mod workspace_node;
+pub use workspace_node::*;
 mod completion;
 pub use completion::*;
 mod receipt_evidence;

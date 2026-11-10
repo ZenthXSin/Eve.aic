@@ -164,6 +164,7 @@ async fn open_fixture(task: Arc<Model>, coding: Arc<Model>, authorized: bool) ->
         },
         Arc::new(NoDigest),
         Arc::new(SqliteRunStorage::open(&directory.path().join("subagent-runs.sqlite3")).unwrap()),
+        None,
     )
     .await
     .unwrap();

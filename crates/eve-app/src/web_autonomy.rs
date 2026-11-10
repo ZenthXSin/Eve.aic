@@ -29,6 +29,7 @@ pub(crate) struct WebAutonomy {
     worker_tools: Vec<String>,
     worker_config: eve_runtime::LlmHostConfig,
     run_storage: Arc<dyn crate::qq_tasks::RunStorage>,
+    workspace_node: Option<Arc<crate::qq_tasks::workspace_node::WorkspaceNodeAdapter>>,
     api_key: String,
 }
 
@@ -148,13 +149,20 @@ impl WebAutonomy {
         });
         business.recover_pending()?;
         bootstrap.tools.push(business.clone());
-        let developer = crate::developer::install_with_member_runtime_backend_profile(
+        let workspace_node_prepared =
+            crate::qq_tasks::workspace_node_config::prepare_from_environment()?;
+        let workspace_node_protected = workspace_node_prepared
+            .as_ref()
+            .map(|prepared| prepared.protected_paths.clone())
+            .unwrap_or_default();
+        let developer = crate::developer::install_with_member_runtime_backend_protected(
             bootstrap,
             state,
             Some(admin.clone()),
             None,
             crate::developer::action_reviewer(registry.clone(), health.clone()),
             true,
+            &workspace_node_protected,
         )?;
         let development = developer
             .as_ref()
@@ -301,6 +309,12 @@ impl WebAutonomy {
         bootstrap.context = Some(context);
 
         let late = Arc::new(crate::qq_tasks::Late::default());
+        let workspace_node = crate::qq_tasks::workspace_node_config::attach(
+            workspace_node_prepared,
+            developer.clone(),
+            bootstrap,
+            &late,
+        )?;
         late.admission
             .set(admission.clone())
             .map_err(|_| "Web 主体准入重复装配")?;
@@ -557,6 +571,7 @@ impl WebAutonomy {
             run_storage: Arc::new(crate::qq_tasks::SqliteRunStorage::open(
                 &state.join("subagent-runs.sqlite3"),
             )?),
+            workspace_node,
             api_key: bootstrap.api_key.clone(),
         })
     }
@@ -625,6 +640,7 @@ impl WebAutonomy {
             },
             self.digests.clone(),
             self.run_storage.clone(),
+            self.workspace_node.clone(),
         )
         .await?;
         worker.authorize_with(self.admin.clone());

@@ -407,6 +407,13 @@ impl StoredTasks {
         {
             return Err(TaskError::Unavailable);
         }
+        // 工作区测试目前只由普通子代理宿主完成独立收尾观察；后台没有对应采集与持久化接线。
+        if matches!(
+            completion_contract,
+            Some(TaskCompletionContract::WorkspaceNodeTest { .. })
+        ) {
+            return Err(TaskError::Unavailable);
+        }
         let mine = || {
             inner
                 .ledger

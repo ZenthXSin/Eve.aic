@@ -42,6 +42,9 @@ pub fn evaluate_completion_contract(
         TaskCompletionContract::FrozenNodeTest { .. } => {
             unknown("missing_trusted_frozen_node_evidence")
         }
+        TaskCompletionContract::WorkspaceNodeTest { .. } => {
+            unknown("missing_trusted_workspace_node_evidence")
+        }
         TaskCompletionContract::Text {
             required_fragments,
             json_equals,

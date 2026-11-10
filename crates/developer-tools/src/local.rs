@@ -22,6 +22,7 @@ mod live_upgrade;
 mod member;
 mod review;
 mod source;
+mod workspace_snapshot;
 mod workspaces;
 
 const MAX_FILE: usize = 8 * 1024 * 1024;
@@ -1431,6 +1432,21 @@ impl LocalDeveloper {
     }
 }
 impl DeveloperBackend for LocalDeveloper {
+    fn capture_workspace_snapshot(
+        &self,
+        request: WorkspaceSnapshotRequest,
+        context: ToolExecutionContext,
+    ) -> WorkspaceSnapshotFuture<'_> {
+        Box::pin(async move {
+            let _serial = tokio::select! {
+                lock = self.ledger.serial.lock() => lock,
+                _ = cancelled(&context) => return Err(ToolExecutionError::Cancelled(
+                    "工作区快照等待已取消或到期".into(),
+                )),
+            };
+            self.workspace_snapshot(request, &context)
+        })
+    }
     fn observation_capabilities(&self) -> Option<DeveloperObservationCapabilities> {
         Some(DeveloperObservationCapabilities {
             workspace: self.root.clone(),

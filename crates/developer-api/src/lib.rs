@@ -11,6 +11,8 @@ mod upgrade;
 pub use upgrade::*;
 mod credentials;
 pub use credentials::credential_path;
+mod workspace_snapshot;
+pub use workspace_snapshot::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -528,6 +530,19 @@ pub fn session_workspace_key(scope: &eve_llm_api::ContextScope) -> String {
 
 /// 可替换后端；接收宿主的可信会话身份与取消状态，而非模型自报 owner。
 pub trait DeveloperBackend: Send + Sync {
+    /// 宿主专用只读采集：不暴露为模型工具，不从 JSON 接受可信快照。
+    /// 不支持的后端必须明确拒绝，不猜测目录或改用宿主读取。
+    fn capture_workspace_snapshot(
+        &self,
+        _request: WorkspaceSnapshotRequest,
+        _context: ToolExecutionContext,
+    ) -> WorkspaceSnapshotFuture<'_> {
+        Box::pin(async {
+            Err(ToolExecutionError::Rejected(
+                "后端不支持可信工作区快照".into(),
+            ))
+        })
+    }
     /// 未声明能力的后端不能由宿主猜测目录或默认开放进程观察。
     fn observation_capabilities(&self) -> Option<DeveloperObservationCapabilities> {
         None

@@ -116,7 +116,7 @@ fn plain_directory(path: &Path) -> Result<(), ToolExecutionError> {
 }
 
 impl LocalDeveloper {
-    fn at_root(&self, root: PathBuf) -> Self {
+    pub(super) fn at_root(&self, root: PathBuf) -> Self {
         let mut config = self.config.clone();
         config.workspace = root.clone();
         Self {

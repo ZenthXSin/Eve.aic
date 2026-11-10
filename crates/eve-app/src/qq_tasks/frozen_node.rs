@@ -291,7 +291,7 @@ impl TaskCompletionEvidenceSource for FrozenNodeAdapter {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use eve_llm_api::{ChatMessage, ChatRole, ContextScope, SharedToolSteps};
     use eve_script_runtime::FrozenNodeRuntime;
@@ -431,7 +431,7 @@ mod tests {
         assert!(fs::symlink_metadata(destination).unwrap().is_file());
     }
 
-    fn real_runner() -> FrozenNodeTestRunner {
+    pub(crate) fn real_runner() -> FrozenNodeTestRunner {
         let node = trusted_binary("node");
         let ldd = trusted_binary("ldd");
         let interpreter = elf_interpreter(&node);

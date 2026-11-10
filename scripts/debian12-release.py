@@ -39,6 +39,7 @@ SUITES = (
     ("natural-progress", QQ + "natural_progress_test.py"),
     ("natural-speech-parts", QQ + "natural_speech_parts_test.py"),
     ("subagent-records", QQ + "subagent_profiles_test.py"),
+    ("workspace-node-evidence", QQ + "workspace_node_test.py"),
     ("conversation-learning", QQ + "conversation_learning_test.py"),
     ("conversation-history-maintenance", QQ + "conversation_history_maintenance_test.py"),
     ("message-learning-flow", QQ + "message_learning_flow_test.py"),

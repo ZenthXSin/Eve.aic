@@ -18,7 +18,11 @@ pub(crate) const OBSERVATION_RULES: &str = "回执只接受宿主真实观察：
 pub(crate) fn validate_contract(contract: &TaskCompletionContract) -> TaskResult<()> {
     contract.validate()?;
     // 普通模型入口尚未装配冻结 bundle 与可信运行器，不能仅因定义层认识新 tag 就接纳。
-    if matches!(contract, TaskCompletionContract::FrozenNodeTest { .. }) {
+    if matches!(
+        contract,
+        TaskCompletionContract::FrozenNodeTest { .. }
+            | TaskCompletionContract::WorkspaceNodeTest { .. }
+    ) {
         return Err(TaskError::Unavailable);
     }
     if let TaskCompletionContract::Receipts { contract } = contract {

@@ -198,6 +198,12 @@ jobs:
         id: process-binaries
         run: cargo build -p eve-app -p eve-runtime -p eve-cognition-plugin --bins --examples --locked
       # 独立进程验收继续收集失败，避免每修一处重跑全量才能发现下一处；失败仍使作业失败。
+      - name: 验证工作区测试证据复用与重启不重跑
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        run: |
+          $env:EVE_QQBOT_BINARY = "target/debug/eve-qqbot"
+          python -X utf8 connectors/qqbot/test/workspace_node_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证后台策略通过真实文件回执学习与恢复
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |

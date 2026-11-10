@@ -587,6 +587,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_node_is_operator_only_and_respects_stop_and_business_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = Admin::open(
+            directory.path(),
+            eve_qqbot_plugin::QqConversations::default(),
+            std::collections::BTreeSet::from(["administrator".into()]),
+            eve_kernel::KernelServices::default().registry,
+        )
+        .unwrap();
+        let context = |user: &str| {
+            ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
+                session_id: "s".into(),
+                user_id: user.into(),
+            }))
+        };
+        let name = eve_task_api::WORKSPACE_NODE_TEST_TOOL;
+        assert!(!public_tool(name));
+        assert!(authorize_tool(&admin, false, name, None, &context("member")).is_err());
+        let operator = context("administrator");
+        assert!(authorize_tool(&admin, false, name, None, &operator).is_ok());
+        operator.cancellation_handle().cancel();
+        assert!(matches!(
+            authorize_tool(&admin, false, name, None, &operator),
+            Err(ToolExecutionError::Cancelled(_))
+        ));
+        admin.business.fail_closed();
+        assert!(authorize_tool(&admin, false, name, None, &context("administrator")).is_err());
+    }
+
+    #[test]
     fn source_queries_remain_available_in_legacy_and_group_conversations() {
         use eve_llm_api::ToolScopePolicy;
         let directory = tempfile::tempdir().unwrap();

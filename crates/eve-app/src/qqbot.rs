@@ -2212,13 +2212,20 @@ async fn run_qqbot_composed(
             subject: subject.clone(),
             binding: exploration_notes.binding.clone(),
         }));
-        let developer_backend = crate::developer::install_with_member_runtime_backend_profile(
+        let workspace_node_prepared = qq_tasks::workspace_node_config::prepare_from_environment()?;
+        let workspace_node_protected = workspace_node_prepared.as_ref()
+            .map(|prepared| prepared.protected_paths.clone()).unwrap_or_default();
+        let developer_backend = crate::developer::install_with_member_runtime_backend_protected(
             &mut bootstrap,
             &options.state_directory,
             Some(qq_admin.clone()),
             Some(crate::developer::member_runtime(options.practice_java.as_deref(), options.practice_server_jar.as_deref())),
             crate::developer::action_reviewer(registry.clone(), model_health.clone()),
             options.automatic_capabilities,
+            &workspace_node_protected,
+        )?;
+        let workspace_node = qq_tasks::workspace_node_config::attach(
+            workspace_node_prepared, developer_backend.clone(), &mut bootstrap, &task_late,
         )?;
         if let Some(services) = preference_services {
             let mut services = (*services).clone();
@@ -2732,6 +2739,7 @@ async fn run_qqbot_composed(
                 },
                 history_digests.clone(),
                 Arc::new(qq_tasks::SqliteRunStorage::open(&options.state_directory.join("subagent-runs.sqlite3"))?),
+                workspace_node.clone(),
             )
             .await?;
             worker.authorize_with(qq_admin.clone());

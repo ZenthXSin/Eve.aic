@@ -22,6 +22,7 @@ const MAX_RUNTIME_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LAUNCHER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INPUT_FILES: usize = 64;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INPUT_ENTRIES: usize = 4096;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_INVOCATIONS: usize = 1024;
 const MOUNT_DIRECTORIES: &[&str] = &["work", "control", "tmp", "dev"];
@@ -123,15 +124,37 @@ impl FrozenNodeRuntime {
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
+
+    /// 只供可信宿主把私有运行时登记到受保护路径；不得作为模型工具输出。
+    pub fn snapshot_path(&self) -> &Path {
+        self.snapshot.path()
+    }
 }
 
 /// 完整小型纯 JS bundle。字节由调用方明确提交，不读取模型指定宿主路径。
 /// 禁止 node native addon；完整依赖必须随 bundle 提供，缺失即失败。
 pub struct FrozenNodeTestBundle {
     files: BTreeMap<String, Vec<u8>>,
+    // 旧 new(files) 保留原摘要及隐式目录行为；新路径显式冻结完整目录树与执行位。
+    entries: Option<BTreeMap<String, InputMetadata>>,
     entry: String,
     arguments: Vec<String>,
     sha256: String,
+}
+
+/// 可信输入采集器提交的完整目录树；根目录必须显式为 `.`，不读取宿主路径。
+pub struct FrozenNodeInputEntry {
+    pub path: String,
+    pub executable_bits: u32,
+    pub contents: FrozenNodeInputContents,
+}
+pub enum FrozenNodeInputContents {
+    Directory,
+    File(Vec<u8>),
+}
+struct InputMetadata {
+    directory: bool,
+    executable_bits: u32,
 }
 impl FrozenNodeTestBundle {
     pub fn new(
@@ -176,6 +199,85 @@ impl FrozenNodeTestBundle {
         let sha256 = digest(&(POLICY_VERSION, &manifest))?;
         Ok(Self {
             files,
+            entries: None,
+            entry,
+            arguments,
+            sha256,
+        })
+    }
+
+    /// 工作区输入版本：保留空目录与执行位，拒绝截断、不完整父目录和特殊路径。
+    /// 使用独立摘要域；不会重释既有 new(files) 冻結合同。
+    pub fn from_entries(
+        input: Vec<FrozenNodeInputEntry>,
+        entry: String,
+        arguments: Vec<String>,
+    ) -> Result<Self> {
+        validate_selection(&entry, &arguments)?;
+        if input.is_empty() || input.len() > MAX_INPUT_ENTRIES {
+            return Err(reject("Node 完整目录树数量超限"));
+        }
+        let mut files = BTreeMap::new();
+        let mut entries = BTreeMap::new();
+        let mut bytes = 0usize;
+        for item in input {
+            if item.path != "." {
+                relative_path(&item.path)?;
+            }
+            if item.executable_bits & !0o111 != 0 || entries.contains_key(&item.path) {
+                return Err(reject("Node 输入执行位无效或路径重复"));
+            }
+            let directory = matches!(item.contents, FrozenNodeInputContents::Directory);
+            if let FrozenNodeInputContents::File(content) = item.contents {
+                if item.path == "."
+                    || Path::new(&item.path)
+                        .extension()
+                        .is_some_and(|ext| ext == "node")
+                {
+                    return Err(reject("Node 输入根目录或 native addon 无效"));
+                }
+                bytes = bytes.saturating_add(content.len());
+                if files.len() >= MAX_INPUT_FILES || bytes > MAX_INPUT_BYTES {
+                    return Err(reject("Node 完整测试输入超过 64 文件或 8 MiB；未裁剪"));
+                }
+                files.insert(item.path.clone(), content);
+            }
+            entries.insert(
+                item.path,
+                InputMetadata {
+                    directory,
+                    executable_bits: item.executable_bits,
+                },
+            );
+        }
+        if !entries.get(".").is_some_and(|item| item.directory) || !files.contains_key(&entry) {
+            return Err(reject("Node 输入缺少完整根目录或 JS 入口"));
+        }
+        let mut manifest = Vec::new();
+        for (path, item) in &entries {
+            if path != "." {
+                let parent = Path::new(path)
+                    .parent()
+                    .and_then(Path::to_str)
+                    .unwrap_or("");
+                let parent = if parent.is_empty() { "." } else { parent };
+                if !entries.get(parent).is_some_and(|entry| entry.directory) {
+                    return Err(reject("Node 完整输入缺少父目录或文件目录冲突"));
+                }
+            }
+            let content = files.get(path);
+            manifest.push(ManifestEntry {
+                path: path.clone(),
+                directory: item.directory,
+                executable_bits: item.executable_bits,
+                bytes: content.map_or(0, |bytes| bytes.len() as u64),
+                sha256: content.map(|bytes| archive_digest(bytes)),
+            });
+        }
+        let sha256 = digest(&("frozen-node-input-tree:v1", &manifest))?;
+        Ok(Self {
+            files,
+            entries: Some(entries),
             entry,
             arguments,
             sha256,
@@ -280,6 +382,12 @@ impl FrozenNodeTestRunner {
     }
 
     pub fn command_sha256(&self, bundle: &FrozenNodeTestBundle) -> Result<String> {
+        self.command_sha256_for(&bundle.entry, &bundle.arguments)
+    }
+
+    /// 冻结命令策略与入口/参数，不要求入口源码已经存在，也不伪造占位 bundle。
+    pub fn command_sha256_for(&self, entry: &str, arguments: &[String]) -> Result<String> {
+        validate_selection(entry, arguments)?;
         digest(&(
             POLICY_VERSION,
             &self.bwrap_sha256,
@@ -287,8 +395,8 @@ impl FrozenNodeTestRunner {
             FLAGS,
             ENVIRONMENT,
             archive_digest(BOOTSTRAP.as_bytes()),
-            &bundle.entry,
-            &bundle.arguments,
+            entry,
+            arguments,
         ))
     }
 
@@ -369,15 +477,12 @@ impl FrozenNodeTestRunner {
         let control = stage.path().join("control");
         fs::create_dir(&work).map_err(fail)?;
         fs::create_dir(&control).map_err(fail)?;
-        for (path, bytes) in &bundle.files {
-            crate::runtime::check_stop(&context, deadline)?;
-            let destination = work.join(path);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).map_err(fail)?;
-            }
-            fs::write(&destination, bytes).map_err(fail)?;
-            set_mode(&destination, 0)?;
-        }
+        // 输入目录可没有搜索位；结束后恢复私有副本目录权限，使取消/失败也能清理。
+        let _input_cleanup = InputModeCleanup {
+            work: &work,
+            bundle,
+        };
+        materialize_input(bundle, &work, &context, deadline)?;
         let bootstrap = control.join("start.cjs");
         fs::write(&bootstrap, BOOTSTRAP).map_err(fail)?;
         set_mode(&bootstrap, 0)?;
@@ -498,6 +603,74 @@ impl FrozenNodeTestRunner {
         }
         Ok(receipt)
     }
+}
+
+fn validate_selection(entry: &str, arguments: &[String]) -> Result<()> {
+    relative_path(entry)?;
+    if !matches!(
+        Path::new(entry).extension().and_then(|s| s.to_str()),
+        Some("js" | "cjs" | "mjs")
+    ) || arguments.len() > 16
+        || arguments.iter().map(String::len).sum::<usize>() > 4096
+        || arguments.iter().any(|value| value.contains('\0'))
+    {
+        return Err(reject(
+            "Node 入口须为 JS，参数最多 16 项和 4096 字节且不含 NUL",
+        ));
+    }
+    Ok(())
+}
+
+struct InputModeCleanup<'a> {
+    work: &'a Path,
+    bundle: &'a FrozenNodeTestBundle,
+}
+impl Drop for InputModeCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(entries) = &self.bundle.entries {
+            // BTreeMap 中父目录先于子目录；只改即将删除的私有临时副本。
+            for (path, _) in entries.iter().filter(|(_, entry)| entry.directory) {
+                let _ = set_mode(&self.work.join(path), 0o111);
+            }
+        }
+    }
+}
+
+fn materialize_input(
+    bundle: &FrozenNodeTestBundle,
+    work: &Path,
+    context: &ToolExecutionContext,
+    deadline: Instant,
+) -> Result<()> {
+    if let Some(entries) = &bundle.entries {
+        // 先写完整字节，再从深到浅恢复目录执行位；无搜索位目录不能阻碍准备阶段。
+        for (path, item) in entries {
+            crate::runtime::check_stop(context, deadline)?;
+            if path != "." && item.directory {
+                fs::create_dir_all(work.join(path)).map_err(fail)?;
+            }
+        }
+    }
+    for (path, bytes) in &bundle.files {
+        crate::runtime::check_stop(context, deadline)?;
+        let destination = work.join(path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(fail)?;
+        }
+        fs::write(&destination, bytes).map_err(fail)?;
+        let bits = bundle
+            .entries
+            .as_ref()
+            .map_or(0, |entries| entries[path].executable_bits);
+        set_mode(&destination, bits)?;
+    }
+    if let Some(entries) = &bundle.entries {
+        for (path, item) in entries.iter().rev().filter(|(_, item)| item.directory) {
+            crate::runtime::check_stop(context, deadline)?;
+            set_mode(&work.join(path), item.executable_bits)?;
+        }
+    }
+    Ok(())
 }
 
 fn exit_outcome(
@@ -819,7 +992,141 @@ fn set_mode(path: &Path, executable_bits: u32) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
+
+    fn tree(empty_directory: bool, file_bits: u32) -> Vec<FrozenNodeInputEntry> {
+        let mut entries = vec![
+            FrozenNodeInputEntry {
+                path: ".".into(),
+                executable_bits: 0o111,
+                contents: FrozenNodeInputContents::Directory,
+            },
+            FrozenNodeInputEntry {
+                path: "entry.cjs".into(),
+                executable_bits: file_bits,
+                contents: FrozenNodeInputContents::File(b"console.log('ok')".to_vec()),
+            },
+        ];
+        if empty_directory {
+            entries.push(FrozenNodeInputEntry {
+                path: "empty".into(),
+                executable_bits: 0o101,
+                contents: FrozenNodeInputContents::Directory,
+            });
+        }
+        entries
+    }
+
+    #[test]
+    fn full_tree_binds_empty_directories_and_execution_bits_without_changing_legacy_digest() {
+        let old = FrozenNodeTestBundle::new(
+            BTreeMap::from([("entry.cjs".into(), b"console.log('ok')".to_vec())]),
+            "entry.cjs".into(),
+            vec![],
+        )
+        .unwrap();
+        let expected = digest(&(
+            POLICY_VERSION,
+            vec![(
+                "entry.cjs",
+                b"console.log('ok')".len(),
+                archive_digest(b"console.log('ok')"),
+            )],
+        ))
+        .unwrap();
+        assert_eq!(old.sha256(), expected);
+        let plain =
+            FrozenNodeTestBundle::from_entries(tree(false, 0), "entry.cjs".into(), vec![]).unwrap();
+        let directories =
+            FrozenNodeTestBundle::from_entries(tree(true, 0), "entry.cjs".into(), vec![]).unwrap();
+        let executable =
+            FrozenNodeTestBundle::from_entries(tree(true, 0o010), "entry.cjs".into(), vec![])
+                .unwrap();
+        assert_ne!(plain.sha256(), old.sha256());
+        assert_ne!(plain.sha256(), directories.sha256());
+        assert_ne!(directories.sha256(), executable.sha256());
+        let mut reversed = tree(true, 0o010);
+        reversed.reverse();
+        assert_eq!(
+            executable.sha256(),
+            FrozenNodeTestBundle::from_entries(reversed, "entry.cjs".into(), vec![])
+                .unwrap()
+                .sha256()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        materialize_input(
+            &executable,
+            directory.path(),
+            &ToolExecutionContext::default(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(directory.path().join("empty").is_dir());
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("empty"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0o101
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("entry.cjs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0o010
+        );
+        assert_eq!(
+            fs::read(directory.path().join("entry.cjs")).unwrap(),
+            b"console.log('ok')"
+        );
+    }
+
+    #[test]
+    fn full_tree_rejects_missing_parents_duplicates_modes_and_input_truncation() {
+        for change in 0..5 {
+            let mut entries = tree(false, 0);
+            match change {
+                0 => {
+                    entries.remove(0);
+                }
+                1 => entries.push(FrozenNodeInputEntry {
+                    path: "missing/a.cjs".into(),
+                    executable_bits: 0,
+                    contents: FrozenNodeInputContents::File(vec![]),
+                }),
+                2 => entries.push(FrozenNodeInputEntry {
+                    path: "entry.cjs".into(),
+                    executable_bits: 0,
+                    contents: FrozenNodeInputContents::Directory,
+                }),
+                3 => entries[1].executable_bits = 0o777,
+                _ => {
+                    entries[1].contents =
+                        FrozenNodeInputContents::File(vec![0; MAX_INPUT_BYTES + 1])
+                }
+            }
+            assert!(
+                FrozenNodeTestBundle::from_entries(entries, "entry.cjs".into(), vec![]).is_err()
+            );
+        }
+        let mut entries = tree(false, 0);
+        for index in 0..MAX_INPUT_FILES {
+            entries.push(FrozenNodeInputEntry {
+                path: format!("file-{index}"),
+                executable_bits: 0,
+                contents: FrozenNodeInputContents::File(vec![]),
+            });
+        }
+        assert!(FrozenNodeTestBundle::from_entries(entries, "entry.cjs".into(), vec![]).is_err());
+    }
 
     #[tokio::test]
     async fn ready_exit_cannot_override_cancellation_at_settlement() {

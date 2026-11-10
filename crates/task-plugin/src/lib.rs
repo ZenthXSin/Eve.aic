@@ -3,9 +3,11 @@ mod archive;
 mod capacity;
 mod cold;
 mod completion;
+mod workspace_node_completion;
 pub use completion::{
     evaluate_checkpoint_completion, evaluate_completion_contract, evaluate_task_completion,
 };
+pub use workspace_node_completion::evaluate_workspace_node_completion;
 mod receipt_evidence;
 pub use receipt_evidence::select_task_receipt_evidence;
 mod progress;

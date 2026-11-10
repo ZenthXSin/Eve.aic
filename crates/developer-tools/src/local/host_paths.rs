@@ -59,13 +59,23 @@ pub fn resolve_host_path(
     if protected_name(&real) {
         return Err(failed("宿主链接目标属于受保护区域"));
     }
+    check_protected_paths(&real, protected)?;
+    Ok(real)
+}
+
+/// 显式保护集合对相对工程文件同样生效；不因此扩大宿主文件访问能力。
+fn check_protected_paths(
+    path: &Path,
+    protected: &BTreeSet<PathBuf>,
+) -> Result<(), ToolExecutionError> {
+    let real = canonical_or_missing(path, true)?;
     for entry in protected {
         let entry = canonical_or_missing(entry, true)?;
         if real.starts_with(entry) {
             return Err(failed("该宿主路径由运行器保护，不提供模型文件访问"));
         }
     }
-    Ok(real)
+    Ok(())
 }
 
 pub(super) fn paths(operation: &DeveloperOperation) -> Vec<String> {
@@ -202,10 +212,10 @@ impl LocalDeveloper {
                     .to_str()
                     .ok_or_else(|| failed("宿主路径不是 UTF-8"))?
                     .to_owned();
-            } else if self.config.host_filesystem && !self.isolated {
+            } else {
                 let missing = !self.root.join(&*path).exists();
                 let resolved = self.path(path, missing)?;
-                resolve_host_path(&resolved, true, &protected)?;
+                self.check_model_file(&resolved)?;
             }
             Ok(())
         };
@@ -257,8 +267,10 @@ impl LocalDeveloper {
     }
 
     pub(super) fn check_model_file(&self, path: &Path) -> Result<(), ToolExecutionError> {
+        let protected = self.protected_paths();
+        check_protected_paths(path, &protected)?;
         if self.config.host_filesystem && !self.isolated {
-            resolve_host_path(path, true, &self.protected_paths())?;
+            resolve_host_path(path, true, &protected)?;
         }
         Ok(())
     }
