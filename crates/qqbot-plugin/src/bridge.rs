@@ -1621,7 +1621,7 @@ pub(crate) async fn run(
             let stale_foreground: Vec<_> = foreground_inputs.iter().filter_map(|(anchor,input)| {
                 let current=live_dialogue.as_ref().is_some_and(|live| input.current(live,&foreground_activity,control.as_ref()))
                     && conversations.latest_message_id(&input.key.session).ok().flatten().as_deref()==Some(anchor)
-                    && (input.progress || foreground_windows.get(anchor).is_none_or(|window|tokio::time::Instant::now()<window.deadline));
+                    && ((input.progress && !input.pending_progress) || foreground_windows.get(anchor).is_none_or(|window|tokio::time::Instant::now()<window.deadline));
                 (!current).then_some(anchor.clone())
             }).collect();
             for anchor in stale_foreground {
@@ -1656,7 +1656,7 @@ pub(crate) async fn run(
                 foreground_windows.remove(&anchor);
                 write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor})).await?;
             }
-            // 没有追加用户消息时，真正的慢工具也可获得一次自然交流机会。
+            // 慢工具和新的委派进展可获得交流机会；待消费输入必须先结束首次判断。
             // 只向当前原消息的私聊发送；短工具、已排队表达和近期主动说话让步。
             let mut open_progress_windows = Vec::new();
             if let (Some(speaker), Some(live)) = (&speech, &live_dialogue)
@@ -1680,9 +1680,15 @@ pub(crate) async fn run(
                     let Some(turn_id) = snapshot.turn_id else { continue };
                     let scope = eve_llm_api::ContextScope { session_id: current.key.session.session_id.clone(), user_id: current.key.session.user_id.clone() };
                     if snapshot.key != current.key || snapshot.phase != ControlPhase::Tools || snapshot.cancel_requested
-                        || snapshot.events_retired || !live.progress_is_current(&scope, turn_id) { continue; }
-                    let Some(batch) = foreground_activity.progress_candidate(&current.key, turn_id) else { continue };
-                    let mut input = ForegroundInput::progress(batch, anchor.clone(), current.started);
+                        || snapshot.events_retired { continue; }
+                    let mut input = if live.progress_is_current(&scope, turn_id) {
+                        let Some(batch) = foreground_activity.progress_candidate(&current.key, turn_id) else { continue };
+                        ForegroundInput::progress(batch, anchor.clone(), current.started)
+                    } else if merged && live.pending_progress_is_current(&scope, turn_id, &anchor) {
+                        let Some(previous) = foreground_inputs.get(&anchor) else {continue};
+                        let Some(batch) = foreground_activity.pending_progress_candidate(&current.key, turn_id, previous) else {continue};
+                        ForegroundInput::pending_progress(batch, anchor.clone(), current.started)
+                    } else {continue};
                     if merged { input.use_merged_window(); }
                     // 开窗期间子工具仍可能推进，首次判断前才冻结并持久化事实。
                     if let Some(previous) = foreground_inputs.insert(anchor.clone(), input) { speaker.retire(&previous.event)?; }
@@ -2583,12 +2589,17 @@ pub(crate) async fn run(
                         Ok(true)
                     };
                     let claim = if input.progress {
-                        live.claim_progress_reply(&scope, input.turn_id, eve_llm_api::InputReplyHandoff {
+                        let handoff = eve_llm_api::InputReplyHandoff {
                             kind: eve_llm_api::InputReplyKind::Progress,
                             input_message_id: ready.event.anchor.clone(), input_text: route.turn_text(),
                             event_id: ready.event.id.clone(), reply_text: ready.text.clone(),
                             delivery: eve_llm_api::InputReplyDelivery::Sending,
-                        }, persist)?
+                        };
+                        if input.pending_progress {
+                            live.claim_pending_progress_reply(&scope, input.turn_id, handoff, persist)?
+                        } else {
+                            live.claim_progress_reply(&scope, input.turn_id, handoff, persist)?
+                        }
                     } else {
                         live.claim_input_reply(&scope,input.turn_id,&ready.event.anchor,&ready.event.id,&ready.text,persist)?
                     };

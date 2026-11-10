@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location("debian12_release", Path(__file__).with_name("debian12-release.py"))
@@ -150,6 +151,33 @@ class ReleaseEvidenceAcceptance(unittest.TestCase):
         self.assertEqual(receipt["exit_code"], 3)
         self.assertEqual(release.digest(self.evidence / receipt["log"]), receipt["sha256"])
         self.assertFalse(receipt["timeout"])
+
+    def test_verify_preserves_all_suites_and_only_extends_natural_progress_total_budget(self):
+        def elf_read(*args):
+            if args[:2] == ("readelf", "-h"):
+                return "ELF64 Advanced Micro Devices X86-64"
+            if args[:2] == ("readelf", "--version-info"):
+                return "GLIBC_2.36"
+            return "synthetic ELF metadata"
+
+        def receipt(evidence, name, args, *, env=None, timeout=600):
+            return {"name": name, "exit_code": 0, "timeout": False}
+
+        with patch.object(release, "source_identity", return_value=self.built["source"]), \
+             patch.object(release, "environment", return_value=self.built["environment"]), \
+             patch.object(release, "read", side_effect=elf_read), \
+             patch.object(release, "command", side_effect=receipt) as commands:
+            release.verify(self.out, self.evidence, self.revision)
+
+        calls = commands.call_args_list
+        self.assertEqual([call.args[1] for call in calls],
+                         [name + "-help" for name in release.BINARIES]
+                         + [name for name, _ in release.SUITES])
+        for call in calls:
+            name = call.args[1]
+            expected_timeout = 30 if name.endswith("-help") else (900 if name == "natural-progress" else 600)
+            self.assertEqual(call.kwargs["timeout"], expected_timeout, name)
+        self.assertTrue(json.loads((self.evidence / "verification.json").read_text())["success"])
 
     def test_timeout_stops_before_next_suite_even_when_child_survives(self):
         # 探针故意生成独立 session 的子进程，验证父超时不会被误报成全部已清理。

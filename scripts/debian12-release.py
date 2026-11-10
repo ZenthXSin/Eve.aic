@@ -194,7 +194,10 @@ def verify(out, evidence, revision):
                EVE_WEB_BINARY=str(out / "payload/eve-web"))
     for name, script in SUITES:
         # 用例内部期限不变；某组失败后继续收集其它独立组，最终整体失败且不打包。
-        results.append(command(evidence, name, [sys.executable, "-B", script], env=env))
+        # 自然进度原整组已实测 575.6 秒，新增待消费输入用例还需真实等待约 70 秒。
+        # 只增加该组总预算，不缩短平台窗口/冷却或放宽其他组和单个用例的期限。
+        results.append(command(evidence, name, [sys.executable, "-B", script], env=env,
+                               timeout=900 if name == "natural-progress" else 600))
     final_source = source_identity(revision)
     require(final_source == built["source"], "验收改写了源码或依赖锁")
     require_payload(out, built)

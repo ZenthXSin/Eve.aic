@@ -561,6 +561,128 @@ class NaturalProgressAcceptance(live.LiveToolAcceptance):
         self.assertEqual([event['based_on_message_id'] for event in outputs], ['continued'])
         self.assertEqual([event['text'] for event in outputs], ['第一步已经核对，正在等下一步结果。'])
 
+    def test_new_delegated_stage_can_speak_while_latest_input_is_still_pending(self):
+        followup = '去吧，继续核对，发现需要我决定的事再说。'
+        progress_text = '第一步的回执回来了，第二步还在核对。'
+        config = json.loads(self.developer_config.read_text())
+        config['command_timeout_ms'] = 150_000
+        self.developer_config.write_text(json.dumps(config))
+        for number in (1, 2):
+            (self.source / f'stage-{number}.py').write_text(
+                "from pathlib import Path\nimport time\n"
+                f"Path('stage-{number}-started').touch()\n"
+                "deadline=time.monotonic()+130\n"
+                f"while not Path('release-stage-{number}').exists():\n"
+                "    assert time.monotonic()<deadline, 'stage gate timed out'\n"
+                "    time.sleep(.01)\n"
+                f"p=Path('stage-{number}-completed')\n"
+                "p.write_text(p.read_text()+'x' if p.exists() else 'x')\n"
+                f"print('ACTUAL_STAGE_{number}_PASSED')\n", encoding='utf8')
+        decisions = []
+
+        def respond(body):
+            leaf = '你是 Eve 的子代理' in body['messages'][0]['content']
+            (self.child_requests if leaf else self.main_requests).append(body)
+            results = self.all_results(body)
+            if leaf:
+                if len(results) < 2:
+                    if results:
+                        self.assertTrue(results[-1]['success'], results[-1])
+                        self.assertIn('ACTUAL_STAGE_1_PASSED', results[-1]['stdout'])
+                    return self.choose('run_command', {'program': sys.executable,
+                        'args': [f'stage-{len(results)+1}.py'], 'timeout_ms': 150_000})
+                if len(results) == 2:
+                    self.assertTrue(results[-1]['success'], results[-1])
+                    return self.choose('read_file', {'path': 'stage-2-completed'})
+                self.assertEqual(results[-1]['content'], 'x')
+                return dialogue.text_response('两阶段真实回执均已核验。')
+            if not results:
+                return self.choose('run_subagent', {
+                    'agent_id': 'coding', 'include_context': True, 'max_steps': 4,
+                    'task': '依次运行 stage-1.py 和 stage-2.py，最后读取 stage-2-completed 核验。',
+                    'verification': {'kind': 'receipts', 'contract': {'checks': [{
+                        'tool': 'read_file', 'arguments': {'path': 'stage-2-completed'},
+                        'output_pointer': '/sha256', 'expected': hashlib.sha256(b'x').hexdigest(),
+                    }], 'require_final_batch': True}},
+                })
+            self.assertTrue(results[-1]['completed'], results[-1])
+            self.assertEqual(self.users(body), [INITIAL, followup], '原话只由主轮消费一次')
+            handoff = self.handoffs(body)[-1]
+            self.assertEqual(handoff['kind'], 'progress')
+            self.assertEqual(handoff['input_message_id'], 'continued')
+            self.assertEqual(handoff['input_text'], followup)
+            self.assertEqual(handoff['reply_text'], progress_text)
+            self.assertEqual(handoff['delivery']['state'], 'sent')
+            self.assertTrue(handoff['delivery']['platform_message_id'])
+            self.completed_main = body
+            return dialogue.text_response('内部结束，不重发已经送达的途中进展。')
+
+        def decide(facts):
+            decisions.append((time.monotonic(), facts))
+            if len(decisions) == 1:
+                self.assertEqual(facts['host_event']['kind'], PROGRESS_KIND)
+                self.assertFalse(facts['host_event']['input_pending'])
+                return {'action': 'silence'}
+            if len(decisions) == 2:
+                self.assertEqual(facts['trigger'], 'user_input')
+                self.assertTrue(facts['host_event']['input_pending'])
+                self.assertEqual(facts['host_event']['delegated_tools'][0]['submitted_calls'], 1)
+                return {'action': 'silence'}
+            self.assertEqual(len(decisions), 3, '同一新阶段只审视一次')
+            self.assertEqual(facts['trigger'], 'background_event')
+            self.assertNotIn('current_user_message', facts, '不能把追加原话重新当作新输入')
+            self.assertTrue(facts['host_event']['input_pending'])
+            delegated = facts['host_event']['delegated_tools'][0]
+            self.assertEqual(delegated['submitted_calls'], 2)
+            self.assertEqual(delegated['returned_calls'], 1)
+            self.assertEqual(delegated['pending_tool_names'], ['run_command'])
+            current = json.loads(self.speech_requests[-1]['messages'][4]['content'].split('：', 1)[1])
+            self.assertEqual(current['latest_user_message'], {'id': 'continued', 'text': followup})
+            self.assertEqual(len(self.main_requests), 1, '主轮仍在等待同一个委派结果')
+            self.assertFalse((self.source / 'stage-2-completed').exists())
+            self.assertGreaterEqual(decisions[-1][0] - decisions[0][0], 59)
+            return {'action': 'speak', 'text': progress_text, 'after_ms': 0}
+
+        def input_silenced():
+            self.wait_until(lambda: any(event['facts']['kind'] == 'foreground_input_pending'
+                                       and state == 'silence' for event, state, _ in self.speech_rows()),
+                            '追加输入判断未结束')
+            self.assertEqual(len(decisions), 2)
+
+        def progressed_before_consumption():
+            deadline = time.monotonic() + 80
+            while not any(event['anchor'] == 'continued' and state == 'sent'
+                          for event, state, _ in self.progress_rows()):
+                self.assertLess(time.monotonic(), deadline, 'pending输入挡住了新委派进度')
+                self.assertFalse(self.run_release.wait(.02))
+            self.assertEqual(len(self.main_requests), 1)
+            self.assertEqual(len(self.child_requests), 2)
+            self.assertEqual(self.receipt('working')['state'], 'Processing')
+            self.assertEqual(self.receipt('continued')['state'], 'Merged')
+            self.assertFalse((self.source / 'stage-2-completed').exists())
+
+        self.callback = respond
+        self.speech_callback = decide
+        self.run_natural([
+            {'send': self.message('working', INITIAL)},
+            {'wait_file': str(self.source / 'stage-1-started')},
+            *self.checkpoint('first-silence'), {'send': self.message('continued', followup)},
+            self.wait_receipt('continued', 'Merged'), *self.checkpoint('input-silence'),
+            {'touch': str(self.source / 'release-stage-1')},
+            {'wait_file': str(self.source / 'stage-2-started')}, *self.checkpoint('pending-progress'),
+            {'touch': str(self.source / 'release-stage-2')}, self.wait_receipt('working'),
+            self.wait_command('working', 'finish'),
+        ], checkpoints={'first-silence': lambda: self.wait_progress('silence'),
+                        'input-silence': input_silenced,
+                        'pending-progress': progressed_before_consumption}, timeout=150)
+        self.assertIsNotNone(self.completed_main)
+        self.assertEqual(len(self.main_requests), 2)
+        self.assertEqual(len(self.child_requests), 4)
+        self.assertEqual(len(self.speech_requests), 3)
+        self.assertEqual([event['text'] for event in self.outbound_progress()], [progress_text])
+        for number in (1, 2):
+            self.assertEqual((self.source / f'stage-{number}-completed').read_text(), 'x')
+
     def test_cancel_retires_a_delayed_progress_decision_without_sending_it(self):
         self.install_task()
         self.speech_callback = lambda facts: self.decide(facts, after_ms=3000)
