@@ -107,6 +107,9 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(self.kind('chime'),[])
         self.assertEqual(self.definitions(self.kind('group_speech')[0]['body']), {'read_source'})
         self.assertFalse(any('eve.identity.v1' in m.get('content','') for m in self.kind('group_speech')[0]['body']['messages']))
+        for message in self.kind('group_speech')[0]['body']['messages']:
+            for marker in ('当前称呼取 current.name', '按它决定称呼和分寸：role', 'eve.people.v1'):
+                self.assertNotIn(marker, message.get('content', ''), '群观察不注入个人资料及其解释')
         self.assertEqual(len(self.rows('observations')),2)
         records=self.conversation_events()
         self.assertEqual(len(records),3, '群原话在个人与群范围各一条，群发言只在群范围一条')

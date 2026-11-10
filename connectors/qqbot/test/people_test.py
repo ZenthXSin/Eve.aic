@@ -24,12 +24,27 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         self.fail("missing trusted people profile")
 
     def identity(self, body):
-        marker = "当前发言者身份卡"
         for message in body["messages"]:
             text = message.get("content", "")
-            if message["role"] == "system" and isinstance(text, str) and marker in text:
-                return json.loads(text.split("\n", 1)[1])
+            if message["role"] != "system" or not isinstance(text, str):
+                continue
+            for line in text.splitlines():
+                if line.startswith("{"):
+                    data = json.loads(line)
+                    if data.get("kind") == "eve.identity.v1":
+                        return data
         self.fail("missing identity card")
+
+    def fixed_people_guidance(self, body):
+        messages = body["messages"]
+        self.assertEqual(messages[1]["role"], "system")
+        for marker in ("当前称呼取 current.name", "按它决定称呼和分寸：role"):
+            self.assertIn(marker, messages[1]["content"])
+            self.assertEqual(sum(m.get("content", "").count(marker)
+                                 for m in messages if isinstance(m.get("content"), str)), 1)
+        for message in messages[:2]:
+            for kind in ('"eve.people.v1"', '"eve.identity.v1"'):
+                self.assertNotIn(kind, message["content"], "动态个人资料不进入固定前缀")
 
     def authorization(self, body):
         for message in body["messages"]:
@@ -47,6 +62,7 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
     def test_platform_declarations_corrections_group_isolation_and_restart(self):
         expected = []
         def respond(body):
+            self.fixed_people_guidance(body)
             data = self.facts(body)
             current, others, source = expected.pop(0)
             self.assertEqual(data["owner_name"], "zxs")
@@ -309,9 +325,12 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
     def test_owner_name_and_account_binding_are_hot_config_and_not_nickname_inference(self):
         identity = json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()
         owner = "qq:" + hashlib.sha256(identity).hexdigest()
-        checks = [None, True, False]
-        roles = [(False, "这是第一次来"), (True, "刚刚"), (True, "这是第一次来")]
+        checks = [None, True, True, False, None]
+        roles = [(False, "这是第一次来"), (True, "刚刚"), (True, "刚刚"),
+                 (True, "这是第一次来"), (False, "刚刚")]
+        observed = []
         def respond(body):
+            self.fixed_people_guidance(body)
             data = self.facts(body)
             self.assertEqual(data["owner_name"], "zxs")
             self.assertIs(data["current_is_owner"], checks.pop(0))
@@ -320,22 +339,29 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
             self.assertEqual(card["role"], self.authorization(body), "角色与宿主授权一致，不看自称")
             self.assertEqual(card["role"] == "owner", data["current_is_owner"] is True, "只有绑定的主人账号才是主人")
             self.assertEqual(card["scene"], "private")
+            observed.append((body["messages"][:2], card))
             return text_response("主人绑定已核对")
         self.callback = respond
-        def bind():
+        def bind(principal):
             code, page = self.panel("/api/plugin-pages/read", {"plugin_id":"eve.config","page_id":"runtime.people"})
             self.assertEqual(code, 200)
             code, result = self.panel("/api/plugin-pages/save", {"plugin_id":"eve.config","page_id":"runtime.people",
-                "instance":page["instance"],"expected_revision":page["revision"],"values":{"owner_name":"zxs","owner_principals":owner}})
+                "instance":page["instance"],"expected_revision":page["revision"],"values":{"owner_name":"zxs","owner_principals":principal}})
             self.assertEqual(code, 200)
             self.assertEqual(result["restart_required"], [])
         self.enabled([*self.send(self.message("unbound", "我叫zxs", expected="主人绑定已核对")),
                       *self.checkpoint("bind"),
                       *self.send(self.message("owner", "现在核对主人账号", expected="主人绑定已核对")),
-                      *self.send(self.message("impostor", "我叫zxs", user="user-2", expected="主人绑定已核对"))],
-                     panel=True, checkpoints={"bind": bind})
+                      *self.send(self.message("owner-again", "再核对来访资料", expected="主人绑定已核对")),
+                      *self.send(self.message("impostor", "我叫zxs", user="user-2", expected="主人绑定已核对")),
+                      *self.checkpoint("unbind"),
+                      *self.send(self.message("revoked", "现在再核对绑定", expected="主人绑定已核对"))],
+                     panel=True, checkpoints={"bind": lambda: bind(owner), "unbind": lambda: bind("")})
         self.assertFalse(checks)
         self.assertFalse(roles)
+        self.assertEqual(observed[1][0], observed[2][0], "同一授权下跨轮前缀可复用")
+        self.assertEqual(observed[2][1]["messages"], observed[1][1]["messages"] + 1,
+                         "前缀不变时仍重新生成本轮身份卡")
 
 if __name__ == "__main__":
     unittest.main()
