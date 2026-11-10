@@ -1,10 +1,13 @@
 //! 兴趣观察账本、单次模型观察器与学习目标派生器。
+mod archive;
+mod cold;
 mod goal;
 mod observer;
 mod settings;
 mod store;
 mod strict_json;
 
+pub use archive::FileInterestJobArchive;
 use eve_interest_api::*;
 use eve_memory_api::{MemoryScope, MemorySnapshot};
 use eve_plugin_api::{
@@ -32,6 +35,17 @@ impl InterestController {
     }
 }
 impl InterestAdmin for InterestController {
+    fn jobs_page(
+        &self,
+        scope: &MemoryScope,
+        after_sequence: u64,
+        limit: usize,
+    ) -> InterestResult<InterestJobPage> {
+        self.service()?.jobs_page(scope, after_sequence, limit)
+    }
+    fn archive_status(&self) -> InterestResult<InterestArchiveStatus> {
+        self.service()?.archive_status()
+    }
     fn scopes(&self) -> InterestResult<Vec<MemoryScope>> {
         self.service()?.scopes()
     }
@@ -80,16 +94,22 @@ impl InterestAdmin for InterestController {
 pub struct InterestPlugin {
     manifest: PluginManifest,
     controller: InterestController,
+    archive: Option<Arc<dyn InterestJobArchiveStore>>,
 }
 impl InterestPlugin {
     pub fn new() -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(INTEREST_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             controller: InterestController::default(),
+            archive: None,
         })
     }
     pub fn controller(&self) -> InterestController {
         self.controller.clone()
+    }
+    pub fn with_archive(mut self, archive: Arc<dyn InterestJobArchiveStore>) -> Self {
+        self.archive = Some(archive);
+        self
     }
 }
 impl Plugin for InterestPlugin {
@@ -99,7 +119,7 @@ impl Plugin for InterestPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredInterests::open(context.clone())
+                StoredInterests::open(context.clone(), self.archive.clone())
                     .map_err(|error| PluginError::State(error.to_string()))?,
             );
             let to_close = stored.clone();

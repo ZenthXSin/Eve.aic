@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, future::Future, pin::Pin};
 mod settings;
 pub use settings::*;
+mod archive;
+pub use archive::*;
 
 pub const INTEREST_PLUGIN_ID: &str = "eve.interest";
 pub const INTEREST_STATE_KEY: &str = "interests.v1";
@@ -17,7 +19,7 @@ pub const INTEREST_STATE_KEY: &str = "interests.v1";
 pub const INTEREST_GOAL_CHANNEL: &str = "interest.learning";
 /// 派生学习目标的验证标记；不同于用户待办的 `user-goal:v1`。
 pub const INTEREST_GOAL_VERIFICATION: &str = "interest-learning:v1";
-/// 观察批次总数，不自动淘汰；达到容量后保留原记录并停止新观察。
+/// 观察批次热层上限；未装配归档时仍是总数上限，不自动丢弃原件。
 pub const MAX_JOBS: usize = 128;
 /// 所有作用域的兴趣记录总数，不自动淘汰。
 pub const MAX_INTERESTS: usize = 64;
@@ -444,7 +446,10 @@ pub enum ObservationOutcome {
 pub struct InterestSnapshot {
     pub scope: MemoryScope,
     pub interests: Vec<InterestRecord>,
+    /// 当前范围的有界热任务；归档原件按 jobs_page 读取，不隐式加载到普通快照。
     pub jobs: Vec<ObservationJob>,
+    /// 当前完整范围的归档任务数；不能用 jobs.len() 作为全部观察次数。
+    pub archived_jobs: u64,
 }
 
 /// 用户在当前会话发出的明确撤回命令；宿主负责绑定作用域与消息来源。
@@ -461,6 +466,25 @@ pub trait InterestAdmin: Send + Sync {
     /// 已有兴趣或观察批次的作用域，按作用域排序。
     fn scopes(&self) -> InterestResult<Vec<MemoryScope>>;
     fn snapshot(&self, scope: &MemoryScope) -> InterestResult<InterestSnapshot>;
+    /// 可信宿主按完整范围读取历史；只读且不重新执行批次。
+    /// 默认仅兼容无归档的有界旧快照，内置归档实现使用持久全局序号。
+    fn jobs_page(
+        &self,
+        scope: &MemoryScope,
+        after_sequence: u64,
+        limit: usize,
+    ) -> InterestResult<InterestJobPage> {
+        scope.validate().map_err(|_| InterestError::InvalidInput)?;
+        validate_job_page_limit(limit)?;
+        let snapshot = self.snapshot(scope)?;
+        if snapshot.scope != *scope {
+            return Err(InterestError::CorruptState);
+        }
+        archive::snapshot_page(snapshot, after_sequence, limit)
+    }
+    fn archive_status(&self) -> InterestResult<InterestArchiveStatus> {
+        Ok(InterestArchiveStatus::default())
+    }
     /// 原子保存 Running 与确切输入，成功返回后才可发起一次观察请求。
     /// 只消费新增 CompletedInteraction；失败、空结果、中断都不再观察同一证据。
     fn reserve(

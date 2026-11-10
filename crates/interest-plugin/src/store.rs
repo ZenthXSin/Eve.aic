@@ -1,4 +1,4 @@
-use crate::strict_json;
+use crate::{cold, strict_json};
 use eve_interest_api::*;
 use eve_memory_api::{
     EvidenceSource, InteractionEvidence, MemoryScope, MemorySnapshot, validate_id, validate_text,
@@ -9,28 +9,38 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 const FORMAT_VERSION: u32 = 1;
+// 既有校验游标保存全部来源唯一性元数据；本操作先给该分配设置明确边界。
+const MAX_SOURCE_EVIDENCE: u64 = 262_144;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Document {
+pub(super) struct Document {
     format_version: u32,
     jobs: Vec<JobRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    archive: Vec<cold::JobRef>,
     interests: Vec<InterestRecord>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct JobRecord {
-    job: ObservationJob,
+pub(super) struct JobRecord {
+    pub(super) job: ObservationJob,
     /// 只保存批次来源的记忆修订，不复制未消费的原始记忆。
-    memory_revision: u64,
+    pub(super) memory_revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) sequence: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 struct Inner {
     document: Document,
     context: Option<PluginContext>,
+    archive: Option<Arc<dyn InterestJobArchiveStore>>,
 }
 pub(super) struct StoredInterests {
     inner: Mutex<Inner>,
@@ -61,56 +71,78 @@ fn known_interests(document: &Document, scope: &MemoryScope) -> Vec<KnownInteres
 }
 
 impl StoredInterests {
-    pub(super) fn open(context: PluginContext) -> InterestResult<Self> {
+    pub(super) fn open(
+        context: PluginContext,
+        archive: Option<Arc<dyn InterestJobArchiveStore>>,
+    ) -> InterestResult<Self> {
         let mut document = match context
             .state_get(INTEREST_STATE_KEY)
             .map_err(|_| InterestError::Storage)?
         {
-            None => Document {
-                format_version: FORMAT_VERSION,
-                jobs: vec![],
-                interests: vec![],
-            },
+            None => {
+                // 已有冷文件可能属于丢失根或未确认提交；不得当作空库重新消费来源。
+                if let Some(archive) = &archive
+                    && !archive.is_empty()?
+                {
+                    return Err(InterestError::CorruptState);
+                }
+                Document {
+                    format_version: FORMAT_VERSION,
+                    jobs: vec![],
+                    archive: vec![],
+                    interests: vec![],
+                }
+            }
             Some(bytes) => {
                 if bytes.len() > MAX_STATE_BYTES {
                     return Err(InterestError::CorruptState);
                 }
                 let value =
                     strict_json::from_slice(&bytes).map_err(|_| InterestError::CorruptState)?;
-                if value.get("format_version").and_then(|value| value.as_u64())
-                    != Some(u64::from(FORMAT_VERSION))
-                {
-                    return Err(if value.get("format_version").is_some() {
-                        InterestError::UnsupportedVersion
-                    } else {
-                        InterestError::CorruptState
-                    });
+                match value.get("format_version").and_then(|value| value.as_u64()) {
+                    Some(1 | 2) => {}
+                    Some(_) => return Err(InterestError::UnsupportedVersion),
+                    None => return Err(InterestError::CorruptState),
                 }
                 let document: Document =
                     serde_json::from_value(value).map_err(|_| InterestError::CorruptState)?;
-                validate_document(&document).map_err(|_| InterestError::CorruptState)?;
+                validate_document(&document, archive.as_deref())?;
+                if document.format_version == 2
+                    && document
+                        .jobs
+                        .iter()
+                        .any(|record| record.job.status != JobStatus::Running)
+                {
+                    return Err(InterestError::CorruptState);
+                }
                 document
             }
         };
-        let mut interrupted = false;
+        let mut changed = false;
         for record in &mut document.jobs {
             if record.job.status == JobStatus::Running {
                 record.job.status = JobStatus::Interrupted;
-                interrupted = true;
+                changed = true;
             }
         }
-        // 先保存中断结局再公开实例；不重试已消费的输入，也不伪造完成时间。
-        if interrupted {
-            let bytes = encode(&document)?;
-            context
-                .state_set(INTEREST_STATE_KEY, bytes)
-                .map_err(|_| InterestError::Storage)?;
+        if archive.is_some() && document.format_version == 1 {
+            for (index, record) in document.jobs.iter_mut().enumerate() {
+                record.sequence = index as u64 + 1;
+            }
+            document.format_version = 2;
+            changed = true;
+        }
+        let mut inner = Inner {
+            document: document.clone(),
+            context: Some(context),
+            archive,
+        };
+        // 先保存中断与迁移；公开实例前完成持久化，不请求模型或重放输入。
+        if changed {
+            persist(&mut inner, document)?;
         }
         Ok(Self {
-            inner: Mutex::new(Inner {
-                document,
-                context: Some(context),
-            }),
+            inner: Mutex::new(inner),
         })
     }
 
@@ -127,6 +159,9 @@ impl StoredInterests {
         let mut scopes = BTreeSet::new();
         for record in &inner.document.jobs {
             scopes.insert(record.job.batch.scope.clone());
+        }
+        for record in &inner.document.archive {
+            scopes.insert(record.scope.clone());
         }
         for interest in &inner.document.interests {
             scopes.insert(interest.scope.clone());
@@ -153,7 +188,89 @@ impl StoredInterests {
                 .filter(|record| record.job.batch.scope == *scope)
                 .map(|record| record.job.clone())
                 .collect(),
+            archived_jobs: inner
+                .document
+                .archive
+                .iter()
+                .filter(|record| record.scope == *scope)
+                .count() as u64,
         })
+    }
+
+    pub(super) fn archive_status(&self) -> InterestResult<InterestArchiveStatus> {
+        let inner = self.lock()?;
+        Ok(InterestArchiveStatus {
+            enabled: inner.archive.is_some(),
+            hot_jobs: inner.document.jobs.len(),
+            archived_jobs: inner.document.archive.len(),
+            archived_bytes: inner.document.archive.iter().map(|r| r.bytes as u64).sum(),
+            index_bytes: encode(&inner.document)?.len(),
+        })
+    }
+
+    pub(super) fn jobs_page(
+        &self,
+        scope: &MemoryScope,
+        after_sequence: u64,
+        limit: usize,
+    ) -> InterestResult<InterestJobPage> {
+        scope.validate().map_err(|_| InterestError::InvalidInput)?;
+        if limit == 0 || limit > MAX_JOB_PAGE {
+            return Err(InterestError::InvalidInput);
+        }
+        let mut inner = self.lock()?;
+        let mut entries: Vec<(u64, bool, usize)> = inner
+            .document
+            .jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.job.batch.scope == *scope)
+            .map(|(index, record)| {
+                (
+                    if inner.document.format_version == 1 {
+                        index as u64 + 1
+                    } else {
+                        record.sequence
+                    },
+                    false,
+                    index,
+                )
+            })
+            .chain(
+                inner
+                    .document
+                    .archive
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, record)| record.scope == *scope)
+                    .map(|(index, record)| (record.sequence, true, index)),
+            )
+            .filter(|(sequence, _, _)| *sequence > after_sequence)
+            .collect();
+        entries.sort_unstable();
+        let more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after = more.then(|| entries.last().expect("nonzero page").0);
+        let mut jobs = Vec::with_capacity(entries.len());
+        for (_, archived, index) in entries {
+            let job = if archived {
+                match load_ref(&inner, &inner.document.archive[index]) {
+                    Ok(record) => record.job,
+                    Err(error) => {
+                        inner.context = None;
+                        return Err(error);
+                    }
+                }
+            } else {
+                inner.document.jobs[index].job.clone()
+            };
+            if job.batch.scope != *scope {
+                inner.context = None;
+                return Err(InterestError::CorruptState);
+            }
+            jobs.push(job);
+        }
+        Ok(InterestJobPage { jobs, next_after })
     }
 
     pub(super) fn reserve(
@@ -173,39 +290,33 @@ impl StoredInterests {
         if now_ms == 0 {
             return Err(InterestError::InvalidInput);
         }
-        let previous: Vec<_> = inner
-            .document
-            .jobs
-            .iter()
-            .filter(|record| record.job.batch.scope == memory.scope)
-            .collect();
-        let mut consumed = BTreeSet::new();
-        for record in &previous {
-            // 记忆回退或已消费证据被改写时不能继续推进，避免把同一交互当成新输入。
-            if memory.revision < record.memory_revision {
+        if memory.evidence.len() as u64 > MAX_SOURCE_EVIDENCE {
+            return Err(InterestError::LimitReached);
+        }
+        let (consumed, last_start) = consumption(&inner, &memory.scope, memory.revision)?;
+        for (id, expected) in &consumed {
+            let evidence = memory
+                .evidence
+                .iter()
+                .find(|evidence| &evidence.id == id)
+                .ok_or(InterestError::Conflict)?;
+            if cold::consumed(evidence)? != *expected {
                 return Err(InterestError::Conflict);
             }
-            for evidence in &record.job.batch.evidence {
-                if !memory.evidence.iter().any(|value| value == evidence) {
-                    return Err(InterestError::Conflict);
-                }
-                consumed.insert(evidence.id.as_str());
-            }
         }
-        if let Some(last) = previous.last() {
-            let Some(elapsed) = now_ms.checked_sub(last.job.batch.started_at_ms) else {
-                return Ok(None);
-            };
-            if elapsed < options.cooldown_ms {
-                return Ok(None);
-            }
+        if last_start.is_some_and(|at| {
+            now_ms
+                .checked_sub(at)
+                .is_none_or(|elapsed| elapsed < options.cooldown_ms)
+        }) {
+            return Ok(None);
         }
         let mut available: Vec<_> = memory
             .evidence
             .iter()
             .filter(|evidence| {
                 matches!(evidence.source, EvidenceSource::CompletedInteraction { .. })
-                    && !consumed.contains(evidence.id.as_str())
+                    && !consumed.contains_key(evidence.id.as_str())
             })
             .collect();
         available.sort_by_key(|evidence| evidence.revision);
@@ -242,13 +353,17 @@ impl StoredInterests {
         if batch.evidence.len() < options.min_new_evidence {
             return Ok(None);
         }
-        if inner.document.jobs.len() >= MAX_JOBS {
+        if inner.document.jobs.len() >= MAX_JOBS
+            || (inner.document.format_version == 2
+                && inner.document.jobs.len() + inner.document.archive.len() >= MAX_JOB_REFERENCES)
+        {
             return Err(InterestError::LimitReached);
         }
         batch.id = batch_id(&batch)?;
         batch.validate()?;
         let mut next = inner.document.clone();
         next.jobs.push(JobRecord {
+            sequence: next_sequence(&next),
             memory_revision: memory.revision,
             job: ObservationJob {
                 batch: batch.clone(),
@@ -279,30 +394,14 @@ impl StoredInterests {
         }
         let mut inner = self.lock()?;
         let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
-        let revision = cursor.summary().revision;
-        let previous: Vec<_> = inner
-            .document
-            .jobs
-            .iter()
-            .filter(|r| r.job.batch.scope == *scope)
-            .collect();
-        let mut expected = BTreeMap::new();
-        for record in &previous {
-            if revision < record.memory_revision {
-                return Err(InterestError::Conflict);
-            }
-            for evidence in &record.job.batch.evidence {
-                if expected
-                    .insert(evidence.id.as_str(), evidence)
-                    .is_some_and(|old| old != evidence)
-                {
-                    return Err(InterestError::Conflict);
-                }
-            }
+        if cursor.summary().evidence_count > MAX_SOURCE_EVIDENCE {
+            return Err(InterestError::LimitReached);
         }
-        let cooling = previous.last().is_some_and(|r| {
+        let revision = cursor.summary().revision;
+        let (expected, last_start) = consumption(&inner, scope, revision)?;
+        let cooling = last_start.is_some_and(|at| {
             now_ms
-                .checked_sub(r.job.batch.started_at_ms)
+                .checked_sub(at)
                 .is_none_or(|elapsed| elapsed < options.cooldown_ms)
         });
         let mut seen = BTreeSet::new();
@@ -324,7 +423,7 @@ impl StoredInterests {
             }
             for evidence in page {
                 if let Some(prior) = expected.get(evidence.id.as_str()) {
-                    if **prior != evidence {
+                    if *prior != cold::consumed(&evidence)? {
                         return Err(InterestError::Conflict);
                     }
                     seen.insert(evidence.id.clone());
@@ -360,13 +459,17 @@ impl StoredInterests {
         if cooling || batch.evidence.len() < options.min_new_evidence {
             return Ok(None);
         }
-        if inner.document.jobs.len() >= MAX_JOBS {
+        if inner.document.jobs.len() >= MAX_JOBS
+            || (inner.document.format_version == 2
+                && inner.document.jobs.len() + inner.document.archive.len() >= MAX_JOB_REFERENCES)
+        {
             return Err(InterestError::LimitReached);
         }
         batch.id = batch_id(&batch)?;
         batch.validate()?;
         let mut next = inner.document.clone();
         next.jobs.push(JobRecord {
+            sequence: next_sequence(&next),
             memory_revision: revision,
             job: ObservationJob {
                 batch: batch.clone(),
@@ -387,6 +490,27 @@ impl StoredInterests {
         outcome: ObservationOutcome,
     ) -> InterestResult<Vec<UpdateResult>> {
         let mut inner = self.lock()?;
+        if let Some(reference) = inner
+            .document
+            .archive
+            .iter()
+            .find(|record| record.id == batch.id)
+        {
+            if reference.scope != batch.scope {
+                return Err(InterestError::Conflict);
+            }
+            let record = match load_ref(&inner, reference) {
+                Ok(record) => record,
+                Err(error) => {
+                    inner.context = None;
+                    return Err(error);
+                }
+            };
+            if record.job.batch != *batch {
+                return Err(InterestError::Conflict);
+            }
+            return replay(&record.job, &outcome);
+        }
         let index = inner
             .document
             .jobs
@@ -399,19 +523,7 @@ impl StoredInterests {
         }
         if old.status != JobStatus::Running {
             // 同一结局重放返回原结果且零写入；其他结局不能覆盖已保存的批次。
-            return match (&old.status, &outcome) {
-                (JobStatus::Completed, ObservationOutcome::Completed(updates))
-                    if old.updates == *updates =>
-                {
-                    Ok(old.results.clone())
-                }
-                (JobStatus::Failed(first), ObservationOutcome::Failed(second))
-                    if first == second =>
-                {
-                    Ok(vec![])
-                }
-                _ => Err(InterestError::Conflict),
-            };
+            return replay(old, &outcome);
         }
         if at_ms < batch.started_at_ms {
             return Err(InterestError::InvalidInput);
@@ -658,8 +770,122 @@ fn source_message(evidence: &InteractionEvidence) -> Option<String> {
     }
 }
 
-fn persist(inner: &mut Inner, next: Document) -> InterestResult<()> {
+fn replay(old: &ObservationJob, outcome: &ObservationOutcome) -> InterestResult<Vec<UpdateResult>> {
+    match (&old.status, outcome) {
+        (JobStatus::Completed, ObservationOutcome::Completed(updates))
+            if old.updates == *updates =>
+        {
+            Ok(old.results.clone())
+        }
+        (JobStatus::Failed(first), ObservationOutcome::Failed(second)) if first == second => {
+            Ok(vec![])
+        }
+        _ => Err(InterestError::Conflict),
+    }
+}
+
+fn next_sequence(document: &Document) -> u64 {
+    if document.format_version == 1 {
+        0
+    } else {
+        (document.jobs.len() + document.archive.len()) as u64 + 1
+    }
+}
+
+fn load_ref(inner: &Inner, reference: &cold::JobRef) -> InterestResult<JobRecord> {
+    cold::load(
+        inner.archive.as_deref().ok_or(InterestError::Unavailable)?,
+        reference,
+    )
+}
+
+fn consumption(
+    inner: &Inner,
+    scope: &MemoryScope,
+    revision: u64,
+) -> InterestResult<(BTreeMap<String, cold::Consumed>, Option<u64>)> {
+    // 使用打开/提交时核实的消费目录；空闲轮和冷却不重新读取所有冷正文。
+    // 真正新增 Running 必须经过 persist 的完整正文校验，成功返回后才允许请求模型。
+    let mut expected = BTreeMap::new();
+    let mut latest = None;
+    for reference in inner
+        .document
+        .archive
+        .iter()
+        .filter(|record| record.scope == *scope)
+    {
+        if revision < reference.memory_revision {
+            return Err(InterestError::Conflict);
+        }
+        latest = Some(latest.map_or(reference.started_at_ms, |value: u64| {
+            value.max(reference.started_at_ms)
+        }));
+        for item in &reference.consumed {
+            if expected.insert(item.id.clone(), item.clone()).is_some() {
+                return Err(InterestError::Conflict);
+            }
+        }
+    }
+    for record in inner
+        .document
+        .jobs
+        .iter()
+        .filter(|record| record.job.batch.scope == *scope)
+    {
+        if revision < record.memory_revision {
+            return Err(InterestError::Conflict);
+        }
+        latest = Some(latest.map_or(record.job.batch.started_at_ms, |value| {
+            value.max(record.job.batch.started_at_ms)
+        }));
+        for evidence in &record.job.batch.evidence {
+            if expected
+                .insert(evidence.id.clone(), cold::consumed(evidence)?)
+                .is_some()
+            {
+                return Err(InterestError::Conflict);
+            }
+        }
+    }
+    Ok((expected, latest))
+}
+
+fn persist(inner: &mut Inner, mut next: Document) -> InterestResult<()> {
+    if let Err(error) = validate_document(&next, inner.archive.as_deref()) {
+        if matches!(
+            error,
+            InterestError::Storage | InterestError::CorruptState | InterestError::Unavailable
+        ) {
+            inner.context = None;
+        }
+        return Err(error);
+    }
+    let mut terminal = Vec::new();
+    if next.format_version == 2 {
+        let mut running = Vec::new();
+        for record in next.jobs.drain(..) {
+            if record.job.status == JobStatus::Running {
+                running.push(record);
+            } else {
+                terminal.push(record);
+            }
+        }
+        next.jobs = running;
+        for record in &terminal {
+            next.archive.push(cold::encode(record)?.0);
+        }
+        next.archive.sort_by_key(|reference| reference.sequence);
+    }
+    // 候选根容量先核对；每次只编码一份冷正文，保留旧根和原消费证据直到提交成功。
     let bytes = encode(&next)?;
+    for record in &terminal {
+        let (reference, body) = cold::encode(record)?;
+        let archive = inner.archive.as_deref().ok_or(InterestError::Unavailable)?;
+        if let Err(error) = archive.put(&reference.sha256, &body) {
+            inner.context = None;
+            return Err(error);
+        }
+    }
     let context = inner.context.as_ref().ok_or(InterestError::Unavailable)?;
     // 失败也可能已经提交；关闭整个实例，禁止旧缓存继续读取或覆盖后端。
     if context.state_set(INTEREST_STATE_KEY, bytes).is_err() {
@@ -671,81 +897,120 @@ fn persist(inner: &mut Inner, next: Document) -> InterestResult<()> {
 }
 
 fn encode(document: &Document) -> InterestResult<Vec<u8>> {
-    if document.jobs.len() > MAX_JOBS || document.interests.len() > MAX_INTERESTS {
+    if document.jobs.len() > MAX_JOBS
+        || document.interests.len() > MAX_INTERESTS
+        || document.jobs.len() + document.archive.len() > MAX_JOB_REFERENCES
+    {
         return Err(InterestError::LimitReached);
     }
     let bytes = serde_json::to_vec(document).map_err(|_| InterestError::InvalidInput)?;
-    // Interrupted 比 Running 多四个字节；写入时预留，保证下次启动能保存中断结局。
-    let recovery_bytes = document
+    // 新格式的短 Running 正文可能小于终态目录；预留每条替换差额及首次 archive 键。
+    // 这是根索引空间，不承诺磁盘还能写入冷正文，也不预先接受任意兴趣更新。
+    let mut recovery_bytes = if document.format_version == 2 && document.archive.is_empty() {
+        32
+    } else {
+        0
+    };
+    for record in document
         .jobs
         .iter()
         .filter(|record| record.job.status == JobStatus::Running)
-        .count()
-        * ("Interrupted".len() - "Running".len());
+    {
+        if document.format_version == 1 {
+            recovery_bytes += "Interrupted".len() - "Running".len();
+        } else {
+            let mut terminal = record.clone();
+            terminal.job.status = JobStatus::Failed(ObservationFailure::InvalidOutput);
+            terminal.job.finished_at_ms = Some(u64::MAX);
+            let (mut reference, _) = cold::encode(&terminal)?;
+            reference.bytes = MAX_JOB_ARCHIVE_RECORD_BYTES;
+            let reference_bytes = serde_json::to_vec(&reference)
+                .map_err(|_| InterestError::InvalidInput)?
+                .len();
+            let hot_bytes = serde_json::to_vec(record)
+                .map_err(|_| InterestError::InvalidInput)?
+                .len();
+            recovery_bytes += reference_bytes.saturating_sub(hot_bytes) + 2;
+        }
+    }
     if bytes.len().saturating_add(recovery_bytes) > MAX_STATE_BYTES {
         return Err(InterestError::LimitReached);
     }
     Ok(bytes)
 }
 
-fn validate_document(document: &Document) -> InterestResult<()> {
+fn validate_job(record: &JobRecord, interest_ids: &BTreeSet<&str>) -> InterestResult<()> {
     let invalid = || InterestError::CorruptState;
-    if document.jobs.len() > MAX_JOBS || document.interests.len() > MAX_INTERESTS {
+    let job = &record.job;
+    job.batch.validate().map_err(|_| invalid())?;
+    if job.batch.id != batch_id(&job.batch).map_err(|_| invalid())?
+        || record.memory_revision == 0
+        || job
+            .batch
+            .evidence
+            .iter()
+            .any(|evidence| evidence.revision > record.memory_revision)
+    {
         return Err(invalid());
     }
-    let mut batches = BTreeMap::new();
-    let mut consumed = BTreeSet::new();
-    let mut last_start: BTreeMap<&MemoryScope, u64> = BTreeMap::new();
-    for record in &document.jobs {
-        let job = &record.job;
-        job.batch.validate().map_err(|_| invalid())?;
-        if job.batch.id != batch_id(&job.batch).map_err(|_| invalid())?
-            || record.memory_revision == 0
-            || batches.insert(job.batch.id.as_str(), job).is_some()
-        {
-            return Err(invalid());
-        }
-        // 同一作用域的批次按开始时间顺序追加，每条证据只被消费一次。
-        let start = last_start.entry(&job.batch.scope).or_insert(0);
-        if job.batch.started_at_ms < *start {
-            return Err(invalid());
-        }
-        *start = job.batch.started_at_ms;
-        for evidence in &job.batch.evidence {
-            if !consumed.insert((&job.batch.scope, evidence.id.as_str())) {
+    match &job.status {
+        JobStatus::Running | JobStatus::Interrupted => {
+            if job.finished_at_ms.is_some() || !job.updates.is_empty() || !job.results.is_empty() {
                 return Err(invalid());
             }
         }
-        match &job.status {
-            JobStatus::Running | JobStatus::Interrupted => {
-                if job.finished_at_ms.is_some()
-                    || !job.updates.is_empty()
-                    || !job.results.is_empty()
-                {
-                    return Err(invalid());
-                }
-            }
-            JobStatus::Failed(_) => {
-                if job
-                    .finished_at_ms
-                    .is_none_or(|at| at < job.batch.started_at_ms)
-                    || !job.updates.is_empty()
-                    || !job.results.is_empty()
-                {
-                    return Err(invalid());
-                }
-            }
-            JobStatus::Completed => {
-                if job
-                    .finished_at_ms
-                    .is_none_or(|at| at < job.batch.started_at_ms)
-                    || job.updates.len() != job.results.len()
-                {
-                    return Err(invalid());
-                }
-                validate_updates(&job.batch, &job.updates).map_err(|_| invalid())?;
+        JobStatus::Failed(_) => {
+            if job
+                .finished_at_ms
+                .is_none_or(|at| at < job.batch.started_at_ms)
+                || !job.updates.is_empty()
+                || !job.results.is_empty()
+            {
+                return Err(invalid());
             }
         }
+        JobStatus::Completed => {
+            if job
+                .finished_at_ms
+                .is_none_or(|at| at < job.batch.started_at_ms)
+                || job.updates.len() != job.results.len()
+            {
+                return Err(invalid());
+            }
+            validate_updates(&job.batch, &job.updates).map_err(|_| invalid())?;
+        }
+    }
+    for result in &job.results {
+        let id = match result {
+            UpdateResult::Created { interest_id }
+            | UpdateResult::Updated { interest_id, .. }
+            | UpdateResult::Withdrawn { interest_id, .. } => interest_id,
+            UpdateResult::Rejected { .. } => continue,
+        };
+        if !interest_ids.contains(id.as_str()) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn validate_document(
+    document: &Document,
+    archive: Option<&dyn InterestJobArchiveStore>,
+) -> InterestResult<()> {
+    let invalid = || InterestError::CorruptState;
+    if document.jobs.len() > MAX_JOBS
+        || document.interests.len() > MAX_INTERESTS
+        || document.jobs.len() + document.archive.len() > MAX_JOB_REFERENCES
+        || (document.format_version == 1
+            && (!document.archive.is_empty()
+                || document.jobs.iter().any(|record| record.sequence != 0)))
+        || !matches!(document.format_version, 1 | 2)
+    {
+        return Err(invalid());
+    }
+    if document.format_version == 2 && archive.is_none() {
+        return Err(InterestError::Unavailable);
     }
     let mut ids = BTreeSet::new();
     for interest in &document.interests {
@@ -753,16 +1018,83 @@ fn validate_document(document: &Document) -> InterestResult<()> {
         if !ids.insert(interest.id.as_str()) {
             return Err(invalid());
         }
+    }
+    let mut batches = BTreeMap::new();
+    let mut chronological = Vec::new();
+    let mut consumed = BTreeSet::new();
+    for (index, record) in document.jobs.iter().enumerate() {
+        validate_job(record, &ids)?;
+        if batches
+            .insert(record.job.batch.id.as_str(), (false, index))
+            .is_some()
+        {
+            return Err(invalid());
+        }
+        let sequence = if document.format_version == 1 {
+            index as u64 + 1
+        } else {
+            record.sequence
+        };
+        chronological.push((
+            sequence,
+            &record.job.batch.scope,
+            record.job.batch.started_at_ms,
+        ));
+        for evidence in &record.job.batch.evidence {
+            if !consumed.insert((&record.job.batch.scope, evidence.id.as_str())) {
+                return Err(invalid());
+            }
+        }
+    }
+    for (index, reference) in document.archive.iter().enumerate() {
+        let record = cold::load(archive.ok_or_else(invalid)?, reference)?;
+        validate_job(&record, &ids)?;
+        if batches
+            .insert(reference.id.as_str(), (true, index))
+            .is_some()
+        {
+            return Err(invalid());
+        }
+        chronological.push((
+            reference.sequence,
+            &reference.scope,
+            reference.started_at_ms,
+        ));
+        for evidence in &reference.consumed {
+            if !consumed.insert((&reference.scope, evidence.id.as_str())) {
+                return Err(invalid());
+            }
+        }
+    }
+    chronological.sort_by_key(|(sequence, _, _)| *sequence);
+    let mut last_start = BTreeMap::new();
+    for (index, (sequence, scope, started)) in chronological.into_iter().enumerate() {
+        if sequence != index as u64 + 1 {
+            return Err(invalid());
+        }
+        let previous = last_start.entry(scope).or_insert(0);
+        if started < *previous {
+            return Err(invalid());
+        }
+        *previous = started;
+    }
+    let get_job = |id: &str| -> InterestResult<ObservationJob> {
+        let (archived, index) = *batches.get(id).ok_or_else(invalid)?;
+        if archived {
+            Ok(cold::load(archive.ok_or_else(invalid)?, &document.archive[index])?.job)
+        } else {
+            Ok(document.jobs[index].job.clone())
+        }
+    };
+    for interest in &document.interests {
         for statement in &interest.statements {
             let StatementOrigin::Observation { batch_id } = &statement.origin else {
-                // 命令来源只允许撤回；兴趣与经验必须来自已送达交互的观察。
                 if statement.kind != StatementKind::Withdrawal {
                     return Err(invalid());
                 }
                 continue;
             };
-            // 观察来源必须能回溯到同一作用域已完成批次中的用户原文。
-            let job = batches.get(batch_id.as_str()).ok_or_else(invalid)?;
+            let job = get_job(batch_id)?;
             if job.status != JobStatus::Completed || job.batch.scope != interest.scope {
                 return Err(invalid());
             }
@@ -785,23 +1117,8 @@ fn validate_document(document: &Document) -> InterestResult<()> {
             }
         }
         for inference in &interest.inferences {
-            let job = batches
-                .get(inference.batch_id.as_str())
-                .ok_or_else(invalid)?;
+            let job = get_job(&inference.batch_id)?;
             if job.status != JobStatus::Completed || job.batch.scope != interest.scope {
-                return Err(invalid());
-            }
-        }
-    }
-    for record in &document.jobs {
-        for result in &record.job.results {
-            let id = match result {
-                UpdateResult::Created { interest_id }
-                | UpdateResult::Updated { interest_id, .. }
-                | UpdateResult::Withdrawn { interest_id, .. } => interest_id,
-                UpdateResult::Rejected { .. } => continue,
-            };
-            if !ids.contains(id.as_str()) {
                 return Err(invalid());
             }
         }
@@ -835,4 +1152,138 @@ pub(crate) fn hash_id(prefix: &str, bytes: &[u8]) -> String {
         write!(&mut id, "{byte:02x}").expect("writing to a String cannot fail");
     }
     id
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    fn running() -> JobRecord {
+        let mut batch = ObservationBatch {
+            id: "placeholder".into(),
+            scope: MemoryScope {
+                channel: "q".into(),
+                session_id: "s".into(),
+                user_id: "u".into(),
+            },
+            observer_version: "v".into(),
+            started_at_ms: 1,
+            evidence: vec![InteractionEvidence {
+                id: "e".into(),
+                revision: 1,
+                at_ms: 1,
+                source: EvidenceSource::CompletedInteraction {
+                    message_id: "m".into(),
+                    session_revision: 2,
+                    turn_id: 1,
+                    user_text: "a".into(),
+                    assistant_text: "b".into(),
+                },
+            }],
+            known_interests: vec![],
+        };
+        batch.id = batch_id(&batch).unwrap();
+        JobRecord {
+            sequence: 1,
+            memory_revision: 1,
+            job: ObservationJob {
+                batch,
+                status: JobStatus::Running,
+                finished_at_ms: None,
+                updates: vec![],
+                results: vec![],
+            },
+        }
+    }
+
+    fn reference() -> cold::JobRef {
+        let mut record = running();
+        record.job.status = JobStatus::Interrupted;
+        cold::encode(&record).unwrap().0
+    }
+
+    fn document() -> Document {
+        Document {
+            format_version: 2,
+            jobs: vec![],
+            archive: vec![],
+            interests: vec![],
+        }
+    }
+
+    #[test]
+    fn reference_count_cap_is_independent_of_small_serialized_root() {
+        // 仅测试编码容量，不访问冷存储；语义/唯一性校验由集成测试覆盖。
+        let mut root = document();
+        root.archive = vec![reference(); MAX_JOB_REFERENCES];
+        assert!(encode(&root).is_ok());
+        root.archive.push(reference());
+        assert_eq!(encode(&root).err(), Some(InterestError::LimitReached));
+        root.archive.pop();
+        root.jobs.push(running());
+        assert_eq!(encode(&root).err(), Some(InterestError::LimitReached));
+    }
+
+    fn pad_root(root: &mut Document, target_bytes: usize) {
+        // 人工放大目录元数据隔离编码器的字节边界；不把此根当合法业务记录提交。
+        let base = serde_json::to_vec(root).unwrap().len();
+        root.archive[0]
+            .id
+            .push_str(&"x".repeat(target_bytes - base));
+        assert_eq!(serde_json::to_vec(root).unwrap().len(), target_bytes);
+    }
+
+    #[test]
+    fn root_byte_limit_does_not_depend_on_reference_count() {
+        let mut root = document();
+        root.archive.push(reference());
+        pad_root(&mut root, MAX_STATE_BYTES);
+        assert_eq!(encode(&root).unwrap().len(), MAX_STATE_BYTES);
+        root.archive[0].id.push('x');
+        assert_eq!(encode(&root).err(), Some(InterestError::LimitReached));
+    }
+
+    #[test]
+    fn short_running_reserves_growth_for_empty_terminal_or_interrupted_reference() {
+        let mut root = document();
+        let mut original = running();
+        // 编码器边界输入：空正文不是合法观察批次，此处仅使ref替换正增长可被测到。
+        original.job.batch.evidence.clear();
+        root.jobs.push(original.clone());
+        let mut filler = reference();
+        filler.sequence = 2;
+        root.archive.push(filler);
+        let mut worst = original.clone();
+        worst.job.status = JobStatus::Failed(ObservationFailure::InvalidOutput);
+        worst.job.finished_at_ms = Some(u64::MAX);
+        let (mut worst_reference, _) = cold::encode(&worst).unwrap();
+        worst_reference.bytes = MAX_JOB_ARCHIVE_RECORD_BYTES;
+        let growth = serde_json::to_vec(&worst_reference)
+            .unwrap()
+            .len()
+            .saturating_sub(serde_json::to_vec(&original).unwrap().len())
+            + 2;
+        assert!(growth > 2, "短输入必须实际覆盖目录变大情形");
+        pad_root(&mut root, MAX_STATE_BYTES - growth);
+        assert!(encode(&root).is_ok());
+        let mut unreserved = root.clone();
+        unreserved.archive[0].id.push('x');
+        assert!(serde_json::to_vec(&unreserved).unwrap().len() <= MAX_STATE_BYTES);
+        assert_eq!(encode(&unreserved).err(), Some(InterestError::LimitReached));
+        for (status, finished) in [
+            (JobStatus::Interrupted, None),
+            (JobStatus::Completed, Some(u64::MAX)),
+            (
+                JobStatus::Failed(ObservationFailure::InvalidOutput),
+                Some(u64::MAX),
+            ),
+        ] {
+            let mut settled = root.clone();
+            let mut terminal = settled.jobs.pop().unwrap();
+            terminal.job.status = status;
+            terminal.job.finished_at_ms = finished;
+            settled.archive.push(cold::encode(&terminal).unwrap().0);
+            assert!(encode(&settled).is_ok());
+        }
+    }
 }

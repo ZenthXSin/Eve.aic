@@ -21,7 +21,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -29,6 +29,23 @@ const SUBJECT: &str = "eve";
 const HELP: &str = "用法：/interests 查看本会话记录的兴趣，/forget-interest 兴趣ID 撤回一条兴趣。";
 const DISABLED: &str = "兴趣观察未启用。";
 const PREVIEW_BYTES: usize = 120;
+const CAPACITY_RECHECK: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct CapacityRecheck {
+    not_before: Option<Instant>,
+}
+impl CapacityRecheck {
+    fn ready(&self, now: Instant) -> bool {
+        self.not_before.is_none_or(|at| now >= at)
+    }
+    fn limited(&mut self, now: Instant) {
+        self.not_before = Some(now + CAPACITY_RECHECK);
+    }
+    fn available(&mut self) -> bool {
+        self.not_before.take().is_some()
+    }
+}
 
 fn now_ms() -> Result<u64, AppError> {
     Ok(u64::try_from(
@@ -139,7 +156,7 @@ async fn run(
     }
     // 启动后先核对一次，补齐上次进程在兴趣保存与目标同步之间退出留下的差异。
     dirty.store(true, Ordering::SeqCst);
-    let mut observing = true;
+    let mut capacity = CapacityRecheck::default();
     loop {
         if *stopped.borrow() {
             return Ok(());
@@ -153,7 +170,7 @@ async fn run(
             }
             continue;
         }
-        if observing {
+        if capacity.ready(Instant::now()) {
             let mut scopes = memory.scopes()?;
             if scopes.len() > eve_memory_api::MAX_EVIDENCE {
                 return Err("兴趣观察范围超过上限".into());
@@ -178,18 +195,37 @@ async fn run(
                 }
                 // 扫描固定版本的所有来源，但只保留本批正文；坏的后续页不能被跳过。
                 let reader = memory.reader(scope.clone())?;
-                let batch = match interests.reserve_reader(
+                let reserved = interests.reserve_reader(
                     &scope,
                     reader.as_ref(),
                     now_ms()?,
                     observer.version(),
                     &current.settings.observation,
-                ) {
+                );
+                if reserved.is_ok() && capacity.available() {
+                    eprintln!(
+                        "EVE_INTEREST_OBSERVATION capacity_check=completed retry_old_batches=false"
+                    );
+                }
+                let batch = match reserved {
                     Ok(Some(batch)) => batch,
                     Ok(None) => continue,
-                    // 容量满保留原记录：停止新观察，已有兴趣仍继续同步目标。
+                    // 容量满只低频复查准入，不锁死整个进程，也不重试已消费批次。
                     Err(InterestError::LimitReached) => {
-                        observing = false;
+                        capacity.limited(Instant::now());
+                        match interests.archive_status() {
+                            Ok(status) => eprintln!(
+                                "EVE_INTEREST_OBSERVATION capacity_check=limited archive_enabled={} hot_jobs={} archived_jobs={} archived_bytes={} index_bytes={} recheck_seconds=60 retry_old_batches=false",
+                                status.enabled,
+                                status.hot_jobs,
+                                status.archived_jobs,
+                                status.archived_bytes,
+                                status.index_bytes,
+                            ),
+                            Err(_) => eprintln!(
+                                "EVE_INTEREST_OBSERVATION capacity_check=limited archive_status=unavailable recheck_seconds=60 retry_old_batches=false"
+                            ),
+                        }
                         break;
                     }
                     Err(error) => return Err(error.into()),
@@ -311,7 +347,7 @@ impl QqCommandHandler for Commands {
                 let snapshot = enabled.interests.snapshot(&scope).map_err(failure)?;
                 let goals = enabled.cognition.snapshot().map_err(|_| failure_text())?;
                 if snapshot.interests.is_empty() {
-                    return Ok(Some("当前会话还没有记录兴趣。".into()));
+                    return Ok(Some(empty_observation_status(&snapshot)));
                 }
                 let next = match &enabled.pursuit {
                     Some(pursuit) => pursuit
@@ -330,7 +366,7 @@ impl QqCommandHandler for Commands {
                         .get(&id)
                         .map_or("未派生".to_string(), |goal| {
                             let status = match goal.status {
-                                GoalStatus::Waiting => "后台学习中",
+                                GoalStatus::Waiting => "等待后续推进",
                                 GoalStatus::Cancelled => "已取消",
                                 GoalStatus::Completed => "已完成",
                                 GoalStatus::Blocked => "已阻塞",
@@ -394,6 +430,28 @@ impl QqCommandHandler for Commands {
     }
 }
 
+fn empty_observation_status(snapshot: &eve_interest_api::InterestSnapshot) -> String {
+    if snapshot.jobs.is_empty() && snapshot.archived_jobs == 0 {
+        return "当前会话还没有记录兴趣。".into();
+    }
+    let mut running = 0;
+    let mut completed = 0;
+    let mut failed = 0;
+    let mut interrupted = 0;
+    for job in &snapshot.jobs {
+        match job.status {
+            eve_interest_api::JobStatus::Running => running += 1,
+            eve_interest_api::JobStatus::Completed => completed += 1,
+            eve_interest_api::JobStatus::Failed(_) => failed += 1,
+            eve_interest_api::JobStatus::Interrupted => interrupted += 1,
+        }
+    }
+    format!(
+        "当前会话还没有记录兴趣。近期观察批次：运行中 {running}，完成 {completed}，失败 {failed}，中断 {interrupted}；已归档 {} 批。归档数量不表示已生成兴趣或知识。",
+        snapshot.archived_jobs,
+    )
+}
+
 fn latest_quote(interest: &InterestRecord) -> &str {
     interest
         .statements
@@ -440,5 +498,47 @@ fn failure(error: InterestError) -> PluginError {
     match error {
         InterestError::LimitReached => PluginError::State(error.to_string()),
         _ => failure_text(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_recheck_is_bounded_and_can_become_available_without_restart() {
+        let now = Instant::now();
+        let mut check = CapacityRecheck::default();
+        assert!(check.ready(now));
+        check.limited(now);
+        assert!(!check.ready(now + Duration::from_millis(250)));
+        assert!(!check.ready(now + Duration::from_secs(59)));
+        assert!(check.ready(now + CAPACITY_RECHECK));
+        assert!(check.available());
+        assert!(!check.available());
+        assert!(check.ready(now));
+    }
+
+    #[test]
+    fn empty_interest_message_distinguishes_own_archived_history_from_success() {
+        let mut snapshot = eve_interest_api::InterestSnapshot {
+            scope: eve_memory_api::MemoryScope {
+                channel: "qq".into(),
+                session_id: "s".into(),
+                user_id: "u".into(),
+            },
+            interests: vec![],
+            jobs: vec![],
+            archived_jobs: 0,
+        };
+        assert_eq!(
+            empty_observation_status(&snapshot),
+            "当前会话还没有记录兴趣。"
+        );
+        snapshot.archived_jobs = 128;
+        let text = empty_observation_status(&snapshot);
+        assert!(text.contains("已归档 128 批"));
+        assert!(text.contains("归档数量不表示已生成兴趣或知识"));
+        assert!(text.contains("运行中 0"));
     }
 }

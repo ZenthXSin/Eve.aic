@@ -30,6 +30,8 @@ SUITES = (
     ("request-timing", QQ + "request_timing_test.py"),
     ("owner-account", QQ + "owner_account_test.py"),
     ("memory-capacity", QQ + "memory_capacity_test.py"),
+    ("interest-archive-seed", "crates/interest-plugin/tests/archive.rs"),
+    ("interest-archive", QQ + "interest_archive_test.py"),
     ("admin", QQ + "admin_test.py"),
     ("trusted-originals", QQ + "trusted_review_originals_test.py"),
     ("receipt-capacity", QQ + "receipt_capacity_test.py"),
@@ -191,12 +193,21 @@ def verify(out, evidence, revision):
     save(evidence / "elf.json", elf)
     # memory_capacity_test 按 QQ 二进制的同目录寻找 eve-memory。
     env = dict(os.environ, EVE_QQBOT_BINARY=str(out / "payload/eve-qqbot"),
-               EVE_WEB_BINARY=str(out / "payload/eve-web"))
+               EVE_WEB_BINARY=str(out / "payload/eve-web"),
+               EVE_INTEREST_ARCHIVE_SEED_EXPORT=str(evidence / "interest-archive-seed"),
+               EVE_INTEREST_ARCHIVE_SEED_DIR=str(evidence / "interest-archive-seed"),
+               EVE_INTEREST_ARCHIVE_E2E_ARTIFACTS=str(evidence / "interest-archive-process"))
     for name, script in SUITES:
         # 用例内部期限不变；某组失败后继续收集其它独立组，最终整体失败且不打包。
         # 自然进度原整组已实测 575.6 秒，新增待消费输入用例还需真实等待约 70 秒。
         # 只增加该组总预算，不缩短平台窗口/冷却或放宽其他组和单个用例的期限。
-        results.append(command(evidence, name, [sys.executable, "-B", script], env=env,
+        # 该小目标通过真实 Session/Memory/Interest API 导出 v1 原件；使用同一 release
+        # target 复用已构建依赖，不重新构建 eve-app，也不为种子另建 debug 依赖树。
+        args = (["cargo", "test", "-p", "eve-interest-plugin", "--test", "archive", "--release",
+                 "--locked", "--target", TARGET, "export_real_completed_qq_seed_for_process_migration",
+                 "--", "--exact"] if name == "interest-archive-seed"
+                else [sys.executable, "-B", script])
+        results.append(command(evidence, name, args, env=env,
                                timeout=900 if name == "natural-progress" else 600))
     final_source = source_identity(revision)
     require(final_source == built["source"], "验收改写了源码或依赖锁")
@@ -206,7 +217,8 @@ def verify(out, evidence, revision):
                                          "binary_sha256": {name: info["sha256"] for name, info in built["binaries"].items()},
                                          "results": results, "real_model_or_qq": False,
                                          "process_suites": [name for name, _ in SUITES if name not in
-                                                            ("runtime-recovery", "host-handoff")],
+                                                            ("runtime-recovery", "host-handoff", "interest-archive-seed")],
+                                         "rust_fixture_suites": ["interest-archive-seed"],
                                          "python_host_fixture_suites": ["runtime-recovery", "host-handoff"]})
     require(success, "生产二进制验收失败；日志保留，不生成可发布产物")
 

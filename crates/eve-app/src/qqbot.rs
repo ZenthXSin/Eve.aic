@@ -1339,7 +1339,11 @@ async fn run_qqbot_composed(
         };
         // 兴趣账本先于模型与通道加载；损坏或版本不兼容时拒绝启动并保留原字节。
         let interests = if options.interest_learning {
-            let plugin = InterestPlugin::new()?;
+            let plugin = InterestPlugin::new()?.with_archive(Arc::new(
+                eve_interest_plugin::FileInterestJobArchive::open(
+                    options.state_directory.join("interest-job-archive"),
+                )?,
+            ));
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(INTEREST_PLUGIN_ID)?).await?;

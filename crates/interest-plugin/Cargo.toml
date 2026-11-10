@@ -17,6 +17,9 @@ serde_json.workspace = true
 ring.workspace = true
 tokio.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 eve-kernel = { path = "../kernel" }
 eve-memory-plugin = { path = "../memory-plugin" }
@@ -24,4 +27,5 @@ eve-cognition-plugin = { path = "../cognition-plugin" }
 eve-cognition-loop-api = { path = "../cognition-loop-api" }
 eve-cognition-loop-plugin = { path = "../cognition-loop-plugin" }
 eve-session-api = { path = "../session-api" }
+eve-session-plugin = { path = "../session-plugin" }
 tempfile.workspace = true

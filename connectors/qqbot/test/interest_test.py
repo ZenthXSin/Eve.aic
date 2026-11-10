@@ -199,7 +199,53 @@ class InterestAcceptance(unittest.TestCase):
         return self.documents().get("eve.interest", {}).get("interests.v1")
 
     def jobs(self):
-        return [record["job"] for record in (self.interest_state() or {}).get("jobs", [])]
+        import hashlib
+
+        state = self.interest_state()
+        if state is None:
+            return []
+        if state["format_version"] == 1:
+            return [record["job"] for record in state["jobs"]]
+        self.assertEqual(state["format_version"], 2, "未知兴趣账本格式不能作为空历史")
+        records = list(state["jobs"])
+        directory = self.work / "state/interest-job-archive"
+        self.assertFalse(directory.is_symlink())
+        for ref in state.get("archive", []):
+            digest = ref["sha256"]
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(all(c in "0123456789abcdef" for c in digest))
+            self.assertIs(type(ref["bytes"]), int)
+            self.assertTrue(0 < ref["bytes"] <= 128 * 1024)
+            path = directory / (digest + ".json")
+            self.assertFalse(path.is_symlink())
+            with path.open("rb") as source:
+                payload = source.read(128 * 1024 + 1)
+            self.assertEqual(len(payload), ref["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), digest)
+            envelope = json.loads(payload)
+            self.assertEqual(set(envelope), {"format_version", "record"})
+            self.assertEqual(envelope["format_version"], 1)
+            record = envelope["record"]
+            job = record["job"]
+            self.assertNotEqual(job["status"], "Running")
+            actual = {"sequence": record["sequence"], "id": job["batch"]["id"],
+                      "scope": job["batch"]["scope"], "status": job["status"],
+                      "started_at_ms": job["batch"]["started_at_ms"],
+                      "finished_at_ms": job["finished_at_ms"],
+                      "memory_revision": record["memory_revision"],
+                      "sha256": digest, "bytes": len(payload),
+                      "consumed": [{"id": item["id"], "revision": item["revision"],
+                                    "sha256": hashlib.sha256(json.dumps(
+                                        item, ensure_ascii=False, separators=(",", ":")
+                                    ).encode()).hexdigest()}
+                                   for item in job["batch"]["evidence"]]}
+            self.assertEqual(actual, ref, "归档引用必须与完整原件一致")
+            records.append(record)
+        records.sort(key=lambda record: record["sequence"])
+        self.assertEqual([record["sequence"] for record in records],
+                         list(range(1, len(records) + 1)))
+        self.assertEqual(len({record["job"]["batch"]["id"] for record in records}), len(records))
+        return [record["job"] for record in records]
 
     def interests(self):
         return (self.interest_state() or {}).get("interests", [])
@@ -276,6 +322,8 @@ class InterestAcceptance(unittest.TestCase):
                     self.gate(name + "-continue").touch()
 
         inspector = threading.Thread(target=inspect, daemon=True)
+        capture_logs = getattr(self, "capture_process_logs", False)
+        stdout, stderr, communicated, timed_out = "", "", False, False
         with self.panel_stderr.open("w", encoding="utf8") if panel else contextlib.nullcontext(None) as panel_log:
             child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=panel_log or subprocess.PIPE, text=True)
             inspector.start()
@@ -285,16 +333,29 @@ class InterestAcceptance(unittest.TestCase):
                     self.assertTrue(stop_at.exists(), "process exited before stop synchronization")
                     child.kill()
                 stdout, stderr = child.communicate(timeout=timeout)
+                communicated = True
             except subprocess.TimeoutExpired:
+                timed_out = True
                 events = events_path.read_text()[-12000:] if events_path.exists() else ''
                 self.fail('\n'.join(self.errors) + '\n' +
                           (error_path.read_text() if error_path.exists() else 'process_timeout') + '\n' + events)
             finally:
                 if child.poll() is None:
                     child.kill()
-                    child.communicate()
+                    stdout, stderr = child.communicate()
+                    communicated = True
+                elif capture_logs and not communicated:
+                    # 超时后进程可能已自行退出；仍读取完整管道，不丢掉 TimeoutExpired 的输出。
+                    stdout, stderr = child.communicate()
                 self.run_release.set()
                 inspector.join(timeout=2)
+                if capture_logs:
+                    if panel_log:
+                        panel_log.flush()
+                        stderr = self.panel_stderr.read_text(encoding="utf8")
+                    self.process_logs.append({"run": self.runs, "command": command,
+                                              "exit_code": child.returncode, "timed_out": timed_out,
+                                              "stdout": stdout, "stderr": stderr})
         if panel:
             stderr = self.panel_stderr.read_text(encoding="utf8")
         self.assertFalse(inspector.is_alive(), "state inspector did not stop")
@@ -444,7 +505,7 @@ class InterestAcceptance(unittest.TestCase):
 
         # 重启不重放观察或反思；命令只读当前会话，其他用户看不到这条兴趣。
         self.run_eve([
-            *self.send(self.message("own-list", "/interests", contains=["Mindustry 模组创作", "后台学习中",
+            *self.send(self.message("own-list", "/interests", contains=["Mindustry 模组创作", "等待后续推进",
                                                                        interest["id"]])),
             *self.send(self.message("other-list", "/interests", user="user-2", expected=EMPTY)),
             *self.checkpoint("quiet")], checkpoints={"quiet": self.quiet})

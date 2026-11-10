@@ -129,6 +129,37 @@ jobs:
           path: ${{ runner.temp }}/eve-adapter-process-evidence/*.log
           if-no-files-found: error
           retention-days: 7
+      - name: 通过真实 Rust API 生成满容量兴趣迁移种子
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        env:
+          EVE_INTEREST_ARCHIVE_SEED_EXPORT: ${{ runner.temp }}/eve-interest-archive-evidence/seed
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/eve-interest-archive-evidence"
+          # 只运行种子目标，复用当前依赖产物，不重复构建宿主。
+          cargo +1.95.0 test -p eve-interest-plugin --test archive --locked export_real_completed_qq_seed_for_process_migration -- --exact 2>&1 | tee "$RUNNER_TEMP/eve-interest-archive-evidence/seed.log"
+      - name: 验证满容量兴趣迁移、新输入与重启不重放
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        env:
+          EVE_QQBOT_BINARY: target/debug/eve-qqbot
+          EVE_INTEREST_ARCHIVE_SEED_DIR: ${{ runner.temp }}/eve-interest-archive-evidence/seed
+          EVE_INTEREST_ARCHIVE_E2E_ARTIFACTS: ${{ runner.temp }}/eve-interest-archive-evidence/process
+        run: |
+          set -euo pipefail
+          python3 -B connectors/qqbot/test/interest_archive_test.py 2>&1 | tee "$RUNNER_TEMP/eve-interest-archive-evidence/process.log"
+      - name: 保留兴趣迁移的真实种子与进程证据
+        if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: interest-archive-qq-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eve-interest-archive-evidence
+          if-no-files-found: error
+          retention-days: 7
+      - name: 清理本轮兴趣迁移的可再生种子
+        if: ${{ always() }}
+        run: |
+          rm -rf -- "$RUNNER_TEMP/eve-interest-archive-evidence/seed"
+          df -h "$RUNNER_TEMP"
       - name: 进程验收：Web 与基础对话
         if: ${{ !cancelled() && steps.adapter-process-binaries.outcome == 'success' }}
         run: |
