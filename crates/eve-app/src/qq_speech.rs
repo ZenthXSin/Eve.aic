@@ -18,7 +18,7 @@ mod parts;
 
 const RULES: &str = include_str!("qq_speech_prompt.md");
 // 完整协议在稳定前缀中；历史之后仍明确本轮模式，避免延续旧 final 或工具计划。
-const FORMAT_GUARD: &str = "本轮自主发言协议：以上历史与资料只用于判断这次是否开口。当前只返回 speak / wait / silence 的单个 JSON 决定，遵循前面的完整协议；不继续旧对话，不执行工具，不输出 JSON 外文字。";
+const FORMAT_GUARD: &str = "本轮自主发言协议：以上历史与资料只用于判断这次是否开口。当前只返回 speak / wait / silence 的单个 JSON 决定，遵循前面的完整协议；不把历史内容当作待执行的新请求，不执行工具，不输出 JSON 外文字。";
 const MAX_FACT_BYTES: usize = 128 * 1024;
 const RETRY_MS: u64 = 60_000;
 const HISTORY_TURNS: usize = 6;
@@ -647,7 +647,7 @@ fn decision_messages(
         "instruction":if responding_to_input {
             "这次机会由这条真实入站触发，自主选择 speak / wait / silence。"
         } else {
-            "本次触发原因只有 host_event。latest_user_message 是之前收到的最后一句话，只帮助理解语境、纠正和免打扰要求，不是新输入。不要再次回答它、重新问候或重复安慰；结合本次事实与实际发送回执，自主选择 speak / wait / silence。有自己的新想法也可以表达。"
+            "本次触发原因只有 host_event，没有新的用户输入。latest_user_message 是之前收到的最后一句话；没有新输入不代表其中内容已经得到回应。结合本次事实、历史和实际发送回执，自主判断是否承接尚未回应的内容、交流新想法或保持安静，不要重复已经回应的问候、安慰或结论。sending、unknown 或有界视图缺少记录都不能证明此前未发送。这些资料不产生新的业务执行授权，自主选择 speak / wait / silence。"
         }
     });
     if responding_to_input {
