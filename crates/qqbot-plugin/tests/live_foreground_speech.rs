@@ -124,6 +124,8 @@ struct Runner {
     directory: PathBuf,
     observed: Arc<Observed>,
     delayed_receipt: bool,
+    stop_during_receipt: bool,
+    same_anchor_progress: bool,
 }
 impl ControlRunner for Runner {
     fn run_with_metadata<'a>(
@@ -253,7 +255,14 @@ impl ControlRunner for Runner {
             let update = turn.take_update(false).unwrap();
             *self.observed.input_replies.lock().unwrap() = update.input_replies;
             let batch = update.batch;
-            assert_eq!(batch.review_anchor.as_deref(), Some("later-input"));
+            assert_eq!(
+                batch.review_anchor.as_deref(),
+                if self.same_anchor_progress {
+                    None
+                } else {
+                    Some("later-input")
+                }
+            );
             *self.observed.consumed.lock().unwrap() = batch.messages.clone();
             sink.emit(TurnEvent {
                 turn_id: Some(turn_id),
@@ -261,17 +270,33 @@ impl ControlRunner for Runner {
             })
             .await
             .unwrap();
-            if self.delayed_receipt {
+            if self.delayed_receipt && !self.same_anchor_progress {
                 // 模拟原业务的下一项异步工作；回执返回并不负责唤醒这一步。
                 std::fs::write(self.directory.join("input-consumed"), b"ready").unwrap();
-                tokio::time::timeout(Duration::from_secs(3), async {
-                    while !self.directory.join("resume-next-step").exists() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .unwrap();
-                let next = turn.take_update(false).unwrap();
+                let next = if self.stop_during_receipt {
+                    // 保持原 turn 到通道停止时的本地取消，读取清理阶段交接的未知终态。
+                    sink.closed().await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let next = turn.take_update(false).unwrap();
+                            if !next.input_replies.is_empty() {
+                                break next;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("停止没有给仍存活的原turn交接未知终态")
+                } else {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while !self.directory.join("resume-next-step").exists() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    turn.take_update(false).unwrap()
+                };
                 assert!(next.batch.messages.is_empty());
                 assert!(next.batch.review_anchor.is_none());
                 *self.observed.terminal_replies.lock().unwrap() = next.input_replies;
@@ -314,6 +339,7 @@ struct Speech {
     decisions: AtomicUsize,
     deliveries: Mutex<Vec<QqOutreachResult>>,
     retired: AtomicUsize,
+    same_anchor_progress: bool,
 }
 struct DecisionWait<'a>(&'a Speech);
 impl Drop for DecisionWait<'_> {
@@ -352,14 +378,32 @@ impl QqSpeech for Speech {
     }
     fn consider(&self, event: QqSpeechEvent) -> LlmFuture<'_, Option<QqSpeechDecision>> {
         Box::pin(async move {
-            assert_eq!(event.facts["kind"], "foreground_input_pending");
+            assert_eq!(
+                event.facts["kind"],
+                if self.same_anchor_progress {
+                    "foreground_tool_progress"
+                } else {
+                    "foreground_input_pending"
+                }
+            );
             assert_eq!(event.facts["phase"], "tools");
-            assert_eq!(event.anchor, "later-input");
+            assert_eq!(
+                event.anchor,
+                if self.same_anchor_progress {
+                    "initial-input"
+                } else {
+                    "later-input"
+                }
+            );
             let latest = self.archive.0.lock().unwrap().last().unwrap().clone();
             assert_eq!(latest.session_key().unwrap(), event.session);
             assert_eq!(
                 latest.text.as_deref(),
-                Some("你还在吗？先和我说说现在的情况")
+                Some(if self.same_anchor_progress {
+                    "继续执行这个任务"
+                } else {
+                    "你还在吗？先和我说说现在的情况"
+                })
             );
             assert!(self.observed.tool_running.load(Ordering::SeqCst));
             assert!(self.observed.consumed.lock().unwrap().is_empty());
@@ -398,12 +442,15 @@ impl QqSpeech for Speech {
 enum Scenario {
     Speak,
     DelayedReceipt,
+    CancelDuringReceipt,
     FinishAfterClaim,
     CancelAfterClaim,
     ReplaceAfterClaim,
     ToolCompletesDuringDecision,
     StopDuringDecision,
     StopWithRetireFailure,
+    StopDuringReceipt,
+    StopAfterProgressCompleted,
 }
 
 async fn scenario(mode: Scenario) {
@@ -413,7 +460,19 @@ async fn scenario(mode: Scenario) {
             | Scenario::StopDuringDecision
             | Scenario::StopWithRetireFailure
     );
-    let delayed_receipt = matches!(mode, Scenario::DelayedReceipt);
+    let delayed_receipt = matches!(
+        mode,
+        Scenario::DelayedReceipt
+            | Scenario::CancelDuringReceipt
+            | Scenario::StopDuringReceipt
+            | Scenario::StopAfterProgressCompleted
+    );
+    let stop_during_receipt = matches!(
+        mode,
+        Scenario::StopDuringReceipt | Scenario::StopAfterProgressCompleted
+    );
+    let same_anchor_progress = matches!(mode, Scenario::StopAfterProgressCompleted);
+    let cancel_during_receipt = matches!(mode, Scenario::CancelDuringReceipt);
     let stopping = matches!(
         mode,
         Scenario::StopDuringDecision | Scenario::StopWithRetireFailure
@@ -422,6 +481,16 @@ async fn scenario(mode: Scenario) {
     let directory = tempfile::tempdir().unwrap();
     if delayed_receipt {
         std::fs::write(directory.path().join("delay-receipt"), b"delay").unwrap();
+    }
+    if same_anchor_progress {
+        std::fs::write(
+            directory.path().join("original-progress-only"),
+            b"no-followup",
+        )
+        .unwrap();
+    }
+    if matches!(mode, Scenario::FinishAfterClaim) {
+        std::fs::write(directory.path().join("delay-before-sdk"), b"delay").unwrap();
     }
     let services = KernelServices::default();
     let registry = services.registry.clone();
@@ -471,6 +540,7 @@ async fn scenario(mode: Scenario) {
         decisions: AtomicUsize::new(0),
         deliveries: Mutex::default(),
         retired: AtomicUsize::new(0),
+        same_anchor_progress,
     });
     kernel
         .register(Box::new(
@@ -481,6 +551,8 @@ async fn scenario(mode: Scenario) {
                     directory: directory.path().into(),
                     observed: observed.clone(),
                     delayed_receipt,
+                    stop_during_receipt,
+                    same_anchor_progress,
                 }),
                 vec![],
             )
@@ -500,6 +572,7 @@ async fn scenario(mode: Scenario) {
         .unwrap()
         .0
         .clone();
+    let receipt_control = control.clone();
     let race = gate.clone().map(|gate| {
         tokio::spawn(async move {
             let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -601,6 +674,22 @@ async fn scenario(mode: Scenario) {
         .value
         .downcast::<QqBotStatusHandle>()
         .unwrap();
+    if matches!(mode, Scenario::FinishAfterClaim) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !directory.path().join("original-finish-before-sdk").exists() {
+                assert!(!status.status.borrow().closed, "bridge 提前结束");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("已领取发言写入管道后，原轮 finish 必须到达 SDK 前闸门");
+        assert!(directory.path().join("push-before-sdk").exists());
+        assert!(!directory.path().join("platform-started").exists());
+        assert!(observed.completed.load(Ordering::SeqCst));
+        assert!(speech.deliveries.lock().unwrap().is_empty());
+        // 放行已写出的发言及其后续控制帧；正常结束不能在 SDK 前撤销已交接的即时回复。
+        std::fs::write(directory.path().join("release-before-sdk"), b"release").unwrap();
+    }
     let reviewed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let ready = if hold {
@@ -619,6 +708,82 @@ async fn scenario(mode: Scenario) {
     })
     .await;
     let still_running = observed.tool_running.load(Ordering::SeqCst);
+    if stop_during_receipt {
+        reviewed.expect("停止前真实 SDK 尚未开始");
+        assert!(still_running);
+        std::fs::write(directory.path().join("release-tool"), b"release").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while speech.retired.load(Ordering::SeqCst) == 0
+                || (same_anchor_progress && status.status.borrow().completed != 1)
+                || (!same_anchor_progress && !directory.path().join("input-consumed").exists())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("停止前候选未退役或原任务未到受控状态");
+        assert!(speech.deliveries.lock().unwrap().is_empty());
+        let before = std::fs::read_to_string(directory.path().join("bridge.jsonl")).unwrap();
+        assert!(
+            !before
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|row| row["type"] == "close_foreground")
+        );
+        if same_anchor_progress {
+            assert!(
+                !before
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|row| row["type"] == "finish" && row["id"] == "initial-input")
+            );
+        }
+        status.request_stop();
+        tokio::time::timeout(Duration::from_secs(3), kernel.stop_all())
+            .await
+            .expect("停止未完成")
+            .unwrap();
+        assert_eq!(
+            *speech.deliveries.lock().unwrap(),
+            [QqOutreachResult::Unknown]
+        );
+        let rows: Vec<Value> = std::fs::read_to_string(directory.path().join("bridge.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let close = rows
+            .iter()
+            .position(|row| row["type"] == "close_foreground")
+            .unwrap();
+        let stop = rows.iter().position(|row| row["type"] == "stop").unwrap();
+        assert!(close < stop);
+        assert_eq!(
+            rows.iter().filter(|row| row["type"] == "platform").count(),
+            1
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["type"] == "delivery" && row["push"] == true)
+        );
+        if same_anchor_progress {
+            let finish = rows
+                .iter()
+                .position(|row| row["type"] == "finish" && row["id"] == "initial-input")
+                .unwrap();
+            assert!(
+                close < finish && finish < stop,
+                "原anchor延迟finish在关窗后、stop前排空"
+            );
+        } else {
+            let terminal = observed.terminal_replies.lock().unwrap();
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0].input_message_id, "later-input");
+            assert_eq!(terminal[0].delivery, InputReplyDelivery::Unknown);
+        }
+        return;
+    }
     if stopping {
         status.request_stop();
         let stopped = tokio::time::timeout(Duration::from_secs(3), kernel.stop_all())
@@ -673,22 +838,43 @@ async fn scenario(mode: Scenario) {
             assert_eq!(handoffs.len(), 1);
             assert_eq!(handoffs[0].delivery, InputReplyDelivery::Sending);
         }
-        // 等旧前台窗口真实关闭，终态仍必须能找到原轮，而不是借最新前台输入归属。
+        // 候选可退役，已领取发送仍持有独立窗口；晚回执不能依赖旧 ForegroundInput。
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while speech.retired.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("已消费输入的旧前台候选未退役");
+        assert!(speech.events.lock().unwrap().is_empty());
+        if cancel_during_receipt {
+            let session = receipt_control.list_keys(None, 10).unwrap().remove(0);
+            let current = receipt_control.snapshot(&session).unwrap().unwrap();
+            assert_eq!(
+                receipt_control.cancel(&current.key).unwrap(),
+                eve_control_api::CancelDisposition::Requested
+            );
+        }
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let rows = std::fs::read_to_string(directory.path().join("bridge.jsonl")).unwrap();
-                if rows
+                let closed = rows
                     .lines()
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .any(|row| row["type"] == "close_foreground")
-                {
+                    .any(|row| row["type"] == "close_foreground");
+                if !cancel_during_receipt {
+                    assert!(!closed, "正常消费不能关闭已领取发言的在途窗口");
+                    break;
+                }
+                if closed {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("已消费输入的前台窗口未关闭");
+        .expect("SDK 已启动后的取消未关闭原窗口");
+        assert!(speech.deliveries.lock().unwrap().is_empty());
         std::fs::write(directory.path().join("release-receipt"), b"release").unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while speech.deliveries.lock().unwrap().is_empty() {
@@ -762,6 +948,17 @@ async fn scenario(mode: Scenario) {
         assert!(observed.input_replies.lock().unwrap().is_empty());
     } else {
         assert_eq!(sent.len(), 1);
+        if matches!(after_claim, Some(AfterClaim::Finish)) {
+            let sent_at = rows
+                .iter()
+                .position(|row| row["type"] == "platform")
+                .unwrap();
+            let close_at = rows
+                .iter()
+                .position(|row| row["type"] == "close_foreground")
+                .unwrap();
+            assert!(sent_at < close_at, "正常完成只在已领取发言结算后关闭窗口");
+        }
         assert_eq!(sent[0]["target"]["msgId"], "later-input");
         assert_eq!(
             sent[0]["text"],
@@ -816,6 +1013,21 @@ async fn new_input_can_be_answered_while_the_original_tool_runs_and_is_consumed_
 #[tokio::test]
 async fn receipt_after_foreground_removal_updates_only_the_original_live_turn() {
     scenario(Scenario::DelayedReceipt).await;
+}
+
+#[tokio::test]
+async fn cancellation_after_sdk_started_closes_window_but_late_receipt_keeps_original_turn() {
+    scenario(Scenario::CancelDuringReceipt).await;
+}
+
+#[tokio::test]
+async fn stopping_after_sdk_started_records_unknown_on_the_original_live_turn() {
+    scenario(Scenario::StopDuringReceipt).await;
+}
+
+#[tokio::test]
+async fn stopping_after_original_progress_completes_drains_deferred_finish_and_keeps_unknown() {
+    scenario(Scenario::StopAfterProgressCompleted).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

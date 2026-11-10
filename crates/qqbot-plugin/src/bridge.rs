@@ -56,6 +56,16 @@ use bridge_speech_parts::SpeechParts;
 use foreground_speech::{ForegroundActivity, ForegroundInput};
 use host_progress::HostProgress;
 
+/// 单条已领取发言独立于旧输入/工具候选；正常消费和完成不撤销正在交付的交流。
+struct ForegroundDelivery {
+    event: crate::QqSpeechEvent,
+    key: GenerationKey,
+    turn_id: u64,
+    passive: bool,
+    closed: bool,
+    deferred_finish: Option<Value>,
+}
+
 /// /train words 的回复：按学到次数列出编号、词语或场合、含义与原话摘录。
 fn phrase_list(phrases: &[eve_training_api::LearnedPhrase]) -> String {
     if phrases.is_empty() {
@@ -1573,6 +1583,7 @@ pub(crate) async fn run(
     let mut next_authored = tokio::time::Instant::now();
     let mut pushing_speech: Option<crate::QqSpeechEvent> = None;
     let mut pushing_input_reply: Option<crate::live::ClaimedInputReply> = None;
+    let mut foreground_delivery: Option<ForegroundDelivery> = None;
     let mut speech_parts: Option<SpeechParts> = None;
     let mut pushing_conversation: Option<(
         Message,
@@ -1622,6 +1633,20 @@ pub(crate) async fn run(
             slow_reported.retain(|id| active.iter().any(|a| &a.message.id == id));
             last_progress.retain(|id, _| active.iter().any(|a| &a.message.id == id));
             rejected_before_send.retain(|(id, _)| active.iter().any(|a| &a.message.id == id));
+            // 已写出的单条只等原回执；取消/换代/新原话仍关闭 SDK 前资格，不能当作正常收尾。
+            if let Some(delivery)=&mut foreground_delivery {
+                let scope=eve_llm_api::ContextScope{session_id:delivery.event.session.session_id.clone(),user_id:delivery.event.session.user_id.clone()};
+                let current=conversations.review_user_message_is_current(&scope,&delivery.event.anchor).unwrap_or(false)
+                    && foreground_speech::claimed_reply_is_current(control.as_ref(),&delivery.key,delivery.turn_id);
+                let window=!delivery.passive || foreground_windows.get(&delivery.event.anchor).is_some_and(|window|
+                    window.session==delivery.event.session && tokio::time::Instant::now()<window.deadline);
+                if (!current || !window) && !delivery.closed {
+                    write(&mut stdin,json!({"type":"close_foreground","version":1,"id":delivery.event.anchor})).await?;
+                    delivery.closed=true;
+                }
+            }
+            if pushing.is_none() && let Some(mut delivery)=foreground_delivery.take()
+                && let Some(frame)=delivery.deferred_finish.take() {write(&mut stdin,frame).await?;}
             // 已认领分条独立收尾：正常消费/工具结束不撤销原窗口，新输入与取消则封存后缀。
             if let (Some(group),Some(speaker))=(&mut speech_parts,&speech) {
                 let scope=eve_llm_api::ContextScope{session_id:group.event.session.session_id.clone(),user_id:group.event.session.user_id.clone()};
@@ -1667,12 +1692,15 @@ pub(crate) async fn run(
                             conversations.latest_message_id(&current.key.session).ok().flatten().as_deref()).as_deref()==Some(&anchor));
                 if considering_foreground.as_ref().is_some_and(|c|c.event.id==input.event.id) {considering_foreground=None;}
                 if ready_foreground.as_ref().is_some_and(|c|c.event.id==input.event.id) {ready_foreground=None;}
+                // 候选已退役，但已领取的同一发言仍独立等回执；保留原窗口对象直到终态或真实撤销。
+                if foreground_delivery.as_ref().is_some_and(|delivery|delivery.event.id==input.event.id && !delivery.closed){continue;}
                 if !retained { foreground_windows.remove(&anchor); }
                 // 即使保留剩余窗口，旧窗口对象也必须撤销，阻止排队的旧决定写进 SDK。
                 write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor,"keep_window":retained})).await?;
             }
             let closed_windows: Vec<_> = foreground_windows.iter().filter_map(|(anchor,window)| {
                 if foreground_inputs.contains_key(anchor) || speech_parts.as_ref().is_some_and(|group|group.foreground.is_some() && &group.event.anchor==anchor && !group.closed) {return None;}
+                if foreground_delivery.as_ref().is_some_and(|delivery| &delivery.event.anchor==anchor && !delivery.closed){return None;}
                 let current = window.remaining > 0 && tokio::time::Instant::now() < window.deadline
                     && active.iter().any(|current| current.key.session == window.session
                         && control.snapshot(&current.key.session).ok().flatten().is_some_and(|s|
@@ -2722,10 +2750,12 @@ pub(crate) async fn run(
                     }
                     pushing_input_reply=Some(claim);
                     pushing_conversation = Some((route.clone(), ready.text.clone(), metadata));
+                    foreground_delivery=Some(ForegroundDelivery{event:ready.event.clone(),key:claimed_key,turn_id:claimed_turn,passive:!proactive,closed:false,deferred_finish:None});
+                    // 写管道失败也保留在途身份，清理时关闭资格并保守处理未知结果。
+                    pushing=Some(AuxiliaryDelivery{id:id.clone(),scope:route.scope.clone(),target:route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
+                    pushing_speech=Some(ready.event.clone());
                     write(&mut stdin,json!({"type":if proactive {"push"} else {"passive_push"},"version":1,"id":id,"scope":"c2c","target_id":route.target_id,
                         "text":ready.text,"based_on_message_id":ready.event.anchor,"sender_id":route.user_id,"foreground":true})).await?;
-                    pushing=Some(AuxiliaryDelivery{id,scope:route.scope.clone(),target:route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
-                    pushing_speech=Some(ready.event);
                     continue;
                 }
                 if considering_foreground.is_none() && ready_foreground.is_none() {
@@ -3192,6 +3222,8 @@ pub(crate) async fn run(
                             && !explicit(&current.message.text) && !spoken.is_empty();
                         if let Some(group)=speech_parts.as_mut().filter(|group|group.foreground.is_some() && group.event.anchor==current.message.id) {
                             group.deferred_finish=Some(json!({"type":"finish","version":1,"id":current.message.id,"keep_passive":keep_passive}));
+                        } else if let Some(delivery)=foreground_delivery.as_mut().filter(|delivery|delivery.event.anchor==current.message.id) {
+                            delivery.deferred_finish=Some(json!({"type":"finish","version":1,"id":current.message.id,"keep_passive":keep_passive}));
                         } else if keep_passive {
                             // Node 只保留本次真实输入仍有效的剩余额度，并回报原窗口期限。
                             write(&mut stdin, json!({"type":"finish","version":1,"id":current.message.id,"keep_passive":true})).await?;
@@ -3817,6 +3849,9 @@ pub(crate) async fn run(
         .values()
         .map(|input| (input.event.id.clone(), input.event.clone()))
         .collect();
+    if let Some(delivery) = &foreground_delivery {
+        retiring_foreground.insert(delivery.event.id.clone(), delivery.event.clone());
+    }
     // 主循环可能在移除输入后的持久化步骤失败，槽中的事实仍必须清理。
     for event in considering_foreground
         .as_ref()
@@ -3855,6 +3890,33 @@ pub(crate) async fn run(
         }
     }
     foreground_inputs.clear();
+    // 单条已写出但未核对终态的发言在关窗后结算 Unknown；不重发，也不覆写已确认的 Sent。
+    if let Some(mut delivery) = foreground_delivery.take() {
+        if pushing_speech.as_ref() == Some(&delivery.event) {
+            pushing_speech.take();
+            let settled = speech
+                .as_ref()
+                .ok_or_else(|| failure("单条前台发言缺少回执服务"))
+                .and_then(|speaker| speaker.delivered(&delivery.event, QqOutreachResult::Unknown));
+            if settled.is_err() {
+                warn(&ctx, "foreground_shutdown_receipt_unrecorded");
+                cleanup_error = Some(failure("单条前台停止回执保存失败；重启时核对"));
+            } else if let Some(claim) = pushing_input_reply.take()
+                && claim
+                    .complete(eve_llm_api::InputReplyDelivery::Unknown)
+                    .is_err()
+            {
+                warn(&ctx, "foreground_shutdown_handoff_failed");
+                cleanup_error = Some(failure("单条前台停止交接失败"));
+            }
+        }
+        if let Some(frame) = delivery.deferred_finish.take()
+            && write(&mut stdin, frame).await.is_err()
+        {
+            warn(&ctx, "foreground_shutdown_finish_failed");
+            cleanup_error = Some(failure("单条前台延迟收尾失败"));
+        }
+    }
     for route in routing {
         if route.wait.await.is_err() {
             cleanup_error = Some(failure("QQBot 消息控制收尾失败"));
