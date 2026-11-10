@@ -62,6 +62,20 @@ pub(super) fn prepare(
 }
 
 impl SpeechParts {
+    /// 每条交付通道前重新观察原轮活动；整组计划不冻结执行阶段。
+    pub fn sending_metadata(
+        &self,
+        control: &dyn eve_control_api::ControlService,
+        activity: &foreground_speech::ForegroundActivity,
+    ) -> eve_training_api::ConversationMetadata {
+        let mut metadata = self.metadata.clone();
+        if let Some((key, turn_id)) = &self.foreground {
+            let snapshot = control.snapshot(&key.session).ok().flatten();
+            metadata.activity = current_activity(key, *turn_id, snapshot.as_ref(), activity);
+        }
+        metadata
+    }
+
     fn parts(&self) -> &[InputReplyPart] {
         let InputReplyDelivery::Parts { parts } = &self.receipt.delivery else {
             unreachable!()
@@ -197,5 +211,93 @@ impl SpeechParts {
                 biz_code: None,
             }
         }
+    }
+}
+
+fn current_activity(
+    key: &GenerationKey,
+    turn_id: u64,
+    snapshot: Option<&eve_control_api::ControlSnapshot>,
+    activity: &foreground_speech::ForegroundActivity,
+) -> Option<eve_training_api::ConversationActivity> {
+    let snapshot = snapshot.filter(|snapshot| {
+        snapshot.key == *key && snapshot.turn_id == Some(turn_id) && snapshot.report.is_none()
+    })?;
+    activity
+        .learning_activity(snapshot)
+        .or_else(|| crate::conversation_observer::activity_metadata(Some(snapshot)).activity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eve_control_api::{ControlEvent, ControlPhase, ControlReport, ControlSnapshot, RunReport};
+    use eve_llm_api::{ToolCall, TurnEvent, TurnEventKind};
+
+    #[test]
+    fn parts_activity_tracks_original_turn_without_borrowing_replacement_or_finished_state() {
+        let key = GenerationKey {
+            session: eve_session_api::SessionKey::new("parts-session", "person").unwrap(),
+            task_id: "parts-task".into(),
+            controller_epoch: [1; 16],
+            generation: 1,
+        };
+        let activity = foreground_speech::ForegroundActivity::default();
+        let emit = |kind| {
+            activity.observe(&ControlEvent {
+                key: key.clone(),
+                event: TurnEvent {
+                    turn_id: Some(7),
+                    kind,
+                },
+            });
+        };
+        let mut snapshot = ControlSnapshot {
+            key: key.clone(),
+            input_text: "合成任务".into(),
+            phase: ControlPhase::Tools,
+            cancel_requested: false,
+            events_retired: false,
+            turn_id: Some(7),
+            report: None,
+        };
+        emit(TurnEventKind::ToolBatchStarted {
+            calls: vec![ToolCall {
+                id: "inspect".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            }],
+        });
+        let before = current_activity(&key, 7, Some(&snapshot), &activity).unwrap();
+        assert_eq!(before.phase, "awaiting_tool_results");
+        assert_eq!(before.tool_name.as_deref(), Some("read_file"));
+        emit(TurnEventKind::ProviderStarted { request: 2 });
+        snapshot.phase = ControlPhase::Generating;
+        let after = current_activity(&key, 7, Some(&snapshot), &activity).unwrap();
+        assert_eq!(after.phase, "generating");
+        assert_eq!(after.tool_name, None);
+        assert_eq!(after.elapsed_ms, None);
+
+        assert!(current_activity(&key, 7, None, &activity).is_none());
+        snapshot.key.generation += 1;
+        assert!(current_activity(&key, 7, Some(&snapshot), &activity).is_none());
+        snapshot.key = key.clone();
+        snapshot.turn_id = Some(8);
+        assert!(current_activity(&key, 7, Some(&snapshot), &activity).is_none());
+        snapshot.turn_id = Some(7);
+        snapshot.report = Some(ControlReport {
+            key: key.clone(),
+            cancel_requested: false,
+            run: RunReport {
+                turn_id: Some(7),
+                commit: eve_control_api::CommitState::Completed,
+                text: None,
+                transcript: None,
+                started_tools: Some(1),
+                tool_results: vec![],
+                failure: None,
+            },
+        });
+        assert!(current_activity(&key, 7, Some(&snapshot), &activity).is_none());
     }
 }

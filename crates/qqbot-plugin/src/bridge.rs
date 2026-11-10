@@ -2616,7 +2616,7 @@ pub(crate) async fn run(
                     window.remaining=window.remaining.checked_sub(1).ok_or_else(||failure("自然分条原额度耗尽"))?;
                 }
                 let frame=group.frame(index);
-                pushing_conversation=Some((group.route.clone(),group.receipt.plan[index].text.clone(),group.metadata.clone()));
+                pushing_conversation=Some((group.route.clone(),group.receipt.plan[index].text.clone(),group.sending_metadata(control.as_ref(),&foreground_activity)));
                 // 先登记在途槽，即使写管道失败，停止清理也将保守记录 Unknown。
                 pushing=Some(AuxiliaryDelivery{id:frame["id"].as_str().expect("分条编号").into(),scope:group.route.scope.clone(),target:group.route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
                 write(&mut stdin,frame).await?;

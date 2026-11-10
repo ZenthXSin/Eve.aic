@@ -11,6 +11,7 @@ import unittest
 
 import dialogue_tools_test as dialogue
 import live_reminder_test as reminder
+import message_learning_flow_test as learning
 import natural_progress_test as natural
 
 
@@ -24,7 +25,7 @@ class NaturalSpeechPartsAcceptance(natural.NaturalProgressAcceptance):
             locals()[name] = None
     del name
 
-    def run_parts(self, script, *, segmented=True, **options):
+    def run_parts(self, script, *, segmented=True, training=False, **options):
         env = {
             'EVE_DEVELOPER_CONFIG': str(self.developer_config),
             'EVE_PROGRESS_STAGE_UPDATES': 'false',
@@ -32,8 +33,11 @@ class NaturalSpeechPartsAcceptance(natural.NaturalProgressAcceptance):
             'EVE_PROGRESS_TOOL_MILESTONES': 'false',
         }
         env.update(options.pop('env_extra', {}))
-        return self.run_live(script, more=['--segmented'] if segmented else [],
+        more = (['--segmented'] if segmented else []) + (['--training'] if training else [])
+        return self.run_live(script, more=more,
                              env_extra=env, **options)
+
+    learning_records = learning.MessageLearningFlow.recorded
 
     def wait_until(self, predicate, message):
         # 自然进度保留真实八秒门槛；杀进程门控还要等首条回执和第二条派发。
@@ -247,6 +251,58 @@ class NaturalSpeechPartsAcceptance(natural.NaturalProgressAcceptance):
         self.assertEqual(len(self.speech_requests), 1)
         self.assertEqual(len(self.main_requests), 2)
         self.assertEqual(self.executions.read_text(), 'x')
+
+    def test_each_part_records_its_actual_activity_instead_of_reusing_the_group_start(self):
+        self.install_parts_task(states=['sent', 'planned', 'planned'])
+        self.speech_callback = lambda facts: self.decide_parts(facts, delay=3000)
+        first_record = None
+
+        def first_sent_during_tool():
+            nonlocal first_record
+            self.first_sent()
+            self.wait_until(lambda: len(self.learning_records()) == 2,
+                            '首条真实发言没有进入逐条学习账本')
+            records = self.learning_records()
+            self.assertEqual([record['role'] for record in records], ['human', 'eve'])
+            first_record = records[1]
+            self.assertEqual(first_record['text'], PARTS[0])
+            metadata = first_record['metadata']
+            self.assertEqual(metadata['source_kind'], 'qq_foreground_sent')
+            self.assertEqual(metadata['activity']['phase'], 'awaiting_tool_results')
+            self.assertEqual(metadata['activity']['tool_name'], 'run_command')
+            self.assertTrue(metadata['turn_id'])
+
+        def completed_before_suffix():
+            self.assertEqual(self.turn(natural.INITIAL)['status']['state'], 'Completed')
+            self.assertEqual(self.executions.read_text(), 'x')
+            self.assert_receipt(['sent', 'planned', 'planned'], parent='sending')
+            self.wait_parts(['sent'] * 3, parent='sent')
+            self.wait_until(lambda: len(self.learning_records()) == 4,
+                            '后续真实发言没有进入逐条学习账本')
+
+        self.run_parts([
+            {'send': self.message('working', natural.INITIAL)},
+            {'wait_file': str(self.tool_started)}, *self.checkpoint('learning-first-sent'),
+            {'touch': str(self.release_tool)}, self.wait_receipt('working'),
+            *self.checkpoint('learning-after-completion'), self.wait_command('working', 'finish'),
+        ], training=True, checkpoints={'learning-first-sent': first_sent_during_tool,
+                                       'learning-after-completion': completed_before_suffix})
+        self.assert_outputs(PARTS)
+        records = self.learning_records()
+        self.assertEqual(records[1], first_record, '首次观察到的学习资料不能被后续阶段改写')
+        self.assertEqual([record['text'] for record in records[1:]], PARTS)
+        parts = self.speech_record()['receipt']['delivery']['parts']
+        original_turn = first_record['metadata']['turn_id']
+        reply_to = learning.qq_id('human', 'working')
+        for record, part in zip(records[1:], parts):
+            self.assertEqual(record['id'], learning.qq_id('eve', part['delivery']['platform_message_id']))
+            self.assertEqual(record['metadata']['turn_id'], original_turn)
+            self.assertEqual(record['metadata']['reply_to'], reply_to)
+        for record in records[2:]:
+            self.assertIsNone(record['metadata'].get('activity'),
+                              '原业务已完成，后段不能继续沿用组领取时的工具运行阶段')
+        self.assertEqual(len(self.main_requests), 2)
+        self.assertEqual(len(self.speech_requests), 1)
 
     def test_pending_input_parts_survive_normal_consumption_by_the_original_turn(self):
         followup = '现在看到哪一步了？'
