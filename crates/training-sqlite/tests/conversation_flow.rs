@@ -13,6 +13,11 @@ use std::{
     },
 };
 
+#[path = "conversation_flow/boundary.rs"]
+mod boundary;
+#[path = "conversation_flow/boundary_safety.rs"]
+mod boundary_safety;
+
 fn scope() -> ContextScope {
     ContextScope {
         session_id: "chat".into(),
@@ -455,7 +460,9 @@ async fn pause_preserves_unclaimed_backlog_and_reset_keeps_history_without_react
     let cursor = checkpoint(store.as_ref())["cursor"]["sequence"]
         .as_u64()
         .unwrap();
-    assert_eq!(cursor, 21);
+    // 已领取批次含一条旧 Eve 背景，只越过十五条新事件。
+    assert_eq!(claimed.messages.first().unwrap().id, "m-3");
+    assert_eq!(cursor, 20);
     training.observe_conversation(&scope(), event(100)).unwrap();
     assert!(
         training
@@ -1283,6 +1290,10 @@ async fn full_history_legacy_statistics_stay_unclassified_without_changing_consu
     kernel.stop_all().await.unwrap();
     let mut old = checkpoint(sql.as_ref());
     old["sweep"].as_object_mut().unwrap().remove("accounting");
+    old["sweep"]
+        .as_object_mut()
+        .unwrap()
+        .remove("successful_context_from");
     replace_checkpoint(sql.as_ref(), &old);
     let old_bytes = sql.scope(&scope()).unwrap().unwrap().checkpoint.unwrap();
     let (kernel, training) = open(state.clone(), sql.clone()).await;
@@ -1347,6 +1358,10 @@ async fn full_history_legacy_partial_cannot_become_success_after_its_last_fragme
     kernel.stop_all().await.unwrap();
     let mut old = checkpoint(sql.as_ref());
     old["sweep"].as_object_mut().unwrap().remove("accounting");
+    old["sweep"]
+        .as_object_mut()
+        .unwrap()
+        .remove("successful_context_from");
     replace_checkpoint(sql.as_ref(), &old);
     let (kernel, training) = open(state, sql.clone()).await;
     let status = training

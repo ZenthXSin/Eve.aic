@@ -13,6 +13,8 @@ use std::{
     },
 };
 
+const CONTINUITY_MESSAGES: usize = 12;
+
 fn state(message: &str) -> PluginError {
     PluginError::State(message.into())
 }
@@ -91,6 +93,10 @@ struct Sweep {
     covered: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accounting: Option<SweepAccounting>,
+    /// 冻结来源的一基位置；只覆盖最近连续、完整且确认成功的消息。
+    /// 旧检查点缺失时保持未知，不能从 covered 或旧 processed 反推。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successful_context_from: Option<u64>,
 }
 impl Sweep {
     fn pending(&self) -> bool {
@@ -365,6 +371,21 @@ fn validate_checkpoint(
                 return Err(state("交流重访消息统计与消费位置不一致；保留原记录"));
             }
         }
+        if let Some(from) = sweep.successful_context_from {
+            let length = sweep.cursor.sequence.saturating_sub(from);
+            if from == 0
+                || from >= sweep.cursor.sequence
+                || length > CONTINUITY_MESSAGES as u64
+                || length > sweep.processed
+                || sweep.accounting.as_ref().is_none_or(|accounting| {
+                    accounting
+                        .partial
+                        .is_some_and(|outcome| outcome != SweepOutcome::Succeeded)
+                })
+            {
+                return Err(state("交流重访成功背景与完整消息统计不一致"));
+            }
+        }
     }
     let Some(claim) = &checkpoint.inflight else {
         return Ok(());
@@ -375,7 +396,26 @@ fn validate_checkpoint(
             .as_ref()
             .ok_or_else(|| state("交流重访批次缺少请求"))?;
         let mut expected = sweep.cursor.clone();
-        for message in &claim.batch.messages {
+        let first_sequence = *sweep
+            .sequences
+            .get(expected.sequence as usize - 1)
+            .ok_or_else(|| state("交流重访批次越过冻结来源"))?;
+        let first_event = original_event(store, &row.scope, first_sequence)?;
+        let mut messages = claim.batch.messages.as_slice();
+        if messages[0].id != first_event.message.id {
+            if first_event.message.role != ConversationRole::Human
+                || messages.len() < 2
+                || messages[1]
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.fragment.is_some())
+                || sweep_anchor(store, &row.scope, sweep)?.as_ref() != Some(&messages[0])
+            {
+                return Err(state("交流重访背景不是最近已成功的完整原发言"));
+            }
+            messages = &messages[1..];
+        }
+        for message in messages {
             let sequence = *sweep
                 .sequences
                 .get(expected.sequence as usize - 1)
@@ -402,7 +442,7 @@ fn validate_checkpoint(
                 }
             };
         }
-        if expected != claim.after || !fits(&claim.batch)? {
+        if expected == sweep.cursor || expected != claim.after || !fits(&claim.batch)? {
             return Err(state("交流重访批次进度不一致"));
         }
         return validate_claim_lessons(store, row, checkpoint, claim);
@@ -757,6 +797,19 @@ impl PersistentConversations {
                 };
                 self.lesson_page(&row.scope, &mut checkpoint, &mut batch)?;
                 let start = checkpoint.cursor.clone();
+                let previous = normal_context(
+                    self.store.as_ref(),
+                    &row.scope,
+                    &start,
+                    checkpoint.context_from,
+                    &reserved,
+                )?;
+                let anchor = previous
+                    .iter()
+                    .rev()
+                    .find(|event| event.message.role == ConversationRole::Eve)
+                    .map(|event| event.message.clone());
+                reserve_anchor(&mut batch, anchor, first, &start)?;
                 let mut after = start.clone();
                 for event in &events {
                     if reserved.contains(&event.sequence) {
@@ -780,9 +833,10 @@ impl PersistentConversations {
                         );
                     } else {
                         batch.messages.pop();
-                        if !batch.messages.is_empty() {
+                        if after != start {
                             break;
                         }
+                        batch.messages.clear();
                         let (message, cursor) = fitting_fragment(event, &after, &mut batch)?;
                         batch.messages.push(message);
                         after = cursor;
@@ -796,22 +850,27 @@ impl PersistentConversations {
                     return Err(state("交流批次未能推进消费游标"));
                 }
                 // 最近的已消费原文只是连续性背景，正文太大时不挤走新事件。
-                let from = start
-                    .sequence
-                    .saturating_sub(12)
-                    .max(checkpoint.context_from);
-                let previous = self.store.events(&row.scope, from, 12)?;
-                for event in previous
-                    .iter()
-                    .rev()
-                    .filter(|e| e.sequence < start.sequence)
-                {
+                for event in previous.iter().rev() {
+                    if batch
+                        .messages
+                        .iter()
+                        .any(|message| message.id == event.message.id)
+                    {
+                        continue;
+                    }
                     if batch.messages.len() >= MAX_CONVERSATION_MESSAGES {
                         break;
                     }
-                    batch.messages.insert(0, event.message.clone());
+                    let position = batch.messages.partition_point(|message| {
+                        message
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.sequence)
+                            .is_some_and(|sequence| sequence < event.sequence)
+                    });
+                    batch.messages.insert(position, event.message.clone());
                     if !fits(&batch)? {
-                        batch.messages.remove(0);
+                        batch.messages.remove(position);
                         break;
                     }
                 }
@@ -936,6 +995,7 @@ impl PersistentConversations {
                 model_requests: 0,
                 covered: vec![],
                 accounting: Some(SweepAccounting::default()),
+                successful_context_from: None,
             });
             self.save(&row, &checkpoint, vec![], None)
         })
@@ -1001,6 +1061,19 @@ impl PersistentConversations {
             .as_ref()
             .ok_or_else(|| state("交流重访请求缺失"))?;
         let mut after = sweep.cursor.clone();
+        let first_sequence = *sweep
+            .sequences
+            .get(after.sequence as usize - 1)
+            .ok_or_else(|| state("交流重访批次越过冻结来源"))?;
+        let first = original_event(self.store.as_ref(), &row.scope, first_sequence)?;
+        let mut first_offset = after.clone();
+        first_offset.sequence = first_sequence;
+        reserve_anchor(
+            &mut batch,
+            sweep_anchor(self.store.as_ref(), &row.scope, sweep)?,
+            &first,
+            &first_offset,
+        )?;
         while let Some(sequence) = sweep.sequences.get(after.sequence as usize - 1) {
             let event = original_event(self.store.as_ref(), &row.scope, *sequence)?;
             let mut offset = after.clone();
@@ -1011,9 +1084,10 @@ impl PersistentConversations {
                 after = Cursor::at(after.sequence + 1);
             } else {
                 batch.messages.pop();
-                if !batch.messages.is_empty() {
+                if after != sweep.cursor {
                     break;
                 }
+                batch.messages.clear();
                 let (message, cursor) = fitting_fragment(&event, &offset, &mut batch)?;
                 batch.messages.push(message);
                 after = if cursor.sequence > *sequence {
@@ -1276,15 +1350,32 @@ fn advance(
         let mut message_outcome = fragment_outcome.combine(accounting.partial.take());
         for index in sweep.cursor.sequence..claim.after.sequence {
             match message_outcome {
-                SweepOutcome::Succeeded => sweep.processed += 1,
-                SweepOutcome::Failed => accounting.failed += 1,
-                SweepOutcome::Unknown => accounting.unknown += 1,
+                SweepOutcome::Succeeded => {
+                    sweep.processed += 1;
+                    sweep.successful_context_from = Some(
+                        sweep
+                            .successful_context_from
+                            .unwrap_or(index)
+                            .max((index + 1).saturating_sub(CONTINUITY_MESSAGES as u64)),
+                    );
+                }
+                SweepOutcome::Failed => {
+                    accounting.failed += 1;
+                    sweep.successful_context_from = None;
+                }
+                SweepOutcome::Unknown => {
+                    accounting.unknown += 1;
+                    sweep.successful_context_from = None;
+                }
             }
             sweep.covered.push(sweep.sequences[index as usize - 1]);
             message_outcome = fragment_outcome;
         }
         if claim.after.text_offset != 0 || claim.after.context_offset != 0 {
             accounting.partial = Some(message_outcome);
+            if message_outcome != SweepOutcome::Succeeded {
+                sweep.successful_context_from = None;
+            }
         }
         if outcome == "failed" {
             sweep.failed_batches += 1;
@@ -1302,6 +1393,86 @@ fn advance(
         }
     } else {
         checkpoint.cursor = claim.after.clone();
+    }
+    Ok(())
+}
+
+/// 普通背景只来自当前重置边界之后，预约维护来源会切断连续性。
+fn normal_context(
+    store: &dyn ConversationStore,
+    scope: &ContextScope,
+    start: &Cursor,
+    context_from: u64,
+    reserved: &BTreeSet<u64>,
+) -> PluginResult<Vec<ConversationEvent>> {
+    let from = start
+        .sequence
+        .saturating_sub(CONTINUITY_MESSAGES as u64)
+        .max(context_from);
+    let mut previous = Vec::new();
+    for sequence in (from..start.sequence).rev() {
+        if reserved.contains(&sequence) {
+            break;
+        }
+        previous.push(original_event(store, scope, sequence)?);
+    }
+    previous.reverse();
+    Ok(previous)
+}
+
+/// 成功区间按冻结来源位置解释，绝不把原事件序号当历史复访顺序。
+fn sweep_anchor(
+    store: &dyn ConversationStore,
+    scope: &ContextScope,
+    sweep: &Sweep,
+) -> PluginResult<Option<ConversationMessage>> {
+    if sweep.cursor.text_offset != 0 || sweep.cursor.context_offset != 0 {
+        return Ok(None);
+    }
+    let Some(from) = sweep.successful_context_from else {
+        return Ok(None);
+    };
+    for ordinal in (from..sweep.cursor.sequence).rev() {
+        let sequence = *sweep
+            .sequences
+            .get(ordinal as usize - 1)
+            .ok_or_else(|| state("交流重访成功背景越过冻结来源"))?;
+        let event = original_event(store, scope, sequence)?;
+        if event.message.role == ConversationRole::Eve {
+            return Ok(Some(event.message));
+        }
+    }
+    Ok(None)
+}
+
+/// 仅在最近 Eve 与第一条完整新 Human 同时容得下时预留背景。
+/// 大消息和正在消费的分片沿用原新消息优先路径，不被背景挤成零进展。
+fn reserve_anchor(
+    batch: &mut ConversationBatch,
+    anchor: Option<ConversationMessage>,
+    first: &ConversationEvent,
+    cursor: &Cursor,
+) -> PluginResult<()> {
+    if first.message.role != ConversationRole::Human
+        || cursor.text_offset != 0
+        || cursor.context_offset != 0
+    {
+        return Ok(());
+    }
+    let Some(anchor) = anchor else {
+        return Ok(());
+    };
+    let full = project(
+        first,
+        cursor,
+        first.message.text.len() + context_text(&first.message).len(),
+    )?;
+    batch.messages.push(anchor);
+    batch.messages.push(full);
+    let allowed = fits(batch)?;
+    batch.messages.pop();
+    if !allowed {
+        batch.messages.pop();
     }
     Ok(())
 }
