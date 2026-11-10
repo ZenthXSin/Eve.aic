@@ -194,6 +194,13 @@ class NaturalSpeechPartsAcceptance(natural.NaturalProgressAcceptance):
         return [{'touch': str(self.release_tool)}, self.wait_receipt('working'),
                 self.wait_command('working', 'finish')]
 
+    def wait_command_silence(self, message_id):
+        # 命令回执 Handled/finish 之后还会有独立的宿主事实发言判断。
+        # 先等该判断落盘再继续测试，避免桥在业务结束时抢先 EOF。
+        self.wait_until(lambda: any(event['id'] == f'host-reply:{message_id}' and state == 'silence'
+                                   for event, state, _ in self.speech_rows()),
+                        '命令的独立沉默决定尚未落盘：' + message_id)
+
     def assert_outputs(self, texts, *, anchor='working'):
         outputs = self.live_outputs()
         self.assertEqual([event['text'] for event in outputs], texts)
@@ -390,10 +397,12 @@ class NaturalSpeechPartsAcceptance(natural.NaturalProgressAcceptance):
         self.speech_callback = self.decide_parts
         self.run_parts([
             *self.send(self.message('segment-off', '/segment off')),
+            *self.checkpoint('segment-off-silence'),
             {'send': self.message('working', natural.INITIAL)},
             {'wait_file': str(self.tool_started)}, *self.checkpoint('merged-sent'),
             *self.finish_work(),
-        ], checkpoints={'merged-sent': lambda: self.wait_until(
+        ], checkpoints={'segment-off-silence': lambda: self.wait_command_silence('segment-off'),
+                        'merged-sent': lambda: self.wait_until(
             lambda: bool(self.speech_records()) and self.speech_record()['state'] == 'sent',
             '关闭分段后的完整消息没有送达')})
         self.assert_receipt(['sent'], parent='sent', texts=merged)
@@ -436,11 +445,13 @@ class NaturalSpeechPartsAcceptance(natural.NaturalProgressAcceptance):
             facts, kind=INPUT_KIND, texts=texts, delay=500)
         self.run_parts([
             *self.send(self.message('segment-five', '/segment parts 5')),
+            *self.checkpoint('segment-five-silence'),
             {'send': self.message('working', natural.INITIAL)},
             {'wait_file': str(self.tool_started)},
             {'send': self.message('followup', followup)}, self.wait_receipt('followup', 'Merged'),
             *self.checkpoint('window-used'), *self.finish_work(),
-        ], checkpoints={'window-used': lambda: self.wait_parts(
+        ], checkpoints={'segment-five-silence': lambda: self.wait_command_silence('segment-five'),
+                        'window-used': lambda: self.wait_parts(
             states, kind=INPUT_KIND, parent='failed', texts=texts)})
         self.assert_outputs(texts[:4], anchor='followup')
         self.assertTrue(all(event['type'] == 'passive_push' for event in self.live_outputs()))
