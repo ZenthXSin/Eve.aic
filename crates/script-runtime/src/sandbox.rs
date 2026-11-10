@@ -111,51 +111,7 @@ impl Bubblewrap {
         };
         self.preflight(cargo.as_ref().unwrap_or(&version.spec.language))?;
         let mut command = Command::new(&self.bwrap);
-        #[cfg(target_os = "linux")]
-        let filter = syscall_filter()?;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let filter_fd = filter.as_file().as_raw_fd();
-            command.arg("--seccomp").arg(filter_fd.to_string());
-            // pre_exec 只调用 async-signal-safe libc 函数，不分配、不加锁。
-            unsafe {
-                command.pre_exec(move || {
-                    #[repr(C)]
-                    struct Limit {
-                        current: u64,
-                        maximum: u64,
-                    }
-                    unsafe extern "C" {
-                        fn fcntl(fd: i32, command: i32, value: i32) -> i32;
-                        fn setrlimit(resource: u32, limit: *const Limit) -> i32;
-                    }
-                    // 仅 seccomp fd 需跨 exec 交给 bwrap，其余宿主 fd 默认 CLOEXEC。
-                    if fcntl(filter_fd, 2, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    for (resource, value) in [
-                        (0, 3),
-                        (1, 1024 * 1024),
-                        (4, 0),
-                        (7, 64),
-                        (9, 1024 * 1024 * 1024),
-                    ] {
-                        if setrlimit(
-                            resource,
-                            &Limit {
-                                current: value,
-                                maximum: value,
-                            },
-                        ) != 0
-                        {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
+        let _filter = install_process_limits(&mut command)?;
         command.env_clear().args([
             "--unshare-all",
             "--unshare-user",
@@ -256,6 +212,62 @@ impl Bubblewrap {
             })
             .map_err(|_| reject("隔离进程启动失败，未降级到宿主 exec"))
     }
+}
+
+/// 复用已验收的脚本 seccomp 与资源限额；返回的过滤器必须活到 spawn 完成。
+pub(crate) fn install_process_limits(command: &mut Command) -> Result<tempfile::NamedTempFile> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+        return Err(reject("缺少 Linux 隔离，拒绝启动"));
+    }
+    #[cfg(target_os = "linux")]
+    let filter = syscall_filter()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let filter_fd = filter.as_file().as_raw_fd();
+        command.arg("--seccomp").arg(filter_fd.to_string());
+        // pre_exec 只调用 async-signal-safe libc 函数，不分配、不加锁。
+        unsafe {
+            command.pre_exec(move || {
+                #[repr(C)]
+                struct Limit {
+                    current: u64,
+                    maximum: u64,
+                }
+                unsafe extern "C" {
+                    fn fcntl(fd: i32, command: i32, value: i32) -> i32;
+                    fn setrlimit(resource: u32, limit: *const Limit) -> i32;
+                }
+                // 仅 seccomp fd 需跨 exec 交给 bwrap，其余宿主 fd 默认 CLOEXEC。
+                if fcntl(filter_fd, 2, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for (resource, value) in [
+                    (0, 3),
+                    (1, 1024 * 1024),
+                    (4, 0),
+                    (7, 64),
+                    (9, 1024 * 1024 * 1024),
+                ] {
+                    if setrlimit(
+                        resource,
+                        &Limit {
+                            current: value,
+                            maximum: value,
+                        },
+                    ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(target_os = "linux")]
+    Ok(filter)
 }
 
 /// 跟随可信解释器的符号链接，避免沙箱内绑定失效，并从真实安装前缀查找库。

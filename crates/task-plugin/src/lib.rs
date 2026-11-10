@@ -3,7 +3,9 @@ mod archive;
 mod capacity;
 mod cold;
 mod completion;
-pub use completion::{evaluate_completion_contract, evaluate_task_completion};
+pub use completion::{
+    evaluate_checkpoint_completion, evaluate_completion_contract, evaluate_task_completion,
+};
 mod receipt_evidence;
 pub use receipt_evidence::select_task_receipt_evidence;
 mod progress;
@@ -302,8 +304,18 @@ pub struct TaskPlugin {
     manifest: PluginManifest,
     controller: TaskController,
     archive: Option<Arc<dyn TaskArchiveStore>>,
+    completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
 }
 impl TaskPlugin {
+    /// 只由可信宿主注入；采集真实运行器见证，不从模型回执正文推导。
+    pub fn with_completion_evidence_source(
+        mut self,
+        source: Arc<dyn TaskCompletionEvidenceSource>,
+    ) -> Self {
+        self.completion_evidence = Some(source);
+        self
+    }
+
     pub fn with_archive(mut self, archive: Arc<dyn TaskArchiveStore>) -> Self {
         self.archive = Some(archive);
         self
@@ -318,6 +330,7 @@ impl TaskPlugin {
             manifest: PluginManifest::new(TASK_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             controller: TaskController::default(),
             archive: None,
+            completion_evidence: None,
         })
     }
     pub fn controller(&self) -> TaskController {
@@ -331,8 +344,12 @@ impl Plugin for TaskPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredTasks::open_with_archive(context.clone(), self.archive.clone())
-                    .map_err(|error| PluginError::State(error.to_string()))?,
+                StoredTasks::open_with_archive(
+                    context.clone(),
+                    self.archive.clone(),
+                    self.completion_evidence.clone(),
+                )
+                .map_err(|error| PluginError::State(error.to_string()))?,
             );
             let to_close = stored.clone();
             let controller = self.controller.clone();

@@ -39,6 +39,9 @@ pub fn evaluate_completion_contract(
     }
     match contract {
         TaskCompletionContract::Unspecified => unknown("missing_frozen_completion_contract"),
+        TaskCompletionContract::FrozenNodeTest { .. } => {
+            unknown("missing_trusted_frozen_node_evidence")
+        }
         TaskCompletionContract::Text {
             required_fragments,
             json_equals,
@@ -220,6 +223,14 @@ pub fn evaluate_task_completion(task: &Task, result: &str) -> TaskCompletionAsse
     {
         return unknown("invalid_completion_checkpoint");
     }
+    if matches!(
+        contract,
+        Some(TaskCompletionContract::FrozenNodeTest { .. })
+    ) && frozen_node_task_session(&task.owner, &task.id).map_or(true, |session| {
+        checkpoint.model_session.as_ref() != Some(&session)
+    }) {
+        return unknown("mismatched_frozen_node_task_session");
+    }
     if !checkpoint.resumable() {
         return unknown("unknown_tool_effect_not_replayed");
     }
@@ -244,10 +255,120 @@ pub fn evaluate_task_completion(task: &Task, result: &str) -> TaskCompletionAsse
     {
         return unknown("text_contract_cannot_verify_tool_effects");
     }
-    evaluate_completion_contract(
+    evaluate_checkpoint_completion(
         contract,
-        &checkpoint.messages,
+        &task.owner,
+        checkpoint,
+        task.spec.max_steps as usize,
         result,
-        checkpoint.remaining.as_deref(),
+        execution
+            .map(|execution| execution.frozen_node_evidence.as_slice())
+            .unwrap_or_default(),
     )
+}
+
+/// 带宿主持久见证的同一验收入口；纯读已保存输入，不访问当前源码、运行器或模型。
+/// evidence 只能来自可信采集侧或经完整性校验的持久 sidecar，不能反序列化模型输出。
+pub fn evaluate_checkpoint_completion(
+    contract: &TaskCompletionContract,
+    owner: &TaskOwner,
+    checkpoint: &eve_llm_api::TurnCheckpoint,
+    max_tool_calls: usize,
+    result: &str,
+    evidence: &[TaskFrozenNodeEvidence],
+) -> TaskCompletionAssessment {
+    if contract.validate().is_err() {
+        return unknown("invalid_frozen_contract");
+    }
+    if checkpoint.validate(max_tool_calls).is_err()
+        || checkpoint.scope.user_id != owner.user_id
+        || checkpoint.scope.session_id != owner.session_id
+    {
+        return unknown("invalid_completion_checkpoint");
+    }
+    if !checkpoint.resumable() {
+        return unknown("unknown_tool_effect_not_replayed");
+    }
+    if checkpoint.result.as_deref() != Some(result) {
+        return unknown("missing_or_mismatched_saved_final_result");
+    }
+    let TaskCompletionContract::FrozenNodeTest {
+        input_sha256,
+        runtime_sha256,
+        command_sha256,
+    } = contract
+    else {
+        return evaluate_completion_contract(
+            contract,
+            &checkpoint.messages,
+            result,
+            checkpoint.remaining.as_deref(),
+        );
+    };
+    if let Some(blocker) = execution_blocker(&checkpoint.messages, checkpoint.remaining.as_deref())
+    {
+        return blocker;
+    }
+    if result.trim().is_empty() || result.len() > MAX_RESULT_BYTES {
+        return mismatch("invalid_final_result");
+    }
+    if validate_frozen_node_evidence(owner, checkpoint, evidence).is_err() {
+        return unknown("invalid_trusted_frozen_node_evidence");
+    }
+    let calls: Vec<_> = checkpoint
+        .messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .filter(|call| call.name == FROZEN_NODE_TEST_TOOL)
+        .collect();
+    // 任意本工具调用没有可信运行见证时保守保留未知，不能挑更早成功避开新调用。
+    if calls
+        .iter()
+        .any(|call| !evidence.iter().any(|item| item.call_id == call.id))
+    {
+        return unknown("missing_trusted_frozen_node_evidence");
+    }
+    if evidence.iter().any(|item| {
+        matches!(
+            item.outcome,
+            TaskFrozenNodeOutcome::Cancelled | TaskFrozenNodeOutcome::Unknown
+        )
+    }) {
+        return unknown("unknown_frozen_node_effect_not_replayed");
+    }
+    let matches_target = |item: &&TaskFrozenNodeEvidence| {
+        &item.input_sha256 == input_sha256
+            && &item.runtime_sha256 == runtime_sha256
+            && &item.command_sha256 == command_sha256
+    };
+    // 同一并发批次没有完成先后顺序；不能按数组位置挑出一条成功来隐藏失败。
+    let latest_batch = checkpoint.messages.iter().rev().find_map(|message| {
+        let matched: Vec<_> = message
+            .tool_calls
+            .iter()
+            .filter_map(|call| {
+                evidence
+                    .iter()
+                    .find(|item| item.call_id == call.id)
+                    .filter(matches_target)
+            })
+            .collect();
+        (!matched.is_empty()).then_some(matched)
+    });
+    let latest = match latest_batch.as_deref() {
+        Some([item]) => Some(*item),
+        Some(_) => return unknown("ambiguous_frozen_node_test_batch"),
+        None => None,
+    };
+    match latest.map(|item| &item.outcome) {
+        Some(TaskFrozenNodeOutcome::Exited {
+            exit_code: Some(0),
+            signal: None,
+        }) => TaskCompletionAssessment::Verified,
+        Some(TaskFrozenNodeOutcome::Exited { .. }) => mismatch("frozen_node_test_failed"),
+        Some(TaskFrozenNodeOutcome::Cancelled | TaskFrozenNodeOutcome::Unknown) => {
+            unknown("unknown_frozen_node_effect_not_replayed")
+        }
+        None => unknown("missing_matching_frozen_node_evidence"),
+    }
 }

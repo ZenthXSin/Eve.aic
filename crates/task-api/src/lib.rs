@@ -5,6 +5,8 @@
 //! 发送通知时进程退出记为结果未知，不重发。
 mod evidence;
 pub use evidence::{TaskEvidenceKey, TaskEvidenceReader, TaskEvidenceSnapshot};
+mod frozen_node;
+pub use frozen_node::*;
 mod completion;
 pub use completion::*;
 mod receipt_evidence;
@@ -179,6 +181,9 @@ pub struct TaskExecution {
     /// 可信宿主与任务创建原子冻结；None 仅保留旧宿主手工结算兼容路径。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_contract: Option<TaskCompletionContract>,
+    /// 宿主真实运行器采集，与检查点原子保存；模型参数和工具 JSON 不能写入。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen_node_evidence: Vec<TaskFrozenNodeEvidence>,
     /// 派发时由可信宿主冻结的最近六条真实用户正文。与任务身份一并持久化，
     /// 不取模型任务说明或普通历史摘要；空数组表示没有可继承的授权证据。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -122,6 +122,7 @@ impl SqliteRunStorage {
                     end: state.end,
                     usage: state.usage,
                     verification: state.verification,
+                    frozen_node_evidence: state.frozen_node_evidence,
                     finished_at_ms: state.finished_at_ms,
                 }
                 .validate()?;
@@ -248,6 +249,7 @@ mod tests {
             end: None,
             usage: None,
             verification: None,
+            frozen_node_evidence: Vec::new(),
             finished_at_ms: None,
         })
         .unwrap();
@@ -277,6 +279,7 @@ mod tests {
             end: None,
             usage: None,
             verification: None,
+            frozen_node_evidence: Vec::new(),
             finished_at_ms: None,
         };
         let initial = serde_json::to_vec(&state).unwrap();

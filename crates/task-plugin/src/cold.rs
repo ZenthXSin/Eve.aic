@@ -74,6 +74,7 @@ pub(super) fn directory(task: &Task) -> Task {
             // 授权原话只留在按摘要核对的完整冷正文中，目录不复制用户正文。
             review_messages: vec![],
             completion_contract: execution.completion_contract.clone(),
+            frozen_node_evidence: vec![],
             deadline_at_ms: execution.deadline_at_ms,
             authorization_deadline_at_ms: execution.authorization_deadline_at_ms,
             recoveries: execution.recoveries,

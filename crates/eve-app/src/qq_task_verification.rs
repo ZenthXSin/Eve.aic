@@ -17,6 +17,10 @@ pub(crate) const OBSERVATION_RULES: &str = "回执只接受宿主真实观察：
 /// Unspecified 保留原目标为待验收，要求主动执行的入口可另外拒绝未指定合同。
 pub(crate) fn validate_contract(contract: &TaskCompletionContract) -> TaskResult<()> {
     contract.validate()?;
+    // 普通模型入口尚未装配冻结 bundle 与可信运行器，不能仅因定义层认识新 tag 就接纳。
+    if matches!(contract, TaskCompletionContract::FrozenNodeTest { .. }) {
+        return Err(TaskError::Unavailable);
+    }
     if let TaskCompletionContract::Receipts { contract } = contract {
         for check in &contract.checks {
             let valid = match check.tool.as_str() {

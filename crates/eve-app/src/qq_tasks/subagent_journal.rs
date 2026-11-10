@@ -1,11 +1,16 @@
 //! 子代理持久执行证据与可替换存储契约。中断只保全，不重跑旧调用。
 use super::*;
 use eve_llm_api::{ModelSession, TurnCheckpoint, TurnJournal};
+use eve_task_api::{
+    TaskCompletionAssessment, TaskCompletionEvidenceSource, TaskFrozenNodeEvidence,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Mutex};
 
 #[cfg(test)]
 mod evidence_tests;
+#[cfg(test)]
+mod frozen_node_tests;
 mod sqlite;
 pub(crate) use sqlite::SqliteRunStorage;
 const MAX_RECORD_BYTES: usize = 34 * 1024 * 1024;
@@ -81,6 +86,8 @@ struct Record {
     version: u32,
     frozen: FrozenRun,
     checkpoint: Option<TurnCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    frozen_node_evidence: Vec<TaskFrozenNodeEvidence>,
     end: Option<End>,
     usage: Option<TaskUsage>,
     verification: Option<eve_task_api::TaskCompletionAssessment>,
@@ -123,6 +130,41 @@ impl Record {
             {
                 return Err(storage());
             }
+            eve_task_api::validate_frozen_node_evidence(
+                &f.owner,
+                frame,
+                &self.frozen_node_evidence,
+            )
+            .map_err(|_| storage())?;
+        } else if !self.frozen_node_evidence.is_empty() {
+            return Err(storage());
+        }
+        if !self.frozen_node_evidence.is_empty()
+            && !matches!(
+                f.verification,
+                TaskCompletionContract::FrozenNodeTest { .. }
+            )
+        {
+            return Err(storage());
+        }
+        if let (TaskCompletionContract::FrozenNodeTest { .. }, Some(End::Completed { result })) =
+            (&f.verification, &self.end)
+        {
+            let frame = self.checkpoint.as_ref().ok_or_else(storage)?;
+            if self.verification != Some(TaskCompletionAssessment::Verified)
+                || !eve_task_plugin::evaluate_checkpoint_completion(
+                    &f.verification,
+                    &f.owner,
+                    frame,
+                    f.steps as usize,
+                    result,
+                    &self.frozen_node_evidence,
+                )
+                .verified()
+                || self.usage != Some(usage_of(frame.provider_requests, frame.used_tool_calls))
+            {
+                return Err(storage());
+            }
         }
         Ok(())
     }
@@ -153,6 +195,8 @@ pub(crate) trait RunStorage: Send + Sync {
 struct SavedState {
     version: u32,
     checkpoint: Option<TurnCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    frozen_node_evidence: Vec<TaskFrozenNodeEvidence>,
     end: Option<End>,
     usage: Option<TaskUsage>,
     verification: Option<eve_task_api::TaskCompletionAssessment>,
@@ -162,6 +206,7 @@ fn state_bytes(record: &Record) -> Result<Vec<u8>, LlmError> {
     serde_json::to_vec(&SavedState {
         version: record.version,
         checkpoint: record.checkpoint.clone(),
+        frozen_node_evidence: record.frozen_node_evidence.clone(),
         end: record.end.clone(),
         usage: record.usage,
         verification: record.verification.clone(),
@@ -171,12 +216,20 @@ fn state_bytes(record: &Record) -> Result<Vec<u8>, LlmError> {
 }
 pub(super) struct RunStore {
     backend: Arc<dyn RunStorage>,
+    completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
     lock: Mutex<HashSet<String>>,
 }
 impl RunStore {
     pub(super) fn open(backend: Arc<dyn RunStorage>) -> Arc<Self> {
+        Self::open_with_completion_evidence(backend, None)
+    }
+    pub(super) fn open_with_completion_evidence(
+        backend: Arc<dyn RunStorage>,
+        completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             backend,
+            completion_evidence,
             lock: Mutex::new(HashSet::new()),
         })
     }
@@ -196,6 +249,7 @@ impl RunStore {
                     version: state.version,
                     frozen,
                     checkpoint: state.checkpoint,
+                    frozen_node_evidence: state.frozen_node_evidence,
                     end: state.end,
                     usage: state.usage,
                     verification: state.verification,
@@ -225,10 +279,20 @@ impl RunStore {
                 "子代理原调用已持久化，禁止重新执行；用 list_subagent_runs 读取 run_id={id}"
             )));
         }
+        if matches!(
+            frozen.verification,
+            TaskCompletionContract::FrozenNodeTest { .. }
+        ) && self.completion_evidence.is_none()
+        {
+            return Err(LlmError::Context(
+                "冻结测试证据来源未就绪，未启动子代理".into(),
+            ));
+        }
         let record = Record {
             version: 1,
             frozen,
             checkpoint: None,
+            frozen_node_evidence: vec![],
             end: None,
             usage: None,
             verification: None,
@@ -441,6 +505,53 @@ impl RunJournal {
             run.usage.tool_calls = run.usage.tool_calls.max(persisted.tool_calls);
             run.usage.model_requests = run.usage.model_requests.max(persisted.model_requests);
         }
+        if matches!(
+            record.frozen.verification,
+            TaskCompletionContract::FrozenNodeTest { .. }
+        ) {
+            let verification = match &run.end {
+                TaskEnd::Completed { result } => match &record.checkpoint {
+                    Some(frame)
+                        if run.usage
+                            == usage_of(frame.provider_requests, frame.used_tool_calls) =>
+                    {
+                        eve_task_plugin::evaluate_checkpoint_completion(
+                            &record.frozen.verification,
+                            &record.frozen.owner,
+                            frame,
+                            record.frozen.steps as usize,
+                            result,
+                            &record.frozen_node_evidence,
+                        )
+                    }
+                    Some(_) => TaskCompletionAssessment::Unverifiable {
+                        reason: "uncheckpointed_execution_usage".into(),
+                    },
+                    None => TaskCompletionAssessment::Unverifiable {
+                        reason: "missing_checkpoint".into(),
+                    },
+                },
+                TaskEnd::Cancelled => TaskCompletionAssessment::Blocked {
+                    reason: "subagent_cancelled".into(),
+                },
+                TaskEnd::Blocked { .. } => TaskCompletionAssessment::Blocked {
+                    reason: "subagent_execution_blocked".into(),
+                },
+                TaskEnd::Failed { .. } | TaskEnd::SessionEnded { .. } => {
+                    TaskCompletionAssessment::Unverifiable {
+                        reason: "subagent_execution_not_completed".into(),
+                    }
+                }
+            };
+            if !verification.verified()
+                && let TaskEnd::Completed { result } = &run.end
+            {
+                run.end = TaskEnd::Blocked {
+                    result: result.clone(),
+                };
+            }
+            run.verification = Some(verification);
+        }
         record.end = Some(End::capture(&run.end)?);
         record.usage = Some(run.usage);
         record.verification = run.verification.clone();
@@ -473,11 +584,37 @@ impl TurnJournal for RunJournal {
             || record.checkpoint.as_ref().is_some_and(|old| {
                 checkpoint.used_tool_calls < old.used_tool_calls
                     || checkpoint.provider_requests < old.provider_requests
+                    || (matches!(
+                        record.frozen.verification,
+                        TaskCompletionContract::FrozenNodeTest { .. }
+                    ) && old.result.is_some())
             })
         {
             return Err(storage());
         }
         record.checkpoint = Some(checkpoint.clone());
+        if matches!(
+            record.frozen.verification,
+            TaskCompletionContract::FrozenNodeTest { .. }
+        ) {
+            // 先核可信身份与预算，再读运行器私有账本；checkpoint 与 sidecar 同次提交。
+            record.validate()?;
+            let captured = self
+                .store
+                .completion_evidence
+                .as_ref()
+                .map(|source| source.capture(&record.frozen.owner, checkpoint))
+                .transpose()
+                .map_err(|_| storage())?
+                .unwrap_or_default();
+            record.frozen_node_evidence = eve_task_api::merge_frozen_node_evidence(
+                &record.frozen.owner,
+                checkpoint,
+                &record.frozen_node_evidence,
+                captured,
+            )
+            .map_err(|_| storage())?;
+        }
         self.store.write(&self.id, &record)
     }
 }

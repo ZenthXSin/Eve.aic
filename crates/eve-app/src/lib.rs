@@ -113,6 +113,8 @@ pub mod startup_checkpoint;
 mod subject_memory;
 mod task_cognition;
 mod task_strategy_catalog;
+/// 宿主显式注入的冻结测试组合；普通 QQ/Web 模型入口默认不注册。
+pub use qq_tasks::frozen_node::{FrozenNodeAdapter, FrozenNodeBinding, FrozenNodeTool};
 pub use task_cognition::CognitiveServices;
 mod storage;
 mod web_autonomy;

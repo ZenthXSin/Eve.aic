@@ -46,6 +46,7 @@ use tokio::{
 
 mod action_capabilities;
 mod delegated_progress;
+pub(crate) mod frozen_node;
 mod subagent_journal;
 use delegated_progress::StopSignal;
 pub(crate) use subagent_journal::{ListRuns, RunStorage, SqliteRunStorage};
@@ -804,7 +805,13 @@ impl Worker {
                 diagnostics,
                 transcript,
             })) => {
-                let verification = child.then(|| {
+                // 冻结测试需要与检查点原子保存的可信见证；最终结算只在 RunJournal 中做。
+                let frozen_node_candidate = child
+                    && matches!(
+                        completion_contract.as_ref(),
+                        Some(TaskCompletionContract::FrozenNodeTest { .. })
+                    );
+                let verification = (child && !frozen_node_candidate).then(|| {
                     if let Some(reason) = eve_task_api::blocked_progress(&transcript) {
                         return eve_task_api::TaskCompletionAssessment::Blocked {
                             reason: reason.into(),
@@ -842,6 +849,8 @@ impl Worker {
                     }
                     } else if eve_task_api::blocked_progress(&transcript).is_some() {
                         TaskEnd::Blocked { result: text }
+                    } else if frozen_node_candidate {
+                        TaskEnd::Completed { result: text }
                     } else if child {
                         match verification.as_ref() {
                             Some(eve_task_api::TaskCompletionAssessment::Verified) => {

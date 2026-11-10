@@ -27,6 +27,7 @@ struct Inner {
 }
 pub(super) struct StoredTasks {
     inner: Mutex<Inner>,
+    completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
 }
 
 fn now_ms() -> u64 {
@@ -42,6 +43,7 @@ impl StoredTasks {
     pub(super) fn open_with_archive(
         context: PluginContext,
         archive: Option<Arc<dyn TaskArchiveStore>>,
+        completion_evidence: Option<Arc<dyn TaskCompletionEvidenceSource>>,
     ) -> TaskResult<Self> {
         let initialized = context
             .state_get(INITIALIZED_KEY)
@@ -178,6 +180,7 @@ impl StoredTasks {
             state.compact();
         }
         Ok(Self {
+            completion_evidence,
             inner: Mutex::new(Inner {
                 ledger,
                 context: Some(context),
@@ -396,6 +399,13 @@ impl StoredTasks {
                 return Err(TaskError::InvalidTransition);
             }
             return load_task(&inner, existing);
+        }
+        if matches!(
+            completion_contract,
+            Some(TaskCompletionContract::FrozenNodeTest { .. })
+        ) && self.completion_evidence.is_none()
+        {
+            return Err(TaskError::Unavailable);
         }
         let mine = || {
             inner
@@ -666,6 +676,29 @@ impl StoredTasks {
             {
                 return Err(TaskError::InvalidInput);
             }
+            if matches!(
+                execution.completion_contract,
+                Some(TaskCompletionContract::FrozenNodeTest { .. })
+            ) {
+                if checkpoint.model_session.as_ref()
+                    != Some(&frozen_node_task_session(&task.owner, &task.id)?)
+                {
+                    return Err(TaskError::InvalidInput);
+                }
+                // 运行器重启后可只返回新见证；原见证保持不变并重新绑定原轨迹。
+                let captured = self
+                    .completion_evidence
+                    .as_ref()
+                    .map(|source| source.capture(&task.owner, &checkpoint))
+                    .transpose()?
+                    .unwrap_or_default();
+                execution.frozen_node_evidence = merge_frozen_node_evidence(
+                    &task.owner,
+                    &checkpoint,
+                    &execution.frozen_node_evidence,
+                    captured,
+                )?;
+            }
             execution.deadline_at_ms = deadline_at_ms;
             execution.resume_at_ms = None;
             execution.checkpoint = Some(checkpoint);
@@ -719,6 +752,7 @@ impl StoredTasks {
             }
             let execution = task.execution.as_mut().ok_or(TaskError::InvalidTransition)?;
             let text_contract = matches!(execution.completion_contract.as_ref(), Some(TaskCompletionContract::Text { .. }));
+            if frozen_node_effects_unknown(execution) { return Err(TaskError::InvalidTransition); }
             let frame = execution.checkpoint.as_mut().ok_or(TaskError::InvalidTransition)?;
             if expected.is_some_and(|expected| expected != frame) {
                 return Err(TaskError::InvalidTransition);
@@ -1439,6 +1473,9 @@ pub(super) fn completion_repair_messages(
 }
 
 fn can_retry(execution: &TaskExecution, now_ms: u64) -> bool {
+    if frozen_node_effects_unknown(execution) {
+        return false;
+    }
     execution.recoveries < MAX_AUTO_RECOVERIES
         && execution
             .authorization_deadline_at_ms
@@ -1453,6 +1490,9 @@ fn can_retry(execution: &TaskExecution, now_ms: u64) -> bool {
 }
 
 fn can_wait_for_retry(execution: &TaskExecution, now_ms: u64) -> bool {
+    if frozen_node_effects_unknown(execution) {
+        return false;
+    }
     execution
         .authorization_deadline_at_ms
         .is_none_or(|at| now_ms < at)
@@ -1692,6 +1732,29 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
         }
         if let Some(contract) = &execution.completion_contract {
             contract.validate().map_err(|_| TaskError::CorruptState)?;
+        }
+        if matches!(
+            execution.completion_contract,
+            Some(TaskCompletionContract::FrozenNodeTest { .. })
+        ) && execution.checkpoint.as_ref().is_some_and(|frame| {
+            frozen_node_task_session(&task.owner, &task.id).map_or(true, |session| {
+                frame.model_session.as_ref() != Some(&session)
+            })
+        }) {
+            return Err(TaskError::CorruptState);
+        }
+        if !execution.frozen_node_evidence.is_empty() {
+            if !matches!(
+                execution.completion_contract,
+                Some(TaskCompletionContract::FrozenNodeTest { .. })
+            ) {
+                return Err(TaskError::CorruptState);
+            }
+            let frame = execution
+                .checkpoint
+                .as_ref()
+                .ok_or(TaskError::CorruptState)?;
+            validate_frozen_node_evidence(&task.owner, frame, &execution.frozen_node_evidence)?;
         }
         validate_review_messages(&execution.review_messages)
             .map_err(|_| TaskError::CorruptState)?;
@@ -1963,6 +2026,9 @@ fn recover(ledger: &mut Ledger, now: u64) -> TaskResult<bool> {
                     .is_some_and(|execution| execution.completion_contract.is_some());
                 if strict {
                     let stopped = task.execution.as_ref().and_then(|execution| {
+                        if frozen_node_effects_unknown(execution) {
+                            return Some("unknown_frozen_node_effect_not_replayed".to_owned());
+                        }
                         if execution.recoveries >= MAX_AUTO_RECOVERIES
                             && !(execution.resume_at_ms.is_some()
                                 && can_wait_for_retry(execution, now))

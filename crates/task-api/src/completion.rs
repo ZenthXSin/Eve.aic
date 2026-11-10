@@ -12,6 +12,12 @@ pub enum TaskCompletionContract {
     Unspecified,
     /// 实际工具回执必须满足固定检查；自述进度和 echo 不能充当验收。
     Receipts { contract: TaskEvaluationContract },
+    /// 完整冻结纯 JS 输入在固定运行时的测试；不证明活工作区或外部交付。
+    FrozenNodeTest {
+        input_sha256: String,
+        runtime_sha256: String,
+        command_sha256: String,
+    },
     /// 仅用于没有调用任何工具的纯文本交付物，不能证明外部动作已发生。
     Text {
         #[serde(default)]
@@ -37,6 +43,20 @@ impl TaskCompletionContract {
         match self {
             Self::Unspecified => Ok(()),
             Self::Receipts { contract } => contract.validate(),
+            Self::FrozenNodeTest {
+                input_sha256,
+                runtime_sha256,
+                command_sha256,
+            } => {
+                if [input_sha256, runtime_sha256, command_sha256]
+                    .into_iter()
+                    .all(|value| crate::valid_strategy_digest(value))
+                {
+                    Ok(())
+                } else {
+                    Err(TaskError::InvalidInput)
+                }
+            }
             Self::Text {
                 required_fragments,
                 json_equals,
