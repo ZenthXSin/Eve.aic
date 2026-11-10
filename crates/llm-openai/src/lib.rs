@@ -24,6 +24,7 @@ mod timing;
 mod usage;
 mod vision;
 mod wire;
+mod wire_diagnostics;
 
 /// 显式选择线协议；不根据模型名猜测，也不在失败时切换协议。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -100,6 +101,7 @@ pub struct OpenAiProvider {
     authorization: Option<HeaderValue>,
     client: Client,
     timing_diagnostics: bool,
+    wire_diagnostics: Option<wire_diagnostics::WireDiagnostics>,
     transient_retries: bool,
     recover_tool_arguments: bool,
     streamed_completions: bool,
@@ -213,6 +215,7 @@ impl OpenAiProvider {
             authorization,
             client,
             timing_diagnostics: false,
+            wire_diagnostics: None,
             transient_retries: false,
             recover_tool_arguments: false,
             streamed_completions: false,
@@ -241,6 +244,20 @@ impl OpenAiProvider {
     pub fn with_timing_diagnostics(mut self) -> Self {
         self.timing_diagnostics = true;
         self
+    }
+
+    /// 显式启用最终请求的有界摘要及用量关联；不输出正文，不改变请求或重试策略。
+    /// 随机诊断密钥无法初始化时保持关闭，不影响模型请求。
+    pub fn with_wire_diagnostics(mut self) -> Self {
+        self.wire_diagnostics = wire_diagnostics::WireDiagnostics::new();
+        self
+    }
+
+    fn wire_protocol(&self) -> wire_diagnostics::WireProtocol {
+        match self.config.protocol {
+            OpenAiProtocol::Responses => wire_diagnostics::WireProtocol::Responses,
+            OpenAiProtocol::ChatCompletions => wire_diagnostics::WireProtocol::Chat,
+        }
     }
 
     /// 完整响应在原请求期限内最多退避重试三次；不重放工具、不续接部分流。
@@ -448,6 +465,12 @@ impl OpenAiProvider {
         // 模型结果已经完整校验并离开重试范围。统计尾流不得把成功变成失败；
         // 由持有结果的这一层处理原总期限，避免外层 timeout 丢弃已完成结果。
         let (response, usage) = completed.finish(deadline).await;
+        if let Some(wire) = &self.wire_diagnostics {
+            eprintln!(
+                "EVE_MODEL_WIRE_USAGE {}",
+                wire.usage(usage, diagnostics.identity(), self.wire_protocol())
+            );
+        }
         self.report_usage(usage);
         Ok(response)
     }
@@ -512,6 +535,11 @@ impl OpenAiProvider {
         retry_after: &mut Option<Duration>,
         identity: timing::RequestIdentity,
     ) -> Result<completion::CompletedRequest, LlmError> {
+        if let Some(wire) = &self.wire_diagnostics {
+            let mut fields = wire.capture(body, headers, identity, self.wire_protocol());
+            fields["destination"] = wire.endpoint(self.endpoint.as_str());
+            eprintln!("EVE_MODEL_WIRE_FINAL {fields}");
+        }
         let mut timing = timing::RequestTiming::start(self.timing_diagnostics, identity);
         let started = std::time::Instant::now();
         let policy = sink.and(self.stream_timeouts);
@@ -545,6 +573,12 @@ impl OpenAiProvider {
             }
             transport_error(error)
         })?;
+        if let Some(wire) = &self.wire_diagnostics {
+            let mut fields =
+                wire.response_headers(response.headers(), identity, self.wire_protocol());
+            fields["http_status"] = serde_json::json!(response.status().as_u16());
+            eprintln!("EVE_MODEL_WIRE_HEADERS {fields}");
+        }
         let status = response.status();
         if let Some(timing) = &timing {
             timing.record("headers", Some(status.as_u16()));

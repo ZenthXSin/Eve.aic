@@ -25,6 +25,10 @@ pub(crate) fn timing_enabled() -> bool {
     std::env::var("EVE_TRACE_DIALOGUE_TIMING").is_ok_and(|v| matches!(v.as_str(), "1" | "true"))
 }
 
+pub(crate) fn wire_diagnostics_enabled() -> bool {
+    std::env::var("EVE_TRACE_MODEL_PREFIX").is_ok_and(|v| matches!(v.as_str(), "1" | "true"))
+}
+
 #[derive(PartialEq)]
 struct CapturedModel {
     provider: ConfigSnapshot,

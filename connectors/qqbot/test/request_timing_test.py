@@ -1,4 +1,6 @@
 """真实 QQ 宿主的请求前阻塞定位；仅连接本地模型和 QQ 替身。"""
+import hashlib
+import io
 import json
 import threading
 import time
@@ -12,6 +14,107 @@ class RequestTimingAcceptance(semantic.SemanticAcceptance):
     for name in dir(semantic.SemanticAcceptance):
         if name.startswith('test_'): locals()[name] = None
     del name
+
+    def capture_wire_requests(self):
+        """保留替身实际收到的字节；仍由已有处理器回复，不增加请求或模型行为。"""
+        captured = []
+        handler = self.server.RequestHandlerClass
+
+        class CaptureHandler(handler):
+            def respond(self):
+                if self.path != '/v1/chat/completions':
+                    return super().respond()
+                raw = self.rfile.read(int(self.headers['Content-Length']))
+                captured.append({'raw': raw, 'headers': {
+                    name: self.headers.get(name)
+                    for name in ('session-id', 'thread-id', 'x-client-request-id')}})
+                original = self.rfile
+                self.rfile = io.BytesIO(raw)
+                try:
+                    return super().respond()
+                finally:
+                    self.rfile = original
+
+        self.server.RequestHandlerClass = CaptureHandler
+        return captured
+
+    def test_wire_prefix_diagnostics_use_actual_host_body_with_timing_disabled(self):
+        captured = self.capture_wire_requests()
+        query = 'WIRE_HOST_PRIVATE_MARKER：这是本地合成交流，不应进入诊断日志。'
+        self.run_eve(self.send(self.message('wire-on', query)), memory=False,
+                     env_extra={'EVE_TRACE_MODEL_PREFIX': 'true', 'EVE_TRACE_DIALOGUE_TIMING': '0'})
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(self.requests), 1, '诊断不得额外请求主模型')
+        self.assertNotIn('EVE_HTTP_TIMING ', self.last_stderr)
+        lines = [line for line in self.last_stderr.splitlines() if line.startswith('EVE_MODEL_WIRE_')]
+        self.assertEqual([line.split(' ', 1)[0] for line in lines],
+                         ['EVE_MODEL_WIRE_FINAL', 'EVE_MODEL_WIRE_HEADERS', 'EVE_MODEL_WIRE_USAGE'])
+        final, headers, usage = [json.loads(line.split(' ', 1)[1]) for line in lines]
+        for event in (final, headers, usage):
+            self.assertEqual(event['schema_version'], 1)
+            self.assertEqual(event['protocol'], 'chat')
+            self.assertEqual(event['role'], 'dialogue')
+            self.assertGreater(event['call'], 0)
+            self.assertGreater(event['request'], 0)
+            self.assertEqual(event['attempt'], 1)
+            for key in ('domain', 'process_nonce', 'call', 'request', 'attempt'):
+                self.assertEqual(event[key], final[key])
+        raw = captured[0]['raw']
+        body = json.loads(raw)
+        self.assertEqual(body, self.requests[0]['body'])
+        self.assertEqual(final['body']['bytes'], len(raw))
+        self.assertEqual(len(final['body']['hmac_sha256']), 64)
+        self.assertEqual(final['message_count'], len(body['messages']))
+        self.assertFalse(final['messages_truncated'])
+        self.assertTrue(any(message['role'] == 'system' for message in body['messages']))
+        self.assertEqual(body['messages'][-1]['content'], query)
+
+        def encoded_size(value):
+            return len(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf8'))
+
+        endpoint = f'http://127.0.0.1:{self.server.server_port}/v1/chat/completions'
+        self.assertEqual(final['destination']['bytes'], encoded_size(endpoint))
+        self.assertRegex(final['destination']['hmac_sha256'], r'^[0-9a-f]{64}$')
+        self.assertNotIn(endpoint, self.last_stderr)
+        # 对照最终 HTTP 正文中的全部消息（含宿主补充的 system），而非提前的 ModelRequest。
+        for index, (message, item) in enumerate(zip(body['messages'], final['messages'], strict=True)):
+            self.assertEqual(item['index'], index)
+            self.assertEqual(item['role'], message['role'])
+            self.assertEqual(item['bytes'], encoded_size(message))
+        self.assertEqual(final['input']['bytes'], encoded_size(body['messages']))
+        self.assertTrue(body['tools'], '此用例应覆盖宿主真实工具清单')
+        self.assertEqual(final['tools']['count'], len(body['tools']))
+        self.assertEqual(final['tools']['bytes'], encoded_size(body['tools']))
+        self.assertEqual(final['tools']['truncated'], len(body['tools']) > 128)
+        self.assertEqual(len(final['tools']['items']), min(len(body['tools']), 128))
+        for tool, item in zip(body['tools'], final['tools']['items']):
+            self.assertEqual(item['bytes'], encoded_size(tool))
+        for field, name in (('session_id', 'session-id'), ('thread_id', 'thread-id'),
+                            ('client_request_id', 'x-client-request-id')):
+            value = captured[0]['headers'][name]
+            self.assertTrue(value, name)
+            self.assertEqual(final['identifiers'][field]['sha256'], hashlib.sha256(value.encode()).hexdigest())
+            self.assertNotIn(value, self.last_stderr)
+        self.assertEqual(final['identifiers']['prompt_cache_key']['sha256'],
+                         hashlib.sha256(body['prompt_cache_key'].encode()).hexdigest())
+        self.assertEqual(headers['http_status'], 200)
+        # 既有替身没有 usage；诊断必须保留未知，不能为了验收补成零命中。
+        self.assertIs(usage['usage_reported'], False)
+        for field in ('input_tokens', 'cached_input_tokens', 'output_tokens'):
+            self.assertIsNone(usage[field])
+        self.assertNotIn(query, self.last_stderr)
+        self.assertNotIn(body['prompt_cache_key'], self.last_stderr)
+
+    def test_wire_prefix_diagnostics_stay_off_when_only_timing_is_enabled(self):
+        captured = self.capture_wire_requests()
+        query = 'WIRE_DISABLED_PRIVATE_MARKER：只开启阶段计时。'
+        self.run_eve(self.send(self.message('wire-off', query)), memory=False,
+                     env_extra={'EVE_TRACE_DIALOGUE_TIMING': '1'})
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn('EVE_HTTP_TIMING ', self.last_stderr)
+        self.assertNotIn('EVE_MODEL_WIRE_', self.last_stderr)
+        self.assertNotIn(query, self.last_stderr)
 
     def test_context_can_wait_without_a_primary_request_and_timing_separates_the_stages(self):
         self.seed_interaction('source', semantic.HISTORY)

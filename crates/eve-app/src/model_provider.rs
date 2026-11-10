@@ -120,6 +120,9 @@ impl ProviderConfig {
                 if options.timing_diagnostics {
                     provider = provider.with_timing_diagnostics();
                 }
+                if crate::models::wire_diagnostics_enabled() {
+                    provider = provider.with_wire_diagnostics();
+                }
                 if let Some((observer, role)) = &options.usage {
                     provider = provider.with_usage_observer(observer.clone(), role);
                 }
