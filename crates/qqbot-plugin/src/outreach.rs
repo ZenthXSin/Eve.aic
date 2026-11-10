@@ -89,9 +89,9 @@ pub struct QqOutreachCandidate {
 /// 平台对一次邀请投递的真实结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QqOutreachResult {
-    Sent {
-        platform_message_id: Option<String>,
-    },
+    /// 完整决定已确认送达。分条决定必须先持久保存全部逐条凭据；
+    /// 此处编号仅引用最后一条消息，不能解释成完整正文只有一个平台编号。
+    Sent { platform_message_id: Option<String> },
     /// 平台拒绝或发送失败，内容没有送达。
     Failed {
         http_status: Option<u16>,

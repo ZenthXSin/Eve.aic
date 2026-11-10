@@ -14,6 +14,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+mod parts;
 
 const RULES: &str = include_str!("qq_speech_prompt.md");
 // 完整协议在稳定前缀中；历史之后仍明确本轮模式，避免延续旧 final 或工具计划。
@@ -186,7 +187,7 @@ impl Store {
             .map_err(|_| "自主发言账本已由另一宿主持有")?;
         let db = Connection::open(path)?;
         let schema: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if schema > 1 {
+        if schema > 2 {
             return Err("自主发言账本版本不支持；保留原文件".into());
         }
         let tables: u64 = db.query_row(
@@ -200,7 +201,7 @@ impl Store {
             |r| r.get(0),
         )?;
         if (schema == 0 && (existed || tables != 0))
-            || (schema == 1 && (!has_speech || tables != 1))
+            || ((schema == 1 || schema == 2) && (!has_speech || tables != 1))
         {
             return Err("自主发言账本结构不匹配；保留原文件".into());
         }
@@ -243,6 +244,13 @@ impl Store {
                 if let Some(value) = &decision {
                     validate_record_decision(&event, value)?;
                 }
+                if let Some(decision @ QqSpeechDecision::SpeakParts { .. }) = &decision {
+                    if schema < 2 {
+                        return Err("旧版自主发言账本包含新分条记录；保留原文件".into());
+                    }
+                    parts::validate_parts_record(&event, decision, &state, receipt.as_deref())?;
+                    continue;
+                }
                 let valid = match state.as_str() {
                     "pending" | "evaluating" => decision.is_none(),
                     "waiting" => decision
@@ -275,11 +283,13 @@ impl Store {
         }
         // 模型请求没有发送副作用，可以重新审视；已交给发送层的结果保守记未知。
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        parts::recover_parts(&db)?;
         let tx = db.unchecked_transaction()?;
         tx.execute(
             "UPDATE speech SET state='waiting',due=?1 WHERE state='evaluating'",
             [now().saturating_add(RETRY_MS)],
         )?;
+        tx.execute_batch("PRAGMA user_version=2;")?;
         tx.execute(
             "UPDATE speech SET state='unknown' WHERE state='sending'",
             [],
@@ -323,7 +333,7 @@ impl Store {
                     "pending" | "waiting" | "ready" | "evaluating" | "stale"
                 )
             {
-                db.execute("UPDATE speech SET event=?2,decision=NULL,state='pending',due=?3,updated=?3 WHERE id=?1", params![id,encoded,now()]).map_err(error)?;
+                db.execute("UPDATE speech SET event=?2,decision=NULL,receipt=NULL,state='pending',due=?3,updated=?3 WHERE id=?1", params![id,encoded,now()]).map_err(error)?;
             }
         } else {
             db.execute(
@@ -385,7 +395,9 @@ impl Store {
     ) -> PluginResult<()> {
         let db = self.connection.lock().map_err(error)?;
         let encoded = serde_json::to_string(event).map_err(error)?;
-        let changed = db.execute("UPDATE speech SET state=?2,decision=?3,due=?4,updated=?5 WHERE id=?1 AND event=?6 AND state NOT IN ('sending','sent','unknown','failed','silence')", params![key(event)?,state,decision.map(serde_json::to_string).transpose().map_err(error)?,due,now(),encoded]).map_err(error)?;
+        // NotSent 后的新审视是未派发的新生命周期，不能继承旧发送形状的回执。
+        // 在途和所有发送终态仍由 WHERE 排除，不能借此清空真实或未知的结果。
+        let changed = db.execute("UPDATE speech SET state=?2,decision=?3,receipt=NULL,due=?4,updated=?5 WHERE id=?1 AND event=?6 AND state NOT IN ('sending','sent','unknown','failed','silence')", params![key(event)?,state,decision.map(serde_json::to_string).transpose().map_err(error)?,due,now(),encoded]).map_err(error)?;
         if changed != 1 {
             return Err(error("过期决定"));
         }
@@ -574,6 +586,25 @@ fn validate_decision(decision: &QqSpeechDecision) -> Result<(), &'static str> {
                 && !text
                     .chars()
                     .any(|c| c.is_control() && c != '\n' && c != '\t') =>
+        {
+            Ok(())
+        }
+        QqSpeechDecision::SpeakParts { parts, after_ms }
+            if *after_ms <= 60_000
+                && !parts.is_empty()
+                && parts.len() <= 5
+                && parts.iter().all(|part| {
+                    part.after_ms <= 10_000
+                        && !part.text.trim().is_empty()
+                        && part.text.trim() == part.text
+                        && !part
+                            .text
+                            .chars()
+                            .any(|c| c.is_control() && c != '\n' && c != '\t')
+                })
+                && parts.iter().map(|part| part.text.len()).sum::<usize>()
+                    + (parts.len() - 1) * 2
+                    <= 2048 =>
         {
             Ok(())
         }
@@ -803,6 +834,12 @@ impl QqSpeech for Speech {
                     QqSpeechDecision::Speak { text, .. } => {
                         QqSpeechDecision::Speak { text, after_ms: 0 }
                     }
+                    QqSpeechDecision::SpeakParts { mut parts, .. } => {
+                        if let Some(first) = parts.first_mut() {
+                            first.after_ms = 0;
+                        }
+                        QqSpeechDecision::SpeakParts { parts, after_ms: 0 }
+                    }
                     other => other,
                 }));
             }
@@ -854,6 +891,9 @@ impl QqSpeech for Speech {
                 Ok(decision) => {
                     let (state, delay) = match &decision {
                         QqSpeechDecision::Speak { after_ms, .. } => ("ready", *after_ms),
+                        QqSpeechDecision::SpeakParts { parts, after_ms } => {
+                            ("ready", (*after_ms).max(parts[0].after_ms))
+                        }
                         QqSpeechDecision::Wait { after_ms } => ("waiting", *after_ms),
                         QqSpeechDecision::Silence {} => ("silence", 0),
                     };
@@ -879,6 +919,20 @@ impl QqSpeech for Speech {
     }
     fn delivered(&self, event: &QqSpeechEvent, result: QqOutreachResult) -> PluginResult<()> {
         self.store.delivered(event, result)
+    }
+    fn dispatched_parts(
+        &self,
+        event: &QqSpeechEvent,
+        receipt: &eve_qqbot_plugin::QqSpeechPartsReceipt,
+    ) -> PluginResult<()> {
+        self.store.dispatched_parts(event, receipt)
+    }
+    fn update_parts(
+        &self,
+        event: &QqSpeechEvent,
+        receipt: &eve_qqbot_plugin::QqSpeechPartsReceipt,
+    ) -> PluginResult<()> {
+        self.store.update_parts(event, receipt)
     }
     fn record_expression(
         &self,
@@ -920,7 +974,7 @@ impl ContextAssembler for Context {
             if let Some(scope) = scope {
                 let records = self.store.recent(&scope).map_err(context_error)?;
                 if !records.is_empty() {
-                    context.memories.push(format!("宿主保存的自主发言回执数据：{}。只有 sent 且有平台编号才确认送达；medium=image 的 text 是图片描述，不是说出的文字。unknown 不重发，普通内部 final 不算对外发言。",json!(records)));
+                    context.memories.push(format!("宿主保存的自主发言回执数据：{}。单条只有 sent 且有平台编号才确认送达；receipt.version=2 的分条记录逐项看 delivery.parts：每项 sent 与其平台编号仅确认该条，planned/sending/failed/unknown/not_attempted 不能当作已送达。原轮关闭后晚到的回执以这里同一事件的最新持久快照为准，不用旧交接的 sending 覆盖已确认结果。medium=image 的 text 是图片描述，不是说出的文字。unknown 不重发，普通内部 final 不算对外发言。",json!(records)));
                 }
             }
             Ok(context)

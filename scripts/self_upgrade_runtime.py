@@ -892,7 +892,8 @@ def runtime_idle_gate(state_path, inherited=frozenset()):
         if speech.is_symlink() or not speech.is_file():
             raise ValueError('invalid_speech_database')
         with contextlib.closing(sqlite3.connect(speech.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
-            if db.execute('PRAGMA user_version').fetchone() != (1,):
+            # v2 分条在整组结束前保持 sending，条间等待也不能切换宿主。
+            if db.execute('PRAGMA user_version').fetchone() not in ((1,), (2,)):
                 raise ValueError('unknown_speech_database_version')
             if db.execute("SELECT 1 FROM speech WHERE state IN ('evaluating','sending') LIMIT 1").fetchone():
                 return False

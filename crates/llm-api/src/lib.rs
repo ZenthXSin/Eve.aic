@@ -50,8 +50,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub use steering::{
-    InputReplyDelivery, InputReplyHandoff, InputReplyKind, MAX_INPUT_REPLY_HANDOFF_BYTES,
-    MAX_INPUT_REPLY_HANDOFFS, SteeringBatch, SteeringUpdate, TurnSteering, TurnSteeringSource,
+    InputReplyDelivery, InputReplyHandoff, InputReplyKind, InputReplyPart, InputReplyPartDelivery,
+    MAX_INPUT_REPLY_HANDOFF_BYTES, MAX_INPUT_REPLY_HANDOFFS, MAX_INPUT_REPLY_PART_BYTES,
+    MAX_INPUT_REPLY_PARTS, SteeringBatch, SteeringUpdate, TurnSteering, TurnSteeringSource,
     validate_input_reply_handoffs,
 };
 pub use usage::{ModelUsage, ModelUsageObserver, PrefixReuse};

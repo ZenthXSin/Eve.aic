@@ -6,6 +6,8 @@ use std::sync::Arc;
 /// 单轮与持久失败证据共享的有界交接快照上限。
 pub const MAX_INPUT_REPLY_HANDOFFS: usize = 64;
 pub const MAX_INPUT_REPLY_HANDOFF_BYTES: usize = 512 * 1024;
+pub const MAX_INPUT_REPLY_PARTS: usize = 5;
+pub const MAX_INPUT_REPLY_PART_BYTES: usize = 2048;
 
 /// 同一次消费的消息与审核锚点必须原子取出；后到的消息不能提前成为本批授权。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -47,10 +49,162 @@ impl InputReplyKind {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputReplyDelivery {
     Sending,
-    Sent { platform_message_id: String },
+    Sent {
+        platform_message_id: String,
+    },
     Unknown,
     Failed,
     NotSent,
+    /// 同一事件的完整有序快照；首条成功不代表全组送达。
+    Parts {
+        parts: Vec<InputReplyPart>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputReplyPart {
+    pub index: usize,
+    pub text: String,
+    pub delivery: InputReplyPartDelivery,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputReplyPartDelivery {
+    Planned,
+    Sending,
+    Sent { platform_message_id: String },
+    Failed,
+    Unknown,
+    NotAttempted,
+}
+impl<'de> Deserialize<'de> for InputReplyPartDelivery {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Planned {},
+            Sending {},
+            Sent { platform_message_id: String },
+            Failed {},
+            Unknown {},
+            NotAttempted {},
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Planned {} => Self::Planned,
+            Wire::Sending {} => Self::Sending,
+            Wire::Sent {
+                platform_message_id,
+            } => Self::Sent {
+                platform_message_id,
+            },
+            Wire::Failed {} => Self::Failed,
+            Wire::Unknown {} => Self::Unknown,
+            Wire::NotAttempted {} => Self::NotAttempted,
+        })
+    }
+}
+impl InputReplyPartDelivery {
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Planned | Self::Sending)
+    }
+    fn permits_snapshot(&self, next: &Self) -> bool {
+        self == next
+            || match self {
+                // 消费者可跳过中间快照，但已确认或未知的终态绝不倒退。
+                Self::Planned => true,
+                Self::Sending => matches!(next, Self::Sent { .. } | Self::Failed | Self::Unknown),
+                _ => false,
+            }
+    }
+}
+impl InputReplyDelivery {
+    /// 校验独立持久层的同一事件快照；旧单条不受新增分条上限影响。
+    pub fn validate_parts(&self, reply_text: &str) -> Result<(), LlmError> {
+        let Self::Parts { parts } = self else {
+            return Ok(());
+        };
+        let invalid = || LlmError::Context("输入交流分条快照无效".into());
+        if parts.is_empty()
+            || parts.len() > MAX_INPUT_REPLY_PARTS
+            || reply_text.len() > MAX_INPUT_REPLY_PART_BYTES
+            || parts
+                .iter()
+                .fold(0usize, |bytes, part| bytes.saturating_add(part.text.len()))
+                .saturating_add(parts.len().saturating_sub(1) * 2)
+                != reply_text.len()
+            || parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+                != reply_text
+        {
+            return Err(invalid());
+        }
+        // 0=已确认前缀，1=唯一在途，2=待发送后缀，3=已停止后缀。
+        let mut phase = 0;
+        let mut ids = std::collections::BTreeSet::new();
+        for (index, part) in parts.iter().enumerate() {
+            if part.index != index || part.text.trim().is_empty() {
+                return Err(invalid());
+            }
+            match &part.delivery {
+                InputReplyPartDelivery::Sent {
+                    platform_message_id,
+                } if phase == 0
+                    && valid_id(platform_message_id)
+                    && ids.insert(platform_message_id) => {}
+                InputReplyPartDelivery::Planned if phase <= 2 => {
+                    phase = 2;
+                }
+                InputReplyPartDelivery::Sending if phase == 0 => {
+                    phase = 1;
+                }
+                InputReplyPartDelivery::Failed | InputReplyPartDelivery::Unknown if phase == 0 => {
+                    phase = 3;
+                }
+                // 取消时在途条保持 Sending，未开始的后缀同时封为 NotAttempted。
+                InputReplyPartDelivery::NotAttempted if phase != 2 => {
+                    phase = 3;
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        Ok(())
+    }
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Sending => false,
+            Self::Parts { parts } => {
+                !parts.is_empty() && parts.iter().all(|p| p.delivery.is_terminal())
+            }
+            _ => true,
+        }
+    }
+    pub fn permits_snapshot(&self, next: &Self) -> bool {
+        match (self, next) {
+            (Self::Parts { parts }, Self::Parts { parts: next }) => {
+                parts.len() == next.len()
+                    && parts.iter().zip(next).all(|(old, new)| {
+                        old.index == new.index
+                            && old.text == new.text
+                            && old.delivery.permits_snapshot(&new.delivery)
+                    })
+            }
+            (Self::Sending, Self::Parts { .. }) => false,
+            (Self::Sending, _) => true,
+            _ => self == next,
+        }
+    }
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 impl<'de> Deserialize<'de> for InputReplyDelivery {
@@ -64,6 +218,7 @@ impl<'de> Deserialize<'de> for InputReplyDelivery {
             Unknown {},
             Failed {},
             NotSent {},
+            Parts { parts: Vec<InputReplyPart> },
         }
         Ok(match Wire::deserialize(deserializer)? {
             Wire::Sending {} => Self::Sending,
@@ -75,18 +230,13 @@ impl<'de> Deserialize<'de> for InputReplyDelivery {
             Wire::Unknown {} => Self::Unknown,
             Wire::Failed {} => Self::Failed,
             Wire::NotSent {} => Self::NotSent,
+            Wire::Parts { parts } => Self::Parts { parts },
         })
     }
 }
 
 impl InputReplyHandoff {
     pub fn validate(&self) -> Result<(), LlmError> {
-        let valid_id = |value: &str| {
-            !value.is_empty()
-                && value.len() <= 512
-                && value.trim() == value
-                && !value.chars().any(char::is_control)
-        };
         if !valid_id(&self.input_message_id)
             || !valid_id(&self.event_id)
             || self.input_text.is_empty()
@@ -96,6 +246,21 @@ impl InputReplyHandoff {
             || matches!(&self.delivery, InputReplyDelivery::Sent { platform_message_id } if !valid_id(platform_message_id))
         {
             return Err(LlmError::Context("输入交流交接事实无效".into()));
+        }
+        self.delivery.validate_parts(&self.reply_text)?;
+        Ok(())
+    }
+    pub fn validate_successor(&self, next: &Self) -> Result<(), LlmError> {
+        self.validate()?;
+        next.validate()?;
+        if self.kind != next.kind
+            || self.input_message_id != next.input_message_id
+            || self.input_text != next.input_text
+            || self.event_id != next.event_id
+            || self.reply_text != next.reply_text
+            || !self.delivery.permits_snapshot(&next.delivery)
+        {
+            return Err(LlmError::Context("输入交流交接身份或终态不一致".into()));
         }
         Ok(())
     }
@@ -161,6 +326,145 @@ pub trait TurnSteeringSource: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parts(states: Vec<InputReplyPartDelivery>) -> InputReplyHandoff {
+        let parts = states
+            .into_iter()
+            .enumerate()
+            .map(|(index, delivery)| InputReplyPart {
+                index,
+                text: format!("第{index}条"),
+                delivery,
+            })
+            .collect::<Vec<_>>();
+        InputReplyHandoff {
+            kind: InputReplyKind::UserInput,
+            input_message_id: "input".into(),
+            input_text: "继续查".into(),
+            event_id: "event".into(),
+            reply_text: parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            delivery: InputReplyDelivery::Parts { parts },
+        }
+    }
+    fn sent(id: &str) -> InputReplyPartDelivery {
+        InputReplyPartDelivery::Sent {
+            platform_message_id: id.into(),
+        }
+    }
+    #[test]
+    fn parts_keep_confirmed_prefix_and_unknown_suffix_without_claiming_whole_delivery() {
+        use InputReplyPartDelivery::{NotAttempted, Planned, Sending, Unknown};
+        let initial = parts(vec![Sending, Planned, Planned]);
+        let middle = parts(vec![sent("platform-0"), Sending, Planned]);
+        let cancelled = parts(vec![sent("platform-0"), Sending, NotAttempted]);
+        let terminal = parts(vec![sent("platform-0"), Unknown, NotAttempted]);
+        initial.validate_successor(&middle).unwrap();
+        middle.validate_successor(&cancelled).unwrap();
+        cancelled.validate_successor(&terminal).unwrap();
+        assert!(!middle.delivery.is_terminal());
+        assert!(terminal.delivery.is_terminal());
+        assert!(terminal.validate_successor(&middle).is_err());
+        assert!(
+            terminal
+                .validate_successor(&parts(vec![sent("different-id"), Unknown, NotAttempted]))
+                .is_err()
+        );
+        assert!(
+            terminal
+                .validate_successor(&InputReplyHandoff {
+                    delivery: InputReplyDelivery::Sent {
+                        platform_message_id: "platform-0".into()
+                    },
+                    ..terminal.clone()
+                })
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<InputReplyHandoff>(serde_json::to_value(&terminal).unwrap())
+                .unwrap(),
+            terminal
+        );
+        assert!(
+            InputReplyHandoff {
+                delivery: InputReplyDelivery::Sending,
+                ..initial.clone()
+            }
+            .validate_successor(&initial)
+            .is_err()
+        );
+    }
+    #[test]
+    fn parts_reject_out_of_order_receipts_changed_plan_and_unbounded_text() {
+        use InputReplyPartDelivery::{Failed, NotAttempted, Planned, Sending, Unknown};
+        for invalid in [
+            vec![],
+            vec![Sending; 6],
+            vec![Sending, Sending],
+            vec![Planned, Sending],
+            vec![Failed, Planned],
+            vec![Unknown, Planned],
+            vec![NotAttempted, Planned],
+            vec![Planned, NotAttempted],
+            vec![sent("same"), sent("same")],
+            vec![Sending, sent("later")],
+        ] {
+            assert!(parts(invalid).validate().is_err());
+        }
+        let initial = parts(vec![Sending, Planned]);
+        let mut changed = initial.clone();
+        let InputReplyDelivery::Parts {
+            parts: ref mut items,
+        } = changed.delivery
+        else {
+            unreachable!()
+        };
+        items[1].index = 0;
+        assert!(changed.validate().is_err());
+        let mut changed = initial.clone();
+        changed.reply_text.push_str("新文字");
+        assert!(changed.validate().is_err());
+        let huge = "a".repeat(MAX_INPUT_REPLY_PART_BYTES + 1);
+        assert!(
+            InputReplyDelivery::Parts {
+                parts: vec![InputReplyPart {
+                    index: 0,
+                    text: huge.clone(),
+                    delivery: Planned
+                }]
+            }
+            .validate_parts(&huge)
+            .is_err()
+        );
+        assert!(parts(vec![sent("")]).validate().is_err());
+        let skipped = parts(vec![sent("0"), sent("1")]);
+        initial.validate_successor(&skipped).unwrap();
+    }
+    #[test]
+    fn every_part_state_and_container_rejects_unknown_wire_fields() {
+        for state in [
+            "planned",
+            "sending",
+            "sent",
+            "failed",
+            "unknown",
+            "not_attempted",
+        ] {
+            let mut value = serde_json::json!({"state":state});
+            if state == "sent" {
+                value["platform_message_id"] = "id".into();
+            }
+            assert!(serde_json::from_value::<InputReplyPartDelivery>(value.clone()).is_ok());
+            value["unexpected"] = true.into();
+            assert!(serde_json::from_value::<InputReplyPartDelivery>(value).is_err());
+        }
+        let mut value = serde_json::to_value(parts(vec![InputReplyPartDelivery::Planned])).unwrap();
+        value["delivery"]["unexpected"] = true.into();
+        assert!(serde_json::from_value::<InputReplyHandoff>(value).is_err());
+    }
 
     #[test]
     fn existing_steering_sources_keep_their_batch_without_new_observations() {

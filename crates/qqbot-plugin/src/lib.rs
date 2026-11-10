@@ -22,7 +22,7 @@ mod participants;
 mod progress;
 pub use progress::{ModelProgressNarrator, QqProgressFacts, QqProgressNarrator};
 mod speech;
-pub use speech::{QqSpeech, QqSpeechDecision, QqSpeechEvent};
+pub use speech::{QqSpeech, QqSpeechDecision, QqSpeechEvent, QqSpeechPart, QqSpeechPartsReceipt};
 mod state;
 
 pub use archive::{

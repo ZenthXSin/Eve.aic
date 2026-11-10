@@ -42,6 +42,8 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+#[path = "bridge_speech_parts.rs"]
+mod bridge_speech_parts;
 #[path = "bridge_warning.rs"]
 mod bridge_warning;
 #[path = "foreground_speech.rs"]
@@ -50,6 +52,7 @@ mod foreground_speech;
 mod host_progress;
 #[path = "speech_retry.rs"]
 mod speech_retry;
+use bridge_speech_parts::SpeechParts;
 use foreground_speech::{ForegroundActivity, ForegroundInput};
 use host_progress::HostProgress;
 
@@ -813,6 +816,7 @@ struct ReadySpeech {
     event: crate::QqSpeechEvent,
     candidate: Option<(crate::QqOutreachCandidate, bool)>,
     text: String,
+    parts: Option<Vec<crate::QqSpeechPart>>,
 }
 async fn considered(
     pending: &mut Option<ConsideringSpeech>,
@@ -1569,6 +1573,7 @@ pub(crate) async fn run(
     let mut next_authored = tokio::time::Instant::now();
     let mut pushing_speech: Option<crate::QqSpeechEvent> = None;
     let mut pushing_input_reply: Option<crate::live::ClaimedInputReply> = None;
+    let mut speech_parts: Option<SpeechParts> = None;
     let mut pushing_conversation: Option<(
         Message,
         String,
@@ -1617,8 +1622,33 @@ pub(crate) async fn run(
             slow_reported.retain(|id| active.iter().any(|a| &a.message.id == id));
             last_progress.retain(|id, _| active.iter().any(|a| &a.message.id == id));
             rejected_before_send.retain(|(id, _)| active.iter().any(|a| &a.message.id == id));
-            // 工具结束、运行时消费输入或新原话到来后，旧交流决定立即失效。
+            // 已认领分条独立收尾：正常消费/工具结束不撤销原窗口，新输入与取消则封存后缀。
+            if let (Some(group),Some(speaker))=(&mut speech_parts,&speech) {
+                let scope=eve_llm_api::ContextScope{session_id:group.event.session.session_id.clone(),user_id:group.event.session.user_id.clone()};
+                let current=conversations.review_user_message_is_current(&scope,&group.event.anchor).unwrap_or(false)
+                    && group.foreground.as_ref().is_none_or(|(key,turn)|foreground_speech::claimed_reply_is_current(control.as_ref(),key,*turn));
+                let windows=if group.foreground.is_some(){&foreground_windows}else{&passive_windows};
+                let window= !group.passive || windows.get(&group.event.anchor).is_some_and(|window|
+                    window.session==group.event.session && tokio::time::Instant::now()<window.deadline
+                    && (pushing.is_some() || window.remaining>0));
+                if (!current || !window) && !group.closed {
+                    group.stop(pushing.is_some(),speaker.as_ref())?;
+                    group.closed=true;
+                    if group.foreground.is_some() {
+                        write(&mut stdin,json!({"type":"close_foreground","version":1,"id":group.event.anchor})).await?;
+                    }
+                }
+            }
+            if speech_parts.as_ref().is_some_and(|group|group.receipt.delivery.is_terminal()) && pushing.is_none() {
+                let mut group=speech_parts.take().expect("已结束自然分条");
+                let result=group.aggregate();
+                if let Some(claim)=group.claim.take(){claim.complete(group.receipt.delivery.clone())?;}
+                if let (Some(hook),Some(id))=(&outreach,&group.source_id){report(hook,&ctx,id,result);}
+                if let Some(frame)=group.deferred_finish.take(){write(&mut stdin,frame).await?;}
+            }
+            // 工具结束、运行时消费输入或新原话到来后，尚未认领的旧交流决定立即失效。
             let stale_foreground: Vec<_> = foreground_inputs.iter().filter_map(|(anchor,input)| {
+                if speech_parts.as_ref().is_some_and(|group|group.event.id==input.event.id && !group.closed){return None;}
                 let current=live_dialogue.as_ref().is_some_and(|live| input.current(live,&foreground_activity,control.as_ref()))
                     && conversations.latest_message_id(&input.key.session).ok().flatten().as_deref()==Some(anchor)
                     && ((input.progress && !input.pending_progress) || foreground_windows.get(anchor).is_none_or(|window|tokio::time::Instant::now()<window.deadline));
@@ -1642,7 +1672,7 @@ pub(crate) async fn run(
                 write(&mut stdin,json!({"type":"close_foreground","version":1,"id":anchor,"keep_window":retained})).await?;
             }
             let closed_windows: Vec<_> = foreground_windows.iter().filter_map(|(anchor,window)| {
-                if foreground_inputs.contains_key(anchor) {return None;}
+                if foreground_inputs.contains_key(anchor) || speech_parts.as_ref().is_some_and(|group|group.foreground.is_some() && &group.event.anchor==anchor && !group.closed) {return None;}
                 let current = window.remaining > 0 && tokio::time::Instant::now() < window.deadline
                     && active.iter().any(|current| current.key.session == window.session
                         && control.snapshot(&current.key.session).ok().flatten().is_some_and(|s|
@@ -1660,7 +1690,7 @@ pub(crate) async fn run(
             // 只向当前原消息的私聊发送；短工具、已排队表达和近期主动说话让步。
             let mut open_progress_windows = Vec::new();
             if let (Some(speaker), Some(live)) = (&speech, &live_dialogue)
-                && pushing.is_none() && sending_file.is_none() && pending_file.is_none()
+                && speech_parts.is_none() && pushing.is_none() && sending_file.is_none() && pending_file.is_none()
                 && delivering.is_empty() && progress_delivery.is_empty() {
                 for current in active.iter().filter(|current| current.message.scope == "c2c") {
                     let latest = conversations.latest_message_id(&current.key.session)?;
@@ -1940,7 +1970,7 @@ pub(crate) async fn run(
                     Err(_) => warn(&ctx, "file_delivery_unavailable"),
                 }
             }
-            if pending_file.as_ref().is_some_and(|(_, message)| !destination_busy(message,
+            if pending_file.as_ref().is_some_and(|(_, message)| speech_parts.as_ref().is_none_or(|group| !group.targets(message)) && !destination_busy(message,
                 &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
                 && !replies.iter().any(|r| same_destination(message, &r.message))) {
                 let (file, message) = pending_file.take().expect("pending file");
@@ -1957,6 +1987,7 @@ pub(crate) async fn run(
                         return !routing.iter().any(|r| r.target.session == event.key.session);
                     };
                     (text.is_some() || matches!(event.event.kind, TurnEventKind::AssistantMessage { .. }) || !narrating)
+                        && speech_parts.as_ref().is_none_or(|group|!group.targets(&current.message))
                         && !destination_busy(&current.message, &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
                         && !replies.iter().any(|r| same_destination(&r.message, &current.message))
                 }) {
@@ -2133,6 +2164,7 @@ pub(crate) async fn run(
                         || host_progress::quiet_request(&current.message.text)
                         || live_waiting.contains_key(&current.message.id)
                         || live.has_outgoing(&current.key.session)
+                        || speech_parts.as_ref().is_some_and(|group|group.targets(&current.message))
                         || destination_busy(&current.message, &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
                         || replies.iter().any(|r| same_destination(&r.message, &current.message))
                         || last_progress.get(&current.message.id).is_some_and(|last| last.elapsed() < min_interval.max(after))
@@ -2182,6 +2214,7 @@ pub(crate) async fn run(
             if delivering.len() + judging.len() < MAX_DELIVERIES
                 && let Some(index) = replies.iter().enumerate().find_map(|(index, reply)| {
                     (!pending_control(&reply.message, &routing, &commands)
+                        && speech_parts.as_ref().is_none_or(|group|!group.targets(&reply.message))
                         && !destination_busy(&reply.message, &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
                         && !judging.iter().any(|(r, _)| same_destination(&r.message, &reply.message))
                         && !replies.iter().take(index).any(|r| same_destination(&r.message, &reply.message)))
@@ -2550,7 +2583,46 @@ pub(crate) async fn run(
                 continue;
             }
             // 主动私聊：通道空闲时定期询问宿主；路由只取自已确认的私聊回执。
-            let channel_idle = pushing.is_none() && sending_file.is_none() && pending_file.is_none()
+            if let (Some(group),Some(speaker))=(&mut speech_parts,&speech)
+                && !group.closed && pushing.is_none() && group.due<=tokio::time::Instant::now()
+                && !destination_busy(&group.route,&delivering,&progress_delivery,None,sending_file.as_ref())
+                && let Some(index)=group.next() {
+                let scope=eve_llm_api::ContextScope{session_id:group.event.session.session_id.clone(),user_id:group.event.session.user_id.clone()};
+                let still_current=||conversations.review_user_message_is_current(&scope,&group.event.anchor).unwrap_or(false)
+                    && group.foreground.as_ref().is_none_or(|(key,turn)|foreground_speech::claimed_reply_is_current(control.as_ref(),key,*turn));
+                let windows=if group.foreground.is_some(){&foreground_windows}else{&passive_windows};
+                let window=!group.passive || windows.get(&group.event.anchor).is_some_and(|window|
+                    window.session==group.event.session && window.remaining>0 && tokio::time::Instant::now()<window.deadline);
+                if !window || !still_current() {
+                    group.stop(false,speaker.as_ref())?;
+                    group.closed=true;
+                    continue;
+                }
+                group.sending(index,speaker.as_ref())?;
+                // 持久化期间控制器可能取消；在写入管道前再次核对，不依赖顶部旧快照。
+                let current=conversations.review_user_message_is_current(&scope,&group.event.anchor).unwrap_or(false)
+                    && group.foreground.as_ref().is_none_or(|(key,turn)|foreground_speech::claimed_reply_is_current(control.as_ref(),key,*turn));
+                let windows=if group.foreground.is_some(){&foreground_windows}else{&passive_windows};
+                let window=!group.passive || windows.get(&group.event.anchor).is_some_and(|window|
+                    window.session==group.event.session && window.remaining>0 && tokio::time::Instant::now()<window.deadline);
+                if !window || !current {
+                    group.stop(false,speaker.as_ref())?;
+                    group.closed=true;
+                    continue;
+                }
+                if group.passive {
+                    let windows=if group.foreground.is_some(){&mut foreground_windows}else{&mut passive_windows};
+                    let window=windows.get_mut(&group.event.anchor).ok_or_else(||failure("自然分条原窗口缺失"))?;
+                    window.remaining=window.remaining.checked_sub(1).ok_or_else(||failure("自然分条原额度耗尽"))?;
+                }
+                let frame=group.frame(index);
+                pushing_conversation=Some((group.route.clone(),group.receipt.plan[index].text.clone(),group.metadata.clone()));
+                // 先登记在途槽，即使写管道失败，停止清理也将保守记录 Unknown。
+                pushing=Some(AuxiliaryDelivery{id:frame["id"].as_str().expect("分条编号").into(),scope:group.route.scope.clone(),target:group.route.target_id.clone(),deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
+                write(&mut stdin,frame).await?;
+                continue;
+            }
+            let channel_idle = speech_parts.is_none() && pushing.is_none() && sending_file.is_none() && pending_file.is_none()
                 && delivering.is_empty() && progress_delivery.is_empty()
                 && judging.is_empty() && replies.is_empty() && status.borrow().ready;
             let push_ready = push_interval.is_some() && channel_idle;
@@ -2583,9 +2655,18 @@ pub(crate) async fn run(
                     }
                     let id=format!("speech-{}",ready.event.id.split_once(':').expect("前台事实编号").1);
                     let input=foreground_inputs.get(&ready.event.anchor).expect("当前前台输入");
+                    let parts_receipt=match ready.parts.as_ref().map(|parts|bridge_speech_parts::prepare(Some(live.as_ref()),segmentation.as_deref(),&ready.event,parts)).transpose() {
+                        Ok(receipt)=>receipt,
+                        Err(_)=>{
+                            warn(&ctx,"foreground_speech_parts_plan_rejected");
+                            speaker.retire(&ready.event)?;
+                            if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor){input.resolved=true;}
+                            continue;
+                        }
+                    };
                     let persist = || {
                         if !input.activity_is_current(&foreground_activity,control.as_ref()) {return Ok(false);}
-                        speaker.dispatched(&ready.event)?;
+                        if let Some(receipt)=&parts_receipt {speaker.dispatched_parts(&ready.event,receipt)?;} else {speaker.dispatched(&ready.event)?;}
                         Ok(true)
                     };
                     let claim = if input.progress {
@@ -2593,13 +2674,16 @@ pub(crate) async fn run(
                             kind: eve_llm_api::InputReplyKind::Progress,
                             input_message_id: ready.event.anchor.clone(), input_text: route.turn_text(),
                             event_id: ready.event.id.clone(), reply_text: ready.text.clone(),
-                            delivery: eve_llm_api::InputReplyDelivery::Sending,
+                            delivery: parts_receipt.as_ref().map_or(eve_llm_api::InputReplyDelivery::Sending,|receipt|receipt.delivery.clone()),
                         };
                         if input.pending_progress {
                             live.claim_pending_progress_reply(&scope, input.turn_id, handoff, persist)?
                         } else {
                             live.claim_progress_reply(&scope, input.turn_id, handoff, persist)?
                         }
+                    } else if let Some(receipt)=&parts_receipt {
+                        let eve_llm_api::InputReplyDelivery::Parts{parts}=&receipt.delivery else{unreachable!()};
+                        live.claim_input_reply_parts(&scope,input.turn_id,&ready.event.anchor,&ready.event.id,&ready.text,parts.clone(),persist)?
                     } else {
                         live.claim_input_reply(&scope,input.turn_id,&ready.event.anchor,&ready.event.id,&ready.text,persist)?
                     };
@@ -2612,18 +2696,17 @@ pub(crate) async fn run(
                     let claimed_key=input.key.clone();
                     let claimed_turn=input.turn_id;
                     if let Some(input)=foreground_inputs.get_mut(&ready.event.anchor) {input.resolved=true;}
-                    if !proactive && let Some(window)=foreground_windows.get_mut(&ready.event.anchor) {window.remaining-=1;}
+                    if parts_receipt.is_none() && !proactive && let Some(window)=foreground_windows.get_mut(&ready.event.anchor) {window.remaining-=1;}
                     // 领取后主轮可以消费输入并恢复工作，不能据此撤销已经交接的即时交流。
                     // 取消或新的原话仍使尚未写出的操作失效。
                     let cancelled=!conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false)
                         || !foreground_speech::claimed_reply_is_current(control.as_ref(),&claimed_key,claimed_turn);
-                    if cancelled {
+                    if cancelled && parts_receipt.is_none() {
                         speaker.delivered(&ready.event,QqOutreachResult::NotSent)?;
                         claim.complete(eve_llm_api::InputReplyDelivery::NotSent)?;
                         speaker.retire(&ready.event)?;
                         continue;
                     }
-                    pushing_input_reply=Some(claim);
                     let snapshot = control.snapshot(&claimed_key.session).ok().flatten();
                     let mut metadata = crate::conversation_observer::activity_metadata(snapshot.as_ref());
                     if let Some(activity) = snapshot.as_ref().and_then(|s| foreground_activity.learning_activity(s)) {
@@ -2632,6 +2715,12 @@ pub(crate) async fn run(
                     metadata.turn_id = Some(claimed_turn);
                     metadata.reply_to = Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human, &ready.event.anchor));
                     metadata.source_kind = Some("qq_foreground_sent".into());
+                    if let Some(receipt)=parts_receipt {
+                        speech_parts=Some(SpeechParts{event:ready.event,receipt,route:route.clone(),metadata,passive:!proactive,
+                            foreground:Some((claimed_key,claimed_turn)),source_id:None,claim:Some(claim),due:tokio::time::Instant::now(),deferred_finish:None,closed:false});
+                        continue;
+                    }
+                    pushing_input_reply=Some(claim);
                     pushing_conversation = Some((route.clone(), ready.text.clone(), metadata));
                     write(&mut stdin,json!({"type":if proactive {"push"} else {"passive_push"},"version":1,"id":id,"scope":"c2c","target_id":route.target_id,
                         "text":ready.text,"based_on_message_id":ready.event.anchor,"sender_id":route.user_id,"foreground":true})).await?;
@@ -2681,6 +2770,10 @@ pub(crate) async fn run(
                     }
                     let route=route_for(&ledger,&config.app_id,&ready.event.session)?;
                     if let Some(route)=route.filter(|_|valid_outreach_text(&ready.text)) {
+                        let parts_receipt=match ready.parts.as_ref().map(|parts|bridge_speech_parts::prepare(live_dialogue.as_deref(),segmentation.as_deref(),&ready.event,parts)).transpose() {
+                            Ok(receipt)=>receipt,
+                            Err(_)=>{warn(&ctx,"speech_parts_plan_rejected");speaker.retire(&ready.event)?;continue;}
+                        };
                         let id=if let Some((candidate, passive))=&ready.candidate {
                             let Some(hook)=&outreach else {speaker.retire(&ready.event)?;continue};
                             let claim=if *passive {hook.inner.claim_passive_candidate(candidate,&ready.text,&ready.event.anchor)} else {hook.inner.claim_candidate(candidate,&ready.text,&ready.event.anchor)};
@@ -2696,12 +2789,22 @@ pub(crate) async fn run(
                             claimed.message.id
                         } else {format!("speech-{}",ring::digest::digest(&ring::digest::SHA256,ready.event.id.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>())};
                         if !valid_message_id(&id) {return Err(failure("自主发言认领 ID 无效"))}
-                        if let Err(error)=speaker.dispatched(&ready.event) {
+                        let dispatched=if let Some(receipt)=&parts_receipt {speaker.dispatched_parts(&ready.event,receipt)} else {speaker.dispatched(&ready.event)};
+                        if let Err(error)=dispatched {
                             if ready.candidate.is_some() && let Some(hook)=&outreach {report(hook,&ctx,&id,QqOutreachResult::NotSent);}
                             return Err(error);
                         }
-                        if passive && let Some(window) = passive_windows.get_mut(&ready.event.anchor) {window.remaining -= 1;}
+                        if parts_receipt.is_none() && passive && let Some(window) = passive_windows.get_mut(&ready.event.anchor) {window.remaining -= 1;}
                         write(&mut stdin,json!({"type":"restore_anchor","version":1,"scope":route.scope,"target_id":route.target_id,"sender_id":route.user_id,"message_id":ready.event.anchor})).await?;
+                        if let Some(receipt)=parts_receipt {
+                            let metadata=eve_training_api::ConversationMetadata {
+                                reply_to:Some(crate::conversation_observer::message_id(eve_training_api::ConversationRole::Human,&ready.event.anchor)),
+                                source_kind:Some("qq_spoken_push".into()),..Default::default()
+                            };
+                            let source_id=ready.candidate.as_ref().map(|_|id);
+                            speech_parts=Some(SpeechParts{event:ready.event,receipt,route,metadata,passive,foreground:None,source_id,claim:None,due:tokio::time::Instant::now(),deferred_finish:None,closed:false});
+                            continue;
+                        }
                         let mut frame=json!({"type":if passive {"passive_push"} else {"push"},"version":1,"id":id,"scope":route.scope,"target_id":route.target_id,"text":ready.text,
                             "based_on_message_id":ready.event.anchor,"sender_id":route.user_id});
                         if route.scope=="group" {frame["mention_user_id"]=json!(route.user_id);}
@@ -2841,6 +2944,7 @@ pub(crate) async fn run(
             let deadline = delivering.iter().filter(|d| d.awaiting()).map(|d| d.deadline)
                 .chain(progress_delivery.iter().map(|p| p.deadline))
                 .chain(pushing.iter().chain(sending_file.iter()).map(|d| d.deadline))
+                .chain(speech_parts.as_ref().filter(|group|!group.closed && pushing.is_none() && group.due>tokio::time::Instant::now()).map(|group|group.due))
                 .chain((!status.borrow().ready).then_some(ready_deadline))
                 .min();
             let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
@@ -2856,7 +2960,11 @@ pub(crate) async fn run(
                     }
                     if result.is_ok() {speech_retries.succeeded(&pending.event);}
                     match result {
-                        Ok(Some(crate::QqSpeechDecision::Speak{text,..}))=>ready_foreground=Some(ReadySpeech{event:pending.event,candidate:None,text}),
+                        Ok(Some(crate::QqSpeechDecision::Speak{text,..}))=>ready_foreground=Some(ReadySpeech{event:pending.event,candidate:None,text,parts:None}),
+                        Ok(Some(crate::QqSpeechDecision::SpeakParts{parts,..}))=>{
+                            let text=parts.iter().map(|part|part.text.as_str()).collect::<Vec<_>>().join("\n\n");
+                            ready_foreground=Some(ReadySpeech{event:pending.event,candidate:None,text,parts:Some(parts)});
+                        },
                         Ok(Some(crate::QqSpeechDecision::Silence{}))=>{
                             if let Some(input)=foreground_inputs.get_mut(&pending.event.anchor) {input.resolved=true;}
                         },
@@ -2877,7 +2985,11 @@ pub(crate) async fn run(
                     let pending=considering_speech.take().expect("发言审视");
                     if result.is_ok() {speech_retries.succeeded(&pending.event);}
                     match result {
-                        Ok(Some(crate::QqSpeechDecision::Speak{text,..}))=>ready_speech=Some(ReadySpeech{event:pending.event,candidate:pending.candidate,text}),
+                        Ok(Some(crate::QqSpeechDecision::Speak{text,..}))=>ready_speech=Some(ReadySpeech{event:pending.event,candidate:pending.candidate,text,parts:None}),
+                        Ok(Some(crate::QqSpeechDecision::SpeakParts{parts,..}))=>{
+                            let text=parts.iter().map(|part|part.text.as_str()).collect::<Vec<_>>().join("\n\n");
+                            ready_speech=Some(ReadySpeech{event:pending.event,candidate:pending.candidate,text,parts:Some(parts)});
+                        },
                         Ok(Some(crate::QqSpeechDecision::Silence {}))=>{
                             if let (Some(hook),Some((candidate,_)))=(&outreach,&pending.candidate) && hook.inner.silence_candidate(candidate).is_err(){warn(&ctx,"speech_silence_source_unavailable");}
                         }
@@ -2944,7 +3056,9 @@ pub(crate) async fn run(
                     if pushing.as_ref().is_some_and(|d| d.deadline <= now) {
                         pushing_conversation = None;
                         let delivery = pushing.take().expect("timed out push");
-                        if let Some(event)=pushing_speech.take() {
+                        if let (Some(group),Some(speaker))=(&mut speech_parts,&speech) {
+                            group.result(&QqOutreachResult::Unknown,speaker.as_ref())?;
+                        } else if let Some(event)=pushing_speech.take() {
                             if let Some(speaker)=&speech {speaker.delivered(&event,QqOutreachResult::Unknown)?;}
                             if let Some(claim)=pushing_input_reply.take() {claim.complete(eve_llm_api::InputReplyDelivery::Unknown)?;}
                             if event.id.starts_with("outreach:") && let Some(hook)=&outreach {report(hook,&ctx,&delivery.id,QqOutreachResult::Unknown);}
@@ -3074,8 +3188,11 @@ pub(crate) async fn run(
                             }
                         }
                         status.send_modify(|s| s.completed += 1);
-                        if speech.is_some() && outreach.is_some() && current.ordinary && current.message.scope == "c2c"
-                            && !explicit(&current.message.text) && !spoken.is_empty() {
+                        let keep_passive=speech.is_some() && outreach.is_some() && current.ordinary && current.message.scope == "c2c"
+                            && !explicit(&current.message.text) && !spoken.is_empty();
+                        if let Some(group)=speech_parts.as_mut().filter(|group|group.foreground.is_some() && group.event.anchor==current.message.id) {
+                            group.deferred_finish=Some(json!({"type":"finish","version":1,"id":current.message.id,"keep_passive":keep_passive}));
+                        } else if keep_passive {
                             // Node 只保留本次真实输入仍有效的剩余额度，并回报原窗口期限。
                             write(&mut stdin, json!({"type":"finish","version":1,"id":current.message.id,"keep_passive":true})).await?;
                         } else { finish(&mut stdin, &current.message.id).await?; }
@@ -3127,7 +3244,7 @@ pub(crate) async fn run(
                     conversations.set_idle(false);
                     let Some(frame) = frame? else {
                         if !active.is_empty() || !routing.is_empty() || !delivering.is_empty() || pushing.is_some() || sending_file.is_some() || pending_file.is_some() || !progress_delivery.is_empty() || !judging.is_empty() || !queue.is_empty()
-                            || !commands.is_empty() || !replies.is_empty() || considering_speech.is_some() || ready_speech.is_some()
+                            || !commands.is_empty() || !replies.is_empty() || speech_parts.is_some() || considering_speech.is_some() || ready_speech.is_some()
                             || considering_foreground.is_some() || ready_foreground.is_some() || !status.borrow().ready {
                             break Err(failure("QQBot 在未完成交互时断开；保留状态"));
                         }
@@ -3245,6 +3362,10 @@ pub(crate) async fn run(
                             let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             if !ok { delivery_log(&ctx, "outreach_push_failed_no_retry", &frame); }
+                            let result=outreach_result(&frame,ok);
+                            if let (Some(group),Some(speaker))=(&mut speech_parts,&speech) {
+                                group.result(&result,speaker.as_ref())?;
+                            }
                             // 群旁路与后回复也逐条保存真实送达；先进入学习待写记录，再结算来源。
                             if let Some((route, text, mut metadata)) = pushing_conversation.take()
                                 && ok {
@@ -3254,8 +3375,9 @@ pub(crate) async fn run(
                                     Err(_) => warn(&ctx, "conversation_observer_sent_invalid"),
                                 }
                             }
-                            let result=outreach_result(&frame,ok);
-                            if let Some(event)=pushing_speech.take() {
+                            if speech_parts.is_some() {
+                                // 完整来源结算在组终态执行，不能把首条当作整组成功。
+                            } else if let Some(event)=pushing_speech.take() {
                                 if let Some(speaker)=&speech {speaker.delivered(&event,result.clone())?;}
                                 if let Some(claim)=pushing_input_reply.take() {claim.complete(input_reply_delivery(&result))?;}
                                 if event.id.starts_with("outreach:") && let Some(hook)=&outreach {report(hook,&ctx,current,result);}
@@ -3663,6 +3785,33 @@ pub(crate) async fn run(
     // 先等路由收尾，再查询目标会话最新代，随后取消并等待全部本地执行器。
     closed.send_replace(true);
     let mut cleanup_error = None;
+    if let (Some(mut group), Some(speaker)) = (speech_parts.take(), &speech) {
+        let settled = if pushing.is_some() {
+            group.result(&QqOutreachResult::Unknown, speaker.as_ref())
+        } else {
+            group.stop(false, speaker.as_ref())
+        };
+        if settled.is_err() {
+            warn(&ctx, "speech_parts_shutdown_receipt_unrecorded");
+            cleanup_error = Some(failure("自然分条停止回执保存失败；重启时核对"));
+        } else {
+            let result = group.aggregate();
+            if let Some(claim) = group.claim.take()
+                && claim.complete(group.receipt.delivery.clone()).is_err()
+            {
+                cleanup_error = Some(failure("自然分条停止交接失败"));
+            }
+            if let (Some(hook), Some(id)) = (&outreach, &group.source_id) {
+                report(hook, &ctx, id, result);
+            }
+        }
+        if let Some(frame) = group.deferred_finish.take()
+            && write(&mut stdin, frame).await.is_err()
+        {
+            warn(&ctx, "speech_parts_finish_failed");
+        }
+    }
+
     // 前台资格随通道停止失效；先撤销事实，再丢弃审视 future，避免取消守卫复活旧决定。
     let mut retiring_foreground: BTreeMap<_, _> = foreground_inputs
         .values()

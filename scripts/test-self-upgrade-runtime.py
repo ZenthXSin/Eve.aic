@@ -1545,6 +1545,31 @@ while True:
         with self.assertRaisesRegex(ValueError, 'speech_database_missing'):
             runtime.runtime_idle_gate(self.state / 'state.json')
 
+    def test_speech_v2_parts_keep_upgrade_closed_until_the_whole_group_settles(self):
+        import sqlite3
+        path = self.state / 'speech.sqlite3'
+        with sqlite3.connect(path) as connection:
+            connection.execute('PRAGMA user_version=2')
+            connection.execute('CREATE TABLE speech(state TEXT, receipt TEXT)')
+            receipt = {'version': 2, 'plan': [{'text': '已核实一项', 'after_ms': 0},
+                {'text': '另一项还在处理', 'after_ms': 3000}], 'delivery': {'state': 'parts', 'parts': [
+                    {'index': 0, 'text': '已核实一项', 'delivery': {'state': 'sent', 'platform_message_id': 'first-real-id'}},
+                    {'index': 1, 'text': '另一项还在处理', 'delivery': {'state': 'planned'}},
+                ]}}
+            connection.execute("INSERT INTO speech VALUES ('sending', ?)", (json.dumps(receipt),))
+            connection.commit()
+            self.assertFalse(runtime.runtime_idle_gate(self.state / 'state.json'),
+                '首条送达后条间等待仍属于在途分组，不能切换宿主')
+            receipt['delivery']['parts'][1]['delivery'] = {'state': 'unknown'}
+            connection.execute("UPDATE speech SET state='unknown', receipt=?", (json.dumps(receipt),))
+            connection.commit()
+            self.assertTrue(runtime.runtime_idle_gate(self.state / 'state.json'),
+                '未知已封口且保留证据，不应等待重发来满足升级')
+            connection.execute('PRAGMA user_version=3')
+            connection.commit()
+            with self.assertRaisesRegex(ValueError, 'unknown_speech_database_version'):
+                runtime.runtime_idle_gate(self.state / 'state.json')
+
     def test_legacy_ledger_cannot_smuggle_authored_fields_and_invalid_platform_ids_are_refused(self):
         path = self.state / 'state.json'
         state = runtime.read_json(path)

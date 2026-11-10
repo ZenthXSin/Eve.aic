@@ -16,6 +16,19 @@ fn key(scope: &ContextScope) -> Key {
 fn unavailable() -> LlmError {
     LlmError::Context("实时交互队列不可用".into())
 }
+fn initial_delivery(delivery: &InputReplyDelivery) -> bool {
+    match delivery {
+        InputReplyDelivery::Sending => true,
+        InputReplyDelivery::Parts { parts } => {
+            !parts.is_empty()
+                && parts.iter().enumerate().all(|(index, part)| {
+                    part.delivery == InputReplyPartDelivery::Planned
+                        || index == 0 && part.delivery == InputReplyPartDelivery::Sending
+                })
+        }
+        _ => false,
+    }
+}
 
 #[derive(Default)]
 struct Input {
@@ -40,6 +53,13 @@ pub(crate) struct ClaimedInputReply {
 }
 impl ClaimedInputReply {
     pub(crate) fn complete(self, delivery: InputReplyDelivery) -> PluginResult<()> {
+        if !delivery.is_terminal() {
+            return Err(PluginError::Task("交流交接尚无终态".into()));
+        }
+        self.update(delivery)
+    }
+    /// 同一事件的有界最新快照；只合并投递证据，不触发新输入或唤醒模型。
+    pub(crate) fn update(&self, delivery: InputReplyDelivery) -> PluginResult<()> {
         let Some(turn) = self.turn.upgrade() else {
             return Ok(());
         };
@@ -50,25 +70,36 @@ impl ClaimedInputReply {
         if !input.accepting {
             return Ok(());
         }
+        let old_total = input.reply_bytes;
         let handoff = input
             .replies
             .get_mut(&self.event_id)
             .ok_or_else(|| PluginError::Task("交流交接事实缺失".into()))?;
-        if handoff.event_id != self.event_id || handoff.delivery != InputReplyDelivery::Sending {
+        if handoff.event_id != self.event_id {
             return Err(PluginError::Task("交流交接身份或终态不一致".into()));
-        }
-        if delivery == InputReplyDelivery::Sending {
-            return Err(PluginError::Task("交流交接尚无终态".into()));
         }
         let updated = InputReplyHandoff {
             delivery,
             ..handoff.clone()
         };
-        updated
-            .validate()
+        handoff
+            .validate_successor(&updated)
             .map_err(|_| PluginError::Task("交流交接结果无效".into()))?;
+        let previous_bytes = serde_json::to_vec(handoff)
+            .map_err(|_| PluginError::Task("交流交接事实无法序列化".into()))?
+            .len();
+        let updated_bytes = serde_json::to_vec(&updated)
+            .map_err(|_| PluginError::Task("交流交接事实无法序列化".into()))?
+            .len();
+        let updated_total = old_total
+            .saturating_sub(previous_bytes)
+            .saturating_add(updated_bytes);
+        if updated_total > MAX_INPUT_REPLY_HANDOFF_BYTES {
+            return Err(PluginError::Task("交流交接数据过大".into()));
+        }
         *handoff = updated;
-        input.reply_updates.insert(self.event_id);
+        input.reply_bytes = updated_total;
+        input.reply_updates.insert(self.event_id.clone());
         // 不通知 wait_for_input：这只是同一输入的投递更新，不是用户又说了话。
         Ok(())
     }
@@ -210,6 +241,46 @@ impl LiveDialogue {
         preference.effective(&policy).map_err(|_| unavailable())
     }
 
+    pub(crate) fn prepare_speech_parts(
+        &self,
+        scope: &ContextScope,
+        parts: &[crate::speech::QqSpeechPart],
+    ) -> PluginResult<Vec<crate::speech::QqSpeechPart>> {
+        let invalid = || PluginError::Task("自主交流分条计划无效；未发送".into());
+        if parts.is_empty()
+            || parts.len() > MAX_INPUT_REPLY_PARTS
+            || parts
+                .iter()
+                .any(|part| part.text.trim().is_empty() || part.after_ms > 10_000)
+            || parts
+                .iter()
+                .map(|p| p.text.len())
+                .sum::<usize>()
+                .saturating_add((parts.len() - 1) * 2)
+                > MAX_INPUT_REPLY_PART_BYTES
+        {
+            return Err(invalid());
+        }
+        let values = parts
+            .iter()
+            .map(|part| json!({"text":part.text,"after_ms":part.after_ms}))
+            .collect::<Vec<_>>();
+        let prepared = prepare_parts(
+            &values,
+            0,
+            self.effective_segmentation(scope).map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+        Ok(prepared
+            .parts
+            .into_iter()
+            .map(|part| crate::speech::QqSpeechPart {
+                text: part.text,
+                after_ms: part.after_ms,
+            })
+            .collect())
+    }
+
     /// 与主轮消费争用同一个输入锁。主轮已取走输入时，前台不能再领取其即时交流。
     /// 先持久保存 sending，再让同消息批次看见交接；失败不吞输入、不宣称接手。
     /// persist 在锁内复核活动身份；返回 false 表示资格已撤销且没有写入发送状态。
@@ -222,6 +293,51 @@ impl LiveDialogue {
         reply_text: &str,
         persist: impl FnOnce() -> PluginResult<bool>,
     ) -> PluginResult<Option<ClaimedInputReply>> {
+        self.claim_input_reply_delivery(
+            scope,
+            turn_id,
+            input_message_id,
+            event_id,
+            reply_text,
+            InputReplyDelivery::Sending,
+            persist,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn claim_input_reply_parts(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        input_message_id: &str,
+        event_id: &str,
+        reply_text: &str,
+        parts: Vec<InputReplyPart>,
+        persist: impl FnOnce() -> PluginResult<bool>,
+    ) -> PluginResult<Option<ClaimedInputReply>> {
+        self.claim_input_reply_delivery(
+            scope,
+            turn_id,
+            input_message_id,
+            event_id,
+            reply_text,
+            InputReplyDelivery::Parts { parts },
+            persist,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn claim_input_reply_delivery(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        input_message_id: &str,
+        event_id: &str,
+        reply_text: &str,
+        delivery: InputReplyDelivery,
+        persist: impl FnOnce() -> PluginResult<bool>,
+    ) -> PluginResult<Option<ClaimedInputReply>> {
+        if !initial_delivery(&delivery) {
+            return Err(PluginError::Task("交流交接初始状态无效".into()));
+        }
         let turn = self
             .turns
             .lock()
@@ -258,7 +374,7 @@ impl LiveDialogue {
             input_text: input_text.clone(),
             event_id: event_id.into(),
             reply_text: reply_text.into(),
-            delivery: InputReplyDelivery::Sending,
+            delivery,
         };
         handoff
             .validate()
@@ -311,9 +427,7 @@ impl LiveDialogue {
         pending: bool,
         persist: impl FnOnce() -> PluginResult<bool>,
     ) -> PluginResult<Option<ClaimedInputReply>> {
-        if handoff.kind != InputReplyKind::Progress
-            || handoff.delivery != InputReplyDelivery::Sending
-        {
+        if handoff.kind != InputReplyKind::Progress || !initial_delivery(&handoff.delivery) {
             return Err(PluginError::Task("进展交流交接类型无效".into()));
         }
         handoff
@@ -1012,6 +1126,185 @@ impl Tool for WaitForInput {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speech_parts_apply_current_channel_preference_and_keep_bounded_original_text() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let parts = vec![
+            crate::speech::QqSpeechPart {
+                text: "在查".into(),
+                after_ms: 0,
+            },
+            crate::speech::QqSpeechPart {
+                text: "等结果".into(),
+                after_ms: 100,
+            },
+        ];
+        assert_eq!(live.prepare_speech_parts(&scope, &parts).unwrap().len(), 2);
+        for after_ms in [6_000, 10_000] {
+            let mut delayed = parts.clone();
+            delayed[1].after_ms = after_ms;
+            let actual = live.prepare_speech_parts(&scope, &delayed).unwrap();
+            assert_eq!(
+                actual[1].after_ms,
+                crate::QQ_SEGMENT_POLICY.defaults.max_pause_ms
+            );
+        }
+        let mut excessive_delay = parts.clone();
+        excessive_delay[1].after_ms = 10_001;
+        assert!(live.prepare_speech_parts(&scope, &excessive_delay).is_err());
+        live.configure_segmentation(None, crate::QQ_SEGMENT_POLICY)
+            .unwrap();
+        let merged = live.prepare_speech_parts(&scope, &parts).unwrap();
+        assert_eq!(
+            merged,
+            [crate::speech::QqSpeechPart {
+                text: "在查\n\n等结果".into(),
+                after_ms: 0
+            }]
+        );
+        let oversized = vec![
+            crate::speech::QqSpeechPart {
+                text: "a".repeat(1024),
+                after_ms: 0,
+            },
+            crate::speech::QqSpeechPart {
+                text: "a".repeat(1024),
+                after_ms: 0,
+            },
+        ];
+        assert!(live.prepare_speech_parts(&scope, &oversized).is_err());
+        assert!(live.prepare_speech_parts(&scope, &[]).is_err());
+    }
+    #[test]
+    fn parts_claim_has_one_input_event_and_preserves_sent_prefix_after_consumption() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        live.steer_anchored(&scope, 1, "继续查".into(), Some("input".into()), || {
+            Ok(())
+        })
+        .unwrap();
+        let parts = |states: Vec<InputReplyPartDelivery>| {
+            states
+                .into_iter()
+                .enumerate()
+                .map(|(index, delivery)| InputReplyPart {
+                    index,
+                    text: ["在查", "等结果", "查完告诉你"][index].into(),
+                    delivery,
+                })
+                .collect::<Vec<_>>()
+        };
+        use InputReplyPartDelivery::{NotAttempted, Planned, Sending, Sent, Unknown};
+        let initial = parts(vec![Sending, Planned, Planned]);
+        let claim = live
+            .claim_input_reply_parts(
+                &scope,
+                1,
+                "input",
+                "event",
+                "在查\n\n等结果\n\n查完告诉你",
+                initial.clone(),
+                || Ok(true),
+            )
+            .unwrap()
+            .unwrap();
+        let consumed = turn.take_update(false).unwrap();
+        assert_eq!(consumed.batch.messages, ["继续查"]);
+        assert_eq!(consumed.input_replies.len(), 1);
+        assert_eq!(
+            consumed.input_replies[0].delivery,
+            InputReplyDelivery::Parts { parts: initial }
+        );
+        let sent = || Sent {
+            platform_message_id: "first".into(),
+        };
+        let middle = InputReplyDelivery::Parts {
+            parts: parts(vec![sent(), Sending, Planned]),
+        };
+        claim.update(middle.clone()).unwrap();
+        let update = turn.take_update(false).unwrap();
+        assert!(update.batch.messages.is_empty());
+        assert!(update.batch.review_anchor.is_none());
+        assert_eq!(update.input_replies.len(), 1);
+        assert_eq!(update.input_replies[0].event_id, "event");
+        assert_eq!(update.input_replies[0].delivery, middle);
+        assert!(
+            claim
+                .update(InputReplyDelivery::Sent {
+                    platform_message_id: "first".into()
+                })
+                .is_err()
+        );
+        let terminal = InputReplyDelivery::Parts {
+            parts: parts(vec![sent(), Unknown, NotAttempted]),
+        };
+        claim.complete(terminal.clone()).unwrap();
+        let update = turn.take_update(false).unwrap();
+        assert!(update.batch.messages.is_empty());
+        assert_eq!(update.input_replies[0].delivery, terminal);
+        assert!(turn.take_update(true).unwrap().input_replies.is_empty());
+    }
+
+    #[test]
+    fn parts_claim_requires_frozen_initial_plan_and_atomic_persistence() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        live.steer_anchored(&scope, 1, "继续查".into(), Some("input".into()), || {
+            Ok(())
+        })
+        .unwrap();
+        let parts = vec![InputReplyPart {
+            index: 0,
+            text: "在查".into(),
+            delivery: InputReplyPartDelivery::Sending,
+        }];
+        assert!(
+            live.claim_input_reply_parts(
+                &scope,
+                1,
+                "input",
+                "event",
+                "在查",
+                parts.clone(),
+                || Err(PluginError::State("disk full".into()))
+            )
+            .is_err()
+        );
+        let invalid = vec![InputReplyPart {
+            delivery: InputReplyPartDelivery::Sent {
+                platform_message_id: "id".into(),
+            },
+            ..parts[0].clone()
+        }];
+        assert!(
+            live.claim_input_reply_parts(&scope, 1, "input", "event", "在查", invalid, || panic!(
+                "不能持久化已成功的初始计划"
+            ))
+            .is_err()
+        );
+        let update = turn.take_update(false).unwrap();
+        assert_eq!(update.batch.messages, ["继续查"]);
+        assert!(update.input_replies.is_empty());
+        assert!(
+            live.claim_input_reply_parts(&scope, 1, "input", "event", "在查", parts, || panic!(
+                "输入已消费不能重新claim"
+            ))
+            .unwrap()
+            .is_none()
+        );
+    }
     use super::*;
 
     fn parts_scope() -> ContextScope {

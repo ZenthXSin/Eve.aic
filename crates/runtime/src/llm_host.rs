@@ -2297,7 +2297,7 @@ impl LlmHost {
         // 每次按实际剩余工具重建即时选择规则，不写回持久历史或检查点。
         // 放在最后一条 System 的末尾，保持用户输入、工具回执的顺序和身份。
         if request.tools.iter().any(|tool| tool.name == "send_message") {
-            let mut choice = "本次即时通讯输出选择：想说的话必须作为 send_message 的 text 参数真正调用；不要把聊天正文写在普通 assistant final。看实际回执决定后续动作，送达只说明这条话已发出，不表示承担的工作已完成。决定本轮结束且不再发言时，final 只输出 {\"action\":\"silence\"}，不附带正文或动作说明。这个标记仅用于内部结束；宿主不会替你发送草稿。".to_owned();
+            let mut choice = "本次即时通讯输出选择：想说的话必须真正调用 send_message，按本轮工具定义选择单条 text 或连续消息 parts；不要把聊天正文写在普通 assistant final。看实际回执决定后续动作，送达只说明对应话语已发出，不表示承担的工作已完成。决定本轮结束且不再发言时，final 只输出 {\"action\":\"silence\"}，不附带正文或动作说明。这个标记仅用于内部结束；宿主不会替你发送草稿。".to_owned();
             if request
                 .tools
                 .iter()
@@ -3021,15 +3021,7 @@ fn input_reply_handoff_message(
             .iter_mut()
             .find(|previous| previous.event_id == handoff.event_id)
         {
-            if previous.input_message_id != handoff.input_message_id
-                || previous.kind != handoff.kind
-                || previous.input_text != handoff.input_text
-                || previous.reply_text != handoff.reply_text
-                || (previous.delivery != eve_llm_api::InputReplyDelivery::Sending
-                    && previous.delivery != handoff.delivery)
-            {
-                return Err(LlmError::Context("输入交流交接身份或终态不一致".into()));
-            }
+            previous.validate_successor(handoff)?;
             *previous = handoff.clone();
         } else {
             latest.push(handoff.clone());
@@ -3049,6 +3041,7 @@ fn input_reply_handoff_message(
          kind=user_input（旧记录省略 kind）表示同一 input_message_id 的即时交流已由前台支路领取；kind=progress 仅记录原工作进行中的自主发言，不是新输入，不领取用户交流职责。原始用户消息仍交给本轮理解和处理业务，\
          不能把这次交接重新当作一条无人回应的新输入事件。sending 表示正在发送，不是已经送达；\
          sent 且有平台编号才确认发出；unknown 表示结果不确定，不自动重发。\
+         parts 表示同一事件的完整分条快照，逐条以 index/text/delivery 核对：sent 只确认该条；planned 尚未开始，sending 尚未确认，failed/unknown/not_attempted 不得自动重放。首条送达不代表后续或全组送达。\
          failed/not_sent 表示本次前台交流未完成，本轮可在自然继续时按用户需要回应。\
          这不表示原工作已完成，也不禁止回答新问题、执行补充指令或表达新的工作进展。\
          后续同事件的状态更新仅补充事实，不要求另起一轮判断或重复发言。"
@@ -3273,6 +3266,75 @@ fn review_originals(history: &[ChatMessage], input: &str, delegated: bool) -> Ve
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_parts_update_one_event_and_keep_confirmed_prefix_on_invalid_updates() {
+        use eve_llm_api::{
+            InputReplyDelivery, InputReplyHandoff, InputReplyKind, InputReplyPart,
+            InputReplyPartDelivery as Part,
+        };
+        let handoff = |states: Vec<Part>| InputReplyHandoff {
+            kind: InputReplyKind::UserInput,
+            input_message_id: "input".into(),
+            input_text: "继续查".into(),
+            event_id: "event".into(),
+            reply_text: "在查\n\n等结果".into(),
+            delivery: InputReplyDelivery::Parts {
+                parts: states
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, delivery)| InputReplyPart {
+                        index,
+                        text: ["在查", "等结果"][index].into(),
+                        delivery,
+                    })
+                    .collect(),
+            },
+        };
+        let initial = handoff(vec![Part::Sending, Part::Planned]);
+        let middle = handoff(vec![
+            Part::Sent {
+                platform_message_id: "first".into(),
+            },
+            Part::Sending,
+        ]);
+        let final_state = handoff(vec![
+            Part::Sent {
+                platform_message_id: "first".into(),
+            },
+            Part::Unknown,
+        ]);
+        let mut diagnostics = TurnDiagnostics::default();
+        for next in [&initial, &middle, &final_state] {
+            let message = input_reply_handoff_message(&mut diagnostics, vec![next.clone()])
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.role, ChatRole::System);
+            assert!(message.tool_calls.is_empty());
+            assert_eq!(
+                diagnostics.input_replies.as_slice(),
+                std::slice::from_ref(next)
+            );
+        }
+        assert!(input_reply_handoff_message(&mut diagnostics, vec![initial]).is_err());
+        assert_eq!(
+            diagnostics.input_replies.as_slice(),
+            std::slice::from_ref(&final_state)
+        );
+        let false_success = InputReplyHandoff {
+            delivery: InputReplyDelivery::Sent {
+                platform_message_id: "first".into(),
+            },
+            ..final_state.clone()
+        };
+        assert!(input_reply_handoff_message(&mut diagnostics, vec![false_success]).is_err());
+        assert_eq!(diagnostics.input_replies, [final_state]);
+        assert_eq!(diagnostics.provider_requests, 0);
+        assert!(
+            input_reply_handoff_message(&mut diagnostics, vec![])
+                .unwrap()
+                .is_none()
+        );
+    }
     #[test]
     fn delegated_progress_channels_bind_parallel_parent_ids_and_drop_after_cancel_or_close() {
         use eve_llm_api::DelegatedProgressObserver;
