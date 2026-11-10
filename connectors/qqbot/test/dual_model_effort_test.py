@@ -189,13 +189,12 @@ class DualModelEffortAcceptance(WireAcceptance):
             self.assertFalse(set(definitions) & RECURSIVE)
         elif WORKER_PREFIX not in first_system(body):
             self.assertIn("run_subagent", definitions)
-            policy = "\n".join(content_text(item) for item in items(body) if item.get("role") == "system")
-            self.assertIn("编程分工：", policy)
-            self.assertIn("agent_id=coding", policy)
-            self.assertIn("include_context=true", policy)
-            self.assertIn("中等及以上", policy)
-            self.assertIn("默认在同一工具批次并行调用多个 run_subagent", policy)
-            self.assertIn("不让多个执行者同时修改同一文件", policy)
+            parameters = definitions["run_subagent"]["parameters"]
+            self.assertFalse(parameters["additionalProperties"])
+            self.assertEqual(parameters["properties"]["agent_id"]["type"], "string")
+            self.assertEqual(parameters["properties"]["include_context"]["type"], "boolean")
+            self.assertNotIn("include_context", parameters.get("required", []),
+                             "完整历史是显式可选上下文，不是委派所需的前置表单")
 
     def assert_coding_wire(self, captured):
         self.assert_wire_identity(captured, CODING_MODEL, CODING_KEY, CODING_OUTPUT, self.coding_effort)
@@ -221,6 +220,64 @@ class DualModelEffortAcceptance(WireAcceptance):
                 self.assert_same_session(group)
         self.assertEqual(len({group[0]["headers"]["session-id"] for group in groups}), len(groups))
         self.assertEqual(len({group[0]["body"]["prompt_cache_key"] for group in groups}), len(groups))
+
+    def test_primary_can_edit_and_verify_without_delegation_or_progress_registration(self):
+        """替身选择直接处理；验证宿主允许这条路径，不评价真实模型的自主选择。"""
+        path = "direct-change.py"
+        original = "value = 1\n"
+        updated = "value = 2\n"
+        unchanged = "保留无关资料\n"
+        (self.source / path).write_text(original, encoding="utf8")
+        (self.source / "unrelated.txt").write_text(unchanged, encoding="utf8")
+        turn = "把 direct-change.py 的 value 从 1 改成 2，并核对保存结果"
+
+        def main(captured):
+            body = captured["body"]
+            self.assertNotIn(LEAF_PREFIX, first_system(body))
+            self.assertNotIn(WORKER_PREFIX, first_system(body))
+            self.assertEqual(latest_user(body), turn)
+            definitions = tool_definitions(body)
+            self.assertTrue({"run_subagent", "read_file", "edit_file"} <= set(definitions),
+                            "同时提供委派和直接操作能力，由本轮执行选择路径")
+            results = current_results(body)
+            if not results:
+                return Reply(calls=[("direct-read-before", "read_file", {"path": path})])
+            if len(results) == 1:
+                self.assertEqual(results[0]["content"], original)
+                return Reply(calls=[("direct-edit", "edit_file", {
+                    "path": path, "old_string": "value = 1", "new_string": "value = 2",
+                    "expected_sha256": results[0]["sha256"],
+                })])
+            if len(results) == 2:
+                self.assertTrue(results[-1]["success"], results[-1])
+                return Reply(calls=[("direct-read-after", "read_file", {"path": path})])
+            self.assertEqual(len(results), 3)
+            self.assertEqual(results[-1]["content"], updated)
+            self.assertEqual(results[-1]["sha256"], hashlib.sha256(updated.encode()).hexdigest())
+            return Reply(text="已改为 2，并读取确认保存结果")
+
+        self.callback = main
+        self.enabled(self.send(self.message("direct-change", turn, expected="已改为 2，并读取确认保存结果")))
+        self.assertEqual((self.source / path).read_text(encoding="utf8"), updated)
+        self.assertEqual((self.source / "unrelated.txt").read_text(encoding="utf8"), unchanged)
+        self.assertEqual(self.coding_requests, [], "直接处理不能暗中启动编码模型")
+        self.assertEqual(len(self.requests), 4, "三次真实工具操作加最终交付，不补流程性模型轮次")
+        self.assert_same_session(self.requests)
+        call_names = {}
+        for request in self.requests:
+            for message in items(request["body"]):
+                for call in message.get("tool_calls", []):
+                    call_names[call["id"]] = call["function"]["name"]
+                if message.get("type") == "function_call":
+                    call_names[message["call_id"]] = message["name"]
+        self.assertEqual(call_names, {
+            "direct-read-before": "read_file", "direct-edit": "edit_file",
+            "direct-read-after": "read_file",
+        }, "执行轨迹不插入 task_progress、委派或重复验证")
+        self.assertEqual(self.documents().get("eve.task", {}).get("tasks.v1", {}).get("tasks", []), [])
+        with closing(sqlite3.connect(
+                (self.work / "state/subagent-runs.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
 
     def test_coding_chat_and_codex_write_verify_return_then_restart_without_replay(self):
         turns = []

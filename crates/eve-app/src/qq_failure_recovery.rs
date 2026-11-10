@@ -184,7 +184,7 @@ impl QqFailureRecovery for Recovery {
         let source = source(&owner, turn_id);
         let task = match self.tasks.create_authorized(&owner, TaskSpec {
             title:"错误后恢复原任务".into(),
-            instructions:format!("继续完成上下文中 eve.failed_turn.original_input 对应的原任务，以及失败前已消费用户补充中的未完成业务。先阅读历史、错误类别、已执行工具回执和宿主输入交流交接；即时交流的领取或送达不表示补充业务完成，不重新触发已交接输入的即时回应。不要重放已完成操作，不改变原任务授权和权限。先用 task_progress 登记尚未完成的工作，完成并验证后标记 completed，真正阻塞则标记 blocked。最多 {max_steps} 次工具调用；仍未完成时汇报已完成事项、剩余工作，并请求用户在原会话同意追加步数。未经同意不得再派生任务或扩大预算。"),
+            instructions:format!("继续完成上下文中 eve.failed_turn.original_input 对应的原任务，以及失败前已消费用户补充中的未完成业务。先阅读历史、错误类别、已执行工具回执和宿主输入交流交接；即时交流的领取或送达不表示补充业务完成，不重新触发已交接输入的即时回应。不要重放已完成操作，未知副作用先核对，不改变原任务授权和权限。按实际需要登记进度，不要求固定起止流程；本轮若已登记 in_progress，结束前按真实情况更新，completed 不替代验收，阻塞则说明原因。已有冻结验收合同仍按原规则核对，缺少合同或当前有效性证据时保留待核验。最多 {max_steps} 次工具调用；仍未完成时汇报已完成事项、剩余工作，并请求用户在原会话同意追加步数。未经同意不得再派生任务或扩大预算。"),
             max_steps,
             context:Some(DelegatedContext { owner:owner.clone(), messages_json }),
         }, &source, review_messages, Some(TaskCompletionContract::Unspecified), None, crate::qq_tasks::now_ms()) {
