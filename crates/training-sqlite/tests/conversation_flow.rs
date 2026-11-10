@@ -17,6 +17,8 @@ use std::{
 mod boundary;
 #[path = "conversation_flow/boundary_safety.rs"]
 mod boundary_safety;
+#[path = "conversation_flow/history_baseline.rs"]
+mod history_baseline;
 
 fn scope() -> ContextScope {
     ContextScope {

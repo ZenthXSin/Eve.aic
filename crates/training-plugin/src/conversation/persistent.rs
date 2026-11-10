@@ -520,11 +520,6 @@ fn validate_claim_lessons(
     checkpoint: &Checkpoint,
     claim: &Claim,
 ) -> PluginResult<()> {
-    for lesson in &claim.batch.lessons {
-        if !checkpoint.lessons.contains(lesson) {
-            return Err(state("交流固定批次的当前经验版本不一致"));
-        }
-    }
     for revision in &claim.batch.lesson_history {
         if revision.sequence <= checkpoint.history_from {
             return Err(state("交流固定批次越过经验重置边界"));
@@ -537,7 +532,101 @@ fn validate_claim_lessons(
             return Err(state("交流固定批次的经验历史来源不一致"));
         }
     }
+    for lesson in &claim.batch.lessons {
+        if let Some(current) = checkpoint.lessons.iter().find(|l| l.id == lesson.id) {
+            if current != lesson {
+                return Err(state("交流固定批次的当前经验版本不一致"));
+            }
+            continue;
+        }
+        // 容量归档仅作为输入基线；必须由本批已核验的历史原件绑定。
+        if !claim
+            .batch
+            .lesson_history
+            .iter()
+            .any(|revision| revision.lesson.id == lesson.id)
+        {
+            return Err(state("交流固定批次的归档基线缺少历史来源"));
+        }
+        let latest = latest_history_baseline(store, &row.scope, checkpoint, &lesson.id)?;
+        if latest.reason == "reset" || latest.lesson != *lesson {
+            return Err(state("交流固定批次的归档基线不是可修订的最新版本"));
+        }
+    }
     Ok(())
+}
+
+fn latest_history_baseline(
+    store: &dyn ConversationStore,
+    scope: &ContextScope,
+    checkpoint: &Checkpoint,
+    lesson_id: &str,
+) -> PluginResult<ConversationLessonRevision> {
+    let latest = store
+        .latest_revision(scope, lesson_id)?
+        .ok_or_else(|| state("交流历史缺少最新经验基线；保留原记录"))?;
+    if latest.lesson.id != lesson_id
+        || latest.sequence <= checkpoint.history_from
+        || !lesson_valid(&latest.lesson)
+        || checkpoint
+            .lessons
+            .iter()
+            .find(|lesson| lesson.id == lesson_id)
+            .is_some_and(|lesson| *lesson != latest.lesson)
+    {
+        return Err(state("交流历史最新基线与当前经验或重置边界不一致"));
+    }
+    Ok(latest)
+}
+
+fn contains_baseline(batch: &ConversationBatch, lesson: &ConversationLesson) -> PluginResult<bool> {
+    let Some(existing) = batch.lessons.iter().find(|l| l.id == lesson.id) else {
+        return Ok(false);
+    };
+    if existing != lesson {
+        return Err(state("交流批次同一经验包含不同版本的基线"));
+    }
+    Ok(true)
+}
+
+fn append_current_lesson(
+    batch: &mut ConversationBatch,
+    lesson: &ConversationLesson,
+) -> PluginResult<bool> {
+    if contains_baseline(batch, lesson)? {
+        return Ok(true);
+    }
+    batch.lessons.push(lesson.clone());
+    if batch.lessons.len() > MAX_CONVERSATION_LESSONS
+        || conversation_prompt_json(batch)?.len() > MAX_CONVERSATION_PROMPT_BYTES - 16_384
+    {
+        batch.lessons.pop();
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn append_history_baseline(
+    batch: &mut ConversationBatch,
+    revision: ConversationLessonRevision,
+    latest: &ConversationLesson,
+) -> PluginResult<bool> {
+    let included = contains_baseline(batch, latest)?;
+    let lessons_before = batch.lessons.len();
+    if !included {
+        batch.lessons.push(latest.clone());
+    }
+    // 非 current 的基线即使与历史相同，也保留原件以核验来源。
+    batch.lesson_history.push(revision);
+    if batch.lessons.len() > MAX_CONVERSATION_LESSONS
+        || batch.lesson_history.len() > 4
+        || conversation_prompt_json(batch)?.len() > MAX_CONVERSATION_PROMPT_BYTES - 8_192
+    {
+        batch.lesson_history.pop();
+        batch.lessons.truncate(lessons_before);
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub(crate) struct PersistentConversations {
@@ -1130,38 +1219,72 @@ impl PersistentConversations {
         batch: &mut ConversationBatch,
     ) -> PluginResult<()> {
         let len = checkpoint.lessons.len();
+        let start = if len == 0 {
+            0
+        } else {
+            checkpoint.lesson_cursor % len
+        };
+        let mut current_walked = 0;
         if len > 0 {
-            let start = checkpoint.lesson_cursor % len;
-            for offset in 0..len {
-                batch
-                    .lessons
-                    .push(checkpoint.lessons[(start + offset) % len].clone());
-                if conversation_prompt_json(batch)?.len() > MAX_CONVERSATION_PROMPT_BYTES - 16_384 {
-                    batch.lessons.pop();
-                    break;
-                }
-            }
-            if batch.lessons.is_empty() {
+            // 先保证当前轮转头前进，再为历史与其完整最新基线留位置。
+            if !append_current_lesson(batch, &checkpoint.lessons[start])? {
                 return Err(state("单条交流经验超出批次预算"));
             }
-            checkpoint.lesson_cursor = (start + batch.lessons.len()) % len;
+            current_walked = 1;
         }
         let mut history = self.store.revisions(scope, checkpoint.history_cursor, 4)?;
         if history.is_empty() && checkpoint.history_cursor > checkpoint.history_from {
             checkpoint.history_cursor = checkpoint.history_from;
             history = self.store.revisions(scope, checkpoint.history_from, 4)?;
         }
+        let mut history_progress = Vec::new();
         for revision in history {
             let sequence = revision.sequence;
-            if batch.lessons.contains(&revision.lesson) {
-                checkpoint.history_cursor = sequence;
+            let latest = latest_history_baseline(
+                self.store.as_ref(),
+                scope,
+                checkpoint,
+                &revision.lesson.id,
+            )?;
+            if sequence <= checkpoint.history_from
+                || latest.sequence < sequence
+                || latest.sequence == sequence && latest != revision
+            {
+                return Err(state("交流历史原件与最新基线顺序不一致"));
+            }
+            if latest.reason == "reset" {
+                history_progress.push((sequence, None));
                 continue;
             }
-            batch.lesson_history.push(revision);
-            if conversation_prompt_json(batch)?.len() > MAX_CONVERSATION_PROMPT_BYTES - 8_192 {
-                batch.lesson_history.pop();
+            let current = checkpoint.lessons.iter().any(|l| l.id == latest.lesson.id);
+            if current && revision.lesson == latest.lesson {
+                // 等当前轮转真实展示后再去重，不能让等价历史抢占当前分页。
+                history_progress.push((sequence, Some(latest.lesson)));
+                continue;
+            }
+            if !append_history_baseline(batch, revision, &latest.lesson)? {
                 break;
             }
+            history_progress.push((sequence, None));
+        }
+        while current_walked < len {
+            let lesson = &checkpoint.lessons[(start + current_walked) % len];
+            if !append_current_lesson(batch, lesson)? {
+                break;
+            }
+            current_walked += 1;
+        }
+        if len > 0 {
+            // 历史可能提前加入后面的 current 或归档条目，不能用批次总数推进。
+            checkpoint.lesson_cursor = (start + current_walked) % len;
+        }
+        for (sequence, equivalent) in history_progress {
+            if let Some(lesson) = equivalent
+                && !contains_baseline(batch, &lesson)?
+            {
+                break;
+            }
+            // 只确认连续已展示（或已明确重置）的前缀，不能越过未展示项。
             checkpoint.history_cursor = sequence;
         }
         Ok(())
