@@ -70,7 +70,7 @@ class PursuitAcceptance(agenda_test.AgendaAcceptance):
                          prefix=self.send(self.message("casual", MINDUSTRY)), stop=False)
         self.run_eve([*self.send(self.message("ask-1", CHAT[0])),
                       *self.send(self.message("list-1", "/interests",
-                                              contains="后台学习中（接下来：能做的都做了，等你提到新的想法或情况）"))],
+                                              contains="等待后续推进（接下来：能做的都做了，等你提到新的想法或情况）"))],
                      stop=False)
         self.assertEqual(self.next(CHAT[0]), WAITING)
 
@@ -87,7 +87,7 @@ class PursuitAcceptance(agenda_test.AgendaAcceptance):
         before = self.cognition()
         self.run_eve([*self.send(self.message("ask-2", CHAT[1])),
                       *self.send(self.message("list-2", "/interests",
-                                              contains="后台学习中（接下来：学习次数已用完，不再推进）"))],
+                                              contains="等待后续推进（接下来：学习次数已用完，不再推进）"))],
                      stop=False)
         self.assertEqual(self.next(CHAT[1]), SPENT)
         self.assertEqual(self.cognition(), before)
