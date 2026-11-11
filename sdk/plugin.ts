@@ -3,6 +3,8 @@
 import type { Json, Manifest } from "../kernel/protocol.ts";
 
 export type { Json, Manifest };
+/** 插件可通过共同协议保留未执行、存盘失败和副作用未知的区别。 */
+export { KernelError } from "../kernel/protocol.ts";
 
 export type Handler = (args: Json) => Json | Promise<Json>;
 

@@ -85,6 +85,10 @@ export class QqSendActions {
 
   constructor(readonly client: QqClient, readonly directory: string) {}
 
+  get available(): boolean {
+    return this.#lock !== undefined && !this.#failed && !this.#closing;
+  }
+
   async initialize(): Promise<void> {
     if (this.#lock || this.#failed || this.#closing) throw new QqActionError("unavailable");
     let lock: Deno.FsFile | undefined;
@@ -147,6 +151,12 @@ export class QqSendActions {
     return this.#inflight.has(actionId)
       ? { actionId, status: "running" }
       : { actionId, status: "unknown", reason: "interrupted" };
+  }
+
+  /** 只供适配器内部重建出站事实；外部浏览仍由有界手机接口提供。 */
+  records(): SendRecord[] {
+    this.#available();
+    return Array.from(this.#records.values(), (record) => structuredClone(record));
   }
 
   async #save(record: SendRecord): Promise<void> {
