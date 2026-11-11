@@ -8,7 +8,7 @@ export type Handler = (args: Json) => Json | Promise<Json>;
 
 export interface CallOptions {
   timeoutMs?: number;
-  /** 同一个键的调用只执行一次，重发时返回第一次的结果。 */
+  /** 同一调用方、契约、方法与键绑定一次动作；结果未知时保留记录，不自动重放。 */
   idempotencyKey?: string;
 }
 
@@ -25,8 +25,8 @@ export interface PluginContext {
   ): Promise<T>;
   /** 读取自己的状态；没有时返回 undefined。 */
   getState<T extends Json = Json>(): T | undefined;
-  /** 写入自己的状态；内核负责落盘、快照与回滚。 */
-  setState(state: Json): void;
+  /** 写入自己的状态；Promise 在内核保存完成后返回。处理器返回前也会收齐未 await 的提交。 */
+  setState(state: Json): Promise<void>;
   /** 登记一个清理动作，卸载时按登记的逆序执行。 */
   onDisable(cleanup: () => void | Promise<void>): void;
   log(message: string): void;

@@ -7,13 +7,14 @@ import {
   type Json,
   KernelError,
   type Manifest,
+  type StateReply,
   toWireError,
   type ToWorker,
 } from "./protocol.ts";
 
 const scope = self as unknown as {
   postMessage(message: FromWorker): void;
-  onmessage: ((event: MessageEvent<ToWorker>) => void) | null;
+  onmessage: ((event: MessageEvent<ToWorker | StateReply>) => void) | null;
 };
 
 const send = (message: FromWorker) => scope.postMessage(message);
@@ -26,6 +27,18 @@ const provided = new Map<string, Record<string, Handler>>();
 const cleanups: Array<() => void | Promise<void>> = [];
 const pending = new Map<number, { resolve(value: Json): void; reject(error: Error): void }>();
 let nextCallId = 1;
+let nextStateId = 1;
+const stateWaiters = new Map<number, { resolve(): void; reject(error: Error): void }>();
+let stateCommit: Promise<void> = Promise.resolve();
+
+async function settleState(): Promise<void> {
+  // 捕获所有已发出的提交；新的提交也必须保存完。
+  while (true) {
+    const current = stateCommit;
+    await current;
+    if (current === stateCommit) return;
+  }
+}
 
 const ctx: PluginContext = {
   get manifest() {
@@ -56,7 +69,14 @@ const ctx: PluginContext = {
   setState(next) {
     // 经过一次结构化复制，保证之后对原对象的修改不会悄悄改变已提交的状态。
     state = structuredClone(next);
-    send({ t: "state", data: state });
+    const id = nextStateId++;
+    const saved = new Promise<void>((resolve, reject) => stateWaiters.set(id, { resolve, reject }));
+    stateCommit = Promise.all([stateCommit, saved]).then(() => {});
+    // 允许旧插件省略 await；失败最终由处理器/生命周期的提交屏障传播。
+    stateCommit.catch(() => {});
+    saved.catch(() => {});
+    send({ t: "state", id, data: state });
+    return saved;
   },
   onDisable(cleanup) {
     cleanups.push(cleanup);
@@ -82,11 +102,12 @@ async function init(message: Extract<ToWorker, { t: "init" }>): Promise<void> {
       );
     }
     state = await plugin.migrate(state, message.stateVersion ?? 0);
-    send({ t: "state", data: state });
+    await ctx.setState(state);
   }
   loading = true;
   try {
     await plugin.load?.(ctx);
+    await settleState();
   } finally {
     loading = false;
   }
@@ -96,6 +117,7 @@ async function init(message: Extract<ToWorker, { t: "init" }>): Promise<void> {
 async function disable(): Promise<void> {
   await plugin.disable?.(ctx);
   while (cleanups.length > 0) await cleanups.pop()!();
+  await settleState();
   send({ t: "disabled" });
 }
 
@@ -106,6 +128,7 @@ async function handleCall(message: Extract<ToWorker, { t: "call" }>): Promise<vo
       throw new KernelError("not_found", `${message.contract} 没有方法 ${message.method}`);
     }
     const value = await handler(message.args);
+    await settleState();
     send({ t: "result", id: message.id, ok: true, value: value ?? null });
   } catch (error) {
     send({ t: "result", id: message.id, ok: false, error: toWireError(error) });
@@ -123,6 +146,7 @@ scope.onmessage = (event) => {
     case "enable":
       Promise.resolve()
         .then(() => plugin.enable?.(ctx))
+        .then(settleState)
         .then(() => send({ t: "enabled" }))
         .catch((error) => send({ t: "failed", stage: "enable", message: describe(error) }));
       break;
@@ -140,6 +164,14 @@ scope.onmessage = (event) => {
       else waiter.reject(new KernelError(message.error.kind, message.error.message));
       break;
     }
+    case "state_saved": {
+      const waiter = stateWaiters.get(message.id);
+      if (!waiter) break;
+      stateWaiters.delete(message.id);
+      if (message.ok) waiter.resolve();
+      else waiter.reject(new KernelError(message.error.kind, message.error.message));
+      break;
+    }
     case "probe":
       Promise.resolve()
         .then(() => plugin.health?.(ctx))
@@ -149,7 +181,8 @@ scope.onmessage = (event) => {
         );
       break;
     case "flush":
-      send({ t: "flushed", id: message.id });
+      settleState().then(() => send({ t: "flushed", id: message.id }))
+        .catch((error) => send({ t: "failed", stage: "flush", message: describe(error) }));
       break;
   }
 };

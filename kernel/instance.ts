@@ -5,6 +5,7 @@ import {
   type Json,
   KernelError,
   type Manifest,
+  type StateReply,
   type ToWorker,
 } from "./protocol.ts";
 
@@ -17,7 +18,7 @@ export class LifecycleError extends Error {
 
 export interface InstanceHooks {
   onCall(call: Extract<FromWorker, { t: "call" }>): Promise<Json>;
-  onState(data: Json): void;
+  onState(data: Json): Promise<void>;
   onLog(message: string): void;
   /** 生命周期之外的崩溃或失败。 */
   onCrash(reason: string): void;
@@ -26,7 +27,7 @@ export interface InstanceHooks {
 interface Waiter<T> {
   resolve(value: T): void;
   reject(error: Error): void;
-  timer: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 export class Instance {
@@ -73,7 +74,7 @@ export class Instance {
     return this.#alive;
   }
 
-  #post(message: ToWorker): void {
+  #post(message: ToWorker | StateReply): void {
     if (this.#alive) this.#worker.postMessage(message);
   }
 
@@ -154,7 +155,16 @@ export class Instance {
         break;
       }
       case "state":
-        this.hooks.onState(message.data);
+        this.hooks.onState(message.data).then(
+          () => this.#post({ t: "state_saved", id: message.id, ok: true }),
+          (error) =>
+            this.#post({
+              t: "state_saved",
+              id: message.id,
+              ok: false,
+              error: { kind: "storage", message: `状态保存失败：${(error as Error).message}` },
+            }),
+        );
         break;
       case "log":
         this.hooks.onLog(message.message);
@@ -227,22 +237,14 @@ export class Instance {
     });
   }
 
-  call(contract: string, method: string, args: Json, timeoutMs: number): Promise<Json> {
+  call(contract: string, method: string, args: Json): Promise<Json> {
     if (!this.#alive) {
       return Promise.reject(new KernelError("unavailable", `${this.manifest.name} 不在运行`));
     }
     const id = this.#nextId++;
     return new Promise<Json>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#calls.delete(id);
-        reject(
-          new KernelError(
-            "timeout",
-            `${contract}.${method} 在 ${timeoutMs} 毫秒内没有结果，是否已执行未知`,
-          ),
-        );
-      }, timeoutMs);
-      this.#calls.set(id, { resolve, reject, timer });
+      // 等待期限由内核管理。调用方不再等待后，仍接收真正的迟到结果。
+      this.#calls.set(id, { resolve, reject });
       this.#post({ t: "call", id, contract, method, args });
     });
   }
@@ -277,7 +279,7 @@ export class Instance {
       clearTimeout(waiter.timer);
       waiter.reject(
         new KernelError(
-          "unavailable",
+          "unknown",
           `${this.manifest.name} 已终止（${reason}），在途调用是否已执行未知`,
         ),
       );

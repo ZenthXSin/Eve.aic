@@ -2,6 +2,8 @@
 // 语义：写入原子（临时文件再改名）；读到损坏的数据时报错并保留原文件，绝不自动清空。
 
 import { type Json, KernelError } from "./protocol.ts";
+import type { CallRecord } from "./calls.ts";
+import { validateCallRecord } from "./calls.ts";
 
 export interface StateRecord {
   schema: 1;
@@ -33,8 +35,23 @@ async function exists(path: string): Promise<boolean> {
 
 async function writeAtomic(path: string, text: string): Promise<void> {
   const temp = `${path}.tmp-${crypto.randomUUID()}`;
-  await Deno.writeTextFile(temp, text);
+  const file = await Deno.open(temp, { write: true, createNew: true, mode: 0o600 });
+  try {
+    const bytes = new TextEncoder().encode(text);
+    for (let written = 0; written < bytes.length;) {
+      written += await file.write(bytes.subarray(written));
+    }
+    await file.sync();
+  } finally {
+    file.close();
+  }
   await Deno.rename(temp, path);
+  const directory = await Deno.open(path.slice(0, path.lastIndexOf("/")), { read: true });
+  try {
+    await directory.sync();
+  } finally {
+    directory.close();
+  }
 }
 
 export class Store {
@@ -43,7 +60,7 @@ export class Store {
   constructor(readonly dir: string) {}
 
   async init(): Promise<void> {
-    for (const sub of ["state", "snapshots", "failed", "receipts"]) {
+    for (const sub of ["state", "snapshots", "failed", "receipts", "calls"]) {
       await Deno.mkdir(`${this.dir}/${sub}`, { recursive: true });
     }
   }
@@ -81,16 +98,48 @@ export class Store {
   save(record: StateRecord): Promise<void> {
     const path = this.statePath(record.plugin);
     const previous = this.#queues.get(record.plugin) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(() =>
-      writeAtomic(path, JSON.stringify(record, null, 2))
-    );
+    const next = previous.then(() => writeAtomic(path, JSON.stringify(record, null, 2)));
     this.#queues.set(record.plugin, next);
     return next;
   }
 
   /** 等这个插件排队中的写入全部落盘。 */
   async settle(plugin: string): Promise<void> {
-    await (this.#queues.get(plugin) ?? Promise.resolve()).catch(() => {});
+    await (this.#queues.get(plugin) ?? Promise.resolve());
+  }
+
+  async loadCall(id: string): Promise<CallRecord | undefined> {
+    if (!/^[a-f0-9]{64}$/.test(id)) throw new KernelError("rejected", "调用编号无效");
+    let text: string;
+    try {
+      text = await Deno.readTextFile(`${this.dir}/calls/${id}.json`);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return undefined;
+      throw error;
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      throw new KernelError("corrupt", "调用记录损坏；已保留原件");
+    }
+    if (!validateCallRecord(value) || value.id !== id) {
+      throw new KernelError("corrupt", "调用记录格式不符；已保留原件");
+    }
+    return value;
+  }
+
+  saveCall(record: CallRecord): Promise<void> {
+    if (!validateCallRecord(record)) {
+      return Promise.reject(new KernelError("rejected", "调用记录无效"));
+    }
+    const key = `call:${record.id}`;
+    const previous = this.#queues.get(key) ?? Promise.resolve();
+    const next = previous.then(() =>
+      writeAtomic(`${this.dir}/calls/${record.id}.json`, JSON.stringify(record))
+    );
+    this.#queues.set(key, next);
+    return next;
   }
 
   /** 换版前给当前状态拍快照，返回快照文件路径与内容。没有状态时内容为 undefined。 */

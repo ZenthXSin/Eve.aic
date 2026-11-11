@@ -15,7 +15,9 @@ export type ErrorKind =
   | "unavailable" // 提供方不在运行，处理器没有执行
   | "not_found" // 没有这个契约或方法
   | "rejected" // 内核在执行前拒绝（未声明依赖、清单不合法等）
-  | "corrupt"; // 持久化数据损坏，已保留原样
+  | "corrupt" // 持久化数据损坏，已保留原样
+  | "storage" // 提交失败，不能宣称状态已经保存
+  | "unknown"; // 已开始执行但结果未知，不能自动重放
 
 export class KernelError extends Error {
   constructor(readonly kind: ErrorKind, message: string) {
@@ -87,6 +89,10 @@ export type ToWorker =
   | { t: "reply"; id: number; ok: false; error: WireError }
   | { t: "probe"; id: number }
   | { t: "flush"; id: number };
+// 状态提交回执与具体 setState 对应，不能用收到消息代替保存完成。
+export type StateReply =
+  | { t: "state_saved"; id: number; ok: true }
+  | { t: "state_saved"; id: number; ok: false; error: WireError };
 
 export type FromWorker =
   | { t: "loaded"; provides: string[] }
@@ -106,5 +112,5 @@ export type FromWorker =
   }
   | { t: "probed"; id: number; ok: boolean; message?: string }
   | { t: "flushed"; id: number }
-  | { t: "state"; data: Json }
+  | { t: "state"; id: number; data: Json }
   | { t: "log"; message: string };

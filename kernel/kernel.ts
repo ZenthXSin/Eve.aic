@@ -6,6 +6,8 @@ import { Instance, LifecycleError } from "./instance.ts";
 import { readManifest } from "./manifest.ts";
 import { type FromWorker, type Json, KernelError, type Manifest } from "./protocol.ts";
 import { type StateRecord, Store } from "./store.ts";
+import { type CallRecord, fingerprint } from "./calls.ts";
+import { toWireError } from "./protocol.ts";
 
 export interface KernelEvent {
   at: string;
@@ -73,11 +75,12 @@ interface Entry {
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const CODE_ROOTS = [`${ROOT}kernel`, `${ROOT}sdk`, `${ROOT}contracts`];
+const WAIT_TIMEOUT = Symbol("wait_timeout");
 
-function sleepUntil<T>(promise: Promise<T>, ms: number): Promise<T | "timeout"> {
+function sleepUntil<T>(promise: Promise<T>, ms: number): Promise<T | typeof WAIT_TIMEOUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<"timeout">((resolve) => {
-    timer = setTimeout(() => resolve("timeout"), ms);
+  const timeout = new Promise<typeof WAIT_TIMEOUT>((resolve) => {
+    timer = setTimeout(() => resolve(WAIT_TIMEOUT), ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
@@ -87,7 +90,7 @@ export class Kernel {
   #entries = new Map<string, Entry>();
   #order: string[] = [];
   #providers = new Map<string, string>();
-  #idempotent = new Map<string, Promise<Json>>();
+  #idempotent = new Map<string, Promise<{ request: string; execution: Promise<Json> }>>();
   #swapping = false;
   #started = false;
   #options: Required<Omit<KernelOptions, "log">> & { log: (event: KernelEvent) => void };
@@ -134,8 +137,8 @@ export class Kernel {
   #spawn(entry: Entry, manifest: Manifest, dir: string): Instance {
     const instance: Instance = new Instance(manifest, dir, CODE_ROOTS, {
       onCall: (call) => this.#fromPlugin(manifest, call),
-      onState: (data) => {
-        entry.record = {
+      onState: async (data) => {
+        const record: StateRecord = {
           schema: 1,
           plugin: manifest.name,
           version: manifest.version,
@@ -143,9 +146,13 @@ export class Kernel {
           updatedAt: new Date().toISOString(),
           data,
         };
-        this.#store.save(entry.record).catch((error) =>
-          this.#log("state_save_failed", manifest.name, (error as Error).message)
-        );
+        try {
+          await this.#store.save(record);
+        } catch (error) {
+          this.#log("state_save_failed", manifest.name, (error as Error).message);
+          throw error;
+        }
+        entry.record = record;
       },
       onLog: (message) => this.#log("plugin_log", manifest.name, message),
       onCrash: (reason) => {
@@ -194,6 +201,7 @@ export class Kernel {
   /** 按启动的逆序停止全部插件，返回停止过程中遇到的问题汇总。 */
   async stop(): Promise<string[]> {
     const problems: string[] = [];
+    for (const entry of this.#entries.values()) this.#pause(entry);
     for (const name of [...this.#order].reverse()) {
       const entry = this.#entries.get(name)!;
       if (!entry.instance) continue;
@@ -201,10 +209,15 @@ export class Kernel {
       if (problem) problems.push(`${name}：${problem}`);
       entry.instance = undefined;
       entry.status = "stopped";
-      await this.#store.settle(name);
+      try {
+        await this.#store.settle(name);
+      } catch (error) {
+        problems.push(`${name}：状态保存失败：${(error as Error).message}`);
+      }
       this.#log("plugin_stopped", name);
     }
     this.#started = false;
+    for (const entry of this.#entries.values()) this.#resume(entry);
     return problems;
   }
 
@@ -223,7 +236,7 @@ export class Kernel {
     args: Json = null,
     options: CallOptions = {},
   ): Promise<T> {
-    return this.#dispatch(contract, method, args, options) as Promise<T>;
+    return this.#dispatch("host", contract, method, args, options) as Promise<T>;
   }
 
   #fromPlugin(caller: Manifest, call: Extract<FromWorker, { t: "call" }>): Promise<Json> {
@@ -232,41 +245,137 @@ export class Kernel {
         new KernelError("rejected", `${caller.name} 没有在清单里声明对 ${call.contract} 的依赖`),
       );
     }
-    return this.#dispatch(call.contract, call.method, call.args, {
+    return this.#dispatch(`plugin:${caller.name}`, call.contract, call.method, call.args, {
       timeoutMs: call.timeoutMs,
       idempotencyKey: call.idempotencyKey,
     });
   }
 
-  #dispatch(contract: string, method: string, args: Json, options: CallOptions): Promise<Json> {
-    if (!options.idempotencyKey) return this.#forward(contract, method, args, options);
-    const key = `${contract}.${method}:${options.idempotencyKey}`;
-    const existing = this.#idempotent.get(key);
-    if (existing) return existing;
-    const promise = this.#forward(contract, method, args, options);
-    this.#idempotent.set(key, promise);
-    // 失败的调用不占用幂等键，允许重试；成功的结果保留，数量有上限。
-    promise.catch(() => this.#idempotent.delete(key));
-    if (this.#idempotent.size > 1000) {
-      this.#idempotent.delete(this.#idempotent.keys().next().value!);
+  async callStatus(contract: string, method: string, key: string): Promise<CallRecord | undefined> {
+    const record = await this.#store.loadCall(await fingerprint(["host", contract, method, key]));
+    if (record?.status === "started") {
+      return {
+        ...record,
+        status: "unknown",
+        error: { kind: "unknown", message: "调用已开始，尚未确认结果；不会重新执行" },
+      };
     }
-    return promise;
+    return record;
+  }
+
+  async #dispatch(
+    caller: string,
+    contract: string,
+    method: string,
+    args: Json,
+    options: CallOptions,
+  ): Promise<Json> {
+    args = structuredClone(args);
+    const timeoutMs = options.timeoutMs ?? this.#options.callTimeoutMs;
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new KernelError("rejected", "调用期限无效");
+    }
+    const deadline = Date.now() + timeoutMs;
+    let execution: Promise<Json>;
+    if (!options.idempotencyKey) execution = this.#forward(contract, method, args, deadline);
+    else {
+      const key = options.idempotencyKey;
+      if (key.length > 512) throw new KernelError("rejected", "幂等键过长");
+      const id = await fingerprint([caller, contract, method, key]);
+      const request = await fingerprint(args);
+      let pending = this.#idempotent.get(id);
+      if (!pending) {
+        pending = this.#prepareCall(id, request, caller, contract, method, key, args, deadline);
+        this.#idempotent.set(id, pending);
+        pending.catch(() => {});
+      }
+      const operation = await pending;
+      if (request !== operation.request) {
+        throw new KernelError("rejected", "相同幂等键不能对应不同参数");
+      }
+      execution = operation.execution;
+    }
+    // 超时仅结束等待，真实执行与迟到回执继续跟踪；不因超时释放幂等键。
+    const result = await sleepUntil(execution, Math.max(0, deadline - Date.now()));
+    if (result === WAIT_TIMEOUT) {
+      throw new KernelError(
+        "timeout",
+        `${contract}.${method} 等待超时，执行结果未知；查询原调用，不要重放`,
+      );
+    }
+    return result;
+  }
+
+  async #prepareCall(
+    id: string,
+    request: string,
+    caller: string,
+    contract: string,
+    method: string,
+    key: string,
+    args: Json,
+    deadline: number,
+  ): Promise<{ request: string; execution: Promise<Json> }> {
+    const previous = await this.#store.loadCall(id);
+    if (previous) {
+      const execution = previous.status === "completed"
+        ? Promise.resolve(previous.value!)
+        : Promise.reject(
+          new KernelError(
+            previous.status === "started" ? "unknown" : previous.error!.kind,
+            previous.error?.message ?? "上次调用已开始但结果未知；原调用保留，不会重放",
+          ),
+        );
+      execution.catch(() => {});
+      return { request: previous.request, execution };
+    }
+    const record: CallRecord = {
+      schema: 1,
+      id,
+      caller,
+      contract,
+      method,
+      key,
+      request,
+      status: "started",
+      updatedAt: new Date().toISOString(),
+    };
+    // 执行前必须记录动作；写入失败时不调用插件。
+    await this.#store.saveCall(record);
+    const execution = this.#forward(contract, method, args, deadline).then(async (value) => {
+      await this.#store.saveCall({
+        ...record,
+        status: "completed",
+        value,
+        updatedAt: new Date().toISOString(),
+      });
+      return value;
+    }, async (error) => {
+      const wire = toWireError(error);
+      await this.#store.saveCall({
+        ...record,
+        status: ["timeout", "unknown"].includes(wire.kind) ? "unknown" : "failed",
+        error: wire,
+        updatedAt: new Date().toISOString(),
+      });
+      throw error;
+    });
+    execution.catch(() => {});
+    return { request, execution };
   }
 
   async #forward(
     contract: string,
     method: string,
     args: Json,
-    options: CallOptions,
+    deadline: number,
   ): Promise<Json> {
     const provider = this.#providers.get(contract);
     if (!provider) throw new KernelError("not_found", `没有插件提供契约 ${contract}`);
     const entry = this.#entries.get(provider)!;
-    const timeoutMs = options.timeoutMs ?? this.#options.callTimeoutMs;
-    const deadline = Date.now() + timeoutMs;
     while (entry.gate) {
       const waited = await sleepUntil(entry.gate.promise, Math.max(0, deadline - Date.now()));
-      if (waited === "timeout") {
+      if (waited === WAIT_TIMEOUT) {
         throw new KernelError("unavailable", `${provider} 正在换版，等待超时，调用没有执行`);
       }
     }
@@ -274,11 +383,11 @@ export class Kernel {
     if (!instance) throw new KernelError("unavailable", `${provider} 不在运行，调用没有执行`);
     entry.inflight++;
     try {
-      const value = await instance.call(contract, method, args, Math.max(1, deadline - Date.now()));
-      entry.observer?.(true);
+      const value = await instance.call(contract, method, args);
+      if (entry.instance === instance) entry.observer?.(true);
       return value;
     } catch (error) {
-      entry.observer?.(false, error as Error);
+      if (entry.instance === instance) entry.observer?.(false, error as Error);
       throw error;
     } finally {
       entry.inflight--;
@@ -306,7 +415,7 @@ export class Kernel {
   async #drain(entry: Entry): Promise<boolean> {
     if (entry.inflight === 0) return true;
     const empty = new Promise<void>((resolve) => entry.drained.push(resolve));
-    return (await sleepUntil(empty, this.#options.drainMs)) !== "timeout";
+    return (await sleepUntil(empty, this.#options.drainMs)) !== WAIT_TIMEOUT;
   }
 
   async #typecheck(manifest: Manifest, dir: string): Promise<string | undefined> {
@@ -458,13 +567,14 @@ export class Kernel {
         this.#pause(entry);
         candidate?.kill("回滚");
         entry.instance = undefined;
-        report.failedState = await this.#store.keepFailed(name, next.version);
-        await this.#store.restore(name, snapshot.record);
-        entry.record = snapshot.record;
-        entry.manifest = oldManifest;
-        entry.dir = oldDir;
-        this.#replan();
         try {
+          // 保存失败版本本身失败时不覆盖原件；整个回滚都在同一错误路径内。
+          report.failedState = await this.#store.keepFailed(name, next.version);
+          await this.#store.restore(name, snapshot.record);
+          entry.record = snapshot.record;
+          entry.manifest = oldManifest;
+          entry.dir = oldDir;
+          this.#replan();
           const restored = this.#spawn(entry, oldManifest, oldDir);
           await restored.start(snapshot.record?.data, snapshot.record?.stateVersion);
           entry.instance = restored;
@@ -482,6 +592,7 @@ export class Kernel {
       }
     } finally {
       this.#swapping = false;
+      this.#resume(entry);
     }
   }
 }

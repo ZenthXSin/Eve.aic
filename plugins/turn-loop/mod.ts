@@ -30,7 +30,7 @@ async function run(ctx: PluginContext, input: string): Promise<TurnResult> {
     } as unknown as Json);
     history.push({ role: "assistant", content: response.content, toolCalls: response.toolCalls });
     if (response.toolCalls.length === 0) {
-      ctx.setState({ history } as unknown as Json);
+      await ctx.setState({ history } as unknown as Json);
       return { reply: response.content, modelRequests, toolCalls };
     }
     for (const call of response.toolCalls) {
@@ -40,6 +40,11 @@ async function run(ctx: PluginContext, input: string): Promise<TurnResult> {
         result = await ctx.call<ToolResult & Json>(TOOLS, "execute", call as unknown as Json);
       } catch (error) {
         // 工具没有给出结果：如实告诉模型，不伪造成功。
+        const kind = (error as { kind?: string }).kind;
+        if (kind === "timeout" || kind === "unknown") {
+          // 尚未确定是否执行，不能转换成可安全重试的失败。
+          throw error;
+        }
         result = { status: "failed", output: `工具调用出错：${(error as Error).message}` };
       }
       history.push({
@@ -53,11 +58,14 @@ async function run(ctx: PluginContext, input: string): Promise<TurnResult> {
 
 export default definePlugin({
   load(ctx) {
+    let tail: Promise<unknown> = Promise.resolve();
     ctx.provide(TURN, {
-      run: async (args) => {
+      run: (args) => {
         const input = (args as { input?: unknown } | null)?.input;
         if (typeof input !== "string") throw new Error("run 需要字符串参数 input");
-        return await run(ctx, input) as unknown as Json;
+        const pending = tail.then(() => run(ctx, input));
+        tail = pending.catch(() => {});
+        return pending as unknown as Promise<Json>;
       },
       history: () => (ctx.getState<State & Json>()?.history ?? []) as unknown as Json,
     });
