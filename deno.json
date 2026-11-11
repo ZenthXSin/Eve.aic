@@ -15,6 +15,7 @@
       "sdk/",
       "contracts/",
       "plugins/",
+      "prompts/",
       "adapters/",
       "tests/",
       "demo/"
