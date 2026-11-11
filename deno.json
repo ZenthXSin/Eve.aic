@@ -3,8 +3,9 @@
     "worker-options"
   ],
   "tasks": {
-    "test": "deno test --allow-read --allow-write --allow-run --allow-env tests/",
-    "check": "deno check kernel/ sdk/ contracts/ plugins/ demo/ tests/*.ts",
+    "test": "deno test --allow-read --allow-write --allow-run --allow-env --allow-net=127.0.0.1 tests/",
+    "test:qq": "deno test --allow-net=127.0.0.1 tests/qq_client_test.ts",
+    "check": "deno check kernel/ sdk/ contracts/ plugins/ adapters/ demo/ tests/*.ts",
     "demo": "deno run --allow-read --allow-write --allow-run --allow-env demo/run.ts"
   },
   "fmt": {
@@ -14,6 +15,7 @@
       "sdk/",
       "contracts/",
       "plugins/",
+      "adapters/",
       "tests/",
       "demo/"
     ]
