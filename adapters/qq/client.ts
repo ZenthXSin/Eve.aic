@@ -198,6 +198,11 @@ function textBody(request: QqSendText): Record<string, unknown> {
   return body;
 }
 
+/** 无网络预检，动作服务可在登记“执行中”之前确认参数确实满足当前传输契约。 */
+export function validateQqSendText(request: QqSendText): void {
+  textBody(request);
+}
+
 export class QqClient {
   #base: URL;
   #credentials: QqCredentials;
