@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
 import { QqPhone } from "../adapters/qq/phone.ts";
+import { QqPhoneReading } from "../adapters/qq/reading.ts";
 import { startPhoneRpc } from "../adapters/qq/rpc.ts";
 import { QqTimeline } from "../adapters/qq/timeline.ts";
 import { composePhonePlugin } from "../composition/phone.ts";
@@ -56,9 +57,11 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
   await actions.initialize();
   const timeline = new QqTimeline(`${directory}/timeline`);
   await timeline.initialize();
+  const reading = new QqPhoneReading(`${directory}/phone-reading`);
+  await reading.initialize();
   const key = "fixture_script_process_key_01234567890123456789";
   const rpc = startPhoneRpc(
-    new QqPhone(() => [], actions, timeline, { id: "fixture-bot", displayName: "Eve" }),
+    new QqPhone(() => [], actions, timeline, { id: "fixture-bot", displayName: "Eve" }, reading),
     key,
   );
   const config = `${directory}/config.json`;
@@ -185,6 +188,7 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
     await rpc.close();
     await actions.close();
     await timeline.close();
+    await reading.close();
     await platform.shutdown();
     await Deno.remove(directory, { recursive: true });
   }

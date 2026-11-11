@@ -1,6 +1,7 @@
-// 独立适配器中的有界手机查询，不调用模型，不标已读，不认定主人。
+// 独立适配器中的有界手机查询，打开会话另存通知水位，不认定主人。
 import type {
   HistoryCursor,
+  OpenedConversation,
   PhoneActionReceipt,
   PhoneMessage,
   PhoneSend,
@@ -9,6 +10,7 @@ import { historyScreen, messageScreen, messageTextPage } from "../../sdk/phone-v
 import { QqSendActions, type SendStatus } from "./actions.ts";
 import type { InboundRecord } from "./journal.ts";
 import { QqTimeline, type TimelineSource } from "./timeline.ts";
+import { QqPhoneReading } from "./reading.ts";
 
 const SCREEN = { pageSize: 8, previewCharacters: 160, attachmentPageSize: 4 };
 const NOTICE = { ...SCREEN, previewCharacters: 80 };
@@ -56,6 +58,7 @@ export class QqPhone {
     readonly actions: QqSendActions,
     readonly timeline: QqTimeline,
     readonly self: { id: string; displayName: string },
+    readonly reading: QqPhoneReading,
     readonly now: () => number = Date.now,
   ) {}
 
@@ -90,7 +93,9 @@ export class QqPhone {
         },
       });
     }
-    return await this.timeline.snapshot(sources);
+    const rows = await this.timeline.snapshot(sources);
+    this.reading.validateSnapshot(rows);
+    return rows;
   }
 
   async conversations(args: {
@@ -112,11 +117,23 @@ export class QqPhone {
       args.cursor === undefined || message.seq < args.cursor.beforeLastSeq
     ).sort((a, b) => b.seq - a.seq);
     const page = eligible.slice(0, SCREEN.pageSize);
+    const pending = new Map<string, number>();
+    for (const row of rows) {
+      const id = row.message.conversationId;
+      if (
+        row.message.seq <= through && row.notify &&
+        row.message.seq > (this.reading.get(id)?.notificationThroughSeq ?? 0)
+      ) {
+        pending.set(id, (pending.get(id) ?? 0) + 1);
+      }
+    }
     return {
       items: page.map((message) => ({
         conversationId: message.conversationId,
         kind: message.conversationId.startsWith("qq:user:") ? "user" : "group",
         latest: messageScreen(message, SCREEN, this.now()),
+        pendingNotifications: pending.get(message.conversationId) ?? 0,
+        reading: this.reading.get(message.conversationId),
       })),
       snapshotThroughSeq: through,
       ...(eligible.length > page.length
@@ -124,6 +141,35 @@ export class QqPhone {
           older: { snapshotThroughSeq: through, beforeLastSeq: page.at(-1)!.seq },
         }
         : {}),
+    };
+  }
+
+  async open(args: { conversationId: string }): Promise<OpenedConversation> {
+    conversation(args.conversationId);
+    // open 不接受历史游标，防止将向前翻页误作打开最新一屏。
+    if (Object.hasOwn(args, "cursor")) throw new QqPhoneError("request");
+    const rows = await this.#snapshot();
+    const screen = historyScreen(
+      rows.map((row) => row.message),
+      args.conversationId,
+      SCREEN,
+      this.now(),
+    );
+    const displayedSeqs = screen.messages.map((message) => message.handle.seq);
+    const reading = displayedSeqs.length
+      ? await this.reading.opened(args.conversationId, screen.snapshotThroughSeq, displayedSeqs)
+      : this.reading.get(args.conversationId);
+    return {
+      ...screen,
+      notificationThroughSeq: reading?.notificationThroughSeq ?? 0,
+      displayedSeqs,
+      earlierMessagesNotShown:
+        rows.filter((row) =>
+          row.message.conversationId === args.conversationId &&
+          row.message.seq < (displayedSeqs[0] ?? 0)
+        ).length,
+      notice:
+        "通知水位仅用于消除本机会话提醒；本屏上方未展示的消息并非真的已读。当前只展示预览，长文和附件仍需主动打开。",
     };
   }
 
@@ -202,7 +248,10 @@ export class QqPhone {
     integer(after, 0);
     const rows = await this.#snapshot();
     if (after > (rows.at(-1)?.message.seq ?? 0)) throw new QqPhoneError("request");
-    const eligible = rows.filter((row) => row.notify && row.message.seq > after);
+    const eligible = rows.filter((row) =>
+      row.notify && row.message.seq > after &&
+      row.message.seq > (this.reading.get(row.message.conversationId)?.notificationThroughSeq ?? 0)
+    );
     const page = eligible.slice(0, SCREEN.pageSize);
     return {
       items: page.map((row) => messageScreen(row.message, NOTICE, this.now())),

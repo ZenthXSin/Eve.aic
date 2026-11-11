@@ -1,4 +1,4 @@
-// 平台事实与手机屏幕契约。适配器提供事实，手机插件另存已读、免打扰、草稿等设置。
+// 平台事实与手机屏幕契约。阅读状态另存于独立适配器，不随手机 worker 换版回滚。
 // 此处不认证调用方，也不从昵称、正文、引用或附件推断主人身份。
 
 export interface PhoneMessage {
@@ -81,6 +81,20 @@ export interface HistoryScreen {
   older?: HistoryCursor;
 }
 
+/** 本机通知水位与最近一次打开的屏幕。水位不代表此前所有消息都实际看过。 */
+export interface PhoneReadingState {
+  notificationThroughSeq: number;
+  lastOpened: { snapshotThroughSeq: number; displayedSeqs: number[] };
+}
+export interface OpenedConversation extends HistoryScreen {
+  notificationThroughSeq: number;
+  /** 本次仅展示这些消息的预览，不表示长文或附件已完整读取。 */
+  displayedSeqs: number[];
+  /** 在本次屏幕上方的消息条数，不是累计未读条数。 */
+  earlierMessagesNotShown: number;
+  notice: string;
+}
+
 export const PHONE = "phone";
 
 export interface PhoneActionReceipt {
@@ -103,15 +117,23 @@ export interface PhoneSend {
   wakeup?: boolean;
 }
 
-/** 脚本可用的手机接口。浏览只返回有界屏幕；已读策略确认前不提供标记动作。 */
+/** 脚本可用的手机接口。只有 open 更新本机会话通知水位，历史/搜索只浏览。 */
 export interface PhoneApi {
   conversations(args?: {
     cursor?: { snapshotThroughSeq: number; beforeLastSeq: number };
   }): Promise<{
-    items: { conversationId: string; kind: "user" | "group"; latest: MessageScreen }[];
+    items: {
+      conversationId: string;
+      kind: "user" | "group";
+      latest: MessageScreen;
+      pendingNotifications: number;
+      reading: PhoneReadingState | null;
+    }[];
     snapshotThroughSeq: number;
     older?: { snapshotThroughSeq: number; beforeLastSeq: number };
   }>;
+  /** 打开最新一屏，先持久保存本会话通知水位；上方未展示内容不算实际读过。 */
+  open(args: { conversationId: string }): Promise<OpenedConversation>;
   history(args: { conversationId: string; cursor?: HistoryCursor }): Promise<HistoryScreen>;
   message(args: {
     handle: { conversationId: string; seq: number };

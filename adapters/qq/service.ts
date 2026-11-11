@@ -4,6 +4,7 @@ import { QqPhone } from "./phone.ts";
 import { QqReceiver, type QqReceiverStatus } from "./receiver.ts";
 import { startPhoneRpc } from "./rpc.ts";
 import { QqTimeline } from "./timeline.ts";
+import { QqPhoneReading } from "./reading.ts";
 import type { OwnershipFence } from "../../sdk/ownership-fence.ts";
 import { fingerprint } from "../../kernel/calls.ts";
 import { phoneReceipt } from "./phone.ts";
@@ -20,6 +21,7 @@ export async function startQqPhoneAdapter(
   const controller = new AbortController();
   const actions = new QqSendActions(client, `${directory}/outbox`);
   const timeline = new QqTimeline(`${directory}/timeline`);
+  const reading = new QqPhoneReading(`${directory}/phone-reading`);
   const receiver = new QqReceiver(client, directory);
   let rpc: ReturnType<typeof startPhoneRpc> | undefined;
   let failure: unknown;
@@ -32,6 +34,7 @@ export async function startQqPhoneAdapter(
   try {
     await actions.initialize();
     await timeline.initialize();
+    await reading.initialize();
     // 只有原发送账本的真实记录可补结算；无证据的 admitted 读取仍保持待核对。
     await fence?.reconcile(async (permit) => {
       const saved = actions.status(permit.actionId);
@@ -62,11 +65,11 @@ export async function startQqPhoneAdapter(
       new QqPhone(() => receiver.messages(), actions, timeline, {
         id: self.id,
         displayName: self.username ?? "",
-      }),
+      }, reading),
       key,
       () => ({
         available: failure === undefined && !controller.signal.aborted && actions.available &&
-          timeline.available,
+          timeline.available && reading.available,
         gateway: status,
         replyScope: "private",
       }),
@@ -89,6 +92,7 @@ export async function startQqPhoneAdapter(
               () => fence?.close(),
               () => actions.close(),
               () => timeline.close(),
+              () => reading.close(),
             ]
           ) {
             try {
@@ -111,6 +115,7 @@ export async function startQqPhoneAdapter(
     await fence?.close().catch(() => {});
     await actions.close().catch(() => {});
     await timeline.close().catch(() => {});
+    await reading.close().catch(() => {});
     throw error;
   }
 }

@@ -4,6 +4,7 @@ import { QqClient } from "../adapters/qq/client.ts";
 import { QqInboundJournal } from "../adapters/qq/journal.ts";
 import { type QqDispatch, qqMessage } from "../adapters/qq/inbound.ts";
 import { QqPhone } from "../adapters/qq/phone.ts";
+import { QqPhoneReading } from "../adapters/qq/reading.ts";
 import { startPhoneRpc } from "../adapters/qq/rpc.ts";
 import { QqTimeline } from "../adapters/qq/timeline.ts";
 import { composeEvePlugin, composeMindPlugin, writeEvePrompt } from "../composition/eve.ts";
@@ -99,12 +100,14 @@ async function fixture(
   await actions.initialize();
   const timeline = new QqTimeline(`${directory}/qq/timeline`);
   await timeline.initialize();
+  const reading = new QqPhoneReading(`${directory}/phone-reading`);
+  await reading.initialize();
   const key = "fixture_conscious_phone_key_01234567890123456789";
   let unavailable = false;
   const phone = new QqPhone(() => journal.records(), actions, timeline, {
     id: "fixture-bot",
     displayName: "Eve",
-  });
+  }, reading);
   const notifications = phone.notifications.bind(phone);
   phone.notifications = (args) => {
     if (unavailable) throw new Error("fixture phone unavailable");
@@ -206,6 +209,7 @@ async function fixture(
       await rpc.close();
       await actions.close();
       await timeline.close();
+      await reading.close();
       await model.shutdown();
       await platform.shutdown();
       await qq.shutdown();

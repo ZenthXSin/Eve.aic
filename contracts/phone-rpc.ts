@@ -4,6 +4,7 @@ import type { OwnershipProof } from "./ownership.ts";
 /** 与适配器通讯的窄接口；认证信息不在工具参数、返回值或模型上下文里。 */
 export const PHONE_METHODS = [
   "conversations",
+  "open",
   "history",
   "message",
   "text",

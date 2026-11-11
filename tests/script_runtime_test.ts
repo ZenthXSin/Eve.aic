@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
 import { QqPhone } from "../adapters/qq/phone.ts";
+import { QqPhoneReading } from "../adapters/qq/reading.ts";
 import { startPhoneRpc } from "../adapters/qq/rpc.ts";
 import { QqTimeline } from "../adapters/qq/timeline.ts";
 import { composePhonePlugin } from "../composition/phone.ts";
@@ -53,8 +54,10 @@ async function fixture(handler?: (request: Request) => Promise<Response>) {
   await actions.initialize();
   const timeline = new QqTimeline(`${directory}/timeline`);
   await timeline.initialize();
+  const reading = new QqPhoneReading(`${directory}/phone-reading`);
+  await reading.initialize();
   const rpc = startPhoneRpc(
-    new QqPhone(() => [], actions, timeline, { id: "fixture-bot", displayName: "Eve" }),
+    new QqPhone(() => [], actions, timeline, { id: "fixture-bot", displayName: "Eve" }, reading),
     key,
   );
   await Deno.writeTextFile(`${directory}/key`, key, { mode: 0o600 });
@@ -98,6 +101,7 @@ async function fixture(handler?: (request: Request) => Promise<Response>) {
       await rpc.close();
       await actions.close();
       await timeline.close();
+      await reading.close();
       await platform.shutdown();
       await Deno.remove(directory, { recursive: true });
     },

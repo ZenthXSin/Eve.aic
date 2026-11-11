@@ -4,12 +4,14 @@ import { QqClient } from "../adapters/qq/client.ts";
 import { type QqDispatch, qqMessage } from "../adapters/qq/inbound.ts";
 import { QqInboundJournal } from "../adapters/qq/journal.ts";
 import { QqPhone } from "../adapters/qq/phone.ts";
+import { QqPhoneReading } from "../adapters/qq/reading.ts";
 import { startPhoneRpc } from "../adapters/qq/rpc.ts";
 import { QqTimeline, QqTimelineError } from "../adapters/qq/timeline.ts";
 import { composePhonePlugin } from "../composition/phone.ts";
 import { Kernel } from "../kernel/kernel.ts";
 import { PhoneRpcClient, PhoneRpcError } from "../plugins/phone/client.ts";
 import { KernelError } from "../sdk/plugin.ts";
+import type { OpenedConversation } from "../contracts/phone.ts";
 
 const KEY = "fixture_phone_connection_key_0123456789";
 function event(seq: number, user = "user-a", text = `消息-${seq}`, group?: string): QqDispatch {
@@ -57,10 +59,12 @@ async function fixture() {
   await actions.initialize();
   const timeline = new QqTimeline(`${directory}/timeline`);
   await timeline.initialize();
+  const reading = new QqPhoneReading(`${directory}/phone-reading`);
+  await reading.initialize();
   const phone = new QqPhone(() => journal.records(), actions, timeline, {
     id: "fixture-bot",
     displayName: "Eve",
-  });
+  }, reading);
   const rpc = startPhoneRpc(phone, KEY);
   const client = new PhoneRpcClient(rpc.url, KEY);
   return {
@@ -68,6 +72,7 @@ async function fixture() {
     journal,
     actions,
     timeline,
+    reading,
     phone,
     rpc,
     client,
@@ -80,7 +85,7 @@ async function fixture() {
       beforeReply = next;
     },
     append: (raw: QqDispatch) => journal.append(qqMessage(raw)!, raw),
-    close: async (expectedTimelineFailure = false) => {
+    close: async (expectedTimelineFailure = false, expectedReadingFailure = false) => {
       client.close();
       await rpc.close();
       await actions.close();
@@ -89,11 +94,100 @@ async function fixture() {
       } catch (error) {
         if (!expectedTimelineFailure) throw error;
       }
+      try {
+        await reading.close();
+      } catch (error) {
+        if (!expectedReadingFailure) throw error;
+      }
       await platform.shutdown();
       await Deno.remove(directory, { recursive: true });
     },
   };
 }
+
+Deno.test("QQ 手机：打开最新屏只消除本会话通知，上方未展示消息不冒充已读，重启保持水位", async () => {
+  const f = await fixture();
+  let restored: QqPhoneReading | undefined;
+  try {
+    for (let seq = 1; seq <= 18; seq++) await f.append(event(seq));
+    await f.append(event(19, "user-b"));
+    const firstNotices = await f.phone.notifications();
+    assert.deepEqual(firstNotices.items.map((m) => m.handle.seq), [1, 2, 3, 4, 5, 6, 7, 8]);
+    const history = await f.phone.history({ conversationId: "qq:user:user-a" });
+    await f.phone.history({ conversationId: "qq:user:user-a", cursor: history.older });
+    await f.phone.search({ query: "消息" });
+    await f.phone.message({ handle: { conversationId: "qq:user:user-a", seq: 1 } });
+    const list = await f.phone.conversations();
+    assert.equal(
+      list.items.find((c) => c.conversationId === "qq:user:user-a")!.pendingNotifications,
+      18,
+    );
+    assert.equal(f.reading.get("qq:user:user-a"), null);
+    const opened = await f.client.call("open", {
+      conversationId: "qq:user:user-a",
+    }) as unknown as OpenedConversation;
+    assert.deepEqual(opened.displayedSeqs, [11, 12, 13, 14, 15, 16, 17, 18]);
+    assert.equal(opened.snapshotThroughSeq, 19);
+    assert.equal(opened.notificationThroughSeq, 18);
+    assert.equal(opened.earlierMessagesNotShown, 10);
+    assert.match(opened.notice, /上方未展示的消息并非真的已读/);
+    const saved = {
+      notificationThroughSeq: 18,
+      lastOpened: { snapshotThroughSeq: 19, displayedSeqs: opened.displayedSeqs },
+    };
+    assert.deepEqual(f.reading.get("qq:user:user-a"), saved);
+    await f.append(event(20));
+    assert.deepEqual(
+      (await f.phone.notifications({ afterSeq: firstNotices.throughSeq })).items.map((m) =>
+        m.handle.seq
+      ),
+      [19, 20],
+    );
+    await f.phone.history({ conversationId: "qq:user:user-a", cursor: opened.older });
+    await f.phone.search({ query: "消息", conversationId: "qq:user:user-a" });
+    assert.deepEqual(f.reading.get("qq:user:user-a"), saved);
+    await f.reading.close();
+    restored = new QqPhoneReading(`${f.directory}/phone-reading`);
+    await restored.initialize();
+    const phone = new QqPhone(() => f.journal.records(), f.actions, f.timeline, {
+      id: "bot",
+      displayName: "Eve",
+    }, restored);
+    assert.deepEqual((await phone.notifications()).items.map((m) => m.handle.seq), [19, 20]);
+    assert.deepEqual(restored.get("qq:user:user-a"), saved);
+    const empty = await phone.open({ conversationId: "qq:user:empty" });
+    assert.deepEqual(empty.displayedSeqs, []);
+    assert.equal(empty.notificationThroughSeq, 0);
+    assert.equal(restored.get("qq:user:empty"), null);
+    assert.equal(f.count(), 0);
+  } finally {
+    await restored?.close();
+    await f.close();
+  }
+});
+
+Deno.test("QQ 手机：打开屏幕先提交，保存失败返回错误且不发布成功水位，原件不动", async () => {
+  const f = await fixture();
+  try {
+    await f.append(event(1));
+    await f.phone.open({ conversationId: "qq:user:user-a" });
+    const path = `${f.directory}/phone-reading`;
+    const original = await Deno.readTextFile(`${path}/index.json`);
+    await f.append(event(2));
+    await Deno.rename(path, `${f.directory}/preserved-reading`);
+    await assert.rejects(
+      () => f.client.call("open", { conversationId: "qq:user:user-a" }),
+      (e) => e instanceof PhoneRpcError && e.category === "storage",
+    );
+    assert.equal(f.reading.available, false);
+    assert.equal(await Deno.readTextFile(`${f.directory}/preserved-reading/index.json`), original);
+    assert.equal(f.journal.records().length, 2);
+    await assert.rejects(() => f.phone.notifications(), KernelError);
+    await assert.rejects(() => f.reading.close(), KernelError);
+  } finally {
+    await f.close(false, true);
+  }
+});
 
 Deno.test("QQ 手机：真实日志经 RPC 有界浏览、搜索和长文本，翻页快照重启仍稳定", async () => {
   const f = await fixture();
@@ -134,7 +228,7 @@ Deno.test("QQ 手机：真实日志经 RPC 有界浏览、搜索和长文本，�
       const phone = new QqPhone(() => f.journal.records(), f.actions, restart, {
         id: "fixture-bot",
         displayName: "Eve",
-      });
+      }, f.reading);
       assert.deepEqual(
         await phone.history({ conversationId: "qq:user:user-a", cursor: first.older }),
         older,
@@ -392,6 +486,10 @@ Deno.test("QQ 手机：真实独立适配器子进程、网关入站与worker发
     >("phone", "history", { conversationId: "qq:user:user-a" });
     assert.equal(before.messages.length, 2);
     assert.equal(before.messages[1].sender.platformUserId, "actual-fixture-bot");
+    const opened = await kernel!.call("phone", "open", { conversationId: "qq:user:user-a" });
+    const readingBeforeRestart = await Deno.readTextFile(
+      `${directory}/data/phone-reading/index.json`,
+    );
     await stop();
     await Deno.remove(endpoint);
     await start();
@@ -400,6 +498,19 @@ Deno.test("QQ 手机：真实独立适配器子进程、网关入站与worker发
       before,
     );
     assert.deepEqual(await kernel!.call("phone", "send", args), receipt);
+    assert.equal(
+      await Deno.readTextFile(`${directory}/data/phone-reading/index.json`),
+      readingBeforeRestart,
+    );
+    assert.deepEqual(
+      await kernel!.call("phone", "open", { conversationId: "qq:user:user-a" }),
+      opened,
+    );
+    assert.deepEqual(await kernel!.call("phone", "notifications"), {
+      items: [],
+      throughSeq: 2,
+      hasMore: false,
+    });
     assert.equal(sends, 1);
     assert.equal(connections, 2);
     const raw = await Deno.readDir(`${directory}/data/inbound`);
@@ -674,7 +785,7 @@ Deno.test("QQ 手机：平台已送达但浏览索引保存失败，原动作仍
     const phone = new QqPhone(() => f.journal.records(), f.actions, restored, {
       id: "fixture-bot",
       displayName: "Eve",
-    });
+    }, f.reading);
     assert.equal(
       (await phone.history({ conversationId: "qq:user:user-a" })).messages.at(-1)!.delivery?.state,
       "sent",

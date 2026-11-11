@@ -98,15 +98,15 @@ export class PhoneRpcClient {
     } catch (error) {
       if (error instanceof PhoneRpcError) {
         if (
-          method === "send" &&
+          (method === "send" || method === "open") &&
           ["transport", "invalid_response", "internal"].includes(error.category)
         ) {
           throw new PhoneRpcError("unknown");
         }
         throw error;
       }
-      // 请求可能已经到达适配器，尤其 send 超时不能当成未执行再发。
-      throw new PhoneRpcError(method === "send" ? "unknown" : "transport");
+      // 请求可能已经到达适配器；发送/打开超时不能声称动作没有执行。
+      throw new PhoneRpcError(method === "send" || method === "open" ? "unknown" : "transport");
     }
   }
 

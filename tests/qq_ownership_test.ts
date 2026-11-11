@@ -4,6 +4,7 @@ import { QqClient } from "../adapters/qq/client.ts";
 import { QqInboundJournal } from "../adapters/qq/journal.ts";
 import { type QqDispatch, qqMessage } from "../adapters/qq/inbound.ts";
 import { QqPhone } from "../adapters/qq/phone.ts";
+import { QqPhoneReading } from "../adapters/qq/reading.ts";
 import { startPhoneRpc } from "../adapters/qq/rpc.ts";
 import { QqTimeline } from "../adapters/qq/timeline.ts";
 import type { OwnershipProof } from "../contracts/ownership.ts";
@@ -65,6 +66,8 @@ async function setup(hold = false) {
   await actions.initialize();
   const timeline = new QqTimeline(`${directory}/timeline`);
   await timeline.initialize();
+  const reading = new QqPhoneReading(`${directory}/phone-reading`);
+  await reading.initialize();
   const incoming = new QqInboundJournal(`${directory}/incoming`);
   await incoming.initialize();
   const raw: QqDispatch = {
@@ -77,7 +80,7 @@ async function setup(hold = false) {
   const phone = new QqPhone(() => incoming.records(), actions, timeline, {
     id: "bot-fixture",
     displayName: "Eve",
-  });
+  }, reading);
   const fence = new OwnershipFence(`${directory}/fence`, "phone", guard);
   await fence.initialize();
   const rpc = startPhoneRpc(phone, bridgeKey, () => ({ available: true }), fence);
@@ -88,6 +91,7 @@ async function setup(hold = false) {
     gate,
     sends: () => sends,
     actions,
+    reading,
     fence,
     rpc,
     close: async () => {
@@ -96,6 +100,7 @@ async function setup(hold = false) {
       await fence.close();
       await actions.close();
       await timeline.close();
+      await reading.close();
       await platform.shutdown();
       await guard.close();
       await Deno.remove(directory, { recursive: true });
@@ -120,6 +125,8 @@ Deno.test("QQ fenced RPC：无令牌拒绝读取/发送，换版采用原送达�
       (e: unknown) => e instanceof PhoneRpcError && e.category === "request",
     );
     await assert.rejects(() => plain.call("send", sendArgs));
+    await assert.rejects(() => plain.call("open", { conversationId: "qq:user:owner-fixture" }));
+    assert.equal(f.reading.get("qq:user:owner-fixture"), null);
     assert.equal(f.sends(), 0);
     const page = await old.call("history", { conversationId: "qq:user:owner-fixture" });
     assert.ok(page);
@@ -144,6 +151,10 @@ Deno.test("QQ fenced RPC：无令牌拒绝读取/发送，换版采用原送达�
       (e: unknown) => e instanceof PhoneRpcError && e.category === "unavailable",
     );
     await assert.rejects(() => old.call("history", { conversationId: "qq:user:owner-fixture" }));
+    await assert.rejects(() => old.call("open", { conversationId: "qq:user:owner-fixture" }));
+    assert.equal(f.reading.get("qq:user:owner-fixture"), null);
+    await next.call("open", { conversationId: "qq:user:owner-fixture" });
+    assert.equal(f.reading.get("qq:user:owner-fixture")!.notificationThroughSeq, 2);
     await assert.rejects(() => next!.call("send", { ...sendArgs, text: "changed" }));
     assert.equal(f.sends(), 1);
     assert.deepEqual(await next.call("action", { actionId: sendArgs.actionId }), receipt);
