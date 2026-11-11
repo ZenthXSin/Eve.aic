@@ -12,9 +12,12 @@ export interface QqClientOptions {
   timeoutMs?: number;
   maxResponseBytes?: number;
   now?: () => number;
+  /** 测试时显式设为 private；在任何认证或发送请求之前拒绝群聊发送。 */
+  sendScope?: "all" | "private";
 }
 
 export type QqErrorCategory =
+  | "scope"
   | "request"
   | "authentication"
   | "rate_limit"
@@ -197,6 +200,7 @@ export class QqClient {
   #now: () => number;
   #token?: { value: string; expiresAt: number };
   #refresh?: Promise<string>;
+  #scope: "all" | "private";
 
   constructor(credentials: QqCredentials, options: QqClientOptions = {}) {
     if (!nonempty(credentials.appId) || !nonempty(credentials.appSecret)) requestError();
@@ -208,6 +212,9 @@ export class QqClient {
     ) requestError();
     const timeout = options.timeoutMs ?? 20_000;
     const limit = options.maxResponseBytes ?? 1_048_576;
+    if (options.sendScope !== undefined && !["all", "private"].includes(options.sendScope)) {
+      requestError();
+    }
     if (!Number.isFinite(timeout) || timeout <= 0 || !Number.isSafeInteger(limit) || limit < 1) {
       requestError();
     }
@@ -216,6 +223,7 @@ export class QqClient {
     this.#timeout = timeout;
     this.#limit = limit;
     this.#now = options.now ?? Date.now;
+    this.#scope = options.sendScope ?? "all";
   }
 
   async #request(path: string, init: RequestInit): Promise<ResponseInfo> {
@@ -310,6 +318,9 @@ export class QqClient {
   async sendText(request: QqSendText): Promise<QqSendResult> {
     request = structuredClone(request);
     const body = textBody(request);
+    if (this.#scope === "private" && request.destination.kind !== "user") {
+      return { status: "failed", attempted: false, error: { category: "scope" } };
+    }
     let token: string;
     try {
       token = await this.#accessToken();
