@@ -25,7 +25,17 @@ const scripts = Object.fromEntries(["status", "cancel", "result", "receipt"].map
   method,
   (args: Json) => invoke("scripts", method, args),
 ]));
-const tools = Object.freeze({ phone: Object.freeze(phone), scripts: Object.freeze(scripts) });
+const mind = Object.fromEntries(
+  ["rest", "remind", "cancelReminder", "compress", "retain", "status"].map((method) => [
+    method,
+    (args: Json = {}) => invoke("mind", method, args),
+  ]),
+);
+const tools = Object.freeze({
+  phone: Object.freeze(phone),
+  scripts: Object.freeze(scripts),
+  mind: Object.freeze(mind),
+});
 let started = false;
 self.onmessage = async (event: MessageEvent<ToScript>) => {
   const message = event.data;

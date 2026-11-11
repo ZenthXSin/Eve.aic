@@ -1,5 +1,6 @@
 import type { Json } from "../kernel/protocol.ts";
 import type { PhoneActionReceipt, PhoneApi, PhoneSend } from "./phone.ts";
+import type { MindApi } from "./mind.ts";
 
 export const SCRIPTS = "scripts";
 export interface ScriptRequest {
@@ -27,6 +28,7 @@ export interface ScriptSummary {
   error?: { kind: string; message: string };
 }
 export interface ScriptApi {
+  mind: MindApi;
   phone: Omit<PhoneApi, "send"> & {
     /** actionId由宿主从持久脚本编号与调用序号产生，不让代码重试制造新动作。 */
     send(args: Omit<PhoneSend, "actionId">): Promise<PhoneActionReceipt>;

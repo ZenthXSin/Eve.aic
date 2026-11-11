@@ -93,6 +93,8 @@ export class Kernel {
   #idempotent = new Map<string, Promise<{ request: string; execution: Promise<Json> }>>();
   #swapping = false;
   #started = false;
+  #stopping = false;
+  #stopWork?: Promise<string[]>;
   #options: Required<Omit<KernelOptions, "log">> & { log: (event: KernelEvent) => void };
 
   constructor(options: KernelOptions) {
@@ -199,12 +201,25 @@ export class Kernel {
   }
 
   /** 按启动的逆序停止全部插件，返回停止过程中遇到的问题汇总。 */
-  async stop(): Promise<string[]> {
+  stop(): Promise<string[]> {
+    if (this.#stopWork) return this.#stopWork;
+    const work = this.#stop();
+    this.#stopWork = work;
+    const clear = () => {
+      this.#stopWork = undefined;
+    };
+    work.then(clear, clear);
+    return work;
+  }
+
+  async #stop(): Promise<string[]> {
     const problems: string[] = [];
-    for (const entry of this.#entries.values()) this.#pause(entry);
+    this.#stopping = true;
     for (const name of [...this.#order].reverse()) {
       const entry = this.#entries.get(name)!;
       if (!entry.instance) continue;
+      // 先排空依赖方，再封住其依赖。Disable中的真实收尾调用仍可到达后续服务。
+      this.#pause(entry);
       const problem = await entry.instance.stop();
       if (problem) problems.push(`${name}：${problem}`);
       entry.instance = undefined;
@@ -218,6 +233,7 @@ export class Kernel {
     }
     this.#started = false;
     for (const entry of this.#entries.values()) this.#resume(entry);
+    this.#stopping = false;
     return problems;
   }
 
@@ -270,6 +286,9 @@ export class Kernel {
     args: Json,
     options: CallOptions,
   ): Promise<Json> {
+    if (this.#stopping && caller === "host") {
+      throw new KernelError("unavailable", "内核正在停止，不接新的宿主动作");
+    }
     args = structuredClone(args);
     const timeoutMs = options.timeoutMs ?? this.#options.callTimeoutMs;
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
@@ -494,6 +513,7 @@ export class Kernel {
       return report;
     };
 
+    if (this.#stopping) return await finish("rejected", "内核正在停止，不能启动换版");
     if (this.#swapping) return await finish("rejected", "已有另一次换版在进行");
     if (!entry.instance) return await finish("rejected", `${name} 不在运行`);
     this.#swapping = true;

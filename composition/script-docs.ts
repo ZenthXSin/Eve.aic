@@ -3,6 +3,7 @@ export async function renderScriptContracts(): Promise<string> {
   const files = [
     new URL("../contracts/phone.ts", import.meta.url),
     new URL("../contracts/script.ts", import.meta.url),
+    new URL("../contracts/mind.ts", import.meta.url),
   ];
   const sections: string[] = [];
   for (const file of files) {

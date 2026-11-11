@@ -20,6 +20,7 @@ export async function composeScriptPlugin(directory: string, configPath: string)
         version: "1.0.0",
         provides: { scripts: "1.0.0", tools: "1.0.0" },
         requires: { phone: "^1.0.0" },
+        optional: { mind: "^1.0.0" },
         permissions: {
           read: [
             configPath,

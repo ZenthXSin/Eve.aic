@@ -18,6 +18,53 @@ async function errorKind(operation: Promise<unknown>, kind: string) {
   await assert.rejects(operation, (e) => e instanceof KernelError && e.kind === kind);
 }
 
+Deno.test("停止先拒绝新的宿主动作，插件清理仍能调用尚未停止的依赖", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "eve-stop-dependent-" });
+  const data = await Deno.makeTempDir({ prefix: "eve-stop-dependent-data-" });
+  await Deno.writeTextFile(
+    `${dir}/manifest.json`,
+    JSON.stringify({
+      name: "dependent",
+      version: "1.0.0",
+      provides: { dependent: "1.0.0" },
+      requires: { counter: "^1.0.0" },
+      deadlines: { disableMs: 2000 },
+    }),
+  );
+  await Deno.writeTextFile(
+    `${dir}/mod.ts`,
+    `import {definePlugin} from "${ROOT}sdk/plugin.ts";
+export default definePlugin({load(ctx){ctx.provide("dependent",{ping:()=>true});},
+async disable(ctx){ctx.log("stop_entered");await new Promise(r=>setTimeout(r,150));
+const n=await ctx.call("counter","add",{n:1});await ctx.setState({cleanupResult:n});ctx.log("cleanup_done");}});`,
+  );
+  let kernel: Kernel | undefined;
+  try {
+    const booted = await boot([dir, fixture("counter-v1")], data);
+    kernel = booted.kernel;
+    const stopped = kernel.stop();
+    assert.equal(kernel.stop(), stopped);
+    for (let i = 0; !booted.events.some((e) => e.detail === "stop_entered"); i++) {
+      assert.ok(i < 200, "没有进入真实插件的停止回调");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await errorKind(kernel.call("counter", "add", { n: 100 }), "unavailable");
+    const swapping = await kernel.swap("counter", fixture("counter-v2"));
+    assert.equal(swapping.outcome, "rejected");
+    assert.match(swapping.reason!, /正在停止/);
+    assert.deepEqual(await stopped, []);
+    assert.ok(booted.events.some((e) => e.detail === "cleanup_done"));
+    const state = JSON.parse(await Deno.readTextFile(`${data}/state/dependent.json`));
+    assert.equal(state.data.cleanupResult, 1);
+    const counter = JSON.parse(await Deno.readTextFile(`${data}/state/counter.json`));
+    assert.equal(counter.data.total, 1);
+  } finally {
+    await kernel?.stop();
+    await Deno.remove(dir, { recursive: true });
+    await Deno.remove(data, { recursive: true });
+  }
+});
+
 Deno.test("超时不重复动作；迟到结果、重启查询与参数绑定保留", async () => {
   const dir = await Deno.makeTempDir({ prefix: "eve-late-plugin-" });
   const data = await Deno.makeTempDir({ prefix: "eve-late-data-" });

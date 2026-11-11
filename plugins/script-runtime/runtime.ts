@@ -372,7 +372,11 @@ export class ScriptRuntime {
     if (
       !(message.namespace === "phone" && PHONE_METHODS.includes(message.method as never)) &&
       !(message.namespace === "scripts" &&
-        ["status", "cancel", "result", "receipt"].includes(message.method))
+        ["status", "cancel", "result", "receipt"].includes(message.method)) &&
+      !(message.namespace === "mind" &&
+        ["rest", "remind", "cancelReminder", "compress", "retain", "status"].includes(
+          message.method,
+        ))
     ) throw new KernelError("rejected", "该能力不在当前契约中");
     canonical(message.args);
     const actionId = `script_${jobId}_${message.seq}`;
@@ -383,6 +387,13 @@ export class ScriptRuntime {
         Object.hasOwn(args, "actionId")
       ) throw new KernelError("rejected", "手机发送编号由脚本宿主提供");
       args.actionId = actionId;
+    }
+    if (message.namespace === "mind" && message.method !== "status") {
+      if (
+        args === null || typeof args !== "object" || Array.isArray(args) ||
+        Object.hasOwn(args, "requestId")
+      ) throw new KernelError("rejected", "意识请求编号由宿主提供");
+      args.requestId = actionId;
     }
     live.nextSeq++;
     await this.store.change((state) =>
@@ -402,7 +413,7 @@ export class ScriptRuntime {
         ? await this[message.method as "status" | "cancel" | "result" | "receipt"](
           args as never,
         ) as unknown as Json
-        : await this.ctx.call<Json>("phone", message.method, args, {
+        : await this.ctx.call<Json>(message.namespace, message.method, args, {
           idempotencyKey: actionId,
           timeoutMs: this.config.defaultTimeoutMs,
         });
