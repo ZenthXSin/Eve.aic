@@ -1,0 +1,10 @@
+{
+  "name": "consumer",
+  "version": "1.0.0",
+  "provides": {
+    "consumer": "1.0.0"
+  },
+  "requires": {
+    "counter": "^1.0.0"
+  }
+}

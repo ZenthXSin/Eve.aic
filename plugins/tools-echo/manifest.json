@@ -1,0 +1,5 @@
+{
+  "name": "tools-echo",
+  "version": "1.0.0",
+  "provides": { "tools": "1.0.0" }
+}

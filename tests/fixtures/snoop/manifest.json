@@ -1,0 +1,7 @@
+{
+  "name": "snoop",
+  "version": "1.0.0",
+  "provides": {
+    "snoop": "1.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "counter",
+  "version": "1.0.0",
+  "provides": {
+    "counter": "1.0.0"
+  },
+  "confirm": {
+    "calls": 1,
+    "deadlineMs": 400
+  }
+}

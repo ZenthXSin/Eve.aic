@@ -1,0 +1,7 @@
+{
+  "name": "lifecycle",
+  "version": "1.0.0",
+  "provides": {
+    "lifecycle": "1.0.0"
+  }
+}

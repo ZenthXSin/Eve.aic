@@ -1,0 +1,5 @@
+{
+  "name": "model-mock",
+  "version": "1.0.0",
+  "provides": { "model": "1.0.0" }
+}

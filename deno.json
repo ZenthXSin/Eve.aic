@@ -1,0 +1,29 @@
+{
+  "unstable": [
+    "worker-options"
+  ],
+  "tasks": {
+    "test": "deno test --allow-read --allow-write --allow-run --allow-env tests/",
+    "check": "deno check kernel/ sdk/ contracts/ plugins/ demo/ tests/*.ts",
+    "demo": "deno run --allow-read --allow-write --allow-run --allow-env demo/run.ts"
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "include": [
+      "kernel/",
+      "sdk/",
+      "contracts/",
+      "plugins/",
+      "tests/",
+      "demo/"
+    ]
+  },
+  "lint": {
+    "exclude": [
+      "tests/fixtures/counter-v2-typeerror/"
+    ]
+  },
+  "exclude": [
+    "data/"
+  ]
+}
