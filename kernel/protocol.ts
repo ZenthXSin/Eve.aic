@@ -44,6 +44,8 @@ export interface Permissions {
   read?: string[];
   /** 允许写入的绝对路径，默认无。 */
   write?: string[];
+  /** 明确授予可执行文件；脚本类型检查需要指定的 Deno，不授予任意 shell。 */
+  run?: string[];
 }
 
 export interface Deadlines {

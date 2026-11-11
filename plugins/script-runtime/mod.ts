@@ -1,0 +1,97 @@
+import type { ScriptRequest } from "../../contracts/script.ts";
+import { SCRIPTS } from "../../contracts/script.ts";
+import { type ToolCall, type ToolResult, TOOLS, type ToolSpec } from "../../contracts/tools.ts";
+import { definePlugin, type Json } from "../../sdk/plugin.ts";
+import { type ScriptConfig, ScriptRuntime } from "./runtime.ts";
+
+export const SCRIPT_TOOL: ToolSpec = {
+  name: "execute_script",
+  description:
+    "执行一份 TypeScript 脚本；使用 tools 的类型接口调用能力。默认异步返回任务编号，可选择同步等待；每个具体动作独立保存真实回执。脚本正文可 await 或 return。",
+  parameters: {
+    type: "object",
+    properties: {
+      code: { type: "string" },
+      mode: { type: "string", enum: ["async", "sync"] },
+      timeoutMs: { type: "integer", minimum: 1 },
+    },
+    required: ["code"],
+    additionalProperties: false,
+  },
+};
+export async function readScriptConfig(path: string): Promise<ScriptConfig> {
+  const value = JSON.parse(await Deno.readTextFile(path)).scripts;
+  if (
+    !value ||
+    [value.directory, value.denoBinary, value.cacheDirectory].some((v) =>
+      typeof v !== "string" || !v.startsWith("/")
+    ) ||
+    !Number.isSafeInteger(value.defaultTimeoutMs) || value.defaultTimeoutMs < 1
+  ) {
+    throw new Error("脚本配置需要绝对目录、Deno路径与有效期限");
+  }
+  return {
+    directory: value.directory,
+    denoBinary: value.denoBinary,
+    cacheDirectory: value.cacheDirectory,
+    defaultTimeoutMs: value.defaultTimeoutMs,
+  };
+}
+export function createScriptPlugin(configPath: string) {
+  let runtime: ScriptRuntime | undefined;
+  return definePlugin({
+    load(ctx) {
+      const current = () => {
+        if (!runtime) throw new Error("脚本运行时未启用");
+        return runtime;
+      };
+      ctx.provide(SCRIPTS, {
+        start: (args) =>
+          current().start(args as unknown as ScriptRequest) as unknown as Promise<Json>,
+        status: (args) => current().status(args as { jobId: string }) as unknown as Json,
+        cancel: (args) => current().cancel(args as { jobId: string }) as unknown as Promise<Json>,
+        result: (args) =>
+          current().result(
+            args as { jobId: string; startChar?: number; limit?: number },
+          ) as unknown as Json,
+        completions: (args) =>
+          current().completions((args ?? {}) as { afterSeq?: number }) as unknown as Json,
+        receipts: (args) =>
+          current().receipts(args as { jobId: string; afterSeq?: number }) as unknown as Json,
+        receipt: (args) =>
+          current().receipt(
+            args as {
+              jobId: string;
+              seq: number;
+              section: "args" | "result" | "error";
+              startChar?: number;
+              limit?: number;
+            },
+          ) as unknown as Json,
+      });
+      ctx.provide(TOOLS, {
+        list: () => [SCRIPT_TOOL] as unknown as Json,
+        execute: async (args) => {
+          const call = args as unknown as ToolCall;
+          if (call?.name !== "execute_script") {
+            return {
+              status: "failed",
+              output: "当前只有 execute_script",
+            } as ToolResult as unknown as Json;
+          }
+          const data = call.args as unknown as Omit<ScriptRequest, "requestId">;
+          const result = await current().start({ ...data, requestId: call.id });
+          return { status: "completed", output: JSON.stringify(result) };
+        },
+      });
+    },
+    async enable(ctx) {
+      runtime = new ScriptRuntime(ctx, await readScriptConfig(configPath));
+      ctx.onDisable(() => runtime?.close());
+      await runtime.initialize();
+    },
+    health() {
+      if (!runtime?.healthy) throw new Error("脚本运行时不可用");
+    },
+  });
+}

@@ -82,6 +82,7 @@ export function parseManifest(raw: unknown, path: string): Manifest {
       net: stringList(permissions.net, path, "permissions.net"),
       read: stringList(permissions.read, path, "permissions.read"),
       write: stringList(permissions.write, path, "permissions.write"),
+      run: stringList(permissions.run, path, "permissions.run"),
     },
     deadlines,
     confirm,

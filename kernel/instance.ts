@@ -56,7 +56,7 @@ export class Instance {
           write: list(permissions.write),
           net: list(permissions.net),
           env: false,
-          run: false,
+          run: list(permissions.run),
           ffi: false,
           sys: false,
         },
