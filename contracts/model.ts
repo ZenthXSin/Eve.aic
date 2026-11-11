@@ -19,6 +19,8 @@ export interface Message {
 export interface ToolSpec {
   name: string;
   description: string;
+  /** 真实工具参数的 JSON Schema；联网模型发送函数定义时必须具备。 */
+  parameters?: { [key: string]: Json };
 }
 
 export interface ModelRequest {
@@ -29,4 +31,12 @@ export interface ModelRequest {
 export interface ModelResponse {
   content: string;
   toolCalls: ToolCall[];
+  /** 不存在的用量字段保持未知，尤其不能把缺失缓存统计写成 0。 */
+  usage?: {
+    status: "reported" | "partial" | "invalid";
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+    totalTokens?: number;
+  };
 }

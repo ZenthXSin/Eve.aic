@@ -5,7 +5,7 @@
   "tasks": {
     "test": "deno test --allow-read --allow-write --allow-run --allow-env --allow-net=127.0.0.1 tests/",
     "test:qq": "deno test --allow-net=127.0.0.1 tests/qq_client_test.ts",
-    "check": "deno check kernel/ sdk/ contracts/ plugins/ adapters/ demo/ tests/*.ts",
+    "check": "deno check kernel/ sdk/ contracts/ plugins/ adapters/ composition/ demo/ tests/*.ts",
     "demo": "deno run --allow-read --allow-write --allow-run --allow-env demo/run.ts"
   },
   "fmt": {
@@ -17,6 +17,7 @@
       "plugins/",
       "prompts/",
       "adapters/",
+      "composition/",
       "tests/",
       "demo/"
     ]
