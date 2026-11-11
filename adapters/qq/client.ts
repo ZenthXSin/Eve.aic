@@ -52,6 +52,12 @@ export interface QqSendText {
   wakeup?: boolean;
 }
 
+/** 鉴权动作只把凭据写入适配器自己的连接，不返回 token 给外部调用方。 */
+export interface QqGatewayConnection {
+  socket: WebSocket;
+  authenticate(intents: number, resume?: { sessionId: string; sequence: number }): void;
+}
+
 export type QqSendResult =
   | {
     status: "sent";
@@ -201,6 +207,7 @@ export class QqClient {
   #token?: { value: string; expiresAt: number };
   #refresh?: Promise<string>;
   #scope: "all" | "private";
+  #closed = new AbortController();
 
   constructor(credentials: QqCredentials, options: QqClientOptions = {}) {
     if (!nonempty(credentials.appId) || !nonempty(credentials.appSecret)) requestError();
@@ -231,7 +238,7 @@ export class QqClient {
       const response = await fetch(new URL(path, this.#base), {
         ...init,
         redirect: "manual",
-        signal: AbortSignal.timeout(this.#timeout),
+        signal: AbortSignal.any([this.#closed.signal, AbortSignal.timeout(this.#timeout)]),
       });
       const data = await readObject(response, this.#limit);
       return {
@@ -282,6 +289,65 @@ export class QqClient {
   /** 凭证留在适配器内存；公开接口不返回 access_token。 */
   async authenticate(): Promise<void> {
     await this.#accessToken();
+  }
+
+  close(): void {
+    this.#closed.abort();
+  }
+
+  /** 获取官方接入点并创建连接；Hello 到达后由网关处理器调用鉴权。 */
+  async openGateway(): Promise<QqGatewayConnection> {
+    const token = await this.#accessToken();
+    const response = await this.#request("/gateway/bot", {
+      headers: { Authorization: `QQBot ${token}` },
+    });
+    const code = codeOf(response.data);
+    if (response.httpStatus !== 200 || (code !== undefined && code !== 0)) {
+      throw new QqRequestError(errorInfo(response, code));
+    }
+    let url: URL;
+    try {
+      url = new URL(String(response.data.url));
+    } catch {
+      throw new QqRequestError({ category: "invalid_response" });
+    }
+    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+    // 当前官方 HTTPS 响应仍可能返回旧的 api.sgroup.qq.com 网关；只允许明确列出的官方主机。
+    const trustedHost = url.hostname === this.#base.hostname ||
+      (this.#base.hostname === "api.bot.qq.com" && url.hostname === "api.sgroup.qq.com");
+    if (
+      url.username || url.password || url.hash || !trustedHost ||
+      (url.protocol !== "wss:" &&
+        !(url.protocol === "ws:" && loopback && this.#base.protocol === "http:"))
+    ) throw new QqRequestError({ category: "invalid_response" });
+    const starts = response.data.session_start_limit;
+    if (object(starts) && starts.remaining === 0) {
+      throw new QqRequestError({ category: "rate_limit", httpStatus: response.httpStatus });
+    }
+    const socket = new WebSocket(url.href);
+    return {
+      socket,
+      authenticate: (intents, resume) => {
+        if (!Number.isSafeInteger(intents) || intents < 0) requestError();
+        if (
+          resume &&
+          (!nonempty(resume.sessionId) || !Number.isSafeInteger(resume.sequence) ||
+            resume.sequence < 0)
+        ) {
+          requestError();
+        }
+        socket.send(
+          JSON.stringify(
+            resume
+              ? {
+                op: 6,
+                d: { token: `QQBot ${token}`, session_id: resume.sessionId, seq: resume.sequence },
+              }
+              : { op: 2, d: { token: `QQBot ${token}`, intents, shard: [0, 1] } },
+          ),
+        );
+      },
+    };
   }
 
   async #accessToken(): Promise<string> {

@@ -42,7 +42,7 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-async function writeAtomic(path: string, data: unknown): Promise<void> {
+export async function writeAtomic(path: string, data: unknown): Promise<void> {
   const temporary = `${path}.${crypto.randomUUID()}.tmp`;
   const file = await Deno.open(temporary, { createNew: true, write: true, mode: 0o600 });
   try {
