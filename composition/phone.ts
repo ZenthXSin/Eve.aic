@@ -23,6 +23,7 @@ export async function composePhonePlugin(directory: string, configPath: string):
           read: [
             configPath,
             config.adapterKeyFile,
+            ...(config.ownershipProofFile ? [config.ownershipProofFile] : []),
             new URL("../plugins/phone/", import.meta.url).pathname,
           ],
         },

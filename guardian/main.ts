@@ -1,0 +1,50 @@
+import { writeDurableJson } from "../sdk/durable-json.ts";
+import { OwnershipAuthority } from "./ownership.ts";
+import { startOwnershipRpc } from "./rpc.ts";
+
+/** 独立令牌仲裁入口，不调用模型，也不直接触发QQ或业务动作。 */
+export async function runOwnershipService(configPath: string) {
+  const config = JSON.parse(await Deno.readTextFile(configPath)).ownership;
+  if (
+    !config ||
+    [config.directory, config.adminKeyFile, config.exitKeyFile].some((path) =>
+      typeof path !== "string" || !path.startsWith("/")
+    )
+  ) throw new Error("守护使用独立私有绝对路径");
+  const authority = new OwnershipAuthority(config.directory, config.leaseMs);
+  await authority.initialize();
+  let rpc: ReturnType<typeof startOwnershipRpc> | undefined;
+  let resolve!: () => void;
+  const done = new Promise<void>((finish) => {
+    resolve = finish;
+  });
+  const stop = () => resolve();
+  let listening = false;
+  try {
+    rpc = startOwnershipRpc(
+      authority,
+      (await Deno.readTextFile(config.adminKeyFile)).trim(),
+      (await Deno.readTextFile(config.exitKeyFile)).trim(),
+    );
+    await writeDurableJson(`${config.directory}/connection.json`, { url: rpc.url });
+    Deno.addSignalListener("SIGINT", stop);
+    Deno.addSignalListener("SIGTERM", stop);
+    listening = true;
+    console.log(JSON.stringify({ ownership: "ready", epoch: authority.status().epoch }));
+    await done;
+  } finally {
+    if (listening) {
+      Deno.removeSignalListener("SIGINT", stop);
+      Deno.removeSignalListener("SIGTERM", stop);
+    }
+    try {
+      await rpc?.close();
+    } finally {
+      await authority.close();
+    }
+  }
+}
+if (import.meta.main) {
+  if (Deno.args.length !== 1) throw new Error("参数：守护私有配置路径");
+  await runOwnershipService(Deno.args[0]);
+}

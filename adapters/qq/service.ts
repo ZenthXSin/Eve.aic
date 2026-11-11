@@ -4,6 +4,10 @@ import { QqPhone } from "./phone.ts";
 import { QqReceiver, type QqReceiverStatus } from "./receiver.ts";
 import { startPhoneRpc } from "./rpc.ts";
 import { QqTimeline } from "./timeline.ts";
+import type { OwnershipFence } from "../../sdk/ownership-fence.ts";
+import { fingerprint } from "../../kernel/calls.ts";
+import { phoneReceipt } from "./phone.ts";
+import type { Json } from "../../kernel/protocol.ts";
 
 /** 一份适配器进程的生命周期，模型和手机插件不在此进程运行。 */
 export async function startQqPhoneAdapter(
@@ -11,6 +15,7 @@ export async function startQqPhoneAdapter(
   directory: string,
   key: string,
   onStatus?: (status: QqReceiverStatus) => void,
+  fence?: OwnershipFence,
 ) {
   const controller = new AbortController();
   const actions = new QqSendActions(client, `${directory}/outbox`);
@@ -27,6 +32,15 @@ export async function startQqPhoneAdapter(
   try {
     await actions.initialize();
     await timeline.initialize();
+    // 只有原发送账本的真实记录可补结算；无证据的 admitted 读取仍保持待核对。
+    await fence?.reconcile(async (permit) => {
+      const saved = actions.status(permit.actionId);
+      if (!saved || saved.status === "running") return undefined;
+      return {
+        outcome: saved.status === "unknown" ? "unknown" : "completed",
+        resultHash: await fingerprint(phoneReceipt(saved) as unknown as Json),
+      };
+    });
     const self = await client.botIdentity();
     receive = receiver.run(controller.signal, (event) => {
       status = event;
@@ -56,6 +70,7 @@ export async function startQqPhoneAdapter(
         gateway: status,
         replyScope: "private",
       }),
+      fence,
     );
     let closing: Promise<void> | undefined;
     return {
@@ -71,6 +86,7 @@ export async function startQqPhoneAdapter(
             const task of [
               () => rpc!.close(),
               () => receive!,
+              () => fence?.close(),
               () => actions.close(),
               () => timeline.close(),
             ]
@@ -92,6 +108,7 @@ export async function startQqPhoneAdapter(
     controller.abort();
     client.close();
     await Promise.allSettled([rpc?.close(), receive]);
+    await fence?.close().catch(() => {});
     await actions.close().catch(() => {});
     await timeline.close().catch(() => {});
     throw error;

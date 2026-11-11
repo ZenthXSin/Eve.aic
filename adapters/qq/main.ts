@@ -2,6 +2,7 @@
 import { readQqTestClient } from "../../composition/qq.ts";
 import { writeAtomic } from "./journal.ts";
 import { startQqPhoneAdapter } from "./service.ts";
+import { readQqOwnershipFence } from "../../composition/ownership.ts";
 
 export async function runQqAdapter(configPath: string, directory: string): Promise<void> {
   if (!configPath.startsWith("/") || !directory.startsWith("/")) {
@@ -22,12 +23,15 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     ).join("");
     await Deno.writeTextFile(keyFile, key + "\n", { createNew: true, mode: 0o600 });
   }
+  const client = await readQqTestClient(configPath);
+  const fence = await readQqOwnershipFence(configPath, directory);
   const adapter = await startQqPhoneAdapter(
-    await readQqTestClient(configPath),
+    client,
     directory,
     key,
     (status) =>
       console.log(JSON.stringify({ adapter: "qq", gateway: status.status, code: status.code })),
+    fence,
   );
   const stop = () => {
     void adapter.close().catch(() => {});

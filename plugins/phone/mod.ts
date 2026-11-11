@@ -2,18 +2,24 @@ import { PHONE } from "../../contracts/phone.ts";
 import { PHONE_METHODS } from "../../contracts/phone-rpc.ts";
 import { definePlugin, type Json } from "../../sdk/plugin.ts";
 import { PhoneRpcClient } from "./client.ts";
+import type { OwnershipProof } from "../../contracts/ownership.ts";
 
 export interface PhoneConfig {
   adapterUrl: string;
   adapterKeyFile: string;
   /** 未配置时所有入站身份均为 other，绝不取第一条私信认定主人。 */
   ownerPlatformUserId?: string;
+  /** 每个实例独立，由组合层写入；手机 worker 不读取守护控制/出口密钥。 */
+  ownershipProofFile?: string;
 }
 export async function readPhoneConfig(path: string): Promise<PhoneConfig> {
   const value = JSON.parse(await Deno.readTextFile(path)).phone;
   if (
     !value || typeof value.adapterUrl !== "string" ||
     typeof value.adapterKeyFile !== "string" || !value.adapterKeyFile.startsWith("/") ||
+    (value.ownershipProofFile !== undefined &&
+      (typeof value.ownershipProofFile !== "string" ||
+        !value.ownershipProofFile.startsWith("/"))) ||
     (value.ownerPlatformUserId !== undefined &&
       (typeof value.ownerPlatformUserId !== "string" || value.ownerPlatformUserId.length === 0 ||
         value.ownerPlatformUserId.length > 512))
@@ -21,6 +27,9 @@ export async function readPhoneConfig(path: string): Promise<PhoneConfig> {
   return {
     adapterUrl: value.adapterUrl,
     adapterKeyFile: value.adapterKeyFile,
+    ...(value.ownershipProofFile === undefined
+      ? {}
+      : { ownershipProofFile: value.ownershipProofFile }),
     ...(value.ownerPlatformUserId === undefined ? {} : {
       ownerPlatformUserId: value.ownerPlatformUserId,
     }),
@@ -78,6 +87,11 @@ export function createPhonePlugin(configPath: string) {
       client = new PhoneRpcClient(
         config.adapterUrl,
         (await Deno.readTextFile(config.adapterKeyFile)).trim(),
+        120_000,
+        config.ownershipProofFile
+          ? async () =>
+            JSON.parse(await Deno.readTextFile(config.ownershipProofFile!)) as OwnershipProof
+          : undefined,
       );
       ownerId = config.ownerPlatformUserId;
       ctx.onDisable(() => client?.close());

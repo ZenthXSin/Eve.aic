@@ -4,11 +4,14 @@ import type { PhoneMethod, PhoneRpcResponse } from "../../contracts/phone-rpc.ts
 import { QqActionError } from "./actions.ts";
 import { QqPhone, QqPhoneError } from "./phone.ts";
 import { QqTimelineError } from "./timeline.ts";
+import { KernelError } from "../../kernel/protocol.ts";
+import type { OwnershipFence } from "../../sdk/ownership-fence.ts";
 
 export function startPhoneRpc(
   phone: QqPhone,
   key: string,
   health: () => unknown = () => ({ available: true }),
+  fence?: OwnershipFence,
 ) {
   if (!/^[a-zA-Z0-9_-]{32,256}$/.test(key)) throw new TypeError("手机连接密钥格式不正确");
   const authorization = `Bearer ${key}`;
@@ -48,7 +51,17 @@ export function startPhoneRpc(
       if (data === null || typeof data !== "object" || Array.isArray(data)) {
         throw new QqPhoneError("request");
       }
-      if (data.method === "health") return Response.json({ ok: true, value: health() });
+      if (data.method === "health") {
+        const reported = health();
+        const value = fence && reported && typeof reported === "object"
+          ? {
+            ...reported,
+            available: (reported as { available?: boolean }).available === true && fence.available,
+            ownershipFenced: true,
+          }
+          : reported;
+        return Response.json({ ok: true, value });
+      }
       if (!PHONE_METHODS.includes(data.method)) throw new QqPhoneError("request");
       const args = data.args ?? {};
       if (typeof args !== "object" || args === null || Array.isArray(args)) {
@@ -56,11 +69,44 @@ export function startPhoneRpc(
       }
       const method = data.method as PhoneMethod;
       // 仅固定契约方法可达，不允许取构造器、内部全量原件或任意成员。
-      const value = await (phone[method] as (args: never) => unknown).call(phone, args as never);
+      const invoke = async () => {
+        try {
+          return await (phone[method] as (args: never) => unknown).call(phone, args as never);
+        } catch (error) {
+          if (
+            (error instanceof QqPhoneError || error instanceof QqActionError ||
+              error instanceof QqTimelineError) &&
+            ["storage", "corrupt", "unknown"].includes(error.category)
+          ) {
+            throw new KernelError(
+              error.category as "storage" | "corrupt" | "unknown",
+              "手机执行未确认，原件保留",
+            );
+          }
+          throw error;
+        }
+      };
+      let value: unknown;
+      if (fence) {
+        if (
+          !data.ownership || typeof data.ownership.actionId !== "string" ||
+          !/^[a-zA-Z0-9_-]{1,128}$/.test(data.ownership.actionId) ||
+          (method === "send" && data.ownership.actionId !== args.actionId)
+        ) throw new QqPhoneError("request");
+        // 包括读取与游标更新；旧实例不能继续消费入站消息。号码不交给 QqPhone 业务层。
+        value = await fence.run(
+          data.ownership.proof,
+          data.ownership.actionId,
+          { method, args },
+          invoke as () => Promise<import("../../kernel/protocol.ts").Json>,
+        );
+      } else value = await invoke();
       return Response.json({ ok: true, value });
     } catch (error) {
-      const category = error instanceof QqPhoneError || error instanceof QqActionError ||
-          error instanceof QqTimelineError
+      const category = error instanceof KernelError
+        ? (error.kind === "rejected" ? "request" : error.kind)
+        : error instanceof QqPhoneError || error instanceof QqActionError ||
+            error instanceof QqTimelineError
         ? error.category
         : error instanceof SyntaxError || error instanceof TypeError
         ? "request"

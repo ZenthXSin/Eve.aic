@@ -1,6 +1,7 @@
 import type { Json } from "../../kernel/protocol.ts";
 import type { PhoneMethod, PhoneRpcResponse } from "../../contracts/phone-rpc.ts";
 import { KernelError } from "../../sdk/plugin.ts";
+import type { OwnershipProof } from "../../contracts/ownership.ts";
 
 export class PhoneRpcError extends KernelError {
   constructor(readonly category: string) {
@@ -26,7 +27,12 @@ export class PhoneRpcError extends KernelError {
 
 export class PhoneRpcClient {
   #controller = new AbortController();
-  constructor(readonly url: string, readonly key: string, readonly timeoutMs = 120_000) {
+  constructor(
+    readonly url: string,
+    readonly key: string,
+    readonly timeoutMs = 120_000,
+    readonly ownershipProof?: () => Promise<OwnershipProof>,
+  ) {
     const parsed = new URL(url);
     if (
       parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" ||
@@ -37,12 +43,22 @@ export class PhoneRpcClient {
   }
 
   async call(method: PhoneMethod | "health", args: Json = {}): Promise<Json> {
+    const captured = structuredClone(args);
+    const proof = method === "health" ? undefined : await this.ownershipProof?.();
+    const actionId =
+      method === "send" && captured && typeof captured === "object" && !Array.isArray(captured)
+        ? captured.actionId
+        : `read_${crypto.randomUUID()}`;
     const signal = AbortSignal.any([this.#controller.signal, AbortSignal.timeout(this.timeoutMs)]);
     try {
       const response = await fetch(this.url, {
         method: "POST",
         headers: { authorization: `Bearer ${this.key}`, "content-type": "application/json" },
-        body: JSON.stringify({ method, args }),
+        body: JSON.stringify({
+          method,
+          args: captured,
+          ...(proof ? { ownership: { proof, actionId } } : {}),
+        }),
         redirect: "error",
         signal,
       });
