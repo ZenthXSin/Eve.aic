@@ -84,6 +84,69 @@ async function lock(path: string, locks: Deno.FsFile[]) {
   locks.push(file);
   if (!await file.tryLock(true)) fail("原件仍被运行实例持有");
 }
+
+/** 回退仍保留已发生的动作：先封存目标旧账本，再接入完整的最新原件。 */
+async function archiveRollbackTargets(paths: Roots, actionId: string, digest: string) {
+  const suffix = createHash("sha256").update(actionId).digest("hex");
+  const receiptPath = `${paths.scripts}.rollback-${suffix}.json`;
+  const marker = { schema: 1, actionId, digest, paths };
+  try {
+    const stat = await Deno.lstat(receiptPath);
+    if (!stat.isFile || stat.isSymlink || stat.size > 65536) fail("回退记录异常");
+    const prior = JSON.parse(await Deno.readTextFile(receiptPath));
+    if (JSON.stringify(prior) !== JSON.stringify(marker)) fail("同一回退编号不能更改原件");
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+    await writeDurableJson(receiptPath, marker);
+  }
+  const locks: Deno.FsFile[] = [];
+  try {
+    // 两个目标及嵌套账本都先取锁；任何一个仍在运行都不能开始封存。
+    for (const path of Object.values(paths)) {
+      await directory(path, true);
+      const visit = async (root: string) => {
+        for await (const entry of Deno.readDir(root)) {
+          if (entry.isSymlink || (!entry.isFile && !entry.isDirectory)) fail("旧账本含非普通原件");
+          if (entry.name === "writer.lock" && root !== path) {
+            await lock(`${root}/writer.lock`, locks);
+          }
+          if (entry.isDirectory) await visit(`${root}/${entry.name}`);
+        }
+      };
+      await lock(`${path}/writer.lock`, locks);
+      await visit(path);
+    }
+    for (const path of Object.values(paths)) {
+      const archive = `${path}.before-rollback-${suffix}`;
+      let archived = false;
+      try {
+        await Deno.lstat(archive);
+        await directory(archive);
+        archived = true;
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      if (archived) continue; // 上次已封存；不要把本次接入的新账本再次移走。
+      const sidecar = `${path}.handover.json`;
+      try {
+        const stat = await Deno.lstat(sidecar);
+        if (!stat.isFile || stat.isSymlink) fail("旧交接回执异常");
+        await Deno.rename(sidecar, `${archive}.handover.json`);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      await Deno.rename(path, archive);
+      const parent = await Deno.open(path.slice(0, path.lastIndexOf("/")), { read: true });
+      try {
+        await parent.sync();
+      } finally {
+        parent.close();
+      }
+    }
+  } finally {
+    for (const file of locks.reverse()) file.close();
+  }
+}
 async function* lines(input: ReadableStream<Uint8Array>) {
   let pending = "", total = 0;
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -204,6 +267,7 @@ export async function importSnapshot(
   configPath: string,
   actionId: string,
   input: ReadableStream<Uint8Array>,
+  restore = false,
 ) {
   if (!actionId || actionId.length > 512) fail("编号无效");
   const paths = await roots(configPath);
@@ -290,7 +354,7 @@ export async function importSnapshot(
         if (
           current || seen.size < 2 || !seen.has("mind/index.json") ||
           !seen.has("scripts/index.json") ||
-          value.digest !== manifestHash.digest("hex")
+          value.digest !== manifestHash.copy().digest("hex")
         ) fail("交接清单不完整");
         ended = true;
       } else fail("未知协议记录");
@@ -307,6 +371,9 @@ export async function importSnapshot(
       }
     };
     await check(staging);
+    if (restore) {
+      await archiveRollbackTargets(paths, actionId, String(manifestHash.copy().digest("hex")));
+    }
     const receipt = {
       actionId,
       mind: await handoverMind(`${staging}/mind`, paths.mind, actionId),
@@ -325,8 +392,8 @@ export async function importSnapshot(
 if (import.meta.main) {
   const [config, mode, actionId] = Deno.args;
   try {
-    if (!config || !actionId || !["export", "import"].includes(mode)) {
-      fail("用法 CONFIG export|import ACTION_ID");
+    if (!config || !actionId || !["export", "import", "restore"].includes(mode)) {
+      fail("用法 CONFIG export|import|restore ACTION_ID");
     }
     if (mode === "export") {
       await exportSnapshot(
@@ -334,7 +401,13 @@ if (import.meta.main) {
         actionId,
         (line) => writeAll(Deno.stdout, new TextEncoder().encode(line)),
       );
-    } else console.log(JSON.stringify(await importSnapshot(config, actionId, Deno.stdin.readable)));
+    } else {
+      console.log(
+        JSON.stringify(
+          await importSnapshot(config, actionId, Deno.stdin.readable, mode === "restore"),
+        ),
+      );
+    }
   } catch (error) {
     console.error(error instanceof Error ? error.message : "交接失败");
     Deno.exit(1);

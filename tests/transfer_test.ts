@@ -143,3 +143,110 @@ Deno.test("隔离交接协议：拒绝活账本、符号链接、路径穿越、
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("回退交接：保留旧账本，接回新增完成与未知动作；截断和重复调用不丢原件", async () => {
+  const { directory, oldConfig, candidateConfig } = await fixture();
+  let store = new ScriptStore(`${directory}/old/scripts/ledger`);
+  try {
+    await store.initialize();
+    await store.change((state) => {
+      state.completions.push({
+        seq: 1,
+        job: {
+          jobId: "old",
+          status: "completed",
+          scriptStarted: true,
+          actions: 0,
+          startedAt: "2026-11-12T00:00:00Z",
+        },
+      });
+    });
+    await store.close();
+    const mind = { schema: 1, events: [], alarms: [], facts: null };
+    await Deno.writeTextFile(`${directory}/old/mind/index.json`, JSON.stringify(mind));
+    const forward: string[] = [];
+    await exportSnapshot(oldConfig, "forward", (line) => {
+      forward.push(line);
+      return Promise.resolve();
+    });
+    await importSnapshot(candidateConfig, "forward", input(forward));
+    store = new ScriptStore(`${directory}/candidate/scripts/ledger`);
+    await store.initialize();
+    await store.change((state) => {
+      state.jobs.push({
+        jobId: "unknown",
+        fingerprint: "unknown",
+        request: { requestId: "unknown", code: "return 1" },
+        status: "unknown",
+        scriptStarted: true,
+        startedAt: "2026-11-12T00:00:00Z",
+        actions: [{
+          seq: 1,
+          actionId: "already-sent",
+          namespace: "phone",
+          method: "send",
+          args: {},
+          status: "unknown",
+          startedAt: "2026-11-12T00:00:00Z",
+        }],
+      });
+      state.completions.push({
+        seq: 2,
+        job: {
+          jobId: "unknown",
+          status: "unknown",
+          scriptStarted: true,
+          actions: 1,
+          startedAt: "2026-11-12T00:00:00Z",
+        },
+      });
+    });
+    const expected = JSON.parse(JSON.stringify(store.state));
+    await store.close();
+    const latestMind = {
+      ...mind,
+      events: [{
+        seq: 1,
+        kind: "rest",
+        requestId: "new-rest",
+        args: {},
+        at: "2026-11-12T00:00:00Z",
+      }],
+    };
+    await Deno.writeTextFile(`${directory}/candidate/mind/index.json`, JSON.stringify(latestMind));
+    const reverse: string[] = [];
+    await exportSnapshot(candidateConfig, "rollback", (line) => {
+      reverse.push(line);
+      return Promise.resolve();
+    });
+    await assert.rejects(importSnapshot(oldConfig, "rollback", input(reverse.slice(0, -1)), true));
+    assert.deepEqual(JSON.parse(await Deno.readTextFile(`${directory}/old/mind/index.json`)), mind);
+    // 持有任一目标账本锁时，两份原件都不允许开始替换。
+    store = new ScriptStore(`${directory}/old/scripts/ledger`);
+    await store.initialize();
+    await assert.rejects(importSnapshot(oldConfig, "rollback", input(reverse), true));
+    assert.deepEqual(JSON.parse(await Deno.readTextFile(`${directory}/old/mind/index.json`)), mind);
+    await store.close();
+    const receipt = await importSnapshot(oldConfig, "rollback", input(reverse), true);
+    assert.deepEqual(await importSnapshot(oldConfig, "rollback", input(reverse), true), receipt);
+    assert.deepEqual(
+      JSON.parse(await Deno.readTextFile(`${directory}/old/mind/index.json`)),
+      latestMind,
+    );
+    const archives = [...Deno.readDirSync(`${directory}/old`)].filter((e) =>
+      e.isDirectory && e.name.startsWith("mind.before-rollback-")
+    );
+    assert.equal(archives.length, 1);
+    assert.deepEqual(
+      JSON.parse(await Deno.readTextFile(`${directory}/old/${archives[0].name}/index.json`)),
+      mind,
+    );
+    store = new ScriptStore(`${directory}/old/scripts/ledger`);
+    await store.initialize();
+    assert.deepEqual(JSON.parse(JSON.stringify(store.state)), expected);
+    assert.equal(store.state.jobs[0].actions[0].status, "unknown");
+  } finally {
+    await store.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});

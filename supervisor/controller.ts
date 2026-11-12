@@ -36,7 +36,12 @@ export interface InstanceDriver {
   call<T = Json>(instance: InstanceSpec, method: string, args?: Json): Promise<T>;
   proof(instance: InstanceSpec, proof: OwnershipProof): Promise<void>;
   terminate(instance: InstanceSpec): Promise<void>;
-  handover?(old: InstanceSpec, candidate: InstanceSpec, actionId: string): Promise<void>;
+  handover?(
+    old: InstanceSpec,
+    candidate: InstanceSpec,
+    actionId: string,
+    mode?: "forward" | "rollback",
+  ): Promise<void>;
 }
 export interface GuardianControl {
   status(): Promise<OwnershipSnapshot>;
@@ -83,6 +88,7 @@ interface Upgrade {
   deadline: number;
   afterSeq: number;
   candidateGranted?: boolean;
+  rollbackHandoverDone?: boolean;
   rollbackMarker?: {
     upgradeId: string;
     sourceCommit: string;
@@ -132,6 +138,7 @@ export class Supervisor {
   };
   #tail: Promise<unknown> = Promise.resolve();
   #closed = false;
+  #channelFailures = new Map<string, { kind: string; since: number }>();
   constructor(
     readonly options: {
       directory: string;
@@ -244,6 +251,15 @@ export class Supervisor {
   }
   async #status(instance: InstanceSpec, active = false) {
     const status = await this.options.driver.call<InstanceStatus>(instance, "status");
+    const channelError = (status.eve as Record<string, Json> | undefined)?.lastError;
+    if (active && typeof channelError === "string") {
+      const previous = this.#channelFailures.get(instance.id);
+      if (!previous || previous.kind !== channelError) {
+        this.#channelFailures.set(instance.id, { kind: channelError, since: this.now() });
+      } else if (this.now() - previous.since >= 30_000) {
+        throw new KernelError("unavailable", "意识流依赖持续失败超过30秒，不能视为健康");
+      }
+    } else this.#channelFailures.delete(instance.id);
     if (
       status.instanceId !== instance.id || status.sourceCommit !== instance.source.commit ||
       status.error ||
@@ -421,6 +437,7 @@ export class Supervisor {
           afterSeq: await this.options.backend.watermark(),
           step: 0,
           reason: "active_or_lease_lost",
+          candidateGranted: true,
         };
         await this.#save();
       }
@@ -688,6 +705,20 @@ export class Supervisor {
       await this.#save();
     }
   }
+  async #restoreContinuity(u: Upgrade, old: InstanceSpec, candidate: InstanceSpec) {
+    if (!u.candidateGranted || u.rollbackHandoverDone) return;
+    await this.options.driver.ensure(old);
+    try {
+      await this.options.driver.call(old, "deactivate");
+    } catch {
+      await this.options.driver.terminate(old);
+      await this.options.driver.ensure(old);
+    }
+    // 共享意识日志不会回退，脚本/提醒账本必须一起跟随最新游标；未知动作原样交接。
+    await this.options.driver.handover?.(candidate, old, `${u.id}_rollback_state`, "rollback");
+    u.rollbackHandoverDone = true;
+    await this.#save();
+  }
   async #rollback(u: Upgrade, old: InstanceSpec, candidate: InstanceSpec) {
     try {
       await this.options.driver.call(candidate, "deactivate");
@@ -713,6 +744,7 @@ export class Supervisor {
       await this.#save();
     }
     if (u.rollbackMarker) await this.options.backend.rollback(u.rollbackMarker);
+    await this.#restoreContinuity(u, old, candidate);
     await this.options.driver.ensure(old);
     if (!u.rollbackGrant) {
       u.rollbackGrant = {
@@ -792,6 +824,7 @@ export class Supervisor {
       const instance = this.instance(
         this.#state.upgrade?.old ?? this.#state.current ?? this.#state.initial!,
       );
+      if (u) await this.#restoreContinuity(u, instance, this.instance(u.candidate));
       await this.options.driver.ensure(instance);
       await this.options.backend.quiesce();
       const status = await this.options.guardian.status();

@@ -155,9 +155,15 @@ export class LocalInstanceDriver implements InstanceDriver {
       await Deno.chown(instance.proofFile, 0, instance.identity.gid);
     }
   }
-  async handover(old: InstanceSpec, candidate: InstanceSpec, actionId: string) {
+  async handover(
+    old: InstanceSpec,
+    candidate: InstanceSpec,
+    actionId: string,
+    mode: "forward" | "rollback" = "forward",
+  ) {
     const configs = await Promise.all([old, candidate].map(readTrustedInstanceConfig));
     const helper = new URL("./transfer.ts", import.meta.url).pathname;
+    const restoration = mode === "rollback";
     const spawn = (instance: InstanceSpec, index: number, mode: "export" | "import") => {
       const isolation = this.#isolation(instance.identity);
       const args = [
@@ -169,7 +175,7 @@ export class LocalInstanceDriver implements InstanceDriver {
         "--allow-write",
         helper,
         instance.configFile,
-        mode,
+        mode === "import" && restoration ? "restore" : mode,
         actionId,
       ];
       return new Deno.Command(isolation[0] ?? args[0], {
@@ -236,6 +242,16 @@ export class LocalInstanceDriver implements InstanceDriver {
         }),
       ]);
       if (!result[0].success || !result[1].success) {
+        await Deno.mkdir(this.directory, { recursive: true, mode: 0o700 });
+        await writeDurableJson(`${this.directory}/handover-failure.json`, {
+          at: new Date().toISOString(),
+          actionId,
+          mode,
+          from: old.id,
+          to: candidate.id,
+          exporter: { code: result[0].code, stderr: result[3] },
+          importer: { code: result[1].code, stderr: result[4] },
+        });
         throw new KernelError("rejected", "隔离交接校验失败，原件保留");
       }
       const receipt = JSON.parse(result[5]);

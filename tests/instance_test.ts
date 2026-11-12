@@ -38,7 +38,25 @@ async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}
   });
   if (grant.status !== "granted") throw new Error("not granted");
   const guardian = startOwnershipRpc(authority, keys.admin, keys.exit);
-  await writeDurableJson(`${directory}/guardian.json`, { url: guardian.url });
+  let renewFailures = 0;
+  const guardianProxy = Deno.serve(
+    { hostname: "127.0.0.1", port: 0, onListen() {} },
+    async (request) => {
+      const data = await request.clone().json();
+      if (data.method === "renew" && renewFailures > 0) {
+        renewFailures--;
+        return new Response(null, { status: 503 });
+      }
+      return await fetch(guardian.url, {
+        method: "POST",
+        headers: request.headers,
+        body: await request.text(),
+      });
+    },
+  );
+  await writeDurableJson(`${directory}/guardian.json`, {
+    url: `http://127.0.0.1:${guardianProxy.addr.port}/ownership`,
+  });
   const proof = { instanceId: "fixture", credential: keys.actor, epoch: grant.owner.epoch };
   await writeDurableJson(`${directory}/proof.json`, proof);
   for (const [name, value] of Object.entries(keys)) {
@@ -153,6 +171,9 @@ async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}
     requests,
     raw,
     call,
+    failRenewals(count: number) {
+      renewFailures = count;
+    },
     url: () => instance.url,
     async restart() {
       await instance.close();
@@ -162,6 +183,7 @@ async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}
       await instance.close();
       await runtime.close();
       await phone.shutdown();
+      await guardianProxy.shutdown();
       await guardian.close();
       await authority.close();
       await Deno.remove(directory, { recursive: true });
@@ -442,6 +464,55 @@ Deno.test("固定版本宿主：3387条观察原件以27页读取，保持来源
     assert.equal(events.length, 3387);
     assert.equal(events.at(-1).digest, f.engine.records.events.at(-1)!.digest);
     assert.equal(f.requests.length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("续租：通信未知在有效租约内重试，明确失效仍停用并留下具体诊断", async () => {
+  const f = await fixture({ leaseMs: 3000 });
+  try {
+    await f.call("activate");
+    const before = await f.call("status") as { lease: { lastRenewedAt: number } };
+    f.failRenewals(1);
+    const diagnosticPath = `${f.directory}/instance/lease-failure.json`;
+    await waitFor(async () => {
+      try {
+        return JSON.parse(await Deno.readTextFile(diagnosticPath)).retry === true;
+      } catch (error) {
+        if (error instanceof Deno.errors.NotFound) return false;
+        throw error;
+      }
+    });
+    await waitFor(async () =>
+      (await f.call("status") as { lease: { lastRenewedAt: number } }).lease.lastRenewedAt >
+        before.lease.lastRenewedAt
+    );
+    assert.equal((await f.call("status") as { state: string }).state, "active");
+    await f.authority.pause({ requestId: "real-pause", expectedEpoch: f.authority.status().epoch });
+    await waitFor(async () => (await f.call("status") as { state: string }).state === "lease_lost");
+    const diagnostic = JSON.parse(await Deno.readTextFile(diagnosticPath));
+    assert.equal(diagnostic.retry, false);
+    assert.equal(diagnostic.error.kind, "unavailable");
+    assert.ok(diagnostic.lastRenewedAt > 0);
+    assert.ok(diagnostic.leaseExpiresAt > diagnostic.lastRenewedAt);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("续租：通信持续未知不得越过最后确认的租约期限继续运行", async () => {
+  const f = await fixture({ leaseMs: 1500 });
+  try {
+    await f.call("activate");
+    f.failRenewals(1000);
+    await waitFor(async () => (await f.call("status") as { state: string }).state === "lease_lost");
+    const diagnostic = JSON.parse(
+      await Deno.readTextFile(`${f.directory}/instance/lease-failure.json`),
+    );
+    assert.equal(diagnostic.error.kind, "unknown");
+    assert.equal(diagnostic.retry, false);
+    assert.ok(Date.parse(diagnostic.at) >= diagnostic.leaseExpiresAt);
   } finally {
     await f.close();
   }

@@ -137,6 +137,8 @@ export async function startInstance(configPath: string) {
   const client = new RuntimeClient(config.runtime);
   let kernel: Kernel | undefined, heartbeat: ReturnType<typeof setTimeout> | undefined;
   let state = "standby", lastError: string | null = null, generation = 0, closed = false;
+  let leaseExpiresAt = 0, lastRenewedAt = 0;
+  let leaseDiagnostic: Promise<void> = Promise.resolve();
   let tail: Promise<unknown> = Promise.resolve();
   const serialize = <T>(work: () => Promise<T>): Promise<T> => {
     const next = tail.then(work);
@@ -192,16 +194,42 @@ export async function startInstance(configPath: string) {
       ) {
         throw new KernelError("rejected", "守护续租回执不匹配");
       }
+      leaseExpiresAt = owner.expiresAt;
+      lastRenewedAt = Date.now();
     } finally {
       rpc.close();
     }
   };
-  const scheduleRenew = (current: number) => {
+  const scheduleRenew = (current: number, delay = Math.floor(c.leaseMs / 3)) => {
     heartbeat = setTimeout(() => {
       if (generation !== current) return;
       void renew().then(() => {
         if (generation === current) scheduleRenew(current);
       }, (error) => {
+        if (generation !== current) return;
+        const at = Date.now();
+        const kind = error instanceof KernelError ? error.kind : "unknown";
+        const retry = kind === "unknown" && at < leaseExpiresAt;
+        const diagnostic = {
+          schema: 1,
+          instanceId: c.id,
+          sourceCommit: c.sourceCommit,
+          at: new Date(at).toISOString(),
+          lastRenewedAt,
+          leaseExpiresAt,
+          error: { kind, message: error instanceof KernelError ? error.message : "本机续租失败" },
+          retry,
+        };
+        leaseDiagnostic = leaseDiagnostic.then(() =>
+          writeDurableJson(`${c.directory}/lease-failure.json`, diagnostic)
+        ).catch(() => {
+          console.error("lease diagnostic could not be saved");
+        });
+        // 只在最后确认的有效租约内重试通信未知；明确拒绝或过期仍立即停用。
+        if (retry) {
+          scheduleRenew(current, Math.max(25, Math.min(1000, Math.floor(c.leaseMs / 10))));
+          return;
+        }
         void serialize(async () => {
           if (generation !== current) return;
           lastError = error instanceof KernelError ? error.kind : "unknown";
@@ -212,7 +240,7 @@ export async function startInstance(configPath: string) {
           }
         }).catch(() => {});
       });
-    }, Math.floor(c.leaseMs / 3));
+    }, delay);
   };
   const snapshot = async () => {
     const events: FactEvent[] = [];
@@ -301,6 +329,7 @@ export async function startInstance(configPath: string) {
         sourceCommit: c.sourceCommit,
         instanceId: c.id,
         error: lastError,
+        lease: { lastRenewedAt, expiresAt: leaseExpiresAt },
         stopFailure: stopDiagnostics.last as unknown as Json,
         eve,
         plugins: kernel?.status() as unknown as Json ?? [],
@@ -606,6 +635,7 @@ export async function startInstance(configPath: string) {
             try {
               await server.shutdown();
             } finally {
+              await leaseDiagnostic;
               hostLock.close();
             }
           }

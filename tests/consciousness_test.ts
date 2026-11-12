@@ -215,8 +215,9 @@ const plugin=createChatModelPlugin(${
       await journal.append(qqMessage(raw)!, raw);
     },
     pulse: () => kernel.call("eve", "pulse"),
-    restart: async () => {
+    restart: async (beforeStart?: () => Promise<void>) => {
       assert.deepEqual(await kernel.stop(), []);
+      await beforeStart?.();
       kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 20000 });
       await start();
     },
@@ -512,7 +513,7 @@ Deno.test("意识流：Eve通过真实脚本决定休息，持久提醒到时再
     Response.json(
       index === 1
         ? script(
-          'await tools.mind.remind({at:new Date(Date.now()+200).toISOString(),text:"我想回来接着看"}); return await tools.mind.rest({wakeAt:new Date(Date.now()+60000).toISOString()});',
+          'await tools.mind.remind({at:new Date(Date.now()+60000).toISOString(),text:"我想回来接着看"}); return await tools.mind.rest({wakeAt:new Date(Date.now()+60000).toISOString()});',
         )
         : completion(),
     )
@@ -524,7 +525,13 @@ Deno.test("意识流：Eve通过真实脚本决定休息，持久提醒到时再
     assert.equal(f.messages.length, 1);
     const status = await f.kernel().call<{ wakeAt: number }>("eve", "status");
     assert.ok(status.wakeAt > Date.now());
-    await new Promise((done) => setTimeout(done, 300));
+    // 先停止真实worker，再恢复一条已经到期的提醒；不依赖200毫秒的负载竞态。
+    await f.restart(async () => {
+      const path = `${f.directory}/mind/index.json`;
+      const state = JSON.parse(await Deno.readTextFile(path));
+      state.alarms[0].at = new Date(Date.now() - 1).toISOString();
+      await Deno.writeTextFile(path, JSON.stringify(state));
+    });
     await f.pulse();
     assert.equal(f.messages.length, 2);
     assert.equal(JSON.stringify(f.messages[1]).includes("我想回来接着看"), true);
@@ -893,6 +900,81 @@ Deno.test("意识流：Eve明确选择original时才将真实原图交给主模�
     await f.pulse();
     assert.equal(reads, 1);
     assert.equal(f.messages.length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("原生上下文工具：查询边界、预览、落盘后重启补收据且真实下轮采用摘要", async () => {
+  let boundary = 0;
+  const native = (name: string, args: unknown) =>
+    Response.json({
+      choices: [{
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          content: "",
+          tool_calls: [{
+            id: "upstream",
+            type: "function",
+            function: { name, arguments: JSON.stringify(args) },
+          }],
+        },
+      }],
+    });
+  const f = await fixture((body, index) => {
+    const tools = body.tools as { function: { name: string } }[];
+    assert.ok(tools.some((tool) => tool.function.name === "inspect_context"));
+    assert.ok(tools.some((tool) => tool.function.name === "compress_context"));
+    const messages = body.messages as { role: string; content: string }[];
+    if (index === 1) return native("inspect_context", {});
+    const last = JSON.parse(messages.findLast((message) => message.role === "tool")!.content);
+    const output = JSON.parse(last.output);
+    if (index === 2) {
+      boundary = output.candidates.at(-1).throughSeq;
+      return native("compress_context", {
+        throughSeq: boundary,
+        summary: "保留重要事实，继续未完成事项",
+        dryRun: true,
+      });
+    }
+    if (index === 3) {
+      assert.equal(output.status, "preview");
+      return native("compress_context", {
+        throughSeq: boundary,
+        summary: "保留重要事实，继续未完成事项",
+      });
+    }
+    assert.equal(output.status, "applied");
+    assert.ok(Number.isSafeInteger(output.compressionSeq));
+    assert.equal(output.after.compressedThroughSeq, boundary);
+    assert.ok(messages.some((message) => message.content.includes("保留重要事实，继续未完成事项")));
+    return Response.json(completion());
+  });
+  try {
+    await f.append(1, "user-a", "原始事实".repeat(300));
+    for (let i = 0; i < 4; i++) await f.pulse();
+    assert.equal((await f.records()).some((event) => event.kind === "compression"), false);
+    await f.pulse(); // 第三个模型请求要求正式压缩
+    await f.pulse(); // 立即持久生效
+    const compression = (await f.records()).find((event) => event.kind === "compression")!;
+    assert.ok(compression);
+    await f.restart(async () => {
+      // 模拟压缩落盘之后、工具收据落盘之前崩溃：删除末尾收据而非压缩事实。
+      const files = [...Deno.readDirSync(`${f.directory}/consciousness/events`)].map((entry) =>
+        entry.name
+      ).sort();
+      const last = files.at(-1)!;
+      const event = JSON.parse(
+        await Deno.readTextFile(`${f.directory}/consciousness/events/${last}`),
+      );
+      assert.equal(event.kind, "tool_result");
+      await Deno.remove(`${f.directory}/consciousness/events/${last}`);
+    });
+    await f.pulse();
+    await f.pulse();
+    assert.equal((await f.records()).filter((event) => event.kind === "compression").length, 1);
+    assert.equal(f.messages.length, 4);
   } finally {
     await f.close();
   }

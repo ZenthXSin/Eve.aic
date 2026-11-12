@@ -3,6 +3,7 @@ import type { MindEvent } from "../../contracts/mind.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type ErrorKind, type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
+import { CONTEXT_TOOLS, inspectContext, previewCompression } from "./context-tools.ts";
 import { recallQuery } from "./recall-query.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 import { type ConsciousEvent, ConsciousJournal } from "./journal.ts";
@@ -426,6 +427,60 @@ export class EveRuntime {
       });
     }
     let result: Json;
+    if (CONTEXT_TOOLS.some((tool) => tool.name === call.name)) {
+      try {
+        // 已落盘压缩但尚未写回执时，重启只补齐原收据，不重新执行或推测生效。
+        const applied = activeEvents(this.journal.events).find((event) =>
+          event.kind === "compression" && (event.data as { callId?: string }).callId === call.id
+        );
+        let output: Json;
+        if (applied) {
+          output = {
+            ...(applied.data as Record<string, Json>).receipt as Record<string, Json>,
+            compressionSeq: applied.seq,
+          };
+        } else {
+          const tools = await this.#tools();
+          if (call.name === "inspect_context") {
+            output = inspectContext(
+              this.journal.events,
+              this.#prompt,
+              tools,
+              call.args,
+              this.contextCounter,
+            ) as unknown as Json;
+          } else {
+            const preview = previewCompression(
+              this.journal.events,
+              this.#prompt,
+              tools,
+              call.args,
+              this.contextCounter,
+            );
+            const receipt = { status: preview.dryRun ? "preview" : "applied", ...preview };
+            // 摘要原件只在压缩事实中保留，回执只报告边界和用量。
+            const { summary: _summary, ...reported } = receipt;
+            if (preview.dryRun) output = reported as unknown as Json;
+            else {
+              const event = await this.journal.append("compression", {
+                throughSeq: preview.throughSeq,
+                summary: preview.summary,
+                source: "eve",
+                callId: call.id,
+                receipt: reported as unknown as Json,
+              });
+              output = { ...reported, compressionSeq: event.seq } as unknown as Json;
+            }
+          }
+        }
+        result = { status: "completed", output: JSON.stringify(output) };
+      } catch (error) {
+        if (!(error instanceof KernelError && error.kind === "rejected")) throw error;
+        result = { status: "failed", error: toWireError(error) as unknown as Json };
+      }
+      await this.journal.append("tool_result", { callId: call.id, result });
+      return;
+    }
     if (call.name === WRITE_THOUGHT_TOOL.name) {
       const valid = thoughtForCall(call) !== undefined &&
         Object.keys(call.args as Record<string, Json>).every((key) => key === "thought");
@@ -530,6 +585,14 @@ export class EveRuntime {
     });
     return render(this.journal.events, this.#prompt);
   }
+  async #tools(): Promise<ToolSpec[]> {
+    const provided = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
+    const native = [WRITE_THOUGHT_TOOL, ...CONTEXT_TOOLS];
+    if (provided.some((tool) => native.some((item) => item.name === tool.name))) {
+      throw new KernelError("rejected", "意识流原生工具不能由外部覆盖");
+    }
+    return [...provided, ...native];
+  }
   async #step() {
     if (this.#closing || !this.journal.available) return;
     // 每次工具批次先完成/恢复原决定，再处理通知；新的通知不打断当前动作。
@@ -551,11 +614,7 @@ export class EveRuntime {
     if (this.#modelBlocked) return;
     if (Date.now() < this.#retryAt) return;
     if (!fresh && Date.now() < this.#wake) return;
-    const providedTools = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
-    if (providedTools.some((tool) => tool.name === WRITE_THOUGHT_TOOL.name)) {
-      throw new KernelError("rejected", "write_thought由意识流原生提供，外部工具不能覆盖");
-    }
-    const tools = [...providedTools, WRITE_THOUGHT_TOOL];
+    const tools = await this.#tools();
     if (this.config.remoteRecords) {
       if (this.#sharedBudget?.paused) return;
       const query = recallQuery(activeEvents(this.journal.events));

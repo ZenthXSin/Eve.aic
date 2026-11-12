@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { fingerprint } from "../kernel/calls.ts";
 import { type GuardianControl, type InstanceSpec, Supervisor } from "../supervisor/controller.ts";
 import { pinSource } from "../supervisor/source.ts";
 import { OwnershipAuthority } from "../guardian/ownership.ts";
@@ -14,6 +15,7 @@ import type { Json } from "../kernel/protocol.ts";
 import { KernelError } from "../kernel/protocol.ts";
 import type { ModelRequest, ModelResponse } from "../contracts/model.ts";
 import { ScriptRuntime } from "../plugins/script-runtime/runtime.ts";
+import { ScriptStore } from "../plugins/script-runtime/store.ts";
 import type { PluginContext } from "../sdk/plugin.ts";
 import { activeEvents } from "../plugins/eve/view.ts";
 
@@ -540,6 +542,78 @@ Deno.test({
       await f.driver.call(f.instances[1], "deactivate");
       await verifyInheritedScript(f.instances[1]);
       assert.equal(f.engine.notes.journal.events.length, 1);
+      // 新版已推进共享游标、旧版目录尚未推进：复现生产的692/701及33/40错位。
+      const latestConfig = JSON.parse(await Deno.readTextFile(f.instances[1].configFile));
+      const latestScripts = new ScriptStore(`${latestConfig.scripts.directory}/ledger`);
+      let scriptThrough = 0;
+      const unknownJobId = await fingerprint(["script-job-v1", "latest-unknown"]);
+      const unknownFingerprint = await fingerprint({
+        code: "return 1",
+        timeoutMs: latestConfig.scripts.defaultTimeoutMs,
+      });
+      const unknownAt = new Date().toISOString();
+      await latestScripts.initialize();
+      try {
+        await latestScripts.change((state) => {
+          state.jobs.push({
+            jobId: unknownJobId,
+            fingerprint: unknownFingerprint,
+            request: { requestId: "latest-unknown", code: "return 1" },
+            status: "unknown",
+            scriptStarted: true,
+            actions: [],
+            startedAt: unknownAt,
+            finishedAt: unknownAt,
+          });
+          scriptThrough = state.completions.length + 1;
+          state.completions.push({
+            seq: scriptThrough,
+            job: {
+              jobId: unknownJobId,
+              status: "unknown",
+              scriptStarted: true,
+              actions: 0,
+              startedAt: unknownAt,
+              finishedAt: unknownAt,
+            },
+          });
+        });
+      } finally {
+        await latestScripts.close();
+      }
+      const latestMind = JSON.parse(
+        await Deno.readTextFile(`${latestConfig.mindDirectory}/index.json`),
+      );
+      const mindThrough = latestMind.events.length + 1;
+      latestMind.events.push({
+        seq: mindThrough,
+        requestId: "latest-control",
+        kind: "rest",
+        args: { text: "fixture" },
+        at: new Date().toISOString(),
+      });
+      await writeDurableJson(`${latestConfig.mindDirectory}/index.json`, latestMind);
+      // 测试由root追加状态；生产写入者是实例UID，恢复它实际拥有的文件权限。
+      const ownState = async (path: string) => {
+        await Deno.chown(path, f.instances[1].identity!.uid, f.instances[1].identity!.gid);
+        const stat = await Deno.lstat(path);
+        if (stat.isDirectory) {
+          for await (const entry of Deno.readDir(path)) await ownState(`${path}/${entry.name}`);
+        }
+      };
+      await ownState(latestConfig.mindDirectory);
+      await ownState(`${latestConfig.scripts.directory}/ledger`);
+
+      await f.engine.records.append("notice", {
+        source: "scripts",
+        throughSeq: scriptThrough,
+        items: [],
+      });
+      await f.engine.records.append("mind_applied", {
+        throughSeq: mindThrough,
+        requestId: "latest-control",
+        outcome: { status: "applied" },
+      });
       // 模拟实例留下的 setsid 后代；只终止已跟踪的宿主 PID 不足以回收专属 UID。
       const identity = f.instances[1].identity!;
       detached = new Deno.Command("/usr/bin/setsid", {
@@ -584,6 +658,15 @@ Deno.test({
       );
       assert.ok((await f.guardian.status()).owner!.epoch > status.epoch);
       await waitFor(() => detachedExited);
+      await waitFor(async () => {
+        const status = await f.driver.call<
+          { eve?: { scriptThroughSeq: number; mindThroughSeq: number; lastError: string | null } }
+        >(f.instances[0], "status");
+        return status.eve?.scriptThroughSeq === scriptThrough &&
+          status.eve?.mindThroughSeq === mindThrough && status.eve?.lastError === null;
+      });
+      await f.driver.call(f.instances[0], "deactivate");
+      await verifyInheritedScript(f.instances[0]);
     } finally {
       await f.close();
       if (detached) {

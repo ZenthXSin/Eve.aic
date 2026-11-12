@@ -53,6 +53,9 @@ async function fixture(
   let seq = 20;
   const markers: unknown[] = [];
   const preparation: string[] = [];
+  const handovers: { from: string; to: string; mode: string }[] = [];
+  const channelErrors = new Map<string, string>();
+  let restoreError = false;
   const driver: InstanceDriver = {
     ensure(instance) {
       if (!states.has(instance.id) || states.get(instance.id) === "dead") {
@@ -69,7 +72,11 @@ async function fixture(
           instanceId: instance.id,
           sourceCommit: instance.source.commit,
           error: null,
-          eve: { healthy: true, running: states.get(instance.id) === "active" },
+          eve: {
+            healthy: true,
+            running: states.get(instance.id) === "active",
+            lastError: channelErrors.get(instance.id) ?? null,
+          },
           plugins: ["runtime", "phone", "scripts", "mind", "eve"].map((name) => ({
             name,
             status: "running",
@@ -111,7 +118,14 @@ async function fixture(
       states.set(instance.id, "dead");
       return Promise.resolve();
     },
-    async handover(old, candidate) {
+    async handover(old, candidate, _actionId, mode = "forward") {
+      handovers.push({ from: old.id, to: candidate.id, mode });
+      if (mode === "rollback") {
+        assert.equal(states.get(old.id) === "active", false);
+        assert.equal(states.get(candidate.id) === "active", false);
+        if (restoreError) throw new KernelError("storage", "回退交接模拟中断");
+        return;
+      }
       if (options.handoverMs === undefined) return;
       assert.equal(states.get(old.id), "standby");
       assert.equal(states.get(candidate.id), "standby");
@@ -159,6 +173,11 @@ async function fixture(
     proofs,
     markers,
     preparation,
+    handovers,
+    channelErrors,
+    setRestoreError(value: boolean) {
+      restoreError = value;
+    },
     supervisor: () => supervisor,
     setResponse(value: ModelResponse) {
       response = value;
@@ -665,5 +684,63 @@ Deno.test("实例RPC客户端：等待超时与取消有区别，不重放不宣
     client.close();
     await server.shutdown();
     await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("回退连续性：确认后的实例失活，先交接最新账本再恢复旧实例", async () => {
+  const f = await fixture();
+  try {
+    f.setResponse({
+      content: "通过",
+      toolCalls: [{ id: "ok", name: "confirm_upgrade", args: { accept: true, reason: "正常" } }],
+    });
+    await f.supervisor().upgrade("new");
+    f.states.set("new", "dead");
+    f.setRestoreError(true);
+    await assert.rejects(() => f.supervisor().tick(), /回退交接模拟中断/);
+    assert.notEqual(f.states.get("old"), "active");
+    assert.equal(f.supervisor().state.upgrade?.phase, "rollback");
+    await f.restart();
+    f.setRestoreError(false);
+    await f.supervisor().tick();
+    assert.equal(f.supervisor().state.current, "old");
+    assert.deepEqual(f.handovers.at(-1), { from: "new", to: "old", mode: "rollback" });
+    assert.equal(f.supervisor().state.lastOutcome?.outcome, "rolled_back");
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("回退连续性：观察中暂停再恢复同样交接最新账本", async () => {
+  const f = await fixture();
+  try {
+    await f.supervisor().upgrade("new");
+    await f.supervisor().pause();
+    await f.restart();
+    await f.supervisor().resume();
+    assert.deepEqual(f.handovers.at(-1), { from: "new", to: "old", mode: "rollback" });
+    assert.equal(f.supervisor().state.current, "old");
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("监督健康：持续依赖拒绝不能因进程在线而永远通过", async () => {
+  const f = await fixture();
+  try {
+    f.setResponse({
+      content: "通过",
+      toolCalls: [{ id: "ok", name: "confirm_upgrade", args: { accept: true, reason: "正常" } }],
+    });
+    await f.supervisor().upgrade("new");
+    f.channelErrors.set("new", "rejected");
+    await f.supervisor().tick();
+    assert.equal(f.supervisor().state.current, "new");
+    f.setNow(32_000);
+    await f.supervisor().tick();
+    assert.equal(f.supervisor().state.current, "old");
+    assert.deepEqual(f.handovers.at(-1), { from: "new", to: "old", mode: "rollback" });
+  } finally {
+    await f.close();
   }
 });
