@@ -4,6 +4,7 @@ import { writeDurableJson } from "../sdk/durable-json.ts";
 import type { InstanceDriver, InstanceSpec, InstanceStatus } from "./controller.ts";
 import { InstanceClient } from "./client.ts";
 import { verifySource } from "./source.ts";
+import { instanceStopControlDeadlineMs } from "../sdk/lifecycle-timeouts.ts";
 
 export async function readTrustedInstanceConfig(instance: InstanceSpec) {
   if (instance.identity) {
@@ -135,7 +136,12 @@ export class LocalInstanceDriver implements InstanceDriver {
     method: string,
     args: import("../kernel/protocol.ts").Json = {},
   ) {
-    const client = new InstanceClient(instance.connectionFile, instance.keyFile);
+    const timeoutMs = method === "deactivate"
+      ? instanceStopControlDeadlineMs(
+        (await readTrustedInstanceConfig(instance)).eve.modelTimeoutMs,
+      )
+      : 180_000;
+    const client = new InstanceClient(instance.connectionFile, instance.keyFile, timeoutMs);
     try {
       return await client.call<T>(method, args);
     } finally {

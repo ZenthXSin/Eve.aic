@@ -100,7 +100,7 @@ export type FromWorker =
   | { t: "loaded"; provides: string[] }
   | { t: "enabled" }
   | { t: "disabled" }
-  | { t: "failed"; stage: string; message: string }
+  | { t: "failed"; stage: string; message: string; error?: WireError }
   | { t: "result"; id: number; ok: true; value: Json }
   | { t: "result"; id: number; ok: false; error: WireError }
   | {

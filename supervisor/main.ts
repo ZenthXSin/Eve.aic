@@ -210,8 +210,8 @@ export async function startSupervisor(configPath: string) {
   };
   const changePause = async (paused: boolean) => {
     if (paused) {
-      await controller.pause();
       await runtime.settings({ paused: true });
+      await controller.pause();
     } else {
       await runtime.settings({ paused: false });
       await controller.resume();

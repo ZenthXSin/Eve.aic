@@ -2,12 +2,16 @@
 // 内核不含任何认知逻辑；Eve 自己也只是其中一个插件。
 
 import { checkReplacement, plan } from "./graph.ts";
-import { Instance, LifecycleError } from "./instance.ts";
+import { Instance, LifecycleError, type StopFailure } from "./instance.ts";
 import { readManifest } from "./manifest.ts";
 import { type FromWorker, type Json, KernelError, type Manifest } from "./protocol.ts";
 import { type StateRecord, Store } from "./store.ts";
 import { type CallRecord, fingerprint } from "./calls.ts";
 import { toWireError } from "./protocol.ts";
+
+export interface PluginStopFailure extends StopFailure {
+  plugin: string;
+}
 
 export interface KernelEvent {
   at: string;
@@ -95,6 +99,11 @@ export class Kernel {
   #started = false;
   #stopping = false;
   #stopWork?: Promise<string[]>;
+  #stopFailures: PluginStopFailure[] = [];
+
+  get stopFailures(): PluginStopFailure[] {
+    return this.#stopFailures.map((failure) => ({ ...failure }));
+  }
   #options: Required<Omit<KernelOptions, "log">> & { log: (event: KernelEvent) => void };
 
   constructor(options: KernelOptions) {
@@ -214,6 +223,7 @@ export class Kernel {
 
   async #stop(): Promise<string[]> {
     const problems: string[] = [];
+    this.#stopFailures = [];
     this.#stopping = true;
     for (const name of [...this.#order].reverse()) {
       const entry = this.#entries.get(name)!;
@@ -221,13 +231,32 @@ export class Kernel {
       // 先排空依赖方，再封住其依赖。Disable中的真实收尾调用仍可到达后续服务。
       this.#pause(entry);
       const problem = await entry.instance.stop();
-      if (problem) problems.push(`${name}：${problem}`);
+      if (problem) {
+        problems.push(`${name}：${problem}`);
+        this.#stopFailures.push({
+          plugin: name,
+          ...(entry.instance.stopFailure ?? {
+            kind: "unknown",
+            stage: "disable",
+            timedOut: false,
+            message: problem,
+          }),
+        });
+      }
       entry.instance = undefined;
       entry.status = "stopped";
       try {
         await this.#store.settle(name);
       } catch (error) {
-        problems.push(`${name}：状态保存失败：${(error as Error).message}`);
+        const message = error instanceof Error ? error.message : String(error);
+        problems.push(`${name}：状态保存失败：${message}`);
+        this.#stopFailures.push({
+          plugin: name,
+          stage: "settle",
+          kind: "storage",
+          timedOut: false,
+          message,
+        });
       }
       this.#log("plugin_stopped", name);
     }

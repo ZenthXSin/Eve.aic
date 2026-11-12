@@ -1,5 +1,6 @@
 import { renderScriptContracts } from "./script-docs.ts";
 import { readEveConfig } from "../plugins/eve/mod.ts";
+import { eveStopDeadlineMs } from "../sdk/lifecycle-timeouts.ts";
 import { nightlySchedule, type NightlySelfCheck } from "../plugins/mind-controls/nightly.ts";
 
 export async function writeEvePrompt(path: string): Promise<void> {
@@ -47,7 +48,10 @@ export async function composeEvePlugin(directory: string, configPath: string): P
           ],
           write: [config.directory],
         },
-        deadlines: { enableMs: config.startupTimeoutMs ?? 300_000, disableMs: 10000 },
+        deadlines: {
+          enableMs: config.startupTimeoutMs ?? 300_000,
+          disableMs: eveStopDeadlineMs(config.modelTimeoutMs),
+        },
       },
       null,
       2,
