@@ -4,6 +4,7 @@ import { AdminControlClient } from "../services/admin/client.ts";
 import type { AdminBackend, AdminControl, AdminQuery } from "../services/admin/contracts.ts";
 import { startAdminControlServer, startAdminServer } from "../services/admin/server.ts";
 import { panelHtml } from "../services/admin/view.ts";
+import { runAdminService } from "../services/admin/main.ts";
 
 const token = "admin_test_operator_01234567890123456789";
 const key = "admin_test_backend_012345678901234567890";
@@ -226,6 +227,180 @@ Deno.test("admin sessions expire and login attempts are throttled", async () => 
     assert.notEqual(session2.cookie, session.cookie);
   } finally {
     await server.close();
+  }
+});
+
+/** 模拟 TLS 代理保留公开 Host；网络连接仍只发往本机 HTTP 监听器。 */
+async function proxyRequest(
+  url: string,
+  path: string,
+  headers: Record<string, string>,
+  body?: Json,
+) {
+  const connection = await Deno.connect({
+    hostname: "127.0.0.1",
+    port: Number(new URL(url).port),
+  });
+  try {
+    const payload = body === undefined ? "" : JSON.stringify(body);
+    const bytes = new TextEncoder().encode(
+      `${body === undefined ? "GET" : "POST"} ${path} HTTP/1.1\r\n` +
+        Object.entries({
+          "content-type": "application/json",
+          "content-length": String(new TextEncoder().encode(payload).length),
+          connection: "close",
+          ...headers,
+        }).map(([key, value]) => `${key}: ${value}\r\n`).join("") + `\r\n${payload}`,
+    );
+    let written = 0;
+    while (written < bytes.length) written += await connection.write(bytes.subarray(written));
+    let raw = "";
+    const buffer = new Uint8Array(8192), decoder = new TextDecoder();
+    for (;;) {
+      const count = await connection.read(buffer);
+      if (count === null) break;
+      raw += decoder.decode(buffer.subarray(0, count), { stream: true });
+    }
+    raw += decoder.decode();
+    const split = raw.indexOf("\r\n\r\n");
+    const [statusLine, ...lines] = raw.slice(0, split).split("\r\n");
+    const responseHeaders = new Headers(lines.map((line) => {
+      const colon = line.indexOf(":");
+      return [line.slice(0, colon), line.slice(colon + 1).trim()];
+    }));
+    let text = raw.slice(split + 4);
+    if (responseHeaders.get("transfer-encoding") === "chunked") {
+      let offset = 0, decoded = "";
+      while (offset < text.length) {
+        const end = text.indexOf("\r\n", offset), count = parseInt(text.slice(offset, end), 16);
+        if (!count) break;
+        decoded += text.slice(end + 2, end + 2 + count);
+        offset = end + 2 + count + 2;
+      }
+      text = decoded;
+    }
+    return {
+      status: Number(statusLine.split(" ")[1]),
+      headers: responseHeaders,
+      body: JSON.parse(text),
+    };
+  } finally {
+    connection.close();
+  }
+}
+
+Deno.test("admin HTTPS proxy accepts an ordinary password and preserves Host Origin CSRF boundaries", async () => {
+  const publicOrigin = "https://eve.example.com", password = "ordinary!密碼 9";
+  const f = fixtureBackend();
+  const server = await startAdminServer(f.backend, { token: password, publicOrigin });
+  const headers = { host: "eve.example.com", origin: publicOrigin };
+  try {
+    const local = await fetch(`${server.url}/api/status`);
+    assert.equal(local.status, 403);
+    await local.json();
+    let result = await proxyRequest(server.url, "/api/login", headers, { token: password });
+    assert.equal(result.status, 200);
+    const cookieHeader = result.headers.get("set-cookie")!;
+    assert.match(cookieHeader, /HttpOnly; SameSite=Strict; Path=\/; Secure;/);
+    const session = { cookie: cookieHeader.split(";")[0], "x-eve-csrf": result.body.value.csrf };
+    for (
+      const extra of [
+        { host: "evil.example.com" },
+        { origin: "http://eve.example.com" },
+        { origin: "https://other.example.com" },
+        { "sec-fetch-site": "same-site" },
+        { "x-eve-csrf": "incorrect" },
+      ] as Record<string, string>[]
+    ) {
+      result = await proxyRequest(
+        server.url,
+        "/api/control",
+        { ...headers, ...session, ...extra },
+        {
+          action: "pause",
+          args: {},
+        },
+      );
+      assert.equal(result.status, 403);
+    }
+    assert.equal(f.controls.length, 0);
+    result = await proxyRequest(server.url, "/api/status", {
+      ...headers,
+      ...session,
+      forwarded: "host=evil.invalid;proto=http",
+      "x-forwarded-host": "evil.invalid",
+      "x-forwarded-proto": "http",
+    });
+    assert.equal(result.status, 200);
+    assert.equal(f.statuses(), 1);
+    result = await proxyRequest(server.url, "/api/control", { ...headers, ...session }, {
+      action: "pause",
+      args: {},
+    });
+    assert.equal(result.status, 200);
+    assert.equal(f.controls.length, 1);
+    result = await proxyRequest(server.url, "/api/logout", { ...headers, ...session }, {});
+    assert.equal(result.status, 200);
+    assert.match(result.headers.get("set-cookie")!, /Secure; Max-Age=0/);
+    result = await proxyRequest(server.url, "/api/status", { ...headers, ...session });
+    assert.equal(result.status, 401);
+    result = await proxyRequest(server.url, "/api/login", {
+      ...headers,
+      host: new URL(server.url).host,
+      "x-forwarded-host": "eve.example.com",
+      "x-forwarded-proto": "https",
+    }, { token: password });
+    assert.equal(result.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+Deno.test("admin validates explicit HTTPS origins and bounded passwords before listening", async () => {
+  const { backend } = fixtureBackend();
+  for (
+    const publicOrigin of [
+      "http://eve.example.com",
+      "https://eve.example.com/",
+      "https://eve.example.com/path",
+      "https://eve.example.com?x=1",
+      "https://eve.example.com#x",
+      "https://user:password@eve.example.com",
+      "https://eve.example.com:443",
+      "invalid",
+    ]
+  ) {
+    await assert.rejects(() => startAdminServer(backend, { token, publicOrigin }), /HTTPS origin/);
+  }
+  for (const password of ["", "short", "a".repeat(1025), "control\npassword"]) {
+    await assert.rejects(() => startAdminServer(backend, { token: password }), /管理员密码/);
+  }
+  const server = await startAdminServer(backend, { token: "a".repeat(1024) });
+  try {
+    assert.equal((await post(server.url, "/api/login", { token: "a".repeat(1024) })).status, 200);
+    assert.equal((await post(server.url, "/api/login", { token: "a".repeat(1025) })).status, 401);
+  } finally {
+    await server.close();
+  }
+  const directory = await Deno.makeTempDir({ prefix: "eve-admin-config-" });
+  try {
+    await Deno.writeTextFile(`${directory}/password`, "normal!password\n");
+    const configPath = `${directory}/config.json`;
+    await Deno.writeTextFile(
+      configPath,
+      JSON.stringify({
+        admin: {
+          directory: `${directory}/service`,
+          tokenFile: `${directory}/password`,
+          backendConnectionFile: `${directory}/backend.json`,
+          backendKeyFile: `${directory}/backend.key`,
+          publicOrigin: "http://eve.example.com",
+        },
+      }),
+    );
+    await assert.rejects(() => runAdminService(configPath), /HTTPS origin/);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
   }
 });
 

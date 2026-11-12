@@ -5,6 +5,7 @@ import { panelHtml } from "./view.ts";
 const MAX_BODY = 65_536;
 const SESSION_MS = 8 * 60 * 60 * 1000;
 const COOKIE = "eve_admin_session";
+const MAX_PASSWORD_LENGTH = 1024;
 
 /** 先按字节限制再解码，避免 request.json() 为无界请求分配内存。 */
 export async function readAdminBody(request: Request): Promise<Record<string, Json>> {
@@ -97,10 +98,25 @@ const secureHeaders = {
 /** 仅监听 loopback；浏览器只收到有期限会话与 CSRF 值，永不收到后端连接密钥。 */
 export async function startAdminServer(
   backend: AdminBackend,
-  options: { token: string; port?: number; now?: () => number },
+  options: { token: string; publicOrigin?: string; port?: number; now?: () => number },
 ) {
-  if (!/^[a-zA-Z0-9_-]{32,256}$/.test(options.token)) {
-    throw new KernelError("rejected", "管理口令须为至少 32 位随机字符串");
+  if (
+    typeof options.token !== "string" || options.token.length < 8 ||
+    options.token.length > MAX_PASSWORD_LENGTH ||
+    Array.from(options.token).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)
+  ) {
+    throw new KernelError("rejected", "管理员密码须为 8 至 1024 个字符且不含控制字符");
+  }
+  let publicOrigin: URL | undefined;
+  if (options.publicOrigin !== undefined) {
+    try {
+      publicOrigin = new URL(options.publicOrigin);
+      if (publicOrigin.protocol !== "https:" || publicOrigin.origin !== options.publicOrigin) {
+        throw new Error("invalid origin");
+      }
+    } catch {
+      throw new KernelError("rejected", "公开管理地址须为完整且规范的 HTTPS origin，不含路径");
+    }
   }
   if (
     options.port !== undefined &&
@@ -110,16 +126,19 @@ export async function startAdminServer(
   }
   const tokenHash = await digest(options.token), now = options.now ?? Date.now;
   const sessions = new Map<string, { csrf: string; expires: number }>();
-  let failedLogins = 0, retryAfter = 0, origin = "";
+  let failedLogins = 0, retryAfter = 0, origin = "", host = "";
+  const cookieAttributes = `HttpOnly; SameSite=Strict; Path=/${publicOrigin ? "; Secure" : ""}`;
   const response = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
     Response.json(body, { status, headers: { ...secureHeaders, ...headers } });
   const server = Deno.serve(
     { hostname: "127.0.0.1", port: options.port ?? 0, onListen() {} },
     async (request) => {
       const url = new URL(request.url), path = url.pathname;
+      // 公开模式由 loopback 反向代理保留 Host/Origin；不信任任何 forwarded 头。
       // Host 校验同时拒绝 DNS rebinding。即使凭据被浏览器附带，跨站请求仍先拒绝。
       if (
-        url.origin !== origin || request.headers.get("host") !== new URL(origin).host ||
+        url.host !== host || request.headers.get("host") !== host ||
+        (!publicOrigin && url.origin !== origin) ||
         (request.headers.has("origin") && request.headers.get("origin") !== origin) ||
         ["cross-site", "same-site"].includes(request.headers.get("sec-fetch-site") ?? "")
       ) return response({ ok: false, error: { message: "拒绝跨站管理请求" } }, 403);
@@ -144,13 +163,14 @@ export async function startAdminServer(
             );
           }
           const body = await readAdminBody(request);
-          const candidate = typeof body.token === "string" && body.token.length <= 256
-            ? body.token
-            : "";
+          const candidate =
+            typeof body.token === "string" && body.token.length <= MAX_PASSWORD_LENGTH
+              ? body.token
+              : "";
           if (!same(await digest(candidate), tokenHash)) {
             failedLogins++;
             if (failedLogins >= 5) retryAfter = now() + 60_000;
-            return response({ ok: false, error: { message: "管理口令无效" } }, 401);
+            return response({ ok: false, error: { message: "管理员密码无效" } }, 401);
           }
           failedLogins = 0;
           retryAfter = 0;
@@ -167,9 +187,7 @@ export async function startAdminServer(
             { ok: true, value: { csrf: session.csrf, expires: session.expires } },
             200,
             {
-              "set-cookie": `${COOKIE}=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${
-                SESSION_MS / 1000
-              }`,
+              "set-cookie": `${COOKIE}=${id}; ${cookieAttributes}; Max-Age=${SESSION_MS / 1000}`,
             },
           );
         }
@@ -189,7 +207,7 @@ export async function startAdminServer(
         if (path === "/api/logout") {
           sessions.delete(cookie!);
           return response({ ok: true, value: null }, 200, {
-            "set-cookie": `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`,
+            "set-cookie": `${COOKIE}=; ${cookieAttributes}; Max-Age=0`,
           });
         }
         const body = await readAdminBody(request);
@@ -214,9 +232,11 @@ export async function startAdminServer(
       }
     },
   );
-  origin = `http://127.0.0.1:${server.addr.port}`;
+  const localOrigin = `http://127.0.0.1:${server.addr.port}`;
+  origin = publicOrigin?.origin ?? localOrigin;
+  host = new URL(origin).host;
   return {
-    url: origin,
+    url: localOrigin,
     async close() {
       sessions.clear();
       await server.shutdown();

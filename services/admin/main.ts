@@ -17,7 +17,8 @@ export async function runAdminService(configPath: string) {
   const server = await startAdminServer(
     new AdminControlClient(c.backendConnectionFile, c.backendKeyFile),
     {
-      token: (await Deno.readTextFile(c.tokenFile)).trim(),
+      token: (await Deno.readTextFile(c.tokenFile)).replace(/\r?\n$/, ""),
+      publicOrigin: c.publicOrigin,
       port: c.port,
     },
   );
