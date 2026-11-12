@@ -36,7 +36,7 @@ class Element {
     return [];
   }
 }
-function viewFixture() {
+function viewFixture(api: (path: string, body: any) => Promise<any> = async () => ({})) {
   const elements = new Map<string, Element>();
   const el = (id: string) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -59,14 +59,17 @@ function viewFixture() {
     "time",
     "num",
     "pretty",
+    "api",
     `
-    let liveSnapshot=null;
+    let liveSnapshot=null,csrf='session';
     ${workspaceScript}
     return {paint(snapshot){liveSnapshot=snapshot;paintWorkspace(snapshot);},
       choose(app){workspaceFollow=false;workspaceApp=app;workspaceOperation=null;workspaceKey='';paintWorkspace(liveSnapshot);},
+      load:loadWorkspaceConversation,refresh:refreshWorkspaceSelected,older:refreshWorkspaceConversation,
+      logout(){clearWorkspace();csrf='';},
       clear:clearWorkspace};
   `,
-  )(document, el, node, String, String, JSON.stringify);
+  )(document, el, node, String, String, JSON.stringify, api);
   return { renderer, el };
 }
 const at = "2026-11-12T00:00:00Z";
@@ -273,7 +276,7 @@ Deno.test("workspace websocket applies snapshots, preserves errors, reconnects a
     `
     let csrf='session',activeView='live',liveFollow=true;
     ${workspaceSocketScript}
-    return {open:openLiveSocket,close:closeLiveSocket};
+    return {open:openLiveSocket,close:closeLiveSocket,stalled:liveSocketStalled,age(){liveSocketFrameAt=Date.now()-13000;}};
   `,
   )(
     Socket,
@@ -295,8 +298,12 @@ Deno.test("workspace websocket applies snapshots, preserves errors, reconnects a
   assert.equal(socket.url.href, "wss://eve.example.com/api/live/ws");
   socket.readyState = 1;
   socket.onopen!();
+  assert.equal(transport.stalled(),false);
+  transport.age();
+  assert.equal(transport.stalled(),true);
   socket.onmessage!({ data: JSON.stringify({ type: "snapshot", value: { throughSeq: 4 } }) });
   assert.equal(applied, 1);
+  assert.equal(transport.stalled(),false);
   socket.onmessage!({ data: JSON.stringify({ type: "error", error: { message: "不可读" } }) });
   assert.equal(failed, 1);
   socket.onclose!({ code: 1011 });
@@ -397,4 +404,54 @@ Deno.test("tools use readable cards for known APIs and preserve non-object input
   assert.match(paint("native", "write_thought", {}, undefined, "failed"), /随记动作.*失败.*未取得有效随记正文/);
   const pending = paint("future", "method", "原始字符串", undefined, "started");
   assert.match(pending, /调用尚待结果/);
+});
+
+Deno.test("manual QQ refreshes even Eve's active conversation and retains good messages on failure", async () => {
+  let text="新的来信",fail=false,calls=0;
+  const {renderer,el}=viewFixture(async (_path,body)=>{
+    calls++;
+    assert.equal(body.resource,"qqHistory");
+    assert.deepEqual(body.args,{conversationId:"qq:group:one"});
+    if(fail)throw new Error("临时断线");
+    return {messages:[{handle:{seq:1},body:{text},direction:"incoming"}]};
+  });
+  renderer.paint({events:[],workspace:{asOf:at,currentApp:{appId:"qq"},apps:{qq:{available:true,activeConversationId:"qq:group:one",conversations:[{conversationId:"qq:group:one"}],messages:[{body:{text:"旧屏幕"}}]}}}});
+  await renderer.load("qq:group:one");
+  assert.equal(calls,1);
+  assert.match(el("workspaceApp").textContent,/新的来信/);
+  assert.doesNotMatch(el("workspaceApp").textContent,/旧屏幕/);
+  text="同一水位下的新状态";
+  await renderer.refresh();
+  assert.match(el("workspaceApp").textContent,/同一水位下的新状态/);
+  fail=true;
+  await renderer.refresh();
+  assert.match(el("workspaceApp").textContent,/同一水位下的新状态.*临时断线/);
+});
+Deno.test("late QQ request after logout cannot restore private content",async()=>{
+  let finish!:(value:any)=>void;
+  const {renderer,el}=viewFixture(()=>new Promise(resolve=>{finish=resolve;}));
+  renderer.paint({events:[],workspace:{apps:{qq:{available:true,conversations:[],messages:[]}}}});
+  const pending=renderer.load("qq:group:one");
+  renderer.logout();
+  finish({messages:[{body:{text:"过期的私密正文"}}]});
+  await pending;
+  assert.equal(el("workspaceApp").textContent,"");
+});
+
+Deno.test("QQ older pages retain the requested older content at the bounded limit and can return latest",async()=>{
+  const make=(start:number,end:number)=>Array.from({length:end-start+1},(_,i)=>({handle:{seq:start+i},body:{text:'消息['+(start+i)+']'},direction:'incoming'}));
+  const {renderer,el}=viewFixture(async(_path,body)=>{
+    const before=body.args.cursor?.beforeSeq??441;
+    return {messages:make(Math.max(1,before-40),before-1),...(before>41?{older:{snapshotThroughSeq:440,beforeSeq:before-40}}:{})};
+  });
+  renderer.paint({events:[],workspace:{apps:{qq:{available:true,activeConversationId:'qq:group:one',conversations:[],messages:[]}}}});
+  await renderer.load('qq:group:one');
+  for(let before=401;before>=41;before-=40)await renderer.older('qq:group:one',{snapshotThroughSeq:440,beforeSeq:before});
+  assert.match(el('workspaceApp').textContent,/消息\[1\]/);
+  assert.match(el('workspaceApp').textContent,/正在回看历史/);
+  await renderer.refresh();
+  assert.match(el('workspaceApp').textContent,/消息\[1\]/);
+  await renderer.load('qq:group:one');
+  assert.match(el('workspaceApp').textContent,/消息\[440\]/);
+  assert.doesNotMatch(el('workspaceApp').textContent,/消息\[1\]/);
 });

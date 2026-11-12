@@ -297,7 +297,7 @@ Deno.test("live page displays a note once, retains ordinary tools and exposes no
   assert(feed.textContent.includes("原件 #6"));
   assert(feed.textContent.includes("回执状态：failed"));
   assert(feed.textContent.includes("调用 1 次脚本工具"));
-  assert.equal(document.getElementById("liveFeedSummary").textContent, "6 条原始记录 · 正在跟随");
+  assert.equal(document.getElementById("liveFeedSummary").textContent, "6 条记录 · 正在跟随");
   const tags = (e: Element): string[] => [e.tag, ...e.children.flatMap(tags)];
   assert(!tags(feed).includes("img"));
 });

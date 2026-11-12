@@ -75,7 +75,7 @@ Deno.test("workspace observer reads content-addressed actions while writer holds
     await Deno.remove(directory, { recursive: true });
   }
 });
-Deno.test("workspace projection follows actual action receipts and preserves captured QQ screen", async () => {
+Deno.test("workspace projection refreshes read-only QQ history while preserving Eve actual captured screen", async () => {
   let reads = 0;
   const message = {
     handle: { conversationId: "qq:group:real", seq: 12 },
@@ -106,6 +106,15 @@ Deno.test("workspace projection follows actual action receipts and preserves cap
           }],
         });
       }
+      if (resource === "qqHistory") {
+        return Promise.resolve({
+          messages: [message, {
+            handle: { conversationId: "qq:group:real", seq: 15 },
+            body: { text: "后来新到，Eve未看" },
+          }],
+          snapshotThroughSeq: 15,
+        });
+      }
       assert.equal(resource, "qqConversations");
       return Promise.resolve({
         items: [{
@@ -119,12 +128,254 @@ Deno.test("workspace projection follows actual action receipts and preserves cap
   });
   const a = await reader.read() as Record<string, Json>;
   const qq = (a.apps as Record<string, Record<string, Json>>).qq;
-  assert.deepEqual(qq.messages, [message]);
+  assert.equal((qq.messages as Json[]).length, 2);
+  assert.deepEqual(qq.capturedMessages, [message]);
+  assert.deepEqual(qq.capturedDisplayedSeqs, [12]);
+  assert.equal(qq.messageSource, "qq_readonly_history");
+  assert.equal(qq.messageFreshness, "fresh");
   assert.equal(qq.activeConversationId, "qq:group:real");
   assert.equal((a.currentApp as Record<string, Json>).appId, "qq");
   assert.equal(await reader.read(), a);
-  assert.equal(reads, 2);
+  assert.equal(reads, 3);
 });
+Deno.test("QQ latest page refreshes inbound, delivery and attachments without Eve ledger progress or marking read", async () => {
+  let now = Date.parse(at), historyReads = 0;
+  let newest = 12, delivery = "unknown", downloaded = false, ledgerWindowRolled = false;
+  const captured = [{
+    handle: { conversationId: "qq:group:real", seq: 12 },
+    body: { text: "Eve 当时看到的正文" },
+  }];
+  const reading = {
+    notificationThroughSeq: 12,
+    lastOpened: { snapshotThroughSeq: 12, displayedSeqs: [12] },
+  };
+  const reader = new WorkspaceReader({
+    status: () => Promise.resolve(null),
+    control: () => {
+      throw new Error("never execute");
+    },
+    query: ({ resource, operation, args }): Promise<Json> => {
+      assert.equal(operation, "page");
+      if (resource === "workspace") {
+        if (ledgerWindowRolled) return Promise.resolve({ throughSeq: 42, items: [] });
+        return Promise.resolve<Json>({
+          throughSeq: 42,
+          items: [{
+            id: "actual-open",
+            namespace: "phone",
+            method: "open",
+            status: "completed",
+            startedAt: at,
+            args: { conversationId: "qq:group:real" },
+            result: {
+              messages: captured,
+              snapshotThroughSeq: 12,
+              displayedSeqs: [12],
+              notificationThroughSeq: 12,
+            },
+          }, {
+            id: "failed-open",
+            namespace: "phone",
+            method: "open",
+            status: "failed",
+            startedAt: at,
+            args: { conversationId: "qq:group:not-actually-opened" },
+          }],
+        });
+      }
+      if (resource === "qqConversations") {
+        return Promise.resolve<Json>({
+          items: [{
+            conversationId: "qq:group:another",
+            latest: { body: { text: "不要猜最新会话" } },
+          }, { conversationId: "qq:group:real", reading }],
+          snapshotThroughSeq: newest,
+        });
+      }
+      assert.equal(resource, "qqHistory");
+      assert.deepEqual(args, { conversationId: "qq:group:real" });
+      historyReads++;
+      return Promise.resolve<Json>({
+        snapshotThroughSeq: newest,
+        messages: [
+          {
+            handle: { conversationId: "qq:group:real", seq: 12 },
+            body: { text: "出站" },
+            delivery: { state: delivery },
+            attachments: downloaded
+              ? [{ index: 1, download: { state: "ready", path: "/tmp/attachment" } }]
+              : [],
+          },
+          ...(newest > 12
+            ? [{
+              handle: { conversationId: "qq:group:real", seq: newest },
+              body: { text: "真实新入站" },
+            }]
+            : []),
+        ],
+      });
+    },
+  }, () => now);
+  const screen = async () => {
+    const value = await reader.read() as Record<string, Json>;
+    assert.equal(value.throughSeq, 42);
+    const qq = (value.apps as Record<string, Record<string, Json>>).qq;
+    assert.equal(qq.activeConversationId, "qq:group:real");
+    assert.deepEqual(qq.capturedMessages, captured);
+    assert.equal(qq.capturedSnapshotThroughSeq, 12);
+    assert.equal(qq.capturedNotificationThroughSeq, 12);
+    assert.deepEqual(qq.readingState, reading);
+    return qq;
+  };
+  assert.equal(((await screen()).messages as Json[]).length, 1);
+  now += 2500;
+  newest = 15;
+  assert.equal(((await screen()).messages as Json[]).length, 2);
+  now += 2500;
+  delivery = "sent";
+  const sent = await screen();
+  assert.equal(
+    ((sent.messages as Record<string, Json>[])[0].delivery as Record<string, Json>).state,
+    "sent",
+  );
+  now += 2500;
+  downloaded = true;
+  const ready = await screen();
+  assert.equal(((ready.messages as Record<string, Json>[])[0].attachments as Json[]).length, 1);
+  assert.equal(ready.historySnapshotThroughSeq, 15);
+  assert.equal(historyReads, 4);
+  now += 2500;
+  ledgerWindowRolled = true;
+  const cachedFocus = await screen();
+  assert.equal(cachedFocus.activeSourceFreshness, "cached");
+  assert.deepEqual(cachedFocus.capturedMessages, captured);
+  assert.equal(cachedFocus.messageFreshness, "fresh");
+  assert.equal(historyReads, 5);
+});
+
+Deno.test("QQ unavailable reads retain labelled confirmed data without leaking another conversation", async () => {
+  let now = Date.parse(at), failing = false, ledgerFailing = false, id = "qq:group:real";
+  const reader = new WorkspaceReader({
+    status: () => Promise.resolve(null),
+    control: () => {
+      throw new Error("never");
+    },
+    query: ({ resource }): Promise<Json> => {
+      if (resource === "workspace") {
+        if (ledgerFailing) return Promise.reject(new Error("ledger down"));
+        return Promise.resolve({
+          throughSeq: 1,
+          items: [{
+            id: "open",
+            namespace: "phone",
+            method: "open",
+            status: "completed",
+            startedAt: at,
+            args: { conversationId: id },
+            result: { messages: [] },
+          }],
+        });
+      }
+      if (failing) return Promise.reject(new Error("QQ temporarily down"));
+      if (resource === "qqConversations") {
+        return Promise.resolve({ items: [{ conversationId: id }] });
+      }
+      return Promise.resolve({
+        messages: [{ body: { text: "已确认的消息" } }],
+        snapshotThroughSeq: 2,
+      });
+    },
+  }, () => now);
+  const screen = async () => {
+    const value = await reader.read() as Record<string, Json>;
+    return (value.apps as Record<string, Record<string, Json>>).qq;
+  };
+  const fresh = await screen();
+  now += 2500;
+  failing = true;
+  ledgerFailing = true;
+  const stale = await screen();
+  assert.equal(stale.available, true);
+  assert.deepEqual(stale.messages, fresh.messages);
+  assert.deepEqual(stale.conversations, fresh.conversations);
+  assert.equal(stale.messagesAsOf, fresh.messagesAsOf);
+  assert.equal(stale.messageFreshness, "stale");
+  assert.equal(stale.conversationsFreshness, "stale");
+  assert.equal(stale.activeSourceFreshness, "stale");
+  assert.equal(stale.activeConversationId, "qq:group:real");
+  assert.equal(typeof stale.historyError, "string");
+  now += 2500;
+  ledgerFailing = false;
+  id = "qq:group:different";
+  const switched = await screen();
+  assert.deepEqual(switched.messages, []);
+  assert.equal(switched.messageFreshness, "unavailable");
+  assert(!JSON.stringify(switched.messages).includes("已确认的消息"));
+});
+
+Deno.test("QQ remains viewable from confirmed Eve receipts when admin QQ reads are unavailable", async () => {
+  let includeReceipt = true;
+  const backend = {
+    status: () => Promise.resolve(null),
+    control: () => {
+      throw new Error("never");
+    },
+    query: ({ resource }: { resource: string }): Promise<Json> => {
+      if (resource !== "workspace") return Promise.reject(new Error("QQ admin down"));
+      return Promise.resolve({
+        items: includeReceipt
+          ? [{
+            id: "read",
+            namespace: "phone",
+            method: "history",
+            status: "completed",
+            startedAt: at,
+            args: { conversationId: "qq:group:real" },
+            result: {
+              messages: [{
+                handle: { conversationId: "qq:group:real", seq: 1 },
+                body: { text: "真实回执保留" },
+              }],
+            },
+          }]
+          : [],
+      });
+    },
+  };
+  const value = await new WorkspaceReader(backend).read() as Record<string, Json>;
+  const qq = (value.apps as Record<string, Record<string, Json>>).qq;
+  assert.equal(qq.available, true);
+  assert.equal(qq.messageFreshness, "stale");
+  assert.equal(qq.messageSource, "eve_script_receipt");
+  assert.equal(qq.conversationsFreshness, "unavailable");
+  assert.equal((qq.messages as Json[]).length, 1);
+  includeReceipt = false;
+  const absent = await new WorkspaceReader(backend).read() as Record<string, Json>;
+  assert.equal((absent.apps as Record<string, Record<string, Json>>).qq.available, false);
+});
+
+Deno.test("QQ conversation list alone never invents an active screen or queries its history", async () => {
+  const calls: string[] = [];
+  const reader = new WorkspaceReader({
+    status: () => Promise.resolve(null),
+    control: () => {
+      throw new Error("never");
+    },
+    query: ({ resource }): Promise<Json> => {
+      calls.push(resource);
+      assert.notEqual(resource, "qqHistory");
+      return Promise.resolve({
+        items: resource === "workspace" ? [] : [{ conversationId: "qq:group:newest" }],
+      });
+    },
+  });
+  const value = await reader.read() as Record<string, Json>;
+  const qq = (value.apps as Record<string, Record<string, Json>>).qq;
+  assert.equal(qq.activeConversationId, null);
+  assert.equal(qq.messageFreshness, "unavailable");
+  assert.equal(calls.length, 2);
+});
+
 Deno.test("workspace queries reject file paths, phone open and invalid cursors", () => {
   assert.throws(() =>
     validateQuery({ resource: "workspace", operation: "page", args: { path: "/root" } })

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { startAdminServer } from "../services/admin/server.ts";
 import type { Json } from "../kernel/protocol.ts";
 import type { AdminBackend } from "../services/admin/contracts.ts";
+import { KernelError } from "../kernel/protocol.ts";
 const token = "workspace_ws_fixture_password";
 
 class RawWebSocket {
@@ -91,6 +92,25 @@ async function connect(url: string, cookie?: string, origin?: string, query = ""
     ),
   );
   return { raw, headers: await raw.headers() };
+}
+async function nextJsonFrame(raw: RawWebSocket) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      (async () => {
+        while (true) {
+          const frame = await raw.frame();
+          if (frame.opcode === 1) return JSON.parse(frame.text);
+          if (frame.opcode === 8) throw new Error("WebSocket closed before next snapshot");
+        }
+      })(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("next WebSocket snapshot timed out")), 8000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 function backendFixture() {
   let statusReads = 0, controls = 0;
@@ -182,6 +202,69 @@ Deno.test("admin WebSocket shares snapshots, closes on logout and session TTL wi
     assert.equal(f.controls(), 0);
   } finally {
     for (const c of connections) c.close();
+    await server.close();
+  }
+});
+Deno.test("admin WebSocket pushes independent QQ changes when conscious journal is unchanged", async () => {
+  let now = 1000, qqThrough = 1;
+  const f = backendFixture();
+  const backend: AdminBackend = {
+    ...f.backend,
+    query: (request) =>
+      request.resource === "qqConversations"
+        ? Promise.resolve({
+          snapshotThroughSeq: qqThrough,
+          items: [{ id: "qq:group:fixture", lastSeq: qqThrough, unread: qqThrough }],
+        })
+        : f.backend.query(request),
+  };
+  const server = await startAdminServer(backend, { token, now: () => now });
+  let raw: RawWebSocket | undefined;
+  try {
+    const session = await login(server.url);
+    raw = (await connect(server.url, session.cookie, server.url)).raw;
+    const first = await nextJsonFrame(raw);
+    assert.equal(first.value.throughSeq, 0);
+    assert.equal(first.value.workspace.apps.qq.snapshotThroughSeq, 1);
+    qqThrough = 2;
+    now += 3000;
+    const next = await nextJsonFrame(raw);
+    assert.equal(next.type, "snapshot");
+    assert.equal(next.value.throughSeq, 0);
+    assert.equal(next.value.workspace.apps.qq.snapshotThroughSeq, 2);
+    assert.equal(next.value.workspace.apps.qq.conversations[0].lastSeq, 2);
+    assert.equal(f.controls(), 0);
+  } finally {
+    raw?.close();
+    await server.close();
+  }
+});
+Deno.test("admin WebSocket recovers on the next tick after a temporary snapshot read failure", async () => {
+  let now = 1000, unavailable = true;
+  const f = backendFixture();
+  const backend: AdminBackend = {
+    ...f.backend,
+    status: () => {
+      if (unavailable) return Promise.reject(new KernelError("unavailable", "temporary outage"));
+      return f.backend.status();
+    },
+  };
+  const server = await startAdminServer(backend, { token, now: () => now });
+  let raw: RawWebSocket | undefined;
+  try {
+    const session = await login(server.url);
+    raw = (await connect(server.url, session.cookie, server.url)).raw;
+    const first = await nextJsonFrame(raw);
+    assert.equal(first.type, "error");
+    assert.equal(first.error.kind, "unavailable");
+    unavailable = false;
+    now += 3000;
+    const next = await nextJsonFrame(raw);
+    assert.equal(next.type, "snapshot");
+    assert.equal(next.value.throughSeq, 0);
+    assert.equal(f.controls(), 0);
+  } finally {
+    raw?.close();
     await server.close();
   }
 });

@@ -451,7 +451,8 @@ Deno.test("admin inline interface compiles and only renders recorded text", () =
   const script = html.match(/<script nonce="nonce-test">([\s\S]*?)<\/script>/)![1];
   assert.doesNotThrow(() => new Function(script));
   assert(!script.includes("innerHTML"));
-  assert(!script.includes("localStorage"));
+  assert(script.includes("browserHistoryMaxBytes=2*1024*1024"));
+  assert(script.includes("clearBrowserHistory();livePoll=null;closeLiveSocket()"));
   assert(!script.includes("sessionStorage"));
   assert(html.includes("语义检索模型接入待办"));
 });
@@ -561,4 +562,20 @@ Deno.test("admin charts exclude unknown cache usage and distinguish the average 
   assert.equal(document.getElementById("inputAverage").textContent, "—");
   assert.equal(document.getElementById("cacheHit").textContent, "未报告");
   assert.equal(document.getElementById("usageChart").hidden, true);
+});
+
+Deno.test("late unauthorized API response from an old login cannot clear a newer session",async()=>{
+  const script=panelHtml("race").match(/<script nonce="race">([\s\S]*?)<\/script>/)![1];
+  const apiCode=script.slice(script.indexOf('async function api('),script.indexOf('function showLogin()'));
+  let finish!:(value:any)=>void,cleared=0;
+  const client=new Function('fetch','showLogin',`let csrf='old';${apiCode};return {request:api,setSession(value){csrf=value;}};`)(()=>new Promise(resolve=>{finish=resolve;}),()=>cleared++);
+  const old=client.request('/api/query',{});
+  client.setSession('new');
+  finish({status:401,json:async()=>({ok:false,error:{message:'过期'}})});
+  await assert.rejects(old,/过期/);
+  assert.equal(cleared,0);
+  const current=client.request('/api/query',{});
+  finish({status:401,json:async()=>({ok:false,error:{message:'过期'}})});
+  await assert.rejects(current,/过期/);
+  assert.equal(cleared,1);
 });

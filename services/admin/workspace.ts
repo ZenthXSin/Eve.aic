@@ -20,6 +20,10 @@ export class WorkspaceReader {
   #cached?: Json;
   #readAt = 0;
   #pending?: Promise<Json>;
+  #conversations?: { value: Record<string, unknown>; asOf: string };
+  #history?: { conversationId: string; value: Record<string, unknown>; asOf: string };
+  #phoneAction?: Record<string, unknown>;
+  #phoneView?: Record<string, unknown>;
   constructor(readonly backend: AdminBackend, readonly now = Date.now) {}
   read(): Promise<Json> {
     if (this.#pending) return this.#pending;
@@ -36,7 +40,12 @@ export class WorkspaceReader {
       this.backend.query({ resource: "workspace", operation: "page", args: {} }),
       this.backend.query({ resource: "qqConversations", operation: "page", args: {} }),
     ]);
-    const journal = actionsResult.status === "fulfilled" ? object(actionsResult.value) : {};
+    const previous = object(this.#cached);
+    const journal = actionsResult.status === "fulfilled" ? object(actionsResult.value) : {
+      items: Array.isArray(previous.operations) ? previous.operations : [],
+      throughSeq: previous.throughSeq,
+      partial: true,
+    };
     const operations: Record<string, unknown>[] = Array.isArray(journal.items)
       ? journal.items.map((item) => ({
         ...object(item),
@@ -50,11 +59,13 @@ export class WorkspaceReader {
       const id = args.conversationId ?? object(args.handle).conversationId;
       return typeof id === "string" ? id : null;
     };
-    const phoneAction = [...operations].reverse().find((item) =>
-      item.namespace === "phone" && conversationFor(item)
+    const currentPhoneAction = [...operations].reverse().find((item) =>
+      item.namespace === "phone" && item.status === "completed" && conversationFor(item)
     );
+    if (currentPhoneAction) this.#phoneAction = currentPhoneAction;
+    const phoneAction = this.#phoneAction;
     const activeConversationId = phoneAction ? conversationFor(phoneAction) : null;
-    const phoneView = [...operations].reverse().find((item) => {
+    const currentPhoneView = [...operations].reverse().find((item) => {
       if (
         item.namespace !== "phone" || item.status !== "completed" ||
         conversationFor(item) !== activeConversationId
@@ -62,6 +73,10 @@ export class WorkspaceReader {
       const result = object(item.result);
       return Array.isArray(result.messages) || Boolean(result.handle && result.body);
     });
+    if (currentPhoneView) this.#phoneView = currentPhoneView;
+    const phoneView = this.#phoneView && conversationFor(this.#phoneView) === activeConversationId
+      ? this.#phoneView
+      : undefined;
     const viewResult = object(phoneView?.result);
     const capturedMessages = Array.isArray(viewResult.messages)
       ? viewResult.messages
@@ -79,8 +94,43 @@ export class WorkspaceReader {
         sourceOperationId: String(phoneAction.id),
       }
       : null;
-    const qq = qqResult.status === "fulfilled" ? object(qqResult.value) : {};
     const asOf = new Date(this.now()).toISOString();
+    if (qqResult.status === "fulfilled") {
+      this.#conversations = { value: object(qqResult.value), asOf };
+    }
+    const qq = this.#conversations?.value ?? {};
+    // One current page only, without a cursor: fresh arrivals, delivery receipts and
+    // attachment download changes must refresh even if Eve's action ledger is unchanged.
+    // This is the separate read-only admin path, never phone.open or an acknowledgement.
+    let historyFresh = false;
+    if (activeConversationId) {
+      try {
+        const value = object(
+          await this.backend.query({
+            resource: "qqHistory",
+            operation: "page",
+            args: { conversationId: activeConversationId },
+          }),
+        );
+        if (!Array.isArray(value.messages)) throw new Error("QQ history page unavailable");
+        this.#history = {
+          conversationId: activeConversationId,
+          value,
+          asOf: new Date(this.now()).toISOString(),
+        };
+        historyFresh = true;
+      } catch {
+        // Preserve only a confirmed page of this exact conversation, labelled stale.
+      }
+    }
+    const history = this.#history?.conversationId === activeConversationId
+      ? this.#history
+      : undefined;
+    const messages = history ? history.value.messages as Json[] : capturedMessages as Json[];
+    const readingState = Array.isArray(qq.items)
+      ? object(qq.items.find((item) => object(item).conversationId === activeConversationId))
+        .reading
+      : undefined;
     const apps: Record<string, Json> = {};
     for (const appId of appIds) {
       const items = appId === "tools"
@@ -104,26 +154,77 @@ export class WorkspaceReader {
     }
     apps.qq = {
       ...object(apps.qq),
-      available: qqResult.status === "fulfilled",
+      available: qqResult.status === "fulfilled" || Boolean(this.#conversations) ||
+        Boolean(activeConversationId) || Boolean(history) || messages.length > 0,
       source: "qq_phone",
       conversations: Array.isArray(qq.items) ? qq.items as Json[] : [],
+      conversationsFreshness: qqResult.status === "fulfilled"
+        ? "fresh"
+        : this.#conversations
+        ? "stale"
+        : "unavailable",
+      conversationsAsOf: this.#conversations?.asOf ?? null,
       activeConversationId,
       activeAt: typeof phoneAction?.startedAt === "string" ? phoneAction.startedAt : null,
+      activeSourceFreshness: actionsResult.status === "rejected"
+        ? "stale"
+        : currentPhoneAction
+        ? "fresh"
+        : phoneAction
+        ? "cached"
+        : "unavailable",
       focusedText,
       focusedMessageSeq: typeof object(focusArgs.handle).seq === "number"
         ? object(focusArgs.handle).seq as number
         : null,
-      messages: capturedMessages as Json[],
-      messageSource: capturedMessages.length ? "eve_script_receipt" : "unavailable",
+      messages,
+      messageSource: history
+        ? "qq_readonly_history"
+        : capturedMessages.length
+        ? "eve_script_receipt"
+        : "unavailable",
+      messageFreshness: historyFresh
+        ? "fresh"
+        : history || messages.length
+        ? "stale"
+        : "unavailable",
+      messagesAsOf: history?.asOf ?? phoneView?.startedAt as string ?? null,
+      historyError: activeConversationId && !historyFresh
+        ? "QQ 最新只读消息暂不可用，当前保留最后已确认屏幕。"
+        : null,
+      historySnapshotThroughSeq: typeof history?.value.snapshotThroughSeq === "number"
+        ? history.value.snapshotThroughSeq
+        : null,
+      ...(history?.value.older ? { historyOlder: history.value.older as Json } : {}),
+      // Separate evidence of what Eve actually requested and saw from this admin preview.
+      capturedMessages: capturedMessages as Json[],
+      capturedSnapshotThroughSeq: typeof viewResult.snapshotThroughSeq === "number"
+        ? viewResult.snapshotThroughSeq
+        : null,
+      capturedDisplayedSeqs: Array.isArray(viewResult.displayedSeqs)
+        ? viewResult.displayedSeqs as Json[]
+        : capturedMessages.map((message) => object(object(message).handle).seq)
+          .filter((seq) => typeof seq === "number") as Json[],
+      capturedNotificationThroughSeq: typeof viewResult.notificationThroughSeq === "number"
+        ? viewResult.notificationThroughSeq
+        : null,
+      readingState: readingState as Json ?? null,
+      readingStateFreshness: readingState === undefined
+        ? "unavailable"
+        : qqResult.status === "fulfilled"
+        ? "fresh"
+        : "stale",
       viewedAt: phoneView?.startedAt as string ?? null,
       viewOperationId: phoneView?.id as string ?? null,
       snapshotThroughSeq: typeof qq.snapshotThroughSeq === "number" ? qq.snapshotThroughSeq : null,
       partial: true,
       ...(qq.older ? { older: qq.older as Json } : {}),
-      ...(!capturedMessages.length
+      ...(!messages.length
         ? {
           emptyReason: activeConversationId
-            ? "本次查看的原始消息屏幕未包含在近期回执中，可手动只读浏览会话。"
+            ? historyFresh
+              ? "此会话的最新只读消息页为空。"
+              : "本次查看的原始消息屏幕未包含在近期回执中，最新只读页也暂不可用。"
             : "近期没有 Eve 查看某个会话的明确操作；可手动只读浏览。",
         }
         : { emptyReason: null }),
