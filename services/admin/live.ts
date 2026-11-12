@@ -1,7 +1,10 @@
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import type { AdminBackend } from "./contracts.ts";
 import type { ToolCall } from "../../contracts/model.ts";
-import { projectThoughts } from "../../plugins/eve/thoughts.ts";
+import { observedPreview } from "../../sdk/script-observer.ts";
+import { callFor } from "../../plugins/eve/view.ts";
+import type { ConsciousEvent } from "../../plugins/eve/journal.ts";
+import { projectThoughts, thoughtForCall, withoutThought } from "../../plugins/eve/thoughts.ts";
 
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): ObjectValue =>
@@ -23,6 +26,21 @@ export interface LiveEvent {
   tool?: string;
   /** 写随记的调用状态保留在 API，阅读流不重复展示成功保存动作。 */
   thoughtWrite?: boolean;
+  /** Native tool previews reference their one original thought record rather than copying it. */
+  nativeCalls?: {
+    id: string;
+    name: string;
+    args: Json;
+    hasThought: boolean;
+    thoughtRecordSeq?: number;
+    partial: boolean;
+  }[];
+  toolArgs?: Json;
+  toolPreviewPartial?: boolean;
+  nativePreviewOmitted?: number;
+  toolHasThought?: boolean;
+  toolReceipt?: Json;
+  toolReceiptPartial?: boolean;
   wakeAt?: number;
   retryAt?: number;
 }
@@ -55,6 +73,27 @@ export function liveEvent(value: unknown): LiveEvent {
       event.category = "thought";
       event.title = "Eve 留下了新的文字记录";
       const calls = Array.isArray(response.toolCalls) ? response.toolCalls : [];
+      const startIndex = Math.max(0, calls.length - 32);
+      event.nativePreviewOmitted = startIndex;
+      let remaining = 8192;
+      event.nativeCalls = calls.slice(startIndex).map((_raw, offset) => {
+        // Core uses this same helper: provider ids are not execution identities.
+        const native = callFor(e as unknown as ConsciousEvent, startIndex + offset);
+        const hasThought = thoughtForCall(native) !== undefined;
+        const preview = observedPreview(
+          withoutThought(native).args,
+          Math.max(0, Math.min(2048, remaining)),
+        );
+        remaining -= JSON.stringify(preview.value).length;
+        return {
+          id: native.id,
+          name: native.name,
+          args: preview.value,
+          hasThought,
+          partial: preview.partial,
+          ...(hasThought ? { thoughtRecordSeq: event.seq } : {}),
+        };
+      });
       const projected = projectThoughts({
         content: string(response.content),
         toolCalls: calls as ToolCall[],
@@ -72,6 +111,13 @@ export function liveEvent(value: unknown): LiveEvent {
     case "tool_start":
       event.category = "action";
       event.tool = string(call.name);
+      {
+        const native = call as unknown as ToolCall;
+        event.toolHasThought = thoughtForCall(native) !== undefined;
+        const preview = observedPreview(withoutThought(native).args, 2048);
+        event.toolArgs = preview.value;
+        event.toolPreviewPartial = preview.partial;
+      }
       if (event.tool === "write_thought") event.thoughtWrite = true;
       event.title = "工具调用开始";
       event.text = event.tool === "execute_script"
@@ -79,6 +125,11 @@ export function liveEvent(value: unknown): LiveEvent {
         : event.tool || "等待工具回执。";
       break;
     case "tool_result":
+      {
+        const preview = observedPreview(result, 2048);
+        event.toolReceipt = preview.value;
+        event.toolReceiptPartial = preview.partial;
+      }
       event.category = ["failed", "unknown"].includes(string(result.status)) ? "error" : "result";
       event.title = "工具调用已返回";
       event.text = "回执状态：" + (string(result.status) || "未提供") +

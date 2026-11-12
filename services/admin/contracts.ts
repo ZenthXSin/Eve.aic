@@ -6,6 +6,9 @@ export const ADMIN_READS = {
   memory: ["page", "get", "search"],
   receipts: ["page", "get", "search"],
   qqFailures: ["page"],
+  qqConversations: ["page"],
+  qqHistory: ["page"],
+  workspace: ["page"],
 } as const;
 
 export interface AdminQuery {

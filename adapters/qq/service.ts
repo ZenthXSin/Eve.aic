@@ -117,6 +117,7 @@ export async function startQqPhoneAdapter(
     return {
       url: rpc.url,
       actions,
+      phone,
       stopped: receive,
       close: () => {
         closing ??= (async () => {

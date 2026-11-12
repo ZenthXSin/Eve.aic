@@ -2,9 +2,45 @@ import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import { readAdminBody } from "../../services/admin/server.ts";
 import { type ResolveFailedQq, validateFailedResolution } from "../../services/admin/contracts.ts";
 import { QqActionError, type QqSendActions } from "./actions.ts";
+import { type QqPhone, QqPhoneError } from "./phone.ts";
 
-/** 专用管理能力：列出失败/送达未知队首并取消等待；手机/模型不持有此密钥。 */
-export function startQqAdminServer(actions: QqSendActions, key: string) {
+export type QqAdminConversations = NonNullable<Parameters<QqPhone["conversations"]>[0]>;
+export type QqAdminHistory = Parameters<QqPhone["history"]>[0];
+type ReadOnlyPhone = Pick<QqPhone, "conversations" | "history">;
+
+function fields(value: unknown, allowed: string[]): asserts value is Record<string, unknown> {
+  if (
+    !value || typeof value !== "object" || Array.isArray(value) ||
+    Object.keys(value).some((key) => !allowed.includes(key))
+  ) {
+    throw new KernelError("rejected", "QQ 只读查询参数无效");
+  }
+}
+function pageCursor(value: unknown, conversations: boolean): void {
+  const before = conversations ? "beforeLastSeq" : "beforeSeq";
+  fields(value, ["snapshotThroughSeq", before, ...(conversations ? ["beforePinned"] : [])]);
+  if (
+    !Number.isSafeInteger(value.snapshotThroughSeq) || Number(value.snapshotThroughSeq) < 0 ||
+    !Number.isSafeInteger(value[before]) || Number(value[before]) < 1 ||
+    Number(value[before]) > Number(value.snapshotThroughSeq) ||
+    (Object.hasOwn(value, "beforePinned") && typeof value.beforePinned !== "boolean")
+  ) {
+    throw new KernelError("rejected", "QQ 只读查询游标无效");
+  }
+}
+function validatePhoneQuery(args: unknown, conversations: boolean): void {
+  fields(args, conversations ? ["cursor"] : ["conversationId", "cursor"]);
+  if (
+    !conversations && (typeof args.conversationId !== "string" ||
+      !/^qq:(user|group):[^\r\n]{1,512}$/.test(args.conversationId))
+  ) {
+    throw new KernelError("rejected", "QQ 会话标识无效");
+  }
+  if (Object.hasOwn(args, "cursor")) pageCursor(args.cursor, conversations);
+}
+
+/** 独立管理能力：失败队列控制与有界会话只读视图；手机/模型不持有此密钥。 */
+export function startQqAdminServer(actions: QqSendActions, key: string, phone?: ReadOnlyPhone) {
   if (!/^[a-zA-Z0-9_-]{32,256}$/.test(key)) throw new KernelError("rejected", "QQ 管理密钥无效");
   let origin = "";
   const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (request) => {
@@ -40,6 +76,23 @@ export function startQqAdminServer(actions: QqSendActions, key: string) {
           expectedFingerprint: args.expectedFingerprint,
           expectedReceiptDigest: args.expectedReceiptDigest,
         }, { actor: "admin", failedHeadOnly: true });
+      } else if (body.method === "conversations" || body.method === "history") {
+        const conversations = body.method === "conversations";
+        validatePhoneQuery(body.args, conversations);
+        if (!phone) throw new KernelError("unavailable", "QQ 只读会话查询尚未启用");
+        // 与 Eve 使用同一个手机事实投影；history 不调用 open，不移动通知或阅读水位。
+        value = conversations
+          ? await phone.conversations(body.args as QqAdminConversations)
+          : await phone.history(body.args as unknown as QqAdminHistory);
+        // Match the client's encoded-byte ceiling. Oversized original identities/cursors
+        // cannot be truncated safely; return a small explicit error without skipping records.
+        const encoded = JSON.stringify({ ok: true, value });
+        if (new TextEncoder().encode(encoded).length > 131_072) {
+          throw new KernelError("unavailable", "QQ 只读分页超过字节上限，原始记录保留");
+        }
+        return new Response(encoded, {
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
+        });
       } else throw new KernelError("rejected", "未知 QQ 管理操作");
       return Response.json({ ok: true, value }, { headers: { "cache-control": "no-store" } });
     } catch (error) {
@@ -50,6 +103,8 @@ export function startQqAdminServer(actions: QqSendActions, key: string) {
             : error.category,
           "QQ 队列状态已变或不可操作，请刷新核对；原件保留",
         )
+        : error instanceof QqPhoneError
+        ? new KernelError("rejected", "QQ 只读查询无效，请刷新分页")
         : error;
       return Response.json({ ok: false, error: toWireError(normalized) }, {
         headers: { "cache-control": "no-store" },
@@ -67,6 +122,12 @@ export class QqAdminClient {
   }
   resolveFailed(args: ResolveFailedQq) {
     return this.#call("resolveFailed", args);
+  }
+  conversations(args: QqAdminConversations = {}) {
+    return this.#call("conversations", args);
+  }
+  history(args: QqAdminHistory) {
+    return this.#call("history", args);
   }
   async #call(method: string, args: unknown): Promise<Json> {
     try {

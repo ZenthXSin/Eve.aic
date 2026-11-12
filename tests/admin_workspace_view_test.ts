@@ -1,0 +1,333 @@
+import assert from "node:assert/strict";
+import { TOOL_CATALOG } from "../services/admin/tool-catalog.ts";
+import { workspaceScript, workspaceSocketScript } from "../services/admin/workspace-view.ts";
+
+class Element {
+  ownText = "";
+  className = "";
+  dataset: Record<string, string> = {};
+  children: Element[] = [];
+  attributes: Record<string, string> = {};
+  hidden = false;
+  scrollTop = 0;
+  scrollHeight = 0;
+  clientHeight = 0;
+  title = "";
+  constructor(readonly tag = "div") {}
+  get textContent(): string {
+    return this.ownText + this.children.map((c) => c.textContent).join("");
+  }
+  set textContent(value: string) {
+    this.ownText = value;
+    this.children = [];
+  }
+  append(...items: Element[]) {
+    this.children.push(...items);
+  }
+  replaceChildren(...items: Element[]) {
+    this.children = items;
+    this.ownText = "";
+  }
+  setAttribute(name: string, value: string) {
+    this.attributes[name] = value;
+  }
+  addEventListener() {}
+  querySelectorAll() {
+    return [];
+  }
+}
+function viewFixture() {
+  const elements = new Map<string, Element>();
+  const el = (id: string) => {
+    if (!elements.has(id)) elements.set(id, new Element());
+    return elements.get(id)!;
+  };
+  const document = {
+    querySelectorAll: () => [],
+    createElementNS: (_ns: string, tag: string) => new Element(tag),
+  };
+  const node = (tag: string, className = "", text?: string) => {
+    const n = new Element(tag);
+    n.className = className;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  const renderer = new Function(
+    "document",
+    "el",
+    "node",
+    "time",
+    "num",
+    "pretty",
+    `
+    let liveSnapshot=null;
+    ${workspaceScript}
+    return {paint(snapshot){liveSnapshot=snapshot;paintWorkspace(snapshot);},
+      choose(app){workspaceFollow=false;workspaceApp=app;workspaceOperation=null;workspaceKey='';paintWorkspace(liveSnapshot);},
+      clear:clearWorkspace};
+  `,
+  )(document, el, node, String, String, JSON.stringify);
+  return { renderer, el };
+}
+const at = "2026-11-12T00:00:00Z";
+Deno.test("workspace renders captured messages, delivery uncertainty and literal text without guessing active conversation", () => {
+  const { renderer, el } = viewFixture();
+  const app = {
+    available: true,
+    source: "qq_phone",
+    partial: true,
+    activeConversationId: "group_1",
+    viewedAt: at,
+    conversations: [{ conversationId: "group_1", kind: "group", pendingNotifications: 2 }],
+    messages: [{
+      direction: "outgoing",
+      sender: { displayName: { text: "Eve" } },
+      time: { at },
+      body: { text: "<img src=x onerror=alert(1)>" },
+      delivery: { state: "unknown" },
+    }],
+  };
+  const snapshot = {
+    events: [],
+    workspace: {
+      asOf: at,
+      currentApp: { appId: "qq", operation: "phone.history" },
+      apps: { qq: app },
+    },
+  };
+  renderer.paint(snapshot);
+  assert.match(el("workspaceApp").textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.match(el("workspaceApp").textContent, /结果未知/);
+  assert.match(el("workspaceApp").textContent, /Eve 最近操作的会话/);
+  renderer.paint({
+    ...snapshot,
+    workspace: {
+      ...snapshot.workspace,
+      apps: { qq: { ...app, activeConversationId: null, messages: [] } },
+    },
+  });
+  assert.match(el("workspaceApp").textContent, /尚未确认查看的会话/);
+  assert.match(el("workspaceApp").textContent, /不会从最新来信猜测/);
+  renderer.clear();
+  assert.equal(el("workspaceApp").textContent, "");
+});
+Deno.test("workspace previews file contents and tool results while keeping proposed writes distinct", () => {
+  const { renderer, el } = viewFixture();
+  const operation = (id: string, method: string, args: unknown, result: unknown) => ({
+    id,
+    namespace: "files",
+    method,
+    args,
+    result,
+    status: "completed",
+    at,
+    sourceSeq: 7,
+  });
+  const snapshot = {
+    events: [],
+    workspace: {
+      asOf: at,
+      currentApp: { appId: "files", operation: "files.read" },
+      apps: {
+        files: {
+          available: true,
+          items: [
+            operation("read", "read", { path: "/notes.txt" }, {
+              path: "/notes.txt",
+              text: "文本文档的真实内容",
+            }),
+          ],
+        },
+        terminal: {
+          available: true,
+          items: [{
+            ...operation("cmd", "start", { cmd: "printf '%s' '<tag>'" }, {
+              state: "completed",
+              exitCode: 3,
+              stdout: { text: "真实输出" },
+              stderr: { text: "真实错误" },
+            }),
+            namespace: "commands",
+          }],
+        },
+        notes: {
+          available: true,
+          items: [{
+            ...operation("note", "get", { alias: "日常" }, {
+              note: { title: "今日", alias: "日常", group: "生活", revision: 4 },
+              text: "便签正文",
+            }),
+            namespace: "notes",
+          }],
+        },
+      },
+    },
+  };
+  renderer.paint(snapshot);
+  assert.match(el("workspaceApp").textContent, /文本文档的真实内容/);
+  assert.match(el("workspaceApp").textContent, /脚本记录 #7/);
+  renderer.choose("terminal");
+  assert.match(el("workspaceApp").textContent, /printf '%s' '<tag>'/);
+  assert.match(el("workspaceApp").textContent, /真实错误/);
+  assert.match(el("workspaceApp").textContent, /退出码 3/);
+  assert.equal(el("workspaceViewing").textContent, "你正在手动查看");
+  renderer.choose("notes");
+  assert.match(el("workspaceApp").textContent, /分组 生活.*@日常.*版本 4/);
+  assert.match(el("workspaceApp").textContent, /便签正文/);
+  renderer.paint({
+    ...snapshot,
+    workspace: {
+      ...snapshot.workspace,
+      apps: { ...snapshot.workspace.apps, notes: { available: false, emptyReason: "当前不可读" } },
+    },
+  });
+  assert.match(el("workspaceApp").textContent, /当前不可读/);
+});
+Deno.test("workspace websocket applies snapshots, preserves errors, reconnects and ends expired sessions", () => {
+  class Socket {
+    static instances: Socket[] = [];
+    readyState = 0;
+    onopen?: () => void;
+    onmessage?: (event: { data: string }) => void;
+    onerror?: () => void;
+    onclose?: ((event: { code: number }) => void) | null;
+    constructor(readonly url: URL) {
+      Socket.instances.push(this);
+    }
+    close() {
+      this.readyState = 3;
+    }
+  }
+  const elements = new Map<string, Element>();
+  const el = (id: string) => {
+    if (!elements.has(id)) elements.set(id, new Element());
+    return elements.get(id)!;
+  };
+  let applied = 0, failed = 0, expired = 0, retry: (() => void) | undefined;
+  const transport = new Function(
+    "WebSocket",
+    "window",
+    "document",
+    "el",
+    "applyLiveSnapshot",
+    "markLiveFailure",
+    "showLogin",
+    "message",
+    "setTimeout",
+    "clearTimeout",
+    `
+    let csrf='session',activeView='live',liveFollow=true;
+    ${workspaceSocketScript}
+    return {open:openLiveSocket,close:closeLiveSocket};
+  `,
+  )(
+    Socket,
+    { location: { href: "https://eve.example.com/" } },
+    { hidden: false },
+    el,
+    () => applied++,
+    () => failed++,
+    () => expired++,
+    () => {},
+    (callback: () => void) => {
+      retry = callback;
+      return 1;
+    },
+    () => {},
+  );
+  transport.open();
+  const socket = Socket.instances[0];
+  assert.equal(socket.url.href, "wss://eve.example.com/api/live/ws");
+  socket.readyState = 1;
+  socket.onopen!();
+  socket.onmessage!({ data: JSON.stringify({ type: "snapshot", value: { throughSeq: 4 } }) });
+  assert.equal(applied, 1);
+  socket.onmessage!({ data: JSON.stringify({ type: "error", error: { message: "不可读" } }) });
+  assert.equal(failed, 1);
+  socket.onclose!({ code: 1011 });
+  assert.equal(failed, 2);
+  retry!();
+  assert.equal(Socket.instances.length, 2);
+  Socket.instances[1].onclose!({ code: 4001 });
+  assert.equal(expired, 1);
+  transport.close();
+});
+
+Deno.test("every catalog method and unknown future tool has a readable parameter/result preview", () => {
+  const { renderer, el } = viewFixture();
+  const catalog = [...TOOL_CATALOG, { namespace: "future", methods: ["unrecognized"] }];
+  let index = 0;
+  for (const group of catalog) {
+    for (const method of group.methods) {
+      const name = group.namespace + "." + method;
+      const operation = {
+        id: name,
+        namespace: group.namespace,
+        method,
+        status: index++ % 2 ? "unknown" : "failed",
+        at,
+        source: group.namespace === "native" ? "timeline" : "script_ledger",
+        sourceResource: group.namespace === "native" ? "timeline" : undefined,
+        sourceSeq: 7,
+        args: { input: "参数-" + name },
+        result: { answer: "结果-" + name },
+        error: { message: "真实异常-" + name },
+        partial: true,
+        hasThought: method === "write_thought",
+        thoughtRecordSeq: 5,
+      };
+      renderer.paint({
+        events: [],
+        workspace: {
+          asOf: at,
+          currentApp: { appId: "tools", operation: name },
+          apps: { tools: { available: true, catalog, items: [operation] } },
+        },
+      });
+      const body = el("workspaceApp").textContent;
+      assert(body.includes(name), name);
+      assert(body.includes("参数-" + name), name);
+      assert(body.includes("结果-" + name), name);
+      assert(body.includes("真实异常-" + name), name);
+      assert(body.includes("有界预览"), name);
+      if (method === "write_thought") assert(body.includes("正文已在右侧呈现"));
+    }
+  }
+  assert(index >= 55);
+});
+
+Deno.test("tools use readable cards for known APIs and preserve non-object inputs", () => {
+  const { renderer, el } = viewFixture();
+  const visibleText = (element: Element): string => element.tag === "details" ? "" : element.ownText + element.children.map(visibleText).join("");
+  const paint = (namespace: string, method: string, args: unknown, result: unknown, status = "completed") => {
+    renderer.paint({ events: [], workspace: { asOf: at, currentApp: { appId: "tools", operation: namespace + "." + method }, apps: { tools: { available: true, items: [{ id: namespace + method, namespace, method, args, result, status, at }] } } } });
+    return visibleText(el("workspaceApp"));
+  };
+  assert.match(paint("files", "read", { path: "/eve.txt" }, { text: "实际文件正文", sizeBytes: 23 }), /文件阅读.*实际文件正文/);
+  assert.match(paint("commands", "completions", {}, { items: [{ sessionId: "cmd-9", state: "completed", exitCode: 7 }], throughSeq: 8 }), /终端完成记录.*cmd-9.*退出码 7/);
+  assert.match(paint("notes", "get", {}, { note: { alias: "daily", revision: 2 }, text: "便签真实正文" }), /@daily.*版本 2.*便签真实正文/);
+  assert.match(paint("memory", "used", {}, { reinforced: ["m-1"] }), /记忆强化回执.*m-1/);
+  assert.match(paint("phone", "settings", {}, { muted: true, pinned: false, draft: "尚未发出的草稿" }), /已静音.*未置顶.*尚未发送.*尚未发出的草稿/);
+  assert.match(paint("phone", "send", { text: "请求正文" }, { actionId: "a-1", state: "unknown" }), /拟发送内容.*请求正文.*结果未知/);
+  assert.match(paint("phone", "listSendQueue", {}, { items: [{ sequence: 1, actionId: "a-2", receipt: { actionId: "a-2", state: "blocked", blockedBy: "a-1" }, canCancel: true }] }), /等待队列.*等待前序.*a-1.*是否可取消/);
+  assert.match(paint("phone", "image", {}, { selectedMode: "describe", description: "返回的图片描述", download: { path: "/image.png" } }), /描述模式.*返回的图片描述.*下载路径/);
+  const original = paint("phone", "image", {}, { selectedMode: "original", image: { dataUrl: "data:image/png;base64,秘密原图" } });
+  assert.match(original, /原图模式.*仅展示附件元数据/);
+  assert(!original.includes("秘密原图"));
+  assert.match(paint("phone", "file", { offsetBytes: 64 }, { text: "附件实际片段", offsetBytes: 64, nextOffsetBytes: 96 }), /附件实际片段.*字节偏移 64.*后续字节位置 96/);
+  assert.match(paint("mind", "remind", { text: "提醒正文", at }, { requestId: "r-1", queued: true }), /提醒申请.*提醒正文.*已排队.*不表示请求已经应用/);
+  assert.match(paint("mind", "status", {}, [{ at, text: "实际提醒项目" }]), /实际提醒项目/);
+  assert.match(paint("upgrades", "status", {}, { state: "submitted", outcome: "rolled_back", phase: "candidate", reason: "真实回退原因" }), /已提交.*真实回退原因.*当前阶段.*candidate.*最终结果.*rolled_back/);
+  assert.match(paint("scripts", "status", {}, { jobId: "j-1", status: "running", actions: 4 }), /脚本任务.*进行中.*j-1.*实际动作数4/);
+  assert.match(paint("scripts", "result", {}, { text: '{"answer":"实际脚本输出"}', truncated: false }), /answer实际脚本输出/);
+  assert.match(paint("scripts", "result", {}, { text: '{"jobId":"business-job","status":"custom","answer":"真实用户结果"}', truncated: false }), /真实用户结果/);
+  assert.match(paint("records", "page", {}, { items: [{ seq: 99, kind: "model_response", digest: "实际摘要" }] }), /意识记录目录.*记录 #99.*实际摘要/);
+  assert.match(paint("records", "text", { startChar: 20 }, { text: "原文片段", nextChar: 40 }), /实际返回的记录原文.*原文片段.*字符偏移 20.*后续位置 40/);
+  paint("native", "execute_script", "非法原始参数", false);
+  assert(el("workspaceApp").textContent.includes("非法原始参数"));
+  assert.match(paint("future", "method", ["原始数组"], 0), /原始数组.*实际回执0/);
+  assert.match(paint("phone", "futureMethod", { query: "未来参数" }, { answer: "未来方法回执" }), /未来参数.*未来方法回执/);
+  assert.match(paint("native", "write_thought", {}, undefined, "failed"), /随记动作.*失败.*未取得有效随记正文/);
+  const pending = paint("future", "method", "原始字符串", undefined, "started");
+  assert.match(pending, /调用尚待结果/);
+});

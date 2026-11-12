@@ -1,4 +1,5 @@
 import type { ModelResponse } from "../contracts/model.ts";
+import { ScriptObserver } from "../sdk/script-observer.ts";
 import { QqAdminClient } from "../adapters/qq/admin.ts";
 import { OwnershipRpcClient } from "../guardian/rpc.ts";
 import { type Json, KernelError, toWireError } from "../kernel/protocol.ts";
@@ -216,6 +217,7 @@ export async function startSupervisor(configPath: string) {
       await controller.resume();
     }
   };
+  let workspaceObserver: { instanceId: string; observer: ScriptObserver } | undefined;
   const admin = await startAdminControlServer({
     async status() {
       return {
@@ -224,7 +226,35 @@ export async function startSupervisor(configPath: string) {
         ownership: await guardian.status() as unknown as Json,
       };
     },
-    query: (request) => {
+    query: async (request) => {
+      if (request.resource === "workspace") {
+        if (Object.keys(request.args).length) {
+          throw new KernelError("rejected", "工作台只读查询不接受路径");
+        }
+        const current = controller.state.current;
+        if (!current) throw new KernelError("unavailable", "当前实例尚未确定");
+        if (workspaceObserver?.instanceId !== current) {
+          const spec = config.instances.find((item) => item.id === current) ??
+            controller.instance(current);
+          const trusted = await readTrustedInstanceConfig(spec);
+          const directory = (trusted as unknown as { scripts?: { directory?: string } }).scripts
+            ?.directory;
+          if (typeof directory !== "string" || !directory.startsWith("/")) {
+            throw new KernelError("unavailable", "当前实例未配置脚本账本");
+          }
+          workspaceObserver = {
+            instanceId: current,
+            observer: new ScriptObserver(`${directory}/ledger`),
+          };
+        }
+        return await workspaceObserver.observer.read();
+      }
+      if (request.resource === "qqConversations" || request.resource === "qqHistory") {
+        if (!qqAdmin) throw new KernelError("unavailable", "QQ 只读视图尚未配置");
+        return request.resource === "qqConversations"
+          ? qqAdmin.conversations(request.args as never)
+          : qqAdmin.history(request.args as never);
+      }
       if (request.resource === "qqFailures") {
         if (!qqAdmin) throw new KernelError("unavailable", "QQ 失败队列管理尚未配置");
         return qqAdmin.failedHeads(request.args);

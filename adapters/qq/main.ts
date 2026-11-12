@@ -87,7 +87,7 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
   Deno.addSignalListener("SIGINT", stop);
   try {
     if (adminKey) {
-      admin = startQqAdminServer(adapter.actions, adminKey);
+      admin = startQqAdminServer(adapter.actions, adminKey, adapter.phone);
       await writeDurableJson(adminControl.connectionFile, { url: admin.url });
     }
     // 仅连接参数；主人身份配置仍由手机组合层另行加入，不由适配器决定。

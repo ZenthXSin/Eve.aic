@@ -203,7 +203,7 @@ Deno.test("admin QQ failure resolution travels browser/CSRF/private bridges and 
   }
 });
 
-Deno.test("runtime admin refuses QQ queue resource instead of falling back to memory", async () => {
+Deno.test("runtime admin refuses external QQ and workspace resources instead of falling back to memory", async () => {
   const key = "r".repeat(48);
   // A QQ query must be rejected before any runtime or memory journal access.
   const engine = new Proxy({}, {
@@ -213,17 +213,16 @@ Deno.test("runtime admin refuses QQ queue resource instead of falling back to me
   }) as RuntimeEngine;
   const server = startRuntimeAdmin(engine, key, () => Promise.resolve());
   try {
-    const response = await fetch(server.url, {
-      method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        method: "query",
-        args: { resource: "qqFailures", operation: "page", args: {} },
-      }),
-    });
-    const wire = await response.json();
-    assert.equal(wire.ok, false);
-    assert.equal(wire.error.kind, "rejected");
+    for (const resource of ["qqFailures", "qqConversations", "qqHistory", "workspace"]) {
+      const response = await fetch(server.url, {
+        method: "POST",
+        headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({ method: "query", args: { resource, operation: "page", args: {} } }),
+      });
+      const wire = await response.json();
+      assert.equal(wire.ok, false);
+      assert.equal(wire.error.kind, "rejected");
+    }
   } finally {
     await server.close();
   }

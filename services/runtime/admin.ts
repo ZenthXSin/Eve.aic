@@ -31,7 +31,9 @@ export function startRuntimeAdmin(
   };
   const query = async (request: AdminQuery): Promise<Json> => {
     if (
-      !request || request.resource === "qqFailures" || !(request.resource in ADMIN_READS) ||
+      !request ||
+      ["qqFailures", "qqConversations", "qqHistory", "workspace"].includes(request.resource) ||
+      !(request.resource in ADMIN_READS) ||
       !(ADMIN_READS[request.resource] as readonly string[]).includes(request.operation) ||
       !request.args || typeof request.args !== "object" || Array.isArray(request.args)
     ) throw new KernelError("rejected", "管理查询不在契约内");

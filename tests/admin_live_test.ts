@@ -247,6 +247,9 @@ Deno.test("live page displays a note once, retains ordinary tools and exposes no
     createElement(tag: string) {
       return new Element(tag);
     },
+    createElementNS(_namespace: string, tag: string) {
+      return new Element(tag);
+    },
   };
   const fetch = () =>
     Promise.resolve({
@@ -257,7 +260,7 @@ Deno.test("live page displays a note once, retains ordinary tools and exposes no
   const paint = new Function(
     "document",
     "fetch",
-    `${script}\nreturn (snapshot) => { liveSnapshot=snapshot; paintLive(snapshot); };`,
+    `${script}\nreturn (snapshot) => { liveSnapshot=snapshot; liveFilter='all'; paintLive(snapshot); };`,
   )(document, fetch);
   // 等待启动时的未登录检查，不让它清理后续的测试画面。
   await new Promise((resolve) => setTimeout(resolve, 0));

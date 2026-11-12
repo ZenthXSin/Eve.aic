@@ -8,6 +8,12 @@ import {
 } from "./contracts.ts";
 import { panelHtml } from "./view.ts";
 import { LiveReader } from "./live.ts";
+import {
+  boundLiveSnapshot,
+  publicLiveEvents,
+  withNativeOperations,
+  WorkspaceReader,
+} from "./workspace.ts";
 
 const MAX_BODY = 65_536;
 const SESSION_MS = 8 * 60 * 60 * 1000;
@@ -61,6 +67,40 @@ export function validateQuery(body: Record<string, Json>): AdminQuery {
     !(ADMIN_READS[resource] as readonly Json[]).includes(body.operation) ||
     !body.args || typeof body.args !== "object" || Array.isArray(body.args)
   ) throw new KernelError("rejected", "不支持的管理查询");
+  if (resource === "workspace" && Object.keys(body.args).length) {
+    throw new KernelError("rejected", "工作台查询不接受文件路径或额外参数");
+  }
+  if (resource === "qqConversations" || resource === "qqHistory") {
+    const args = body.args as Record<string, Json>;
+    const allowed = resource === "qqHistory" ? ["conversationId", "cursor"] : ["cursor"];
+    if (
+      Object.keys(args).some((key) => !allowed.includes(key)) ||
+      resource === "qqHistory" &&
+        (typeof args.conversationId !== "string" ||
+          !/^qq:(user|group):.{1,512}$/.test(args.conversationId))
+    ) {
+      throw new KernelError("rejected", "QQ 只读查询参数无效");
+    }
+    if (args.cursor !== undefined) {
+      const cursor = args.cursor;
+      if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)) {
+        throw new KernelError("rejected", "QQ 只读游标无效");
+      }
+      const before = resource === "qqHistory" ? "beforeSeq" : "beforeLastSeq";
+      if (
+        Object.keys(cursor).some((key) =>
+          !["snapshotThroughSeq", before, ...(resource === "qqHistory" ? [] : ["beforePinned"])]
+            .includes(key)
+        ) ||
+        !Number.isSafeInteger(cursor.snapshotThroughSeq) || Number(cursor.snapshotThroughSeq) < 0 ||
+        !Number.isSafeInteger(cursor[before]) || Number(cursor[before]) < 1 ||
+        Number(cursor[before]) > Number(cursor.snapshotThroughSeq) ||
+        cursor.beforePinned !== undefined && typeof cursor.beforePinned !== "boolean"
+      ) {
+        throw new KernelError("rejected", "QQ 只读游标无效");
+      }
+    }
+  }
   if (resource === "qqFailures") {
     const args = body.args as Record<string, Json>;
     if (
@@ -151,7 +191,86 @@ export async function startAdminServer(
   }
   const tokenHash = await digest(options.token), now = options.now ?? Date.now;
   const live = new LiveReader(backend);
+  const workspace = new WorkspaceReader(backend, now);
   const sessions = new Map<string, { csrf: string; expires: number }>();
+  const sockets = new Map<WebSocket, { sessionId: string; expires: number }>();
+  let streaming: Promise<void> | undefined;
+  let streamTimer: ReturnType<typeof setInterval> | undefined;
+  let snapshotPending: Promise<Json> | undefined;
+  let snapshotCached: { value: Json; at: number } | undefined;
+  const snapshot = () => {
+    if (snapshotPending) return snapshotPending;
+    if (snapshotCached && now() - snapshotCached.at < 1000) {
+      return Promise.resolve(snapshotCached.value);
+    }
+    const pending = Promise.all([live.read(), workspace.read()]).then(([value, screen]) => {
+      const events = (value as unknown as { events: import("./live.ts").LiveEvent[] }).events;
+      return boundLiveSnapshot({
+        ...(value as Record<string, Json>),
+        events: publicLiveEvents(events),
+        workspace: withNativeOperations(screen, events),
+      });
+    });
+    void pending.then((value) => {
+      snapshotCached = { value, at: now() };
+    }).catch(() => {});
+    snapshotPending = pending;
+    void pending.finally(() => {
+      if (snapshotPending === pending) snapshotPending = undefined;
+    }).catch(() => {});
+    return pending;
+  };
+  const closeSocket = (socket: WebSocket, code: number, reason: string) => {
+    sockets.delete(socket);
+    try {
+      socket.close(code, reason);
+    } catch { /* already disconnected */ }
+    if (!sockets.size && streamTimer !== undefined) {
+      clearInterval(streamTimer);
+      streamTimer = undefined;
+    }
+  };
+  const broadcast = (): Promise<void> => {
+    if (streaming) return streaming;
+    const pending = (async () => {
+      for (const [socket, details] of sockets) {
+        if (details.expires <= now() || !sessions.has(details.sessionId)) {
+          closeSocket(socket, 4001, "登录已过期");
+        }
+      }
+      if (!sockets.size) return;
+      let frame: string;
+      try {
+        frame = JSON.stringify({ type: "snapshot", value: await snapshot() });
+        if (new TextEncoder().encode(frame).length > 2_000_000) {
+          throw new KernelError("unavailable", "实时快照超过展示上限，请使用分页原件查看");
+        }
+      } catch (error) {
+        frame = JSON.stringify({ type: "error", error: toWireError(error) });
+      }
+      for (const [socket, details] of sockets) {
+        if (details.expires <= now() || !sessions.has(details.sessionId)) {
+          closeSocket(socket, 4001, "登录已过期");
+          continue;
+        }
+        if (socket.readyState !== WebSocket.OPEN) continue;
+        if (socket.bufferedAmount > 1_048_576) {
+          closeSocket(socket, 4008, "连接处理较慢，请重连");
+          continue;
+        }
+        try {
+          socket.send(frame);
+        } catch {
+          closeSocket(socket, 1011, "连接中断");
+        }
+      }
+    })();
+    streaming = pending;
+    void pending.finally(() => {
+      if (streaming === pending) streaming = undefined;
+    }).catch(() => {});
+    return pending;
+  };
   let failedLogins = 0, retryAfter = 0, origin = "", host = "";
   const cookieAttributes = `HttpOnly; SameSite=Strict; Path=/${publicOrigin ? "; Secure" : ""}`;
   const response = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
@@ -175,7 +294,9 @@ export async function startAdminServer(
             ...secureHeaders,
             "content-type": "text/html; charset=utf-8",
             "content-security-policy":
-              `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`,
+              `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self' ${
+                origin.replace(/^http/, "ws")
+              }; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`,
           },
         });
       }
@@ -228,13 +349,45 @@ export async function startAdminServer(
           return response({ ok: true, value: await backend.status() });
         }
         if (request.method === "GET" && path === "/api/live") {
-          return response({ ok: true, value: await live.read() });
+          return response({ ok: true, value: await snapshot() });
+        }
+        if (request.method === "GET" && path === "/api/live/ws") {
+          if (
+            request.headers.get("origin") !== origin || url.search ||
+            request.headers.get("upgrade")?.toLowerCase() !== "websocket"
+          ) {
+            return response({ ok: false, error: { message: "WebSocket 需要同源登录连接" } }, 403);
+          }
+          if (
+            sockets.size >= 32 ||
+            [...sockets.values()].filter((s) => s.sessionId === cookie).length >= 4
+          ) {
+            return response({ ok: false, error: { message: "实时连接数量已达上限" } }, 429);
+          }
+          const { socket, response: upgraded } = Deno.upgradeWebSocket(request, {
+            idleTimeout: 30,
+          });
+          sockets.set(socket, { sessionId: cookie!, expires: session.expires });
+          socket.onopen = () => {
+            void broadcast();
+            streamTimer ??= setInterval(() => {
+              void broadcast();
+            }, 3000);
+          };
+          socket.onclose = () => closeSocket(socket, 1000, "已断开");
+          socket.onerror = () => closeSocket(socket, 1011, "连接异常");
+          // The stream is strictly read-only; browser messages cannot invoke tools or controls.
+          socket.onmessage = () => closeSocket(socket, 1008, "此连接仅用于读取");
+          return upgraded;
         }
         if (request.method !== "POST" || request.headers.get("x-eve-csrf") !== session.csrf) {
           return response({ ok: false, error: { message: "管理请求校验失败" } }, 403);
         }
         if (path === "/api/logout") {
           sessions.delete(cookie!);
+          for (const [socket, details] of sockets) {
+            if (details.sessionId === cookie) closeSocket(socket, 4001, "已退出登录");
+          }
           return response({ ok: true, value: null }, 200, {
             "set-cookie": `${COOKIE}=; ${cookieAttributes}; Max-Age=0`,
           });
@@ -268,6 +421,9 @@ export async function startAdminServer(
     url: localOrigin,
     async close() {
       sessions.clear();
+      if (streamTimer !== undefined) clearInterval(streamTimer);
+      for (const socket of sockets.keys()) closeSocket(socket, 1001, "服务重启");
+      if (streaming) await streaming;
       await server.shutdown();
     },
   };
