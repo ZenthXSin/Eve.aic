@@ -1,5 +1,9 @@
 /** Pure presentation helpers. Never read files, submit messages or allocate action IDs. */
 
+// Markdown is optional presentation. Bound each regex pass; very large lines remain
+// literal instead of spending unbounded CPU trying to repair malformed formatting.
+const MAX_MARKUP_LINE_LENGTH = 8192;
+
 /** Convert common Markdown chat markup to readable text without interpreting HTML. */
 export function mdToPlain(text: string): string {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
@@ -20,6 +24,7 @@ export function mdToPlain(text: string): string {
       fence = { marker: opening[1][0], length: opening[1].length };
       return undefined;
     }
+    if (line.length > MAX_MARKUP_LINE_LENGTH) return line;
     line = line.replace(/^ {0,3}#{1,6}[\t ]+(.+?)(?:[\t ]+#+[\t ]*)?$/, "$1")
       .replace(/^ {0,3}(?:>[\t ]?)+/, "")
       .replace(/^(\s*)[-+*][\t ]+/, "$1• ");
@@ -30,6 +35,15 @@ export function mdToPlain(text: string): string {
 function inlinePlain(line: string): string {
   // Inline code is a literal island: remove only its matching delimiter, not its contents.
   const pieces: string[] = [];
+  // Index exact delimiter runs once. Repeated unmatched runs of different lengths
+  // must not each search the entire remaining line with indexOf.
+  const runs = [...line.matchAll(/`+/g)];
+  const nextRun = new Map<number, number>(), lastByLength = new Map<number, number>();
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const run = runs[i], next = lastByLength.get(run[0].length);
+    if (next !== undefined) nextRun.set(run.index, next);
+    lastByLength.set(run[0].length, run.index);
+  }
   let start = 0, index = 0;
   while (index < line.length) {
     if (line[index] === "\\" && /[\\`*_[\]{}()#+.!>~-]/.test(line[index + 1] ?? "")) {
@@ -44,13 +58,13 @@ function inlinePlain(line: string): string {
     }
     let end = index + 1;
     while (line[end] === "`") end++;
-    const delimiter = line.slice(index, end), close = line.indexOf(delimiter, end);
-    if (close < 0) {
+    const close = nextRun.get(index);
+    if (close === undefined) {
       index = end;
       continue;
     }
     pieces.push(markupPlain(line.slice(start, index)), line.slice(end, close));
-    index = close + delimiter.length;
+    index = close + end - index;
     start = index;
   }
   pieces.push(markupPlain(line.slice(start)));
@@ -58,14 +72,14 @@ function inlinePlain(line: string): string {
 }
 
 function markupPlain(text: string): string {
-  // Protect URL data while removing emphasis around a whole link. The prefix is
-  // deterministic and absent from input, so user text cannot collide with a token.
-  let prefix = "\uE000qq-url-";
-  while (text.includes(prefix)) prefix += "x";
+  // Escape the marker once instead of repeatedly scanning for an absent prefix.
+  // The restore pass distinguishes escaped original markers from URL placeholders.
+  text = text.replaceAll("\uE000", "\uE000\uE000");
   const urls: string[] = [];
-  const protect = (url: string) => `${prefix}${urls.push(url) - 1}\uE001`;
+  const protect = (url: string) => `\uE000${urls.push(url) - 1}\uE001`;
   // Balanced URL parentheses survive link conversion, e.g. /wiki/Foo_(bar).
-  let linked = "", index = 0;
+  const chunks: string[] = [];
+  let index = 0;
   while (index < text.length) {
     const image = text[index] === "!" && text[index + 1] === "[";
     const begin = index + (image ? 1 : 0);
@@ -87,24 +101,31 @@ function markupPlain(text: string): string {
           const destination = text.slice(labelEnd + 2, cursor).trim()
             .replace(/^<([^>]+)>$/, "$1");
           // Keep destinations and optional titles verbatim: no URL or visible body is discarded.
-          linked += label === destination
-            ? protect(destination)
-            : label
-            ? `${label} (${protect(destination)})`
-            : protect(destination);
+          chunks.push(
+            label === destination
+              ? protect(destination)
+              : label
+              ? `${label} (${protect(destination)})`
+              : protect(destination),
+          );
           index = cursor + 1;
           continue;
         }
       }
+      // No valid closing destination: keep the suffix verbatim. Searching it again
+      // for every later '[' causes quadratic work on malformed or nested input.
+      chunks.push(text.slice(index));
+      break;
     }
-    linked += text[index++];
+    chunks.push(text[index++]);
   }
   // URLs remain literal islands too; emphasis-like characters can be valid URL data.
-  const protectedText = linked.replace(/<(https?:\/\/[^<>\s]+)>/g, "$1")
-    .replace(/https?:\/\/[^\s<>]+/g, protect);
+  const protectedText = chunks.join("").replace(/<(https?:\/\/[^<>\s]+)>/g, "$1")
+    .replace(/https?:\/\/(?:[^\s<>\uE000]|\uE000\uE000)+/g, protect);
   return emphasisPlain(protectedText).replace(
-    new RegExp(`${prefix}(\\d+)\uE001`, "g"),
-    (_match, index: string) => urls[Number(index)],
+    /\uE000(?:\uE000|(\d+)\uE001)/g,
+    (_match, index: string | undefined) =>
+      index === undefined ? "\uE000" : urls[Number(index)].replaceAll("\uE000\uE000", "\uE000"),
   );
 }
 
