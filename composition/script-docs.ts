@@ -1,5 +1,7 @@
 /** 接口说明直接取契约源码，类型检查也导入同一文件，不另写一份签名。 */
-export async function renderScriptContracts(): Promise<string> {
+export async function renderScriptContracts(
+  readSource?: (path: string) => Promise<string>,
+): Promise<string> {
   const files = [
     new URL("../contracts/phone.ts", import.meta.url),
     new URL("../contracts/model.ts", import.meta.url),
@@ -13,9 +15,11 @@ export async function renderScriptContracts(): Promise<string> {
   const sections: string[] = [];
   for (const file of files) {
     sections.push(
-      `接口来源：contracts/${file.pathname.split("/").at(-1)}\n\`\`\`ts\n${await Deno.readTextFile(
-        file,
-      )}\`\`\``,
+      `接口来源：contracts/${
+        file.pathname.split("/").at(-1)
+      }\n\`\`\`ts\n${await (readSource
+        ? readSource(`contracts/${file.pathname.split("/").at(-1)}`)
+        : Deno.readTextFile(file))}\`\`\``,
     );
   }
   return "唯一原生工具 execute_script 的 code 是异步函数正文。当前参数名 tools，类型为 ScriptApi；可 await 和 return。\n" +

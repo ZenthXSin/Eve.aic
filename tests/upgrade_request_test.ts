@@ -17,6 +17,7 @@ import { fingerprint } from "../kernel/calls.ts";
 import { type Json, KernelError } from "../kernel/protocol.ts";
 import type { OwnershipProof } from "../contracts/ownership.ts";
 import type { ModelRequest, ModelResponse } from "../contracts/model.ts";
+import { renderScriptContracts } from "../composition/script-docs.ts";
 
 const key = (name: string) => `upgrade_request_fixture_${name}_012345678901234567890123456789`;
 async function git(directory: string, args: string[]) {
@@ -65,6 +66,29 @@ Deno.test({
       }),
       { mode: 0o644 },
     );
+    await Deno.mkdir(`${repository}/prompts`);
+    await Deno.mkdir(`${repository}/contracts`);
+    const promptFiles = [
+      "prompts/qq-social.md",
+      ...[
+        "phone",
+        "model",
+        "script",
+        "mind",
+        "notes",
+        "workspace",
+        "memory",
+        "upgrades",
+      ].map((name) => `contracts/${name}.ts`),
+    ];
+    const promptManifest = [];
+    for (const path of promptFiles) {
+      const bytes = await Deno.readFile(new URL(`../${path}`, import.meta.url));
+      await Deno.writeFile(`${repository}/${path}`, bytes, { mode: 0o644 });
+      const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+        .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      promptManifest.push({ path, sha256, executable: false });
+    }
     for (const name of ["main.ts", "fixture_test.ts", "deno.json"]) {
       await Deno.chmod(`${repository}/${name}`, 0o644);
     }
@@ -99,16 +123,20 @@ Deno.test({
     await Deno.chown(`${oldPrivate}/credential.key`, 0, oldIdentity.gid);
     await Deno.writeTextFile(`${oldPrivate}/runtime.key`, key("runtime"));
     await Deno.writeTextFile(`${oldPrivate}/phone.key`, key("phone"));
-    await Deno.writeTextFile(`${oldPrivate}/prompt.md`, "你是 Eve，升级测试固定身份。\n");
+    const identity = "你是 Eve，升级测试固定身份。\n定制身份保留。\n";
+    const originalPrompt = `${identity}\n\n${await Deno.readTextFile(
+      `${repository}/prompts/qq-social.md`,
+    )}\n\n${await renderScriptContracts()}`;
+    await Deno.writeTextFile(`${oldPrivate}/prompt.md`, originalPrompt);
     const old: InstanceSpec = {
       id: "old",
       identity: oldIdentity,
       source: {
         commit: "a".repeat(40),
-        directory: `${directory}/old-source`,
-        digest: await fingerprint([]),
+        directory: repository,
+        digest: await fingerprint(promptManifest),
         checkedAt: new Date().toISOString(),
-        files: [],
+        files: promptManifest,
       },
       configFile: `${oldPrivate}/config.json`,
       connectionFile: `${oldPrivate}/connection.json`,
@@ -281,6 +309,7 @@ Deno.test({
         (error) => error instanceof KernelError && error.kind === "unavailable",
       );
       const candidateConfig = JSON.parse(await Deno.readTextFile(active.configFile));
+      assert.equal(await Deno.readTextFile(candidateConfig.eve.promptFile), originalPrompt);
       for (
         const path of [
           active.configFile,

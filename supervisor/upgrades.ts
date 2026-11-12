@@ -7,6 +7,7 @@ import { FactJournal } from "../sdk/fact-journal.ts";
 import type { InstanceSpec, Supervisor } from "./controller.ts";
 import { pinSource } from "./source.ts";
 import { readTrustedInstanceConfig } from "./driver.ts";
+import { refreshUpgradePrompt } from "./prompt.ts";
 
 export interface UpgradeReceipt {
   actionId: string;
@@ -204,7 +205,14 @@ export class UpgradeRequests {
         };
         await copy(base.runtime.keyFile, `${p}/runtime.key`);
         await copy(base.phone.adapterKeyFile, `${p}/phone.key`);
-        await copy(base.eve.promptFile, `${p}/prompt.md`);
+        const prompt = await refreshUpgradePrompt(
+          await Deno.readTextFile(base.eve.promptFile),
+          active.source,
+          artifact,
+        );
+        await Deno.writeTextFile(`${p}/prompt.md`, prompt, { mode: 0o440 });
+        await Deno.chmod(`${p}/prompt.md`, 0o440);
+        await Deno.chown(`${p}/prompt.md`, 0, identity.gid);
         await Deno.mkdir(`${r}/mind`, { mode: 0o700 });
         // 控制状态在旧kernel真正停止后由 driver.handover 原子冻结，构建期间不复制活动队列。
         await Deno.chown(`${r}/mind`, identity.uid, identity.gid);
