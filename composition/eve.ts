@@ -1,5 +1,6 @@
 import { renderScriptContracts } from "./script-docs.ts";
 import { readEveConfig } from "../plugins/eve/mod.ts";
+import { nightlySchedule, type NightlySelfCheck } from "../plugins/mind-controls/nightly.ts";
 
 export async function writeEvePrompt(path: string): Promise<void> {
   const identity = await Deno.readTextFile(new URL("../prompts/identity.md", import.meta.url));
@@ -53,14 +54,21 @@ export async function composeEvePlugin(directory: string, configPath: string): P
     { mode: 0o600 },
   );
 }
-export async function composeMindPlugin(directory: string, dataDirectory: string): Promise<void> {
+export async function composeMindPlugin(
+  directory: string,
+  dataDirectory: string,
+  nightlySelfCheck?: NightlySelfCheck,
+): Promise<void> {
+  if (nightlySelfCheck !== undefined) nightlySchedule(nightlySelfCheck);
   const module = new URL("../plugins/mind-controls/mod.ts", import.meta.url);
   await Deno.mkdir(directory, { recursive: true, mode: 0o700 });
   await Deno.writeTextFile(
     `${directory}/mod.ts`,
     `import {createMindControls} from ${
       JSON.stringify(module.href)
-    };\nexport default createMindControls(${JSON.stringify(dataDirectory)});\n`,
+    };\nexport default createMindControls(${JSON.stringify(dataDirectory)}, ${
+      JSON.stringify(nightlySelfCheck)
+    });\n`,
     { mode: 0o600 },
   );
   await Deno.writeTextFile(

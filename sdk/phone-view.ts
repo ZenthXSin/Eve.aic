@@ -120,6 +120,7 @@ export function messageScreen(
       ...(resource.name === undefined ? {} : { name: excerpt(resource.name, 0, 100) }),
       ...(resource.sizeBytes === undefined ? {} : { sizeBytes: resource.sizeBytes }),
       ...(resource.durationMs === undefined ? {} : { durationMs: resource.durationMs }),
+      ...(resource.download === undefined ? {} : { download: structuredClone(resource.download) }),
     };
   });
   // 显式构造输出，不把任意原始字段、资源 URL 或伪造的 isOwner 传给模型。

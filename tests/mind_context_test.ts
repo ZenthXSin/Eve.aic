@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createMindControls } from "../plugins/mind-controls/mod.ts";
+import { nightlySchedule } from "../plugins/mind-controls/nightly.ts";
 import { checkCondition } from "../plugins/mind-controls/condition.ts";
 import { ConsciousJournal } from "../plugins/eve/journal.ts";
 import {
@@ -42,6 +43,87 @@ function context(read?: (namespace: string, method: string, args: Json) => Promi
     },
   };
 }
+
+Deno.test("每晚自检：当地时间、重启恢复、停机补一次、并发不重复且不代替Eve删文件", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-nightly-" });
+  const attachmentDirectory = `${directory}/attachments`;
+  await Deno.mkdir(attachmentDirectory);
+  await Deno.writeTextFile(`${attachmentDirectory}/kept.txt`, "仍由 Eve 决定");
+  const config = { timeZone: "Asia/Tokyo", hour: 3, minute: 0, attachmentDirectory };
+  let now = Date.parse("2026-11-12T17:59:00Z");
+  let host = context(), plugin = createMindControls(`${directory}/mind`, config, () => now);
+  try {
+    // mind state only accepts its own files, so keep the attachment fixture outside it.
+    const mind = `${directory}/mind`;
+    plugin = createMindControls(mind, config, () => now);
+    await plugin.load!(host.ctx);
+    await plugin.enable!(host.ctx);
+    const status = await host.handlers.status(null) as {
+      nightlySelfCheck: { nextAt: string; timeZone: string };
+    };
+    assert.equal(status.nightlySelfCheck.nextAt, "2026-11-12T18:00:00.000Z");
+    assert.equal(status.nightlySelfCheck.timeZone, "Asia/Tokyo");
+    await host.close();
+    host = context();
+    now = Date.parse("2026-11-16T01:00:00Z");
+    plugin = createMindControls(mind, config, () => now);
+    await plugin.load!(host.ctx);
+    await plugin.enable!(host.ctx);
+    const results = await Promise.all([
+      host.handlers.poll({ afterSeq: 0 }),
+      host.handlers.poll({ afterSeq: 0 }),
+    ]) as {
+      items: { requestId: string; kind: string; args: { text: string; scheduledAt: string } }[];
+    }[];
+    assert.equal(results[0].items.length, 1);
+    assert.equal(results[1].items.length, 1);
+    assert.equal(results[0].items[0].kind, "alarm");
+    assert.equal(results[0].items[0].requestId, "nightly_self_check_2026-11-16");
+    assert.equal(results[0].items[0].args.scheduledAt, "2026-11-15T18:00:00.000Z");
+    assert.ok(results[0].items[0].args.text.includes(attachmentDirectory));
+    assert.equal(await Deno.readTextFile(`${attachmentDirectory}/kept.txt`), "仍由 Eve 决定");
+    assert.deepEqual(await host.handlers.poll({ afterSeq: 1 }), {
+      items: [],
+      throughSeq: 1,
+      hasMore: false,
+    });
+    await host.close();
+    host = context();
+    plugin = createMindControls(mind, config, () => now);
+    await plugin.load!(host.ctx);
+    await plugin.enable!(host.ctx);
+    await host.handlers.poll({ afterSeq: 1 });
+    const saved = JSON.parse(await Deno.readTextFile(`${mind}/index.json`));
+    assert.equal(saved.events.length, 1);
+    assert.equal(saved.nightlySelfCheck.nextAt, "2026-11-16T18:00:00.000Z");
+    now = Date.parse("2026-11-16T18:00:00Z");
+    await host.handlers.poll({ afterSeq: 1 });
+    assert.equal(JSON.parse(await Deno.readTextFile(`${mind}/index.json`)).events.length, 2);
+  } finally {
+    await host.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("每晚自检：夏令时回拨同日不再唤醒，缺失时间跳到下一次，拒绝无效配置", () => {
+  const config = {
+    timeZone: "America/New_York",
+    hour: 1,
+    minute: 30,
+    attachmentDirectory: "/workspace/tmp",
+  };
+  const schedule = nightlySchedule(config);
+  assert.equal(schedule.latest(Date.parse("2026-11-01T06:35:00Z")).date, "2026-11-01");
+  assert.equal(
+    schedule.next(Date.parse("2026-11-01T05:30:00Z"), "2026-11-01").at,
+    "2026-11-02T06:30:00.000Z",
+  );
+  const spring = nightlySchedule({ ...config, hour: 2 });
+  assert.equal(spring.next(Date.parse("2026-03-08T06:00:00Z")).at, "2026-03-09T06:30:00.000Z");
+  assert.throws(() => nightlySchedule({ ...config, timeZone: "invalid" }), KernelError);
+  assert.throws(() => nightlySchedule({ ...config, hour: 24 }), KernelError);
+  assert.throws(() => nightlySchedule({ ...config, attachmentDirectory: "relative" }), KernelError);
+});
 
 Deno.test("条件提醒：纯代码与只读事实检查，无模型、重启后迟到触发一次、可取消", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-conditions-" });

@@ -106,6 +106,8 @@ function directGroupMention(record: InboundRecord): boolean {
 }
 
 export class QqPhone {
+  #attachmentFailures = new Set<string>();
+  #attachmentPending = new Set<string>();
   constructor(
     readonly incoming: () => InboundRecord[],
     readonly actions: QqSendActions,
@@ -115,6 +117,7 @@ export class QqPhone {
     readonly now: () => number = Date.now,
     readonly device?: QqPhoneDevice,
     readonly downloads?: QqPhoneDownloads,
+    readonly autoDownloadAttachments = false,
   ) {}
 
   async #snapshot(options: { storedNotifications?: boolean } = {}) {
@@ -196,7 +199,56 @@ export class QqPhone {
       }
     }
     this.reading.validateSnapshot(rows);
+    if (this.autoDownloadAttachments && this.downloads) {
+      for (const row of rows) {
+        if (row.message.direction !== "incoming") continue;
+        for (const [index, attachment] of (row.message.attachments ?? []).entries()) {
+          const id = `${row.message.conversationId}:${row.message.seq}:${index + 1}`;
+          let local;
+          try {
+            local = await this.downloads.local(id);
+          } catch {
+            attachment.download = { state: "failed" };
+            continue;
+          }
+          if (local) {
+            // 旧版私有原件仍可通过 phone.file 使用，不声称 Eve 能直接读取其 root 路径。
+            if (
+              this.downloads.options.temporaryDirectory &&
+              local.path.startsWith(`${this.downloads.options.temporaryDirectory}/`)
+            ) attachment.download = { state: "ready", path: local.path };
+          } else if (this.downloads.hasReceipt(id)) attachment.download = { state: "cleared" };
+          else if (this.#attachmentFailures.has(id)) attachment.download = { state: "failed" };
+          else if (this.#attachmentPending.has(id)) attachment.download = { state: "pending" };
+        }
+      }
+    }
     return rows;
+  }
+
+  /** 下载只取平台真实附件，复用同一个显式下载通道与并发去重。 */
+  async prefetchAttachments(record: InboundRecord) {
+    if (!this.downloads) return;
+    const rows = await this.#snapshot();
+    const row = rows.find((r) => r.key === `incoming:${record.seq}`);
+    if (!row) return;
+    for (const [index] of (row.message.attachments ?? []).entries()) {
+      const id = `${row.message.conversationId}:${row.message.seq}:${index + 1}`;
+      // 已被 Eve 清理的临时文件不在后台重新下载；显式请求仍可重取。
+      if (this.downloads.hasReceipt(id)) continue;
+      this.#attachmentPending.add(id);
+      try {
+        await this.download({
+          handle: { conversationId: row.message.conversationId, seq: row.message.seq },
+          index: index + 1,
+        });
+        this.#attachmentFailures.delete(id);
+      } catch {
+        this.#attachmentFailures.add(id);
+      } finally {
+        this.#attachmentPending.delete(id);
+      }
+    }
   }
 
   async conversations(args: {

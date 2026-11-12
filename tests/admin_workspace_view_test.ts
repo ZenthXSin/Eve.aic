@@ -111,6 +111,61 @@ Deno.test("workspace renders captured messages, delivery uncertainty and literal
   renderer.clear();
   assert.equal(el("workspaceApp").textContent, "");
 });
+Deno.test("workspace shows attachment download states and literal local paths without opening files", () => {
+  const { renderer, el } = viewFixture();
+  const path = "/tmp/附件/<img src=x onerror=alert(1)>.png";
+  const app = {
+    available: true,
+    source: "qq_phone",
+    activeConversationId: "group_1",
+    conversations: [{ conversationId: "group_1", kind: "group" }],
+    messages: [{
+      direction: "incoming",
+      attachments: [
+        { kind: "image", name: "<script>图片</script>", download: { state: "ready", path } },
+        { kind: "file", name: "等待.txt", download: { state: "pending" } },
+        { kind: "audio", download: { state: "failed" } },
+        { kind: "video", download: { state: "cleared" } },
+        { kind: "file", name: "旧消息无状态.txt" },
+      ],
+    }],
+  };
+  const snapshot = {
+    events: [],
+    workspace: { asOf: at, currentApp: { appId: "qq" }, apps: { qq: app } },
+  };
+  renderer.paint(snapshot);
+  const screen = el("workspaceApp");
+  assert.match(screen.textContent, /已保存 · Eve 可使用/);
+  assert(screen.textContent.includes(path));
+  assert(screen.textContent.includes("<script>图片</script>"));
+  assert.match(screen.textContent, /下载中/);
+  assert.match(screen.textContent, /下载失败 · Eve 可重试下载/);
+  assert.match(screen.textContent, /临时文件已清理 · Eve 可重新下载/);
+  assert.match(screen.textContent, /旧消息无状态.txt/);
+  const nodes = (element: Element): Element[] => [element, ...element.children.flatMap(nodes)];
+  assert(!nodes(screen).some((element) => ["img", "script", "a"].includes(element.tag)));
+  const states = nodes(screen).filter((element) => element.className === "qq-attachment-status")
+    .map((element) => element.dataset.state);
+  assert.deepEqual(states, ["ready", "pending", "failed", "cleared"]);
+  renderer.paint({
+    ...snapshot,
+    workspace: {
+      ...snapshot.workspace,
+      apps: {
+        qq: {
+          ...app,
+          messages: [{
+            direction: "incoming",
+            attachments: [{ kind: "image", download: { state: "cleared" } }],
+          }],
+        },
+      },
+    },
+  });
+  assert(!screen.textContent.includes(path));
+  assert.match(screen.textContent, /临时文件已清理/);
+});
 Deno.test("workspace previews file contents and tool results while keeping proposed writes distinct", () => {
   const { renderer, el } = viewFixture();
   const operation = (id: string, method: string, args: unknown, result: unknown) => ({
@@ -310,6 +365,18 @@ Deno.test("tools use readable cards for known APIs and preserve non-object input
   assert.match(paint("phone", "settings", {}, { muted: true, pinned: false, draft: "尚未发出的草稿" }), /已静音.*未置顶.*尚未发送.*尚未发出的草稿/);
   assert.match(paint("phone", "send", { text: "请求正文" }, { actionId: "a-1", state: "unknown" }), /拟发送内容.*请求正文.*结果未知/);
   assert.match(paint("phone", "listSendQueue", {}, { items: [{ sequence: 1, actionId: "a-2", receipt: { actionId: "a-2", state: "blocked", blockedBy: "a-1" }, canCancel: true }] }), /等待队列.*等待前序.*a-1.*是否可取消/);
+  assert.match(
+    paint("phone", "history", {}, {
+      messages: [{
+        attachments: [{
+          kind: "file",
+          name: "附件.txt",
+          download: { state: "ready", path: "/tmp/附件.txt" },
+        }],
+      }],
+    }),
+    /附件.txt.*已保存 · Eve 可使用.*\/tmp\/附件.txt/,
+  );
   assert.match(paint("phone", "image", {}, { selectedMode: "describe", description: "返回的图片描述", download: { path: "/image.png" } }), /描述模式.*返回的图片描述.*下载路径/);
   const original = paint("phone", "image", {}, { selectedMode: "original", image: { dataUrl: "data:image/png;base64,秘密原图" } });
   assert.match(original, /原图模式.*仅展示附件元数据/);

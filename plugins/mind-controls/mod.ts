@@ -3,6 +3,7 @@ import { MIND, type MindEvent } from "../../contracts/mind.ts";
 import { canonical } from "../../kernel/calls.ts";
 import { definePlugin, type Json, KernelError } from "../../sdk/plugin.ts";
 import { writeDurableJson } from "../../sdk/durable-json.ts";
+import { nightlySchedule, type NightlySelfCheck } from "./nightly.ts";
 
 interface State {
   schema: 1;
@@ -18,8 +19,14 @@ interface State {
     lastError?: string;
   }[];
   facts: Json;
+  nightlySelfCheck?: { signature: string; nextAt: string; lastDate?: string };
 }
-export function createMindControls(directory: string) {
+export function createMindControls(
+  directory: string,
+  nightlySelfCheck?: NightlySelfCheck,
+  clock: () => number = Date.now,
+) {
+  const nightly = nightlySelfCheck ? nightlySchedule(nightlySelfCheck) : undefined;
   let state: State = { schema: 1, events: [], alarms: [], facts: null };
   let lock: Deno.FsFile | undefined;
   let failed = false;
@@ -141,6 +148,18 @@ export function createMindControls(directory: string) {
               ...state.alarms,
               ...(state.conditions ?? []).map(({ code: _code, ...condition }) => condition),
             ],
+            ...(nightly && state.nightlySelfCheck
+              ? {
+                nightlySelfCheck: {
+                  nextAt: state.nightlySelfCheck.nextAt,
+                  timeZone: nightlySelfCheck!.timeZone,
+                  attachmentDirectory: nightlySelfCheck!.attachmentDirectory,
+                  ...(state.nightlySelfCheck.lastDate
+                    ? { lastDate: state.nightlySelfCheck.lastDate }
+                    : {}),
+                },
+              }
+              : {}),
           }) as Json,
         update: async (args) => {
           await change((next) => {
@@ -156,6 +175,35 @@ export function createMindControls(directory: string) {
             const after = (args as { afterSeq?: number } | null)?.afterSeq ?? 0;
             if (!Number.isSafeInteger(after) || after < 0 || after > state.events.length) {
               throw new KernelError("rejected", "意识事件游标无效");
+            }
+            if (
+              nightly && state.nightlySelfCheck &&
+              Date.parse(state.nightlySelfCheck.nextAt) <= clock()
+            ) {
+              await change((next) => {
+                const due = nightly.latest(clock());
+                const schedule = next.nightlySelfCheck!;
+                if (
+                  schedule.lastDate !== due.date &&
+                  !next.events.some((event) => event.requestId === `nightly_self_check_${due.date}`)
+                ) {
+                  next.events.push({
+                    seq: next.events.length + 1,
+                    requestId: `nightly_self_check_${due.date}`,
+                    kind: "alarm",
+                    at: new Date(clock()).toISOString(),
+                    args: {
+                      reminderId: `nightly_self_check_${due.date}`,
+                      text: nightly.text,
+                      scheduledAt: due.at,
+                      lateMs: Math.max(0, clock() - Date.parse(due.at)),
+                      source: "nightly_self_check",
+                    },
+                  });
+                }
+                schedule.lastDate = due.date;
+                schedule.nextAt = nightly.next(clock(), due.date).at;
+              });
             }
             for (
               const condition of (state.conditions ?? []).filter((c) =>
@@ -320,9 +368,28 @@ export function createMindControls(directory: string) {
           conditionIds.add(condition.id);
         }
         canonical(loaded.facts);
+        if (
+          loaded.nightlySelfCheck !== undefined && (
+            typeof loaded.nightlySelfCheck?.signature !== "string" ||
+            !Number.isFinite(Date.parse(loaded.nightlySelfCheck?.nextAt)) ||
+            (loaded.nightlySelfCheck.lastDate !== undefined &&
+              !/^\d{4}-\d{2}-\d{2}$/.test(loaded.nightlySelfCheck.lastDate))
+          )
+        ) throw new KernelError("corrupt", "每晚自检时间原件损坏");
         state = loaded;
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      if (nightly && state.nightlySelfCheck?.signature !== nightly.signature) {
+        await change((next) => {
+          next.nightlySelfCheck = {
+            signature: nightly.signature,
+            nextAt: nightly.next(clock(), next.nightlySelfCheck?.lastDate).at,
+            ...(next.nightlySelfCheck?.lastDate
+              ? { lastDate: next.nightlySelfCheck.lastDate }
+              : {}),
+          };
+        });
       }
     },
     health() {

@@ -33,7 +33,13 @@ export interface PhoneAttachment {
   name?: string;
   sizeBytes?: number;
   durationMs?: number;
+  /** 适配器投影的临时文件状态；远端资源 URL 不进入屏幕。 */
+  download?: AttachmentDownload;
 }
+
+export type AttachmentDownload =
+  | { state: "ready"; path: string }
+  | { state: "pending" | "failed" | "cleared" };
 
 export interface TextPreview {
   text: string;
@@ -69,6 +75,7 @@ export interface MessageScreen {
     name?: TextPreview;
     sizeBytes?: number;
     durationMs?: number;
+    download?: AttachmentDownload;
   }[];
   attachmentCount: number;
   delivery?: PhoneActionReceipt;

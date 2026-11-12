@@ -74,6 +74,9 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     fence,
     {
       captureActivationBoundary: startupConfig.qq?.captureActivationBoundary === true,
+      ...(startupConfig.qq?.attachmentDownloads === undefined ? {} : {
+        attachmentDownloads: startupConfig.qq.attachmentDownloads,
+      }),
       ...(modelControl === undefined ? {} : {
         modelCommands: { ownerPlatformUserId: modelControl.ownerPlatformUserId, control },
       }),

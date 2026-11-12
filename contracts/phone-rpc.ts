@@ -35,6 +35,7 @@ export interface PhoneAttachmentFailure {
     | "timeout"
     | "closed"
     | "body_incomplete"
+    | "too_large"
     | "storage_failed";
   httpStatus?: number;
 }
@@ -53,6 +54,7 @@ export function phoneAttachmentFailure(value: unknown): PhoneAttachmentFailure |
       "timeout",
       "closed",
       "body_incomplete",
+      "too_large",
       "storage_failed",
     ].includes(String(data.reason)) ||
     Object.keys(data).some((key) => !["operation", "reason", "httpStatus"].includes(key)) ||

@@ -1,6 +1,7 @@
-// URL与平台签名只留在适配器。主动下载后才返回本机文件；从不按卡片自动取内容。
+// URL与平台签名只留在适配器。下载回执私有；临时原件可供 Eve 使用并定期清理。
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
+import { isAbsolute, normalize } from "node:path";
 import type { PhoneDownload } from "../../contracts/phone.ts";
 import type { ModelImage } from "../../contracts/model.ts";
 import type { PhoneAttachmentFailure } from "../../contracts/phone-rpc.ts";
@@ -53,6 +54,11 @@ export class QqPhoneDownloads {
     readonly directory: string,
     readonly testOrigin?: string,
     readonly timeoutMs = 30_000,
+    readonly options: {
+      temporaryDirectory?: string;
+      identity?: { uid: number; gid: number };
+      maxBytes?: number;
+    } = {},
   ) {
     if (testOrigin && !/^http:\/\/127\.0\.0\.1:\d+$/.test(testOrigin)) {
       throw new TypeError("测试来源无效");
@@ -61,7 +67,43 @@ export class QqPhoneDownloads {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 90_000) {
       throw new TypeError("附件下载期限无效");
     }
+    if (
+      options.temporaryDirectory !== undefined &&
+        (!isAbsolute(options.temporaryDirectory) ||
+          normalize(options.temporaryDirectory) !== options.temporaryDirectory ||
+          options.temporaryDirectory === "/" || options.temporaryDirectory === directory ||
+          options.temporaryDirectory.startsWith(`${directory}/`)) ||
+      !Number.isSafeInteger(this.maxBytes) || this.maxBytes < 1 ||
+      options.identity &&
+        (!Number.isSafeInteger(options.identity.uid) || options.identity.uid < 0 ||
+          !Number.isSafeInteger(options.identity.gid) || options.identity.gid < 0)
+    ) throw new TypeError("附件临时目录或容量限制无效");
     this.journal = new FactJournal(`${directory}/receipts`);
+  }
+  get maxBytes() {
+    return this.options.maxBytes ?? 64 * 1024 * 1024;
+  }
+  #path(attachmentId: string, temporary = !!this.options.temporaryDirectory) {
+    return `${temporary ? this.options.temporaryDirectory : `${this.directory}/files`}/${
+      createHash("sha256").update(attachmentId).digest("hex")
+    }`;
+  }
+  #temporary(saved: PhoneDownload) {
+    return !!this.options.temporaryDirectory &&
+      saved.path === this.#path(saved.source?.attachmentId ?? "");
+  }
+  #sameSource(a: PhoneDownload["source"], b: PhoneDownload["source"]) {
+    return a.kind === b.kind && a.conversationId === b.conversationId &&
+      a.sourceSeq === b.sourceSeq && a.attachmentId === b.attachmentId &&
+      a.senderPlatformUserId === b.senderPlatformUserId;
+  }
+  hasReceipt(attachmentId: string) {
+    return this.#saved.has(attachmentId);
+  }
+  /** 面板投影只检查位置、类型与大小；真正使用原件时仍校验完整摘要。 */
+  async local(attachmentId: string): Promise<PhoneDownload | undefined> {
+    const saved = this.#saved.get(attachmentId);
+    return saved ? await this.#verify(saved, true, false) : undefined;
   }
   get available() {
     return this.journal.available && !this.#closed.signal.aborted;
@@ -74,22 +116,56 @@ export class QqPhoneDownloads {
     ) {
       throw new KernelError("corrupt", "附件目录不是独立目录，原件保留");
     }
+    if (this.options.temporaryDirectory) {
+      const temporary = this.options.temporaryDirectory;
+      await Deno.mkdir(temporary, { recursive: true, mode: 0o700 });
+      const resolved = await Deno.realPath(temporary);
+      if (resolved !== temporary || !(await Deno.lstat(temporary)).isDirectory) {
+        throw new KernelError("corrupt", "附件临时目录不是独立目录");
+      }
+      await Deno.chmod(temporary, 0o700);
+      if (this.options.identity) {
+        await Deno.chown(temporary, this.options.identity.uid, this.options.identity.gid);
+      }
+      // 正在下载的文件不在可清理的根目录中，且不向 Eve 开放目录内容。
+      const inflight = `${temporary}/.inflight`;
+      await Deno.mkdir(inflight, { recursive: true, mode: 0o700 });
+      const inflightStat = await Deno.lstat(inflight);
+      if (!inflightStat.isDirectory || inflightStat.isSymlink) {
+        throw new KernelError("corrupt", "附件下载中目录不是独立目录");
+      }
+      await Deno.chmod(inflight, 0o700);
+      const { uid, gid } = await Deno.lstat(this.directory);
+      if (uid !== null && gid !== null) await Deno.chown(inflight, uid, gid);
+    }
     await this.journal.initialize();
     try {
       for (const event of this.journal.events) {
         if (event.kind !== "download") throw new KernelError("corrupt", "附件回执异常");
         const saved = event.data as unknown as PhoneDownload;
+        const previous = this.#saved.get(saved?.source?.attachmentId);
         if (
           !saved || !/^[a-f0-9]{64}$/.test(saved.sha256) ||
           !Number.isSafeInteger(saved.sizeBytes) || saved.sizeBytes < 0 ||
-          saved.path !==
-            `${this.directory}/files/${
-              createHash("sha256").update(saved.source?.attachmentId ?? "").digest("hex")
-            }` ||
+          (saved.path !== this.#path(saved.source?.attachmentId ?? "", false) &&
+            !this.#temporary(saved)) ||
           typeof saved.mimeType !== "string" || saved.source?.kind !== "phone_attachment" ||
-          this.#saved.has(saved.source.attachmentId)
+          typeof saved.source.attachmentId !== "string" || !saved.source.attachmentId ||
+          typeof saved.source.conversationId !== "string" ||
+          !Number.isSafeInteger(saved.source.sourceSeq) || saved.source.sourceSeq < 1 ||
+          typeof saved.source.senderPlatformUserId !== "string" ||
+          previous && !(this.#temporary(previous) && this.#temporary(saved) &&
+              this.#sameSource(previous.source, saved.source))
         ) throw new KernelError("corrupt", "附件回执异常，原件保留");
         this.#saved.set(saved.source.attachmentId, saved);
+      }
+      // 成功持有本下载器日志锁后，才清理上次异常退出的临时 part。
+      if (this.options.temporaryDirectory) {
+        for await (const entry of Deno.readDir(`${this.options.temporaryDirectory}/.inflight`)) {
+          if (entry.isFile && /^[a-f0-9-]{36}\.part$/.test(entry.name)) {
+            await Deno.remove(`${this.options.temporaryDirectory}/.inflight/${entry.name}`);
+          }
+        }
       }
     } catch (error) {
       await this.journal.close();
@@ -116,16 +192,25 @@ export class QqPhoneDownloads {
     ) throw new QqAttachmentDownloadError("rejected", reason);
     return url;
   }
-  async #verify(saved: PhoneDownload) {
+  #verify(saved: PhoneDownload): Promise<PhoneDownload>;
+  #verify(
+    saved: PhoneDownload,
+    missingTemporary: true,
+    verifyHash?: boolean,
+  ): Promise<PhoneDownload | undefined>;
+  async #verify(saved: PhoneDownload, missingTemporary = false, verifyHash = true) {
     let stat: Deno.FileInfo;
     try {
       stat = await Deno.lstat(saved.path);
-    } catch {
+    } catch (error) {
+      if (missingTemporary && this.#temporary(saved) && error instanceof Deno.errors.NotFound) {
+        return;
+      }
       throw new KernelError("corrupt", "已下载附件缺失，原回执保留");
     }
     if (
       !stat.isFile || stat.isSymlink || stat.size !== saved.sizeBytes ||
-      await hashFile(saved.path) !== saved.sha256
+      verifyHash && await hashFile(saved.path) !== saved.sha256
     ) {
       throw new KernelError("corrupt", "已下载附件内容发生变化，原件保留");
     }
@@ -133,17 +218,26 @@ export class QqPhoneDownloads {
   }
   async download(source: PhoneDownload["source"], rawUrl: string) {
     if (!this.available) throw new KernelError("unavailable", "附件下载不可用");
-    const saved = this.#saved.get(source.attachmentId);
-    if (saved) return await this.#verify(saved);
     const running = this.#running.get(source.attachmentId);
     if (running) return await running;
-    const task = this.#download(structuredClone(source), rawUrl);
+    const task = this.#reuseOrDownload(structuredClone(source), rawUrl);
     this.#running.set(source.attachmentId, task);
     try {
       return await task;
     } finally {
       this.#running.delete(source.attachmentId);
     }
+  }
+  async #reuseOrDownload(source: PhoneDownload["source"], rawUrl: string) {
+    const saved = this.#saved.get(source.attachmentId);
+    if (saved) {
+      if (!this.#sameSource(saved.source, source)) {
+        throw new KernelError("corrupt", "附件来源与原回执不符，原件保留");
+      }
+      const local = await this.#verify(saved, true);
+      if (local) return local;
+    }
+    return await this.#download(source, rawUrl);
   }
   async #download(source: PhoneDownload["source"], rawUrl: string): Promise<PhoneDownload> {
     let url = this.#url(rawUrl);
@@ -184,11 +278,18 @@ export class QqPhoneDownloads {
         response && !response.ok ? response.status : undefined,
       );
     }
-    const path = `${this.directory}/files/${
-      createHash("sha256").update(source.attachmentId).digest("hex")
-    }`;
-    // 每次失败保留独立部分文件；没有完整回执的旧文件从不当作成功。
-    const partial = `${path}.${crypto.randomUUID()}.part`;
+    const contentLength = response.headers.get("content-length");
+    if (
+      contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > this.maxBytes
+    ) {
+      await response.body.cancel().catch(() => {});
+      throw new QqAttachmentDownloadError("rejected", "too_large");
+    }
+    const path = this.#path(source.attachmentId);
+    // 临时附件与 part 同一文件系统；part 隐藏在适配器私有子目录，夜检仅清理根目录完成文件。
+    const partial = this.options.temporaryDirectory
+      ? `${this.options.temporaryDirectory}/.inflight/${crypto.randomUUID()}.part`
+      : `${path}.${crypto.randomUUID()}.part`;
     let file: Deno.FsFile;
     try {
       file = await Deno.open(partial, { createNew: true, write: true, mode: 0o600 });
@@ -210,6 +311,9 @@ export class QqPhoneDownloads {
         }
         if (next.done) break;
         const chunk = next.value;
+        if (chunk.length > this.maxBytes - sizeBytes) {
+          throw new QqAttachmentDownloadError("rejected", "too_large");
+        }
         if (first.length < 16) {
           const joined = new Uint8Array(Math.min(16, first.length + chunk.length));
           joined.set(first);
@@ -227,24 +331,38 @@ export class QqPhoneDownloads {
       }
       await file.sync();
     } catch (error) {
+      if (this.options.temporaryDirectory) {
+        // 先关闭句柄再删除；旧版私有目录里的部分原件仍保留供诊断。
+        file.close();
+        await Deno.remove(partial).catch(() => {});
+      }
       if (error instanceof QqAttachmentDownloadError) throw error;
       throw new QqAttachmentDownloadError("storage", "storage_failed");
     } finally {
       await reader.cancel().catch(() => {});
       reader.releaseLock();
-      file.close();
+      try {
+        file.close();
+      } catch { /* 失败清理已关闭 */ }
     }
     try {
+      if (this.options.identity) {
+        await Deno.chown(partial, this.options.identity.uid, this.options.identity.gid);
+      }
       // 原有孤立完整文件也保留，避免覆盖尚待核对的唯一原件。
       await Deno.link(partial, path);
       await Deno.remove(partial);
-      const directory = await Deno.open(`${this.directory}/files`, { read: true });
+      const directory = await Deno.open(
+        this.options.temporaryDirectory ?? `${this.directory}/files`,
+        { read: true },
+      );
       try {
         await directory.sync();
       } finally {
         directory.close();
       }
     } catch {
+      if (this.options.temporaryDirectory) await Deno.remove(partial).catch(() => {});
       throw new QqAttachmentDownloadError("storage", "storage_failed");
     }
     const result: PhoneDownload = {

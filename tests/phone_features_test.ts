@@ -18,10 +18,11 @@ import type { ModelImage } from "../contracts/model.ts";
 import { OwnershipAuthority } from "../guardian/ownership.ts";
 import { OwnershipFence } from "../sdk/ownership-fence.ts";
 import { ensurePhoneActivationBoundary } from "../adapters/qq/activation.ts";
+import { QqAttachmentPrefetch } from "../adapters/qq/attachment-prefetch.ts";
 
 const KEY = "phone_features_test_connection_0123456789";
 const PNG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
-async function fixture() {
+async function fixture(autoDownload = false) {
   const directory = await Deno.makeTempDir({ prefix: "eve-phone-features-" });
   let downloads = 0;
   const requests: { path: string; body: Record<string, unknown> }[] = [];
@@ -59,7 +60,12 @@ async function fixture() {
   await reading.initialize();
   const device = new QqPhoneDevice(`${directory}/device`);
   await device.initialize();
-  const files = new QqPhoneDownloads(`${directory}/downloads`, origin);
+  const files = new QqPhoneDownloads(
+    `${directory}/downloads`,
+    origin,
+    30_000,
+    autoDownload ? { temporaryDirectory: `${directory}/tmp/attachments` } : {},
+  );
   await files.initialize();
   actions.client.useDownloadedAttachmentReader((path) => files.readBytes(path));
   const phone = new QqPhone(
@@ -71,6 +77,7 @@ async function fixture() {
     Date.now,
     device,
     files,
+    autoDownload,
   );
   const rpc = startPhoneRpc(phone, KEY);
   const client = new PhoneRpcClient(rpc.url, KEY);
@@ -95,7 +102,7 @@ async function fixture() {
           : {}),
       },
     };
-    await journal.append(qqMessage(raw)!, raw);
+    return (await journal.append(qqMessage(raw)!, raw)).record;
   }
   return {
     directory,
@@ -131,6 +138,71 @@ async function fixture() {
     },
   };
 }
+
+Deno.test("附件自动下载：入站后台串行落入 tmp，屏幕给出路径，清理后不自动重取但可显式重下", async () => {
+  const f = await fixture(true);
+  const prefetch = new QqAttachmentPrefetch((record) => f.phone.prefetchAttachments(record));
+  try {
+    const record = await f.incoming(1, "user-a", `${f.origin}/asset?secret-signature=1`);
+    prefetch.offer(record);
+    prefetch.offer(record);
+    assert.equal(f.downloadCount(), 0);
+    prefetch.start();
+    for (let attempt = 0; attempt < 100 && !f.files.hasReceipt("qq:user:user-a:1:1"); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const screen = await f.phone.message({ handle: { conversationId: "qq:user:user-a", seq: 1 } });
+    assert.equal(screen.attachments[0].download?.state, "ready");
+    const state = screen.attachments[0].download!;
+    if (state.state !== "ready") throw new Error("附件未保存");
+    assert.equal(state.path.startsWith(`${f.directory}/tmp/attachments/`), true);
+    assert.equal(JSON.stringify(screen).includes("secret-signature"), false);
+    assert.equal(f.downloadCount(), 1);
+    assert.equal(f.reading.get("qq:user:user-a"), null);
+    assert.equal(f.requests.length, 0);
+    await Deno.remove(state.path);
+    await f.phone.prefetchAttachments(record);
+    assert.equal(f.downloadCount(), 1);
+    const cleared = await f.phone.message({ handle: screen.handle });
+    assert.equal(cleared.attachments[0].download?.state, "cleared");
+    const again = await f.phone.download({ handle: screen.handle, index: 1 });
+    assert.deepEqual(await Deno.readFile(again.path), PNG);
+    assert.equal(f.downloadCount(), 2);
+  } finally {
+    await prefetch.close();
+    await f.close();
+  }
+});
+
+Deno.test("附件自动下载：单条失败不阻塞下一条，屏幕保留失败状态且网关无需等待下载", async () => {
+  const f = await fixture(true);
+  const prefetch = new QqAttachmentPrefetch((record) => f.phone.prefetchAttachments(record));
+  try {
+    const first = await f.incoming(1, "user-a", `${f.origin}/redirect`);
+    const second = await f.incoming(2, "user-b", `${f.origin}/asset`);
+    prefetch.recover([first, second]);
+    prefetch.start();
+    for (let attempt = 0; attempt < 100 && !f.files.hasReceipt("qq:user:user-b:2:1"); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(
+      (await f.phone.message({ handle: { conversationId: "qq:user:user-a", seq: 1 } }))
+        .attachments[0].download?.state,
+      "failed",
+    );
+    assert.equal(
+      (await f.phone.message({ handle: { conversationId: "qq:user:user-b", seq: 2 } }))
+        .attachments[0].download?.state,
+      "ready",
+    );
+    assert.equal(f.downloadCount(), 1);
+    assert.equal(f.reading.get("qq:user:user-a"), null);
+    assert.equal(f.requests.length, 0);
+  } finally {
+    await prefetch.close();
+    await f.close();
+  }
+});
 
 Deno.test("手机免打扰、置顶、草稿持久保存；不发送草稿，不标记历史已读", async () => {
   const f = await fixture();

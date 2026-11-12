@@ -312,7 +312,7 @@ export async function startInstance(configPath: string) {
         await composeRuntimePlugin(`${generated}/runtime`, configPath);
         await composePhonePlugin(`${generated}/phone`, configPath);
         await composeScriptPlugin(`${generated}/scripts`, configPath);
-        await composeMindPlugin(`${generated}/mind`, config.mindDirectory);
+        await composeMindPlugin(`${generated}/mind`, config.mindDirectory, config.nightlySelfCheck);
         await composeEvePlugin(`${generated}/eve`, configPath);
         next = new Kernel({
           dataDir: config.kernelDataDirectory,

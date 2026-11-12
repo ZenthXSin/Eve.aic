@@ -9,6 +9,7 @@ import { QqTimeline } from "./timeline.ts";
 import { QqPhoneReading } from "./reading.ts";
 import { QqPhoneDevice } from "./device.ts";
 import { QqPhoneDownloads } from "./downloads.ts";
+import { QqAttachmentPrefetch } from "./attachment-prefetch.ts";
 import { ensurePhoneActivationBoundary } from "./activation.ts";
 import type { OwnershipFence } from "../../sdk/ownership-fence.ts";
 import { fingerprint } from "../../kernel/calls.ts";
@@ -22,14 +23,28 @@ export async function startQqPhoneAdapter(
   key: string,
   onStatus?: (status: QqReceiverStatus) => void,
   fence?: OwnershipFence,
-  options: { captureActivationBoundary?: boolean; modelCommands?: QqModelCommandOptions } = {},
+  options: {
+    captureActivationBoundary?: boolean;
+    modelCommands?: QqModelCommandOptions;
+    attachmentDownloads?: {
+      temporaryDirectory?: string;
+      identity?: { uid: number; gid: number };
+      maxBytes?: number;
+    };
+  } = {},
 ) {
   const controller = new AbortController();
   const actions = new QqSendActions(client, `${directory}/outbox`, client.sendScope);
   const timeline = new QqTimeline(`${directory}/timeline`);
   const reading = new QqPhoneReading(`${directory}/phone-reading`);
   const device = new QqPhoneDevice(`${directory}/phone-device`);
-  const downloads = new QqPhoneDownloads(`${directory}/downloads`);
+  const downloads = new QqPhoneDownloads(`${directory}/downloads`, undefined, 30_000, {
+    ...options.attachmentDownloads,
+    temporaryDirectory: options.attachmentDownloads?.temporaryDirectory ??
+      `${directory}/tmp/attachments`,
+  });
+  let phone: QqPhone;
+  const prefetch = new QqAttachmentPrefetch((record) => phone.prefetchAttachments(record));
   const modelCommands = options.modelCommands === undefined ? undefined : new QqModelCommands(
     `${directory}/model-commands`,
     actions,
@@ -38,12 +53,16 @@ export async function startQqPhoneAdapter(
   const receiver = new QqReceiver(
     client,
     directory,
-    modelCommands
-      ? {
-        initialized: (records) => modelCommands.initialize(records),
-        persisted: (record) => modelCommands.offer(record),
-      }
-      : {},
+    {
+      initialized: async (records) => {
+        await modelCommands?.initialize(records);
+        prefetch.recover(records);
+      },
+      persisted: (record) => {
+        modelCommands?.offer(record);
+        prefetch.offer(record);
+      },
+    },
   );
   let rpc: ReturnType<typeof startPhoneRpc> | undefined;
   let failure: unknown;
@@ -86,7 +105,7 @@ export async function startQqPhoneAdapter(
         throw new Error("QQ 接收器未就绪就停止");
       }),
     ]);
-    const phone = new QqPhone(
+    phone = new QqPhone(
       () => receiver.messages().map((record) => modelCommands?.project(record) ?? record),
       actions,
       timeline,
@@ -98,7 +117,9 @@ export async function startQqPhoneAdapter(
       Date.now,
       device,
       downloads,
+      true,
     );
+    prefetch.start();
     if (options.captureActivationBoundary) await ensurePhoneActivationBoundary(phone, directory);
     rpc = startPhoneRpc(
       phone,
@@ -131,13 +152,14 @@ export async function startQqPhoneAdapter(
             const task of [
               () => rpc!.close(),
               () => receive!,
+              () => downloads.close(),
+              () => prefetch.close(),
               () => modelCommands?.close(),
               () => fence?.close(),
               () => actions.close(),
               () => timeline.close(),
               () => reading.close(),
               () => device.close(),
-              () => downloads.close(),
             ]
           ) {
             try {
@@ -159,13 +181,14 @@ export async function startQqPhoneAdapter(
     controller.abort();
     client.close();
     await Promise.allSettled([rpc?.close(), receive]);
+    await downloads.close().catch(() => {});
+    await prefetch.close().catch(() => {});
     await modelCommands?.close().catch(() => {});
     await fence?.close().catch(() => {});
     await actions.close().catch(() => {});
     await timeline.close().catch(() => {});
     await reading.close().catch(() => {});
     await device.close().catch(() => {});
-    await downloads.close().catch(() => {});
     throw error;
   }
 }

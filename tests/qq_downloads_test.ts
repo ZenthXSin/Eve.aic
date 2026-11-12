@@ -104,3 +104,200 @@ Deno.test("QQ 附件：补充精确主机后仍拒绝相似域名、凭据、非
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("QQ 附件：共享临时原件可清理，回执保留，显式重下与重启复用兼容", async () => {
+  const root = await Deno.makeTempDir({ prefix: "eve-qq-tmp-" });
+  const directory = `${root}/private`, temporaryDirectory = `${root}/tmp`;
+  const owner = await Deno.stat(root);
+  const options = { temporaryDirectory, identity: { uid: owner.uid!, gid: owner.gid! } };
+  let downloads = new QqPhoneDownloads(directory, undefined, undefined, options);
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = () => {
+    requests++;
+    return Promise.resolve(new Response(png));
+  };
+  try {
+    await downloads.initialize();
+    assert.equal(downloads.hasReceipt(source.attachmentId), false);
+    assert.equal(await downloads.local(source.attachmentId), undefined);
+    const saved = await downloads.download(source, "https://qpic.cn/fixture");
+    assert.equal(
+      saved.path,
+      `${temporaryDirectory}/${createHash("sha256").update(source.attachmentId).digest("hex")}`,
+    );
+    assert.deepEqual(await downloads.local(source.attachmentId), saved);
+    for (const path of [temporaryDirectory, saved.path]) {
+      const stat = await Deno.stat(path);
+      assert.equal(stat.uid, options.identity.uid);
+      assert.equal(stat.gid, options.identity.gid);
+      assert.equal(stat.mode! & 0o777, path === temporaryDirectory ? 0o700 : 0o600);
+    }
+    assert.equal((await Deno.stat(`${directory}/receipts`)).uid, owner.uid);
+    await Deno.remove(saved.path);
+    assert.equal(await downloads.local(source.attachmentId), undefined);
+    assert.equal(downloads.hasReceipt(source.attachmentId), true);
+    await downloads.close();
+    downloads = new QqPhoneDownloads(directory, undefined, undefined, options);
+    await downloads.initialize();
+    assert.equal(downloads.hasReceipt(source.attachmentId), true);
+    assert.equal(await downloads.local(source.attachmentId), undefined);
+    // 普通面板投影和自动预取可凭回执跳过已清理的附件；只有显式下载才重取。
+    assert.equal(requests, 1);
+    const redownloads = await Promise.all([
+      downloads.download(source, "https://qpic.cn/fixture"),
+      downloads.download(source, "https://qpic.cn/fixture"),
+    ]);
+    assert.deepEqual(redownloads, [saved, saved]);
+    assert.equal(requests, 2);
+    assert.equal(downloads.journal.events.length, 2);
+    await downloads.close();
+    downloads = new QqPhoneDownloads(directory, undefined, undefined, options);
+    await downloads.initialize();
+    assert.deepEqual(await downloads.download(source, "https://qpic.cn/expired"), saved);
+    assert.equal(requests, 2);
+    await Deno.writeFile(saved.path, new Uint8Array(png.length));
+    await assert.rejects(
+      downloads.download(source, "https://qpic.cn/fixture"),
+      (error: unknown) => error instanceof KernelError && error.kind === "corrupt",
+    );
+    await assert.rejects(
+      downloads.image(saved),
+      (error: unknown) => error instanceof KernelError && error.kind === "corrupt",
+    );
+    assert.equal(requests, 2);
+    await Deno.remove(saved.path);
+    await Deno.symlink(`${directory}/receipts`, saved.path);
+    await assert.rejects(
+      downloads.local(source.attachmentId),
+      (error: unknown) => error instanceof KernelError && error.kind === "corrupt",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await downloads.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("QQ 附件：启用临时目录后旧私有原件仍复用且缺失不重下", async () => {
+  const root = await Deno.makeTempDir({ prefix: "eve-qq-legacy-" });
+  const directory = `${root}/private`, temporaryDirectory = `${root}/tmp`;
+  let downloads = new QqPhoneDownloads(directory);
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = () => {
+    requests++;
+    return Promise.resolve(new Response(png));
+  };
+  try {
+    await downloads.initialize();
+    const saved = await downloads.download(source, "https://qpic.cn/fixture");
+    await downloads.close();
+    downloads = new QqPhoneDownloads(directory, undefined, undefined, { temporaryDirectory });
+    await downloads.initialize();
+    assert.deepEqual(await downloads.local(source.attachmentId), saved);
+    assert.deepEqual(await downloads.download(source, "https://qpic.cn/fixture"), saved);
+    await Deno.remove(saved.path);
+    const corrupt = (error: unknown) => error instanceof KernelError && error.kind === "corrupt";
+    await assert.rejects(downloads.local(source.attachmentId), corrupt);
+    await assert.rejects(downloads.download(source, "https://qpic.cn/fixture"), corrupt);
+    assert.equal(requests, 1);
+    assert.equal(downloads.journal.events.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await downloads.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("QQ 附件：响应头或分块超限立即取消，不留下临时 part 和虚假回执", async () => {
+  const root = await Deno.makeTempDir({ prefix: "eve-qq-limit-" });
+  const temporaryDirectory = `${root}/tmp`;
+  const downloads = new QqPhoneDownloads(`${root}/private`, undefined, undefined, {
+    temporaryDirectory,
+    maxBytes: 4,
+  });
+  const originalFetch = globalThis.fetch;
+  let cancelled = 0, withLength = true;
+  globalThis.fetch = () =>
+    Promise.resolve(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array(5));
+          },
+          cancel() {
+            cancelled++;
+          },
+        }),
+        { headers: withLength ? { "content-length": "5" } : undefined },
+      ),
+    );
+  try {
+    await downloads.initialize();
+    for (withLength of [true, false]) {
+      await assert.rejects(
+        downloads.download(source, "https://qpic.cn/fixture"),
+        (error: unknown) =>
+          rejected(error) &&
+          (error as { attachment: { reason: string } }).attachment.reason === "too_large",
+      );
+      assert.equal(downloads.journal.events.length, 0);
+      assert.equal(downloads.hasReceipt(source.attachmentId), false);
+      assert.deepEqual(await Array.fromAsync(Deno.readDir(`${temporaryDirectory}/.inflight`)), []);
+      assert.deepEqual(
+        (await Array.fromAsync(Deno.readDir(temporaryDirectory))).map((entry) => entry.name),
+        [".inflight"],
+      );
+    }
+    assert.equal(cancelled, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await downloads.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("QQ 附件：关闭中断正在下载的临时原件，并等待 part 清理后释放日志", async () => {
+  const root = await Deno.makeTempDir({ prefix: "eve-qq-close-" });
+  const temporaryDirectory = `${root}/tmp`;
+  const downloads = new QqPhoneDownloads(`${root}/private`, undefined, undefined, {
+    temporaryDirectory,
+  });
+  const originalFetch = globalThis.fetch;
+  let started!: () => void;
+  const firstChunk = new Promise<void>((resolve) => started = resolve);
+  globalThis.fetch = (_input, init) =>
+    Promise.resolve(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1]));
+            init!.signal!.addEventListener("abort", () => controller.error(new Error("aborted")), {
+              once: true,
+            });
+          },
+          pull() {
+            started();
+          },
+        }),
+      ),
+    );
+  try {
+    await downloads.initialize();
+    const pending = downloads.download(source, "https://qpic.cn/fixture");
+    const rejectedPending = assert.rejects(
+      pending,
+      (error: unknown) => error instanceof KernelError && error.kind === "unavailable",
+    );
+    await firstChunk;
+    await downloads.close();
+    await rejectedPending;
+    assert.deepEqual(await Array.fromAsync(Deno.readDir(`${temporaryDirectory}/.inflight`)), []);
+    assert.equal(downloads.journal.events.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await downloads.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
