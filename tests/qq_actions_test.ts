@@ -41,8 +41,8 @@ Deno.test("QQ 发送动作：网络前started已落盘，同键并发只发送�
   const directory = await Deno.makeTempDir({ prefix: "eve-send-actions-" });
   const local = service(async (r) => {
     assert.deepEqual(await r.json(), {
-      content: request.text,
-      msg_type: 0,
+      markdown: { content: request.text },
+      msg_type: 2,
       msg_id: "inbound-1",
       msg_seq: 1,
     });
@@ -331,7 +331,9 @@ Deno.test("QQ群范围升级保留旧拒绝和unknown原件，新动作才发送
   const local = service(async (r) => {
     paths.push(new URL(r.url).pathname);
     const body = await r.json();
-    return body.content === "未知群消息" ? Response.json({}) : Response.json({ id: "group-sent" });
+    return (body.markdown?.content ?? body.content) === "未知群消息"
+      ? Response.json({})
+      : Response.json({ id: "group-sent" });
   });
   const group: QqActionSendText = {
     ...request,
@@ -445,8 +447,8 @@ Deno.test("QQ超时按序重试：固定防重请求、真实尝试账本、成�
       attemptCount: 2,
     });
     assert.deepEqual(bodies, [
-      { content: request.text, msg_type: 0, msg_id: "inbound-1", msg_seq: 1 },
-      { content: request.text, msg_type: 0, msg_id: "inbound-1", msg_seq: 1 },
+      { markdown: { content: request.text }, msg_type: 2, msg_id: "inbound-1", msg_seq: 1 },
+      { markdown: { content: request.text }, msg_type: 2, msg_id: "inbound-1", msg_seq: 1 },
     ]);
     const original = new Map<string, string>();
     for (
@@ -659,15 +661,15 @@ Deno.test("QQ同会话队首不限次重试直到成功再第二条，跨会话�
   let firstAttempts = 0;
   const local = service(async (r) => {
     const body = await r.json();
-    order.push(body.content);
-    if (body.content === "first") {
+    order.push(body.markdown?.content ?? body.content);
+    if ((body.markdown?.content ?? body.content) === "first") {
       firstAttempts++;
       if (firstAttempts < 5) {
         entered.resolve();
         await release.promise;
       }
     }
-    return Response.json({ id: `sent-${body.content}` });
+    return Response.json({ id: `sent-${(body.markdown?.content ?? body.content)}` });
   });
   const client = local.client("all", 100);
   const actions = new QqSendActions(client, directory, "private", { retryDelaysMs: [5, 5] });
@@ -908,7 +910,7 @@ Deno.test("新策略在途被kill后仅新许可重入：固定防重键续链�
   for (const ending of ["sent", "permanent"] as const) {
     const directory = await Deno.makeTempDir({ prefix: "eve-qq-head-resume-" });
     const entered = deferred<void>(), release = deferred<void>();
-    const bodies: { content: string; msg_id: string; msg_seq: number }[] = [];
+    const bodies: { markdown: { content: string }; msg_id: string; msg_seq: number }[] = [];
     const local = service(async (r) => {
       const body = await r.json();
       bodies.push(body);
@@ -916,10 +918,10 @@ Deno.test("新策略在途被kill后仅新许可重入：固定防重键续链�
         entered.resolve();
         await release.promise;
       }
-      if (ending === "permanent" && body.content === "head") {
+      if (ending === "permanent" && (body.markdown?.content ?? body.content) === "head") {
         return Response.json({ err_code: 40034105 }, { status: 400 });
       }
-      return Response.json({ id: `actual-${body.content}` });
+      return Response.json({ id: `actual-${(body.markdown?.content ?? body.content)}` });
     });
     const head = { ...request, reply: { messageId: "inbound-1" }, text: "head" };
     const tail = { ...request, text: "tail", reply: { messageId: "inbound-1", sequence: 2 } };
@@ -985,7 +987,7 @@ Deno.test("新策略在途被kill后仅新许可重入：固定防重键续链�
         assert.ok(resumed.status === "finished" && resumed.result.status === "sent");
         const sentTail = await restart.send("tail", tail);
         assert.ok(sentTail.status === "finished" && sentTail.result.status === "sent");
-        assert.deepEqual(bodies.map((b) => b.content), ["head", "head", "tail"]);
+        assert.deepEqual(bodies.map((b) => b.markdown.content), ["head", "head", "tail"]);
       } else {
         assert.deepEqual(resumed, {
           actionId: "head",

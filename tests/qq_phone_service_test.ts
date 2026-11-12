@@ -354,7 +354,7 @@ Deno.test("QQ 手机：真实独立适配器子进程、网关入站与worker发
       if (path.startsWith("/v2/users/")) {
         sends++;
         const body = await r.json();
-        assert.equal(body.content, "独立手机里发出");
+        assert.equal(body.markdown?.content ?? body.content, "独立手机里发出");
         return Response.json({ id: "actual-process-sent-id" });
       }
       const { socket, response } = Deno.upgradeWebSocket(r);
@@ -606,8 +606,8 @@ Deno.test("QQ 手机：明确回复位置与实际回执，unknown也显示且�
       platformMessageId: "actual-sent-id",
     });
     assert.deepEqual(f.received, [{
-      content: "嗯，我在",
-      msg_type: 0,
+      markdown: { content: "嗯，我在" },
+      msg_type: 2,
       msg_id: "platform-1",
       msg_seq: 1,
     }]);
@@ -914,11 +914,11 @@ Deno.test("QQ 引用视图：真实出站回执索引可被引用，发送引用
     assert.deepEqual(incoming.quote, { platformMessageId: "outgoing-platform-id" });
     assert.equal(f.count(), 1);
     assert.deepEqual(f.received, [{
-      content: "回复早先消息",
-      msg_type: 0,
+      markdown: { content: "回复早先消息" },
+      msg_type: 2,
       msg_id: "platform-1",
       msg_seq: 1,
-      message_reference: { message_id: "incoming-index" },
+      // Markdown follows the official SDK: reply anchor retained, visual reference omitted.
     }]);
   } finally {
     await f.close();
