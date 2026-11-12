@@ -56,6 +56,8 @@ export function createRuntimeClientPlugin(configPath: string) {
               ? data._actionId
               : `read_${crypto.randomUUID()}`;
             delete data._actionId;
+            // 只有在线内核模型桥主动声明真实意识活动；隔离调用直接走RuntimeClient。
+            if (namespace === "model" && method === "complete") data._purpose = "online";
             return await client.call(namespace, method, data, id);
           }])),
         );

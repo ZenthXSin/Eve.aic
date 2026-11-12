@@ -1,13 +1,22 @@
 import type { Json } from "../../kernel/protocol.ts";
-import type { PhoneMethod, PhoneRpcResponse } from "../../contracts/phone-rpc.ts";
+import {
+  type PhoneAttachmentFailure,
+  phoneAttachmentFailure,
+  type PhoneMethod,
+  type PhoneRpcResponse,
+} from "../../contracts/phone-rpc.ts";
 import { KernelError } from "../../sdk/plugin.ts";
 import type { OwnershipProof } from "../../contracts/ownership.ts";
 
 export class PhoneRpcError extends KernelError {
-  constructor(readonly category: string) {
+  readonly attachment?: PhoneAttachmentFailure;
+  constructor(readonly category: string, diagnostic?: unknown) {
+    const attachment = phoneAttachmentFailure(diagnostic);
     super(
       category === "unknown"
         ? "unknown"
+        : category === "timeout"
+        ? "timeout"
         : category === "storage"
         ? "storage"
         : category === "corrupt"
@@ -19,8 +28,15 @@ export class PhoneRpcError extends KernelError {
         : category === "request" || category === "conflict"
         ? "rejected"
         : "remote",
-      `手机请求未完成：${category}`,
+      `手机请求未完成：${category}${
+        attachment
+          ? `；附件下载：${attachment.reason}${
+            attachment.httpStatus === undefined ? "" : ` (HTTP ${attachment.httpStatus})`
+          }`
+          : ""
+      }`,
     );
+    this.attachment = attachment;
     this.name = "PhoneRpcError";
   }
 }
@@ -113,7 +129,7 @@ export class PhoneRpcClient {
       const result: PhoneRpcResponse = JSON.parse(new TextDecoder().decode(joined));
       if (result?.ok === true && Object.hasOwn(result, "value")) return result.value;
       if (result?.ok === false && typeof result.error?.category === "string") {
-        throw new PhoneRpcError(result.error.category);
+        throw new PhoneRpcError(result.error.category, result.error.attachment);
       }
       throw new PhoneRpcError("invalid_response");
     } catch (error) {

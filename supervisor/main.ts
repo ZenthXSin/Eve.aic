@@ -130,7 +130,7 @@ export async function startSupervisor(configPath: string) {
           return await client.call(
             "model",
             "complete",
-            request as unknown as Json,
+            { ...request, _purpose: "isolated" } as unknown as Json,
             actionId,
           ) as unknown as ModelResponse;
         } finally {

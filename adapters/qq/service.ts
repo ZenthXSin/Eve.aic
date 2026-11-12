@@ -101,6 +101,7 @@ export async function startQqPhoneAdapter(
       stopped: receive,
       close: () => {
         closing ??= (async () => {
+          actions.requestStop();
           controller.abort();
           client.close();
           const problems: unknown[] = [];
@@ -131,6 +132,7 @@ export async function startQqPhoneAdapter(
       },
     };
   } catch (error) {
+    actions.requestStop();
     controller.abort();
     client.close();
     await Promise.allSettled([rpc?.close(), receive]);

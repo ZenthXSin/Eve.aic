@@ -136,7 +136,7 @@ export class OwnershipFence {
     proof: OwnershipProof,
     actionId: string,
     args: Json,
-    operation: () => Promise<T>,
+    operation: (checkpoint: () => Promise<void>) => Promise<T>,
   ): Promise<T> {
     if (
       !proof || !id(proof.instanceId) || !epoch(proof.epoch) ||
@@ -167,7 +167,7 @@ export class OwnershipFence {
     proof: OwnershipProof,
     actionId: string,
     requestHash: string,
-    operation: () => Promise<T>,
+    operation: (checkpoint: () => Promise<void>) => Promise<T>,
   ): Promise<T> {
     const permit: OwnershipPermit = {
       id: await fingerprint(["exit-permit-v1", crypto.randomUUID()]),
@@ -221,7 +221,26 @@ export class OwnershipFence {
       outcome: PermitOutcome,
       resultHash: string;
     try {
-      value = await operation();
+      // 长重试链每次真正发网前复核同一许可；暂停、交接或失联不能继续下一次尝试。
+      const checkpoint = async () => {
+        if (this.#closing || this.#storageFailed) {
+          throw new KernelError("unavailable", "出口已停止接续操作");
+        }
+        const admitted = await this.exit.begin({
+          permitId: permit.id,
+          proof,
+          resource: this.resource,
+          actionId,
+          requestHash,
+        });
+        if (
+          !validPermit(admitted, this.resource) ||
+          Object.keys(permit).some((key) =>
+            admitted[key as keyof OwnershipPermit] !== permit[key as keyof OwnershipPermit]
+          )
+        ) throw new KernelError("unknown", "续接许可与原申请不匹配");
+      };
+      value = await operation(checkpoint);
       outcome = "completed";
       resultHash = await fingerprint(value);
     } catch (error) {

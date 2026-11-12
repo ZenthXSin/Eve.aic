@@ -236,6 +236,12 @@ export class RuntimeEngine {
     args: Record<string, Json>,
     id: string,
   ): Promise<Json> {
+    if (
+      namespace === "model" && method === "complete" &&
+      args._purpose !== undefined && args._purpose !== "online" && args._purpose !== "isolated"
+    ) {
+      throw new KernelError("rejected", "模型调用目的必须为online或isolated");
+    }
     if (!this.available) throw new KernelError("unavailable", "执行服务不可用");
     if (
       !(namespace in RUNTIME_METHODS) ||
@@ -378,9 +384,10 @@ export class RuntimeEngine {
         );
       }
       const image = description ? args.image as unknown as ModelImage : undefined;
+      const { _purpose: purpose, ...modelArgs } = args;
       const request = description
         ? imageDescriptionRequest(image!)
-        : args as unknown as ModelRequest;
+        : modelArgs as unknown as ModelRequest;
       const amount = new TextEncoder().encode(JSON.stringify(request)).length +
         request.messages.length * 64 + this.options.maxOutputTokens;
       await this.budget.reserve(id, amount);
@@ -394,7 +401,9 @@ export class RuntimeEngine {
           this.options.modelName,
         ) as unknown as Json;
       }
-      await this.memory.observe(response.content + JSON.stringify(response.toolCalls));
+      if (purpose === "online") {
+        await this.memory.observe(response.content);
+      }
       return response as unknown as Json;
     }
     throw new KernelError("rejected", "未知出口");

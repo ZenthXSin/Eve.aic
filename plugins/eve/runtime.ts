@@ -3,7 +3,7 @@ import type { MindEvent } from "../../contracts/mind.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type ErrorKind, type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
-import { imageTextView } from "../../sdk/image-text.ts";
+import { recallQuery } from "./recall-query.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 import { ConsciousJournal } from "./journal.ts";
 import { RemoteJournal } from "./remote-journal.ts";
@@ -479,9 +479,7 @@ export class EveRuntime {
     const tools = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
     if (this.config.remoteRecords) {
       if (this.#sharedBudget?.paused) return;
-      const query = JSON.stringify(
-        activeEvents(this.journal.events).slice(-4).map((e) => imageTextView(e.data)),
-      ).slice(-16000);
+      const query = recallQuery(activeEvents(this.journal.events));
       const anchor = activeEvents(this.journal.events).findLast((e) =>
         e.kind === "model_response" || e.kind === "tool_result" ||
         e.kind === "notice" && (e.data as { source?: string }).source !== "memory"

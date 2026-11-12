@@ -27,9 +27,15 @@ function sourcesValid(sources: NoteSource[]) {
       typeof s.description === "string" && s.description.length > 0 && s.description.length <= 4096
     );
 }
+function aliasValid(alias: unknown): alias is string {
+  return typeof alias === "string" && Array.from(alias).length >= 1 &&
+    Array.from(alias).length <= 64 && !/[\s\p{Cc}\p{Cf}\\/]/u.test(alias) &&
+    !/^[a-f0-9]{64}$/i.test(alias);
+}
 function valid(note: NoteRevision) {
   return note && /^[a-f0-9]{64}$/.test(note.id) && Number.isSafeInteger(note.revision) &&
     note.revision > 0 &&
+    (note.alias === undefined || aliasValid(note.alias)) &&
     (note.basedOnRevision === undefined ||
       Number.isSafeInteger(note.basedOnRevision) && note.basedOnRevision >= 1 &&
         note.basedOnRevision < note.revision) &&
@@ -91,8 +97,39 @@ export class NoteStore {
   #accepted(note: NoteRevision) {
     return !this.quarantine.excluded(note.contextRecordSeq).length;
   }
+  #latest(includeUnconfirmed = false) {
+    const latest = new Map<string, NoteRevision>();
+    for (const note of this.#revisions()) {
+      if (includeUnconfirmed || this.#accepted(note)) latest.set(note.id, note);
+    }
+    return latest;
+  }
+  #resolveId(reference: unknown, includeUnconfirmed = false): string {
+    if (typeof reference !== "string") {
+      throw new KernelError("rejected", "请提供便签永久 ID 或短名");
+    }
+    if (/^[a-f0-9]{64}$/.test(reference)) return reference;
+    if (!aliasValid(reference)) throw new KernelError("rejected", "便签短名格式无效");
+    const matches = [...this.#latest(includeUnconfirmed).values()].filter((n) =>
+      n.alias === reference
+    );
+    if (matches.length > 1) {
+      throw new KernelError("rejected", "便签短名因回滚产生冲突，请通过永久 ID 改名或移除短名");
+    }
+    if (!matches.length) throw new KernelError("not_found", "没有该便签短名");
+    return matches[0].id;
+  }
   async change(method: "create" | "update", args: Record<string, Json>, requestId: string) {
     const captured = structuredClone(args);
+    const saved = this.receipt(requestId);
+    if (saved) return saved;
+    // 在进入写队列前固定目标和版本，不能等前一个写入完成后读最新版本来覆盖它。
+    if (method === "update") {
+      captured.id = this.#resolveId(captured.id);
+      if (captured.expectedRevision === undefined) {
+        captured.expectedRevision = this.get({ id: captured.id }).note.revision;
+      }
+    }
     const work = this.#tail.then(async () => {
       const oldReceipt = this.receipt(requestId);
       if (oldReceipt) return oldReceipt;
@@ -103,8 +140,20 @@ export class NoteStore {
       if (method === "update" && (!previous || previous.revision !== captured.expectedRevision)) {
         throw new KernelError("rejected", "便签版本已经变化或不存在，请重新读取");
       }
+      const alias = captured.alias === null ? undefined : captured.alias ?? previous?.alias;
+      if (alias !== undefined && !aliasValid(alias)) {
+        throw new KernelError(
+          "rejected",
+          "便签短名需为 1–64 字符，不含空白、控制字符、斜线或完整 ID",
+        );
+      }
+      if (
+        alias !== undefined &&
+        [...this.#latest().values()].some((n) => n.id !== id && n.alias === alias)
+      ) throw new KernelError("rejected", "便签短名已被占用，请选择其他短名");
       const note = {
         id,
+        ...(alias === undefined ? {} : { alias }),
         revision: (latest?.revision ?? 0) + 1,
         recordSeq: this.journal.events.length + 1,
         at: new Date().toISOString(),
@@ -132,8 +181,9 @@ export class NoteStore {
       includeUnconfirmed?: boolean;
     },
   ) {
+    const id = this.#resolveId(args.id, args.includeUnconfirmed);
     const found = this.#revisions().filter((n) =>
-      n.id === args.id &&
+      n.id === id &&
       (args.revision === undefined
         ? args.includeUnconfirmed || this.#accepted(n)
         : args.revision === n.revision)
@@ -180,11 +230,12 @@ export class NoteStore {
     };
   }
   versions(args: { id: string; afterRevision?: number }) {
+    const id = this.#resolveId(args.id);
     const after = args.afterRevision ?? 0;
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new KernelError("rejected", "便签版本游标无效");
     }
-    const all = this.#revisions().filter((n) => n.id === args.id && n.revision > after);
+    const all = this.#revisions().filter((n) => n.id === id && n.revision > after);
     return {
       items: all.slice(0, 8).map((revision) => {
         const { content: _content, requestId: _requestId, ...note } = this.#annotate(revision);
@@ -234,6 +285,7 @@ export class NoteStore {
         const score = query.reduce((sum, x, i) => sum + x * v[i], 0);
         scored.push({
           id: note.id,
+          ...(note.alias === undefined ? {} : { alias: note.alias }),
           revision: note.revision,
           title: note.title,
           excerpt: Array.from(note.content).slice(0, 240).join(""),
@@ -250,7 +302,8 @@ export class NoteStore {
         hasMore: scored.length > 8,
       };
     }
-    const searchable = (n: NoteRevision) => `${n.title}\n${n.summary}\n${n.content}`;
+    const searchable = (n: NoteRevision) =>
+      `${n.alias ?? ""}\n${n.title}\n${n.summary}\n${n.content}`;
     const matches = args.mode === "regex"
       ? await regexMatches(args.query, candidates, searchable)
       : candidates.filter((n) => searchable(n).includes(args.query));
@@ -259,6 +312,7 @@ export class NoteStore {
     return {
       items: page.map((n) => ({
         id: n.id,
+        ...(n.alias === undefined ? {} : { alias: n.alias }),
         revision: n.revision,
         title: n.title,
         excerpt: Array.from(n.content).slice(0, 240).join(""),

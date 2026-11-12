@@ -43,16 +43,30 @@ function cursor(value: HistoryCursor | undefined): void {
   if (value.beforeSeq > value.snapshotThroughSeq) throw new QqPhoneError("request");
 }
 export function phoneReceipt(status: SendStatus): PhoneActionReceipt {
-  if (status.status === "running") return { actionId: status.actionId, state: "running" };
+  const attempts = status.attemptCount !== undefined && status.attemptCount > 1
+    ? { attemptCount: status.attemptCount }
+    : {};
+  if (status.status === "running") {
+    return { actionId: status.actionId, state: "running", ...attempts };
+  }
+  if (status.status === "blocked") {
+    return {
+      actionId: status.actionId,
+      state: "blocked",
+      blockedBy: status.blockedBy,
+      ...attempts,
+    };
+  }
   if (status.status === "unknown") {
-    return { actionId: status.actionId, state: "unknown", reason: "interrupted" };
+    return { actionId: status.actionId, state: "unknown", reason: "interrupted", ...attempts };
   }
   const result = status.result;
   return result.status === "sent"
-    ? { actionId: status.actionId, state: "sent", platformMessageId: result.messageId }
+    ? { actionId: status.actionId, state: "sent", platformMessageId: result.messageId, ...attempts }
     : {
       actionId: status.actionId,
       state: result.status,
+      ...attempts,
       attempted: result.attempted,
       error: result.error,
     };
@@ -363,7 +377,10 @@ export class QqPhone {
     };
   }
 
-  async send(args: PhoneSend & { attachment?: { path: string; kind: "image" | "file" } }) {
+  async send(
+    args: PhoneSend & { attachment?: { path: string; kind: "image" | "file" } },
+    options: { beforeAttempt?: () => Promise<void> } = {},
+  ) {
     conversation(args.conversationId);
     const match = /^qq:(user|group):(.+)$/.exec(args.conversationId)!;
     let reply: { messageId: string; sequence: number } | undefined;
@@ -386,7 +403,7 @@ export class QqPhone {
       ...(reply ? { reply } : {}),
       ...(args.referenceIndex === undefined ? {} : { referenceIndex: args.referenceIndex }),
       ...(args.wakeup === undefined ? {} : { wakeup: args.wakeup }),
-    });
+    }, options);
     // 回执先由发送账本保存；时间线失败不能重发已执行动作。恢复会从原账本补齐引用。
     await this.#snapshot();
     return phoneReceipt(result);
@@ -463,11 +480,11 @@ export class QqPhone {
     return await this.downloads!.file(download, args);
   }
 
-  async sendFile(args: PhoneSendFile) {
+  async sendFile(args: PhoneSendFile, options: { beforeAttempt?: () => Promise<void> } = {}) {
     return await this.send({
       ...args,
       text: args.text ?? "",
       attachment: { path: args.path, kind: args.kind },
-    });
+    }, options);
   }
 }

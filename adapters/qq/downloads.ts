@@ -3,8 +3,28 @@ import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import type { PhoneDownload } from "../../contracts/phone.ts";
 import type { ModelImage } from "../../contracts/model.ts";
+import type { PhoneAttachmentFailure } from "../../contracts/phone-rpc.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
-import { type Json, KernelError } from "../../kernel/protocol.ts";
+import { type ErrorKind, type Json, KernelError } from "../../kernel/protocol.ts";
+
+export class QqAttachmentDownloadError extends KernelError {
+  readonly attachment: PhoneAttachmentFailure;
+  constructor(kind: ErrorKind, reason: PhoneAttachmentFailure["reason"], httpStatus?: number) {
+    super(
+      kind,
+      `${
+        reason === "source_rejected" || reason === "redirect_rejected"
+          ? "附件来源不符合下载限制"
+          : "附件下载未完成"
+      }：${reason}，未宣称已保存`,
+    );
+    this.attachment = {
+      operation: "attachment_download",
+      reason,
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+    };
+  }
+}
 
 function mime(bytes: Uint8Array): string | undefined {
   if (
@@ -29,9 +49,17 @@ export class QqPhoneDownloads {
   #saved = new Map<string, PhoneDownload>();
   #running = new Map<string, Promise<PhoneDownload>>();
   #closed = new AbortController();
-  constructor(readonly directory: string, readonly testOrigin?: string) {
+  constructor(
+    readonly directory: string,
+    readonly testOrigin?: string,
+    readonly timeoutMs = 30_000,
+  ) {
     if (testOrigin && !/^http:\/\/127\.0\.0\.1:\d+$/.test(testOrigin)) {
       throw new TypeError("测试来源无效");
+    }
+    // 下载先于手机 RPC 的 120 秒期限终结，避免超时只剩 unknown。
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 90_000) {
+      throw new TypeError("附件下载期限无效");
     }
     this.journal = new FactJournal(`${directory}/receipts`);
   }
@@ -68,12 +96,12 @@ export class QqPhoneDownloads {
       throw error;
     }
   }
-  #url(value: string): URL {
+  #url(value: string, reason: "source_rejected" | "redirect_rejected" = "source_rejected"): URL {
     let url: URL;
     try {
       url = new URL(value.startsWith("//") ? `https:${value}` : value);
     } catch {
-      throw new KernelError("rejected", "附件没有可用下载地址");
+      throw new QqAttachmentDownloadError("rejected", reason);
     }
     // QQ 开放平台当前入站附件来自这个独立的官方多媒体主机。
     // 只补充精确主机，不把整个 qq.com.cn 或相似后缀纳入允许范围。
@@ -85,7 +113,7 @@ export class QqPhoneDownloads {
       url.username || url.password || url.hash ||
       !(url.protocol === "https:" && (!url.port || url.port === "443") && official) &&
         !(this.testOrigin && url.origin === this.testOrigin)
-    ) throw new KernelError("rejected", "附件地址不属于平台资源来源");
+    ) throw new QqAttachmentDownloadError("rejected", reason);
     return url;
   }
   async #verify(saved: PhoneDownload) {
@@ -119,35 +147,69 @@ export class QqPhoneDownloads {
   }
   async #download(source: PhoneDownload["source"], rawUrl: string): Promise<PhoneDownload> {
     let url = this.#url(rawUrl);
-    const signal = AbortSignal.any([this.#closed.signal, AbortSignal.timeout(120_000)]);
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const signal = AbortSignal.any([this.#closed.signal, timeout]);
+    const networkFailure = (reason: "connection_failed" | "body_incomplete") =>
+      this.#closed.signal.aborted
+        ? new QqAttachmentDownloadError("unavailable", "closed")
+        : timeout.aborted
+        ? new QqAttachmentDownloadError("timeout", "timeout")
+        : new QqAttachmentDownloadError("remote", reason);
     let response: Response | undefined;
     for (let redirects = 0; redirects <= 5; redirects++) {
       try {
         response = await fetch(url, { redirect: "manual", signal });
       } catch {
-        throw new KernelError("remote", "附件下载连接失败，未宣称已保存");
+        throw networkFailure("connection_failed");
       }
       if (![301, 302, 303, 307, 308].includes(response.status)) break;
-      await response.body?.cancel();
+      await response.body?.cancel().catch(() => {});
       const location = response.headers.get("location");
-      if (!location || redirects === 5) throw new KernelError("remote", "附件下载重定向无效");
-      url = this.#url(new URL(location, url).href);
+      if (!location || redirects === 5) {
+        throw new QqAttachmentDownloadError("remote", "redirect_invalid");
+      }
+      let next: URL;
+      try {
+        next = new URL(location, url);
+      } catch {
+        throw new QqAttachmentDownloadError("remote", "redirect_invalid");
+      }
+      url = this.#url(next.href, "redirect_rejected");
     }
     if (!response?.ok || !response.body) {
-      await response?.body?.cancel();
-      throw new KernelError("remote", "平台未提供附件内容，可能已过期");
+      await response?.body?.cancel().catch(() => {});
+      throw new QqAttachmentDownloadError(
+        "remote",
+        response && !response.ok ? "http_rejected" : "empty_response",
+        response && !response.ok ? response.status : undefined,
+      );
     }
     const path = `${this.directory}/files/${
       createHash("sha256").update(source.attachmentId).digest("hex")
     }`;
     // 每次失败保留独立部分文件；没有完整回执的旧文件从不当作成功。
     const partial = `${path}.${crypto.randomUUID()}.part`;
-    const file = await Deno.open(partial, { createNew: true, write: true, mode: 0o600 });
+    let file: Deno.FsFile;
+    try {
+      file = await Deno.open(partial, { createNew: true, write: true, mode: 0o600 });
+    } catch {
+      await response.body.cancel().catch(() => {});
+      throw new QqAttachmentDownloadError("storage", "storage_failed");
+    }
     const hash = createHash("sha256");
     let sizeBytes = 0;
     let first = new Uint8Array();
+    const reader = response.body.getReader();
     try {
-      for await (const chunk of response.body) {
+      while (true) {
+        let next: ReadableStreamReadResult<Uint8Array>;
+        try {
+          next = await reader.read();
+        } catch {
+          throw networkFailure("body_incomplete");
+        }
+        if (next.done) break;
+        const chunk = next.value;
         if (first.length < 16) {
           const joined = new Uint8Array(Math.min(16, first.length + chunk.length));
           joined.set(first);
@@ -164,9 +226,12 @@ export class QqPhoneDownloads {
         }
       }
       await file.sync();
-    } catch {
-      throw new KernelError("storage", "附件未完整保存，部分文件保留");
+    } catch (error) {
+      if (error instanceof QqAttachmentDownloadError) throw error;
+      throw new QqAttachmentDownloadError("storage", "storage_failed");
     } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
       file.close();
     }
     try {
@@ -180,7 +245,7 @@ export class QqPhoneDownloads {
         directory.close();
       }
     } catch {
-      throw new KernelError("storage", "附件提交失败，原件保留");
+      throw new QqAttachmentDownloadError("storage", "storage_failed");
     }
     const result: PhoneDownload = {
       path,

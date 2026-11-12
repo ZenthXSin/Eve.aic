@@ -392,3 +392,40 @@ Deno.test("守护损坏/号码上限和出口回退号码不被静默接受，�
     await f.close();
   }
 });
+
+Deno.test("长重试链复核原许可：不新增许可，暂停或交接后禁止下一次真实尝试", async () => {
+  for (const mode of ["pause", "drain"] as const) {
+    const f = await fixture();
+    const fence = new OwnershipFence(`${f.directory}/retry-fence`, "phone", f.authority);
+    await fence.initialize();
+    let attempts = 0;
+    try {
+      const operation = fence.run(f.proof, "retry-chain", { text: "one" }, async (checkpoint) => {
+        await checkpoint();
+        attempts++;
+        await checkpoint();
+        assert.equal(f.authority.status().activePermits, 1);
+        if (mode === "pause") {
+          await f.authority.pause({ requestId: "pause-chain", expectedEpoch: f.proof.epoch });
+        } else {
+          const result = await f.authority.grant({
+            instanceId: "new",
+            requestId: "drain-chain",
+            expectedEpoch: f.proof.epoch,
+          });
+          assert.equal(result.status, "draining");
+        }
+        await checkpoint();
+        attempts++;
+        return null;
+      });
+      await rejects(() => operation, "unavailable");
+      assert.equal(attempts, 1);
+      assert.equal(f.authority.status().activePermits, 0);
+      assert.deepEqual(fence.pending(), []);
+    } finally {
+      await fence.close();
+      await f.close();
+    }
+  }
+});

@@ -5,6 +5,7 @@ import { QqActionError } from "./actions.ts";
 import { QqPhone, QqPhoneError } from "./phone.ts";
 import { QqTimelineError } from "./timeline.ts";
 import { KernelError } from "../../kernel/protocol.ts";
+import { QqAttachmentDownloadError } from "./downloads.ts";
 import type { OwnershipFence } from "../../sdk/ownership-fence.ts";
 
 export function startPhoneRpc(
@@ -69,8 +70,14 @@ export function startPhoneRpc(
       }
       const method = data.method as PhoneMethod;
       // 仅固定契约方法可达，不允许取构造器、内部全量原件或任意成员。
-      const invoke = async () => {
+      const invoke = async (checkpoint?: () => Promise<void>) => {
         try {
+          if (method === "send") {
+            return await phone.send(args as never, { beforeAttempt: checkpoint });
+          }
+          if (method === "sendFile") {
+            return await phone.sendFile(args as never, { beforeAttempt: checkpoint });
+          }
           return await (phone[method] as (args: never) => unknown).call(phone, args as never);
         } catch (error) {
           if (
@@ -99,7 +106,9 @@ export function startPhoneRpc(
           data.ownership.proof,
           data.ownership.actionId,
           { method, args },
-          invoke as () => Promise<import("../../kernel/protocol.ts").Json>,
+          invoke as (
+            checkpoint: () => Promise<void>,
+          ) => Promise<import("../../kernel/protocol.ts").Json>,
         );
       } else value = await invoke();
       return Response.json({ ok: true, value });
@@ -112,7 +121,13 @@ export function startPhoneRpc(
         : error instanceof SyntaxError || error instanceof TypeError
         ? "request"
         : "internal";
-      const response: PhoneRpcResponse = { ok: false, error: { category } };
+      const response: PhoneRpcResponse = {
+        ok: false,
+        error: {
+          category,
+          ...(error instanceof QqAttachmentDownloadError ? { attachment: error.attachment } : {}),
+        },
+      };
       return Response.json(response);
     }
   });

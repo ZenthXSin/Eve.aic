@@ -113,8 +113,12 @@ export const PHONE = "phone";
 
 export interface PhoneActionReceipt {
   actionId: string;
-  state: "running" | "sent" | "failed" | "unknown";
+  state: "running" | "blocked" | "sent" | "failed" | "unknown";
+  /** 同会话未成功的队首动作；不得用新动作越过。 */
+  blockedBy?: string;
   attempted?: boolean;
+  /** 仅多次真实尝试时提供；超时自动重试仍使用相同消息及被动回复序号。 */
+  attemptCount?: number;
   platformMessageId?: string;
   reason?: "interrupted";
   error?: {

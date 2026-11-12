@@ -367,21 +367,23 @@ Deno.test("真实内核 worker→脚本→独立工具出口：便签与文件�
       requestId: "full_tools",
       mode: "sync",
       code:
-        'const file=await tools.files.write({path:"from-script.txt",text:"脚本实际写入",expectedSha256:"absent"}); const note=await tools.notes.create({title:"现场",content:"写入了文件",sources:[{kind:"experienced",at:new Date().toISOString(),description:file.path}]}); return {file,note};',
+        'const file=await tools.files.write({path:"from-script.txt",text:"脚本实际写入",expectedSha256:"absent"}); await tools.notes.create({title:"现场",alias:"现场",content:"写入了文件",sources:[{kind:"experienced",at:new Date().toISOString(),description:file.path}]}); await tools.notes.update({id:"现场",content:"短名修改已完成"}); const note=await tools.notes.get({id:"现场"}); return {file,note};',
     };
     const job = await kernel.call("scripts", "start", request) as unknown as ScriptSummary;
     assert.equal(job.status, "completed");
-    assert.equal(job.actions, 2);
+    assert.equal(job.actions, 4);
     const receipts = await kernel.call("scripts", "receipts", { jobId: job.jobId }) as {
       items: Json[];
     };
-    assert.equal(receipts.items.length, 2);
+    assert.equal(receipts.items.length, 4);
     assert.equal(
       await Deno.readTextFile(`${f.directory}/workspace/from-script.txt`),
       "脚本实际写入",
     );
     assert.deepEqual(await kernel.call("scripts", "start", request), job);
     assert.equal(f.engine().notes.list().items.length, 1);
+    assert.equal(f.engine().notes.get({ id: "现场" }).text, "短名修改已完成");
+    assert.equal(f.engine().notes.versions({ id: "现场" }).items.length, 2);
   } finally {
     if (kernel) assert.deepEqual(await kernel.stop(), []);
     await f.close();

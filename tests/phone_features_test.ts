@@ -274,8 +274,20 @@ Deno.test("媒体发送先上传再发；只有消息编号算已发送，同动
     );
     assert.equal(f.requests.length, 4);
     f.upload({ err_code: 400 });
+    // 未知的媒体动作占住本会话队首，后续动作连上传都不能越过它。
+    assert.deepEqual(await f.phone.sendFile({ ...args, actionId: "send_image_blocked" }), {
+      actionId: "send_image_blocked",
+      state: "blocked",
+      blockedBy: "send_image_unknown",
+    });
+    assert.equal(f.requests.length, 4);
+    // 独立会话仍能验证明确的上传拒绝，不受另一会话的队首影响。
     assert.equal(
-      (await f.phone.sendFile({ ...args, actionId: "send_image_failed" })).state,
+      (await f.phone.sendFile({
+        ...args,
+        conversationId: "qq:user:user-b",
+        actionId: "send_image_failed",
+      })).state,
       "failed",
     );
     assert.equal(f.requests.length, 5);
