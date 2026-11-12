@@ -283,6 +283,12 @@ Deno.test({
       ) as unknown as UpgradeReceipt;
       assert.equal(status.state, "submitted", JSON.stringify(status));
       assert.equal(status.outcome, "confirmed");
+      assert.equal(status.reason, "候选机械验证通过");
+      const latest = await upgrades.invoke(
+        data(proof, "status", {}, "read_latest"),
+        `Bearer ${proof.credential}`,
+      );
+      assert.deepEqual(latest, status);
       assert.notEqual(active.id, old.id);
       assert.equal(active.identity?.uid, nextIdentity.uid);
       assert.equal(supervisor.options.instances.length, 2);

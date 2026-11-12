@@ -63,7 +63,7 @@ Deno.test("升级客户端：真实RPC只传实例证明、每次重读连接与
       );
     }
     await assert.rejects(
-      client.call("status", {}, "bad"),
+      client.call("status", { actionId: "" }, "bad"),
       (e) => e instanceof KernelError && e.kind === "rejected",
     );
     assert.equal(bodies.length, 2);
@@ -168,7 +168,7 @@ Deno.test("升级脚本：真实worker经独立监督RPC，稳定动作编号且
       requestId: "upgrade_test",
       mode: "sync",
       code:
-        `const submitted=await tools.upgrades.request({commit:"${commit}"}); const status=await tools.upgrades.status({actionId:submitted.actionId});const sent=await tools.phone.sendFile({conversationId:"user:owner",path:"file.txt",kind:"file"});return {submitted,status,sent};`,
+        `const submitted=await tools.upgrades.request({commit:"${commit}"}); const status=await tools.upgrades.status();const sent=await tools.phone.sendFile({conversationId:"user:owner",path:"file.txt",kind:"file"});return {submitted,status,sent};`,
     };
     const job = await kernel.call("scripts", "start", request) as unknown as ScriptSummary;
     assert.equal(job.status, "completed");
@@ -176,7 +176,7 @@ Deno.test("升级脚本：真实worker经独立监督RPC，稳定动作编号且
     assert.equal(calls.length, 2);
     assert.equal((calls[0].ownership as { actionId: string }).actionId, `script_${job.jobId}_1`);
     assert.deepEqual(calls[0].args, { commit });
-    assert.deepEqual(calls[1].args, { actionId: `script_${job.jobId}_1` });
+    assert.deepEqual(calls[1].args, {});
     const result = await kernel.call("scripts", "result", { jobId: job.jobId }) as { text: string };
     assert.equal(JSON.parse(result.text).sent.actionId, `script_${job.jobId}_3`);
     assert.equal(JSON.stringify(result).includes(proof.credential), false);

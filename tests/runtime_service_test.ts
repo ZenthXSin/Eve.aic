@@ -389,3 +389,36 @@ Deno.test("真实内核 worker→脚本→独立工具出口：便签与文件�
     await f.close();
   }
 });
+
+Deno.test("执行出口：观察分页加速仍受字节上限约束，记录摘要保持8条", async () => {
+  const f = await fixture();
+  try {
+    for (let n = 0; n < 10; n++) await f.engine().records.append("fixture", { n });
+    const summary = await f.client.call("records", "page") as {
+      items: { seq: number }[];
+      throughSeq: number;
+    };
+    assert.equal(summary.items.length, 8);
+    await f.engine().records.append("fixture", { text: "x".repeat(6_100_000) });
+    await f.engine().records.append("fixture", { text: "x".repeat(6_100_000) });
+    const first = await f.client.call("timeline", "page") as {
+      items: { seq: number }[];
+      throughSeq: number;
+      hasMore: boolean;
+    };
+    assert.equal(first.items.length, 11);
+    assert.equal(first.throughSeq, 11);
+    assert.equal(first.hasMore, true);
+    const second = await f.client.call("timeline", "page", { afterSeq: first.throughSeq }) as {
+      items: { seq: number }[];
+      throughSeq: number;
+      hasMore: boolean;
+    };
+    assert.equal(second.items.length, 1);
+    assert.equal(second.throughSeq, 12);
+    assert.equal(second.hasMore, false);
+    assert.equal(f.paid(), 0);
+  } finally {
+    await f.close();
+  }
+});

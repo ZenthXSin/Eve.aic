@@ -71,3 +71,31 @@ Deno.test("升级提示仅刷新固定原件能力，完整保留身份定制，
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+// Frozen generated preamble from 6107d62: changing it silently would reject existing prompts.
+const legacyPreamble =
+  "唯一原生工具 execute_script 的 code 是异步函数正文。当前参数名 tools，类型为 ScriptApi；可 await 和 return。\n" +
+  "脚本默认异步返回持久任务编号，具体动作编号由宿主生成。不要把同一任务重新写成新调用来猜结果；查 scripts.status/receipt 或 phone.action。\n" +
+  "mode:sync 等待完成后，原生回执的 result 是脚本 return 值的 JSON 文本页；result.truncated 为 true 时保留原 jobId，按 nextChar 分页读取。tools.scripts.result 的 limit 为 1 至 8192；用 return await tools.scripts.result(...) 将该页交回主意识。\n" +
+  "upgrades.request 只提交完整 Git commit，独立监督校验并由旧 Eve 明确确认；回执 actionId 用于 upgrades.status，不以 submitted 冒充升级完成。\n" +
+  "以下为当前契约原件；PhoneApi.send/sendFile 在 ScriptApi 中省去 actionId，由宿主提供。ScriptHostApi 供宿主领取任务/通知，不是 tools 内的额外对象。\n\n";
+
+Deno.test("升级提示：610版固定生成说明可刷新到新能力，并保留当前人格原文", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-upgrade-legacy-prompt-" });
+  try {
+    const active = await fixture(`${directory}/old`, "legacy610");
+    const candidate = await fixture(`${directory}/new`, "newStatus");
+    const identity = await Deno.readTextFile(new URL("../prompts/identity.md", import.meta.url));
+    const generated = await renderScriptContracts((p) =>
+      Deno.readTextFile(`${active.directory}/${p}`)
+    );
+    const sections = generated.slice(generated.indexOf("接口来源：contracts/"));
+    const prompt = `${identity}\n\nQQ legacy610\n\n\n${legacyPreamble}${sections}`;
+    const result = await refreshUpgradePrompt(prompt, active, candidate);
+    assert.ok(result.startsWith(`${identity}\n\nQQ newStatus`));
+    assert.ok(result.includes("interface upgrades { newStatus: string; }"));
+    assert.equal(result.includes("legacy610: string"), false);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});

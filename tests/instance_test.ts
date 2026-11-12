@@ -375,3 +375,30 @@ Deno.test("固定版本宿主：优雅停止在途模型超过租期时仍保存
     await f.close();
   }
 });
+
+Deno.test("固定版本宿主：3387条观察原件以27页读取，保持来源链和完整快照", async () => {
+  const f = await fixture();
+  try {
+    for (let i = 0; i < 3387; i++) {
+      await f.engine.records.append("notice", { origin: `history-${i}` });
+    }
+    let pages = 0;
+    const dispatch = f.engine.dispatch.bind(f.engine);
+    f.engine.dispatch = async (...args: Parameters<typeof dispatch>) => {
+      if (args[0] === "timeline" && args[1] === "page") pages++;
+      return await dispatch(...args);
+    };
+    assert.deepEqual(await f.call("prepareObserver", { stepId: "large-history" }), {
+      throughSeq: 3387,
+    });
+    assert.equal(pages, 27);
+    const events = JSON.parse(
+      await Deno.readTextFile(`${f.directory}/instance/observer-snapshot.json`),
+    );
+    assert.equal(events.length, 3387);
+    assert.equal(events.at(-1).digest, f.engine.records.events.at(-1)!.digest);
+    assert.equal(f.requests.length, 0);
+  } finally {
+    await f.close();
+  }
+});

@@ -496,7 +496,7 @@ export class RuntimeEngine {
     let bytes = 0;
     for (
       let index = Number(after);
-      index < this.records.events.length && page.length < 8;
+      index < this.records.events.length && page.length < (full ? 128 : 8);
       index++
     ) {
       const event = this.records.events[index];

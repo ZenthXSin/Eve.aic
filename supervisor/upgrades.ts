@@ -1,3 +1,4 @@
+import type { UpgradeFailure } from "../contracts/upgrades.ts";
 import type { OwnershipProof, OwnershipSnapshot } from "../contracts/ownership.ts";
 import { OwnershipRpcClient } from "../guardian/rpc.ts";
 import { fingerprint } from "../kernel/calls.ts";
@@ -14,9 +15,13 @@ export interface UpgradeReceipt {
   commit: string;
   state: "preparing" | "submitted" | "failed";
   instanceId?: string;
-  error?: string;
+  error?: string | { kind: string; message: string };
   outcome?: string;
   upgradeId?: string;
+  phase?: string;
+  operation?: string;
+  reason?: string;
+  failure?: UpgradeFailure;
 }
 export interface UpgradeOptions {
   directory: string;
@@ -107,15 +112,29 @@ export class UpgradeRequests {
     ) throw new KernelError("unavailable", "旧版或过期实例不能申请升级");
     const args = data.args as Record<string, Json>;
     if (data.method === "status") {
-      if (typeof args?.actionId !== "string") {
-        throw new KernelError("rejected", "状态查询需要原申请编号");
-      }
-      const item = this.#receipts.get(args.actionId);
+      if (
+        !args || Object.keys(args).some((key) => key !== "actionId") ||
+        (args.actionId !== undefined && (typeof args.actionId !== "string" || !args.actionId))
+      ) throw new KernelError("rejected", "升级状态参数无效");
+      const item = args.actionId === undefined
+        ? [...this.#receipts.values()].at(-1)
+        : this.#receipts.get(String(args.actionId));
       if (!item) throw new KernelError("not_found", "升级申请不存在");
-      const last = this.supervisor.state.lastOutcome;
+      const state = this.supervisor.state, last = state.lastOutcome;
+      const upgrade = state.upgrade?.id === item.upgradeId ? state.upgrade : undefined;
       return {
         ...item,
-        ...(last && last.upgradeId === item.upgradeId ? { outcome: last.outcome } : {}),
+        ...(typeof item.error === "string"
+          ? { error: { kind: item.error, message: "升级准备未完成，请按原申请核对" } }
+          : {}),
+        ...(upgrade ? { phase: upgrade.phase, operation: upgrade.operation ?? upgrade.phase } : {}),
+        ...(last && last.upgradeId === item.upgradeId
+          ? {
+            outcome: last.outcome,
+            reason: last.reason,
+            ...(last.failure ? { failure: last.failure } : {}),
+          }
+          : {}),
       };
     }
     if (
@@ -152,6 +171,9 @@ export class UpgradeRequests {
   async #prepare(receipt: UpgradeReceipt) {
     try {
       const id = receipt.instanceId!;
+      receipt.phase = "validating";
+      receipt.operation = "pin_source";
+      await this.#save(receipt);
       const artifact = await pinSource({
         repository: this.options.repository,
         commit: receipt.commit,
@@ -162,6 +184,8 @@ export class UpgradeRequests {
       receipt.upgradeId = `upgrade_${
         (await fingerprint([receipt.actionId, receipt.commit])).slice(0, 48)
       }`;
+      receipt.phase = "staging";
+      receipt.operation = "stage_upgrade";
       await this.#save(receipt);
       await this.supervisor.stageUpgrade(async (active) => {
         const occupied = new Set(
@@ -256,10 +280,21 @@ export class UpgradeRequests {
         return instance;
       }, receipt.upgradeId);
       receipt.state = "submitted";
+      delete receipt.phase;
+      delete receipt.operation;
       await this.#save(receipt);
     } catch (error) {
+      receipt.failure = {
+        phase: receipt.phase ?? "preparing",
+        operation: receipt.operation ?? "prepare_upgrade",
+        kind: error instanceof KernelError ? error.kind : "remote",
+        message: error instanceof KernelError
+          ? error.message.slice(0, 1024)
+          : "源码验证或候选准备失败，详情保留于宿主诊断",
+      };
       receipt.state = "failed";
-      receipt.error = error instanceof KernelError ? error.kind : "validation_or_staging_failed";
+      receipt.phase = "failed";
+      receipt.error = { kind: receipt.failure.kind, message: receipt.failure.message };
       await this.#save(receipt);
     }
   }

@@ -15,7 +15,12 @@ import { InstanceClient } from "../supervisor/client.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
 
 async function fixture(
-  options: { handoverMs?: number; confirmationMs?: number; activationMs?: number } = {},
+  options: {
+    handoverMs?: number;
+    confirmationMs?: number;
+    activationMs?: number;
+    prepareError?: KernelError;
+  } = {},
 ) {
   const directory = await Deno.makeTempDir({ prefix: "eve-supervisor-test-" });
   let now = 1000;
@@ -84,6 +89,7 @@ async function fixture(
         states.set(instance.id, "standby");
         preparation.push(`${instance.id}:deactivate`);
       }
+      if (method === "prepareObserver" && options.prepareError) throw options.prepareError;
       if (method === "prepareObserver" && options.handoverMs !== undefined) {
         assert.equal(states.get(instance.id), "standby");
         await authority.renew(proofs.get(instance.id)!);
@@ -600,4 +606,64 @@ Deno.test({
       await Deno.remove(directory, { recursive: true });
     }
   },
+});
+
+Deno.test("双版本监督：观察准备超时保留具体阶段与回执，真实回退后重启仍可查", async () => {
+  const f = await fixture({
+    prepareError: new KernelError("timeout", "实例控制 prepareObserver 等待超时，执行结果未确认"),
+  });
+  try {
+    await f.supervisor().upgrade("new");
+    const outcome = f.supervisor().state.lastOutcome;
+    assert.equal(outcome?.outcome, "rolled_back");
+    assert.equal(outcome?.reason, "timeout");
+    assert.deepEqual(outcome?.failure, {
+      phase: "preparing",
+      operation: "prepare_observer",
+      kind: "timeout",
+      message: "实例控制 prepareObserver 等待超时，执行结果未确认",
+    });
+    assert.equal(f.supervisor().state.current, "old");
+    assert.equal(f.states.get("old"), "active");
+    assert.equal(f.authority.status().owner?.instanceId, "old");
+    await f.restart();
+    assert.deepEqual(f.supervisor().state.lastOutcome, outcome);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("实例RPC客户端：等待超时与取消有区别，不重放不宣称动作未执行", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-supervisor-timeout-" });
+  let calls = 0;
+  const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async () => {
+    calls++;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return Response.json({ ok: true, value: null });
+  });
+  const client = new InstanceClient(`${directory}/connection.json`, `${directory}/key`, 40);
+  try {
+    await Deno.writeTextFile(`${directory}/key`, "fixture_control_key_012345678901234567890123");
+    await writeDurableJson(`${directory}/connection.json`, {
+      url: `http://127.0.0.1:${server.addr.port}/instance`,
+    });
+    await assert.rejects(
+      () => client.call("prepareObserver"),
+      (error) =>
+        error instanceof KernelError && error.kind === "timeout" &&
+        error.message.includes("prepareObserver") && error.message.includes("执行结果未确认"),
+    );
+    assert.equal(calls, 1);
+    const cancelled = new InstanceClient(`${directory}/connection.json`, `${directory}/key`, 40);
+    cancelled.close();
+    await assert.rejects(
+      () => cancelled.call("prepareObserver"),
+      (error) => error instanceof KernelError && error.kind === "unknown",
+    );
+    assert.equal(calls, 1);
+  } finally {
+    client.close();
+    await server.shutdown();
+    await Deno.remove(directory, { recursive: true });
+  }
 });

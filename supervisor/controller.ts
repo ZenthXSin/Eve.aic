@@ -4,6 +4,7 @@ import type {
   OwnershipProof,
   OwnershipSnapshot,
 } from "../contracts/ownership.ts";
+import type { UpgradeFailure } from "../contracts/upgrades.ts";
 import type { ModelRequest, ModelResponse } from "../contracts/model.ts";
 import { type Json, KernelError } from "../kernel/protocol.ts";
 import { FactJournal } from "../sdk/fact-journal.ts";
@@ -77,6 +78,8 @@ interface Upgrade {
   old: string;
   candidate: string;
   phase: Phase;
+  operation?: string;
+  failure?: UpgradeFailure;
   deadline: number;
   afterSeq: number;
   candidateGranted?: boolean;
@@ -107,7 +110,13 @@ export interface SupervisorState {
   paused: boolean;
   pendingGrant?: OwnershipGrant;
   upgrade: Upgrade | null;
-  lastOutcome: { upgradeId: string; outcome: string; at: number; reason: string } | null;
+  lastOutcome: {
+    upgradeId: string;
+    outcome: string;
+    at: number;
+    reason: string;
+    failure?: UpgradeFailure;
+  } | null;
 }
 
 /** 独立机械监督。事实先落盘再改变进程/所有权；中断用同一交接编号继续核对。 */
@@ -425,24 +434,31 @@ export class Supervisor {
     }
     try {
       if (u.phase === "preparing") {
-        await this.options.driver.ensure(candidate);
-        await this.#register(candidate);
-        await this.#status(candidate);
-        await this.options.driver.call(old, "deactivate");
+        await this.#run(u, "candidate_start", () => this.options.driver.ensure(candidate));
+        await this.#run(u, "candidate_register", () => this.#register(candidate));
+        await this.#run(u, "candidate_health", () => this.#status(candidate));
+        await this.#run(u, "old_deactivate", () => this.options.driver.call(old, "deactivate"));
         // The old proof is required only while taking its read-only observer snapshot.
         // prepareObserver renews during that read; offline ledger copying may outlast
         // the old lease, so it must follow the last operation requiring that lease.
-        await this.options.driver.call(old, "prepareObserver", {
-          stepId: `${u.id}_prepare`,
-          upgradeId: u.id,
+        await this.#run(
+          u,
+          "prepare_observer",
+          () =>
+            this.options.driver.call(old, "prepareObserver", {
+              stepId: `${u.id}_prepare`,
+              upgradeId: u.id,
+            }),
+        );
+        await this.#run(u, "handover", async () => {
+          await this.options.driver.handover?.(old, candidate, `${u.id}_mind`);
         });
-        await this.options.driver.handover?.(old, candidate, `${u.id}_mind`);
-        u.afterSeq = await this.options.backend.watermark();
+        u.afterSeq = await this.#run(u, "watermark", () => this.options.backend.watermark());
         u.phase = "draining";
         await this.#save();
       }
       if (u.phase === "draining") {
-        await this.options.backend.quiesce();
+        await this.#run(u, "quiesce", () => this.options.backend.quiesce());
         if (!u.grant) {
           const status = await this.options.guardian.status();
           u.grant = {
@@ -452,14 +468,20 @@ export class Supervisor {
           };
           await this.#save();
         }
-        if (!await this.#applyGrant(candidate, u.grant)) return;
+        if (!await this.#run(u, "candidate_grant", () => this.#applyGrant(candidate, u.grant!))) {
+          return;
+        }
         u.candidateGranted = true;
         u.phase = "activating";
         await this.#save();
       }
       if (u.phase === "activating") {
-        await this.options.driver.call(candidate, "activate");
-        await this.#status(candidate, true);
+        await this.#run(
+          u,
+          "candidate_activate",
+          () => this.options.driver.call(candidate, "activate"),
+        );
+        await this.#run(u, "candidate_active_health", () => this.#status(candidate, true));
         if (this.now() >= u.deadline) {
           u.phase = "rollback";
           u.reason = "preparation_timeout";
@@ -474,9 +496,9 @@ export class Supervisor {
         await this.#save();
       }
       if (u.phase === "observing") {
-        await this.#status(old);
-        await this.#status(candidate, true);
-        const status = await this.options.guardian.status();
+        await this.#run(u, "observer_health", () => this.#status(old));
+        await this.#run(u, "candidate_active_health", () => this.#status(candidate, true));
+        const status = await this.#run(u, "candidate_lease", () => this.options.guardian.status());
         if (
           status.mode !== "active" || status.owner?.instanceId !== candidate.id ||
           status.owner.expiresAt <= this.now()
@@ -485,11 +507,24 @@ export class Supervisor {
       }
     } catch (error) {
       // 未确认期间任一版本崩溃/拒绝/观察出错都不准宣布成功。
+      u.failure = {
+        phase: u.phase,
+        operation: u.operation ?? u.phase,
+        kind: error instanceof KernelError ? error.kind : "remote",
+        message: error instanceof KernelError
+          ? error.message.slice(0, 1024)
+          : "升级操作抛出未分类异常",
+      };
       u.phase = "rollback";
       u.reason = error instanceof KernelError ? error.kind : "observer_or_candidate_crash";
       await this.#save();
     }
     if (u.phase === "rollback") await this.#rollback(u, old, candidate);
+  }
+  async #run<T>(u: Upgrade, operation: string, work: () => Promise<T>): Promise<T> {
+    u.operation = operation;
+    await this.#save();
+    return await work();
   }
   async #observe(u: Upgrade, old: InstanceSpec, candidate: InstanceSpec) {
     const id = `${u.id}_observe_${u.step}`;
@@ -506,20 +541,34 @@ export class Supervisor {
         };
         await this.#save();
       }
-      o.request = await this.options.driver.call<ModelRequest>(old, "observerRequest", {
-        ...o.requestArgs as Record<string, Json>,
-      });
+      o.request = await this.#run(
+        u,
+        "observer_request",
+        () =>
+          this.options.driver.call<ModelRequest>(old, "observerRequest", {
+            ...o.requestArgs as Record<string, Json>,
+          }),
+      );
       await this.#save();
     }
     if (!o.response) {
-      o.response = await this.options.backend.complete(candidate, o.request, id);
+      o.response = await this.#run(
+        u,
+        "observer_model",
+        () => this.options.backend.complete(candidate, o.request!, id),
+      );
       await this.#save();
     }
     if (!o.calls) {
-      o.calls = await this.options.driver.call(old, "observerResponse", {
-        stepId: id,
-        response: o.response as unknown as Json,
-      });
+      o.calls = await this.#run(
+        u,
+        "observer_response",
+        () =>
+          this.options.driver.call(old, "observerResponse", {
+            stepId: id,
+            response: o.response as unknown as Json,
+          }),
+      );
       await this.#save();
     }
     if (!o.results) {
@@ -537,25 +586,41 @@ export class Supervisor {
           call.name === "save_observation_note" && typeof args?.title === "string" &&
           typeof args.content === "string"
         ) {
-          value = await this.options.backend.saveNote(candidate, {
-            title: args.title,
-            content: args.content,
-          }, `${id}_${call.id}`);
-        } else if (call.name === "trial_candidate" && typeof args?.text === "string") {
-          const request = await this.options.driver.call<ModelRequest>(candidate, "trialRequest", {
-            stepId: `${id}_${call.id}`,
-            text: args.text,
-          });
-          if (request.tools.length) throw new KernelError("rejected", "试聊不能持有真实工具");
-          const response = await this.options.backend.complete(
-            candidate,
-            request,
-            `${id}_${call.id}_trial`,
+          value = await this.#run(
+            u,
+            "observer_save_note",
+            () =>
+              this.options.backend.saveNote(candidate, {
+                title: String(args.title),
+                content: String(args.content),
+              }, `${id}_${call.id}`),
           );
-          await this.options.driver.call(candidate, "trialResponse", {
-            stepId: `${id}_${call.id}`,
-            response: response as unknown as Json,
-          });
+        } else if (call.name === "trial_candidate" && typeof args?.text === "string") {
+          const request = await this.#run(
+            u,
+            "trial_request",
+            () =>
+              this.options.driver.call<ModelRequest>(candidate, "trialRequest", {
+                stepId: `${id}_${call.id}`,
+                text: args.text,
+              }),
+          );
+          if (request.tools.length) throw new KernelError("rejected", "试聊不能持有真实工具");
+          const response = await this.#run(u, "trial_model", () =>
+            this.options.backend.complete(
+              candidate,
+              request,
+              `${id}_${call.id}_trial`,
+            ));
+          await this.#run(
+            u,
+            "trial_response",
+            () =>
+              this.options.driver.call(candidate, "trialResponse", {
+                stepId: `${id}_${call.id}`,
+                response: response as unknown as Json,
+              }),
+          );
           value = {
             kind: "isolated_test",
             response: response.content,
@@ -567,10 +632,15 @@ export class Supervisor {
       await this.#save();
     }
     if (o.calls!.length) {
-      await this.options.driver.call(old, "observerToolResults", {
-        stepId: id,
-        items: o.results as unknown as Json,
-      });
+      await this.#run(
+        u,
+        "observer_tool_results",
+        () =>
+          this.options.driver.call(old, "observerToolResults", {
+            stepId: id,
+            items: o.results as unknown as Json,
+          }),
+      );
     }
     const decisions = o.calls!.filter((call) => call.name === "confirm_upgrade");
     if (
@@ -585,8 +655,12 @@ export class Supervisor {
       const args = decision.args as Record<string, Json>;
       if (args.accept) {
         if (this.now() >= u.deadline) throw new KernelError("timeout", "旧版确认到达时已超时");
-        await this.#status(candidate, true);
-        const current = await this.options.guardian.status();
+        await this.#run(u, "confirmation_health", () => this.#status(candidate, true));
+        const current = await this.#run(
+          u,
+          "confirmation_lease",
+          () => this.options.guardian.status(),
+        );
         if (
           current.mode !== "active" || current.owner?.instanceId !== candidate.id ||
           current.owner.expiresAt <= this.now()
@@ -658,6 +732,7 @@ export class Supervisor {
       outcome: "rolled_back",
       at: this.now(),
       reason: u.reason ?? "unconfirmed",
+      ...(u.failure ? { failure: u.failure } : {}),
     };
     this.#state.upgrade = null;
     await this.#save();

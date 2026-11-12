@@ -24,7 +24,8 @@ export class UpgradeClient {
     if (
       method === "status" &&
       (Object.keys(args).some((key) => key !== "actionId") ||
-        typeof args.actionId !== "string" || !args.actionId || args.actionId.length > 256)
+        (args.actionId !== undefined &&
+          (typeof args.actionId !== "string" || !args.actionId || args.actionId.length > 256)))
     ) throw new KernelError("rejected", "升级状态参数无效");
     let url: URL;
     let proof: OwnershipProof;

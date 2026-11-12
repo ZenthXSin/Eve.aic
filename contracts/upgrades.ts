@@ -2,18 +2,30 @@
 export const UPGRADES = "upgrades";
 export const UPGRADE_METHODS = ["request", "status"] as const;
 
+export type UpgradeFailure = {
+  phase: string;
+  operation: string;
+  kind: string;
+  message: string;
+};
+
 export interface UpgradeReceipt {
   actionId: string;
   commit: string;
   state: "preparing" | "submitted" | "failed";
   instanceId?: string;
   outcome?: string;
+  upgradeId?: string;
+  phase?: string;
+  operation?: string;
+  reason?: string;
+  failure?: UpgradeFailure;
   error?: { kind: string; message: string };
 }
 
 export interface UpgradeApi {
   /** 仅接受已提交的完整 40 位 Git 提交；实际校验、切换和旧 Eve 确认由独立监督完成。 */
   request(args: { commit: string }): Promise<UpgradeReceipt>;
-  /** 查询原升级申请编号，不制造新的升级请求。 */
-  status(args: { actionId: string }): Promise<UpgradeReceipt>;
+  /** 无参数查询最近一次申请；也可带原编号查询，不制造新申请。 */
+  status(args?: { actionId?: string }): Promise<UpgradeReceipt>;
 }

@@ -9,6 +9,7 @@ export class InstanceClient {
     readonly timeoutMs = 180_000,
   ) {}
   async call<T = Json>(method: string, args: Json = {}): Promise<T> {
+    const timeout = AbortSignal.timeout(this.timeoutMs);
     try {
       const { url } = JSON.parse(await Deno.readTextFile(this.connectionFile));
       const parsed = new URL(url);
@@ -25,7 +26,7 @@ export class InstanceClient {
         },
         body: JSON.stringify({ method, args }),
         redirect: "error",
-        signal: AbortSignal.any([this.#abort.signal, AbortSignal.timeout(this.timeoutMs)]),
+        signal: AbortSignal.any([this.#abort.signal, timeout]),
       });
       if (!response.ok || !response.body) {
         await response.body?.cancel();
@@ -75,6 +76,12 @@ export class InstanceClient {
       throw new KernelError("unknown", "实例控制回执格式无效");
     } catch (error) {
       if (error instanceof KernelError) throw error;
+      if (timeout.aborted && !this.#abort.signal.aborted) {
+        throw new KernelError(
+          "timeout",
+          `实例控制 ${method} 等待 ${this.timeoutMs} 毫秒超时，执行结果未确认`,
+        );
+      }
       throw new KernelError("unknown", "实例控制连接中断，不能假定动作未执行");
     }
   }
