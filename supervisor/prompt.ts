@@ -15,7 +15,20 @@ async function generatedPrompt(source: SourceArtifact): Promise<string> {
   };
   const qq = await read("prompts/qq-social.md");
   if (!qq.trim()) throw new KernelError("corrupt", "QQ 提示原件为空");
-  return `${qq}\n\n${await renderScriptContracts(read)}`;
+  const hasMechanics = source.files.some((file) => file.path === "prompts/qq-mechanics.md");
+  const splitLayout = /^<!-- eve-qq-prompt-layout: social-mechanics-v1 -->\r?$/m.test(qq);
+  if (splitLayout && !hasMechanics) {
+    throw new KernelError("corrupt", "固定源码缺少 QQ 机制提示原件");
+  }
+  // Old source artifacts have only social + contracts. Reproduce those exact bytes
+  // to identify the existing generated suffix before introducing the new section.
+  const mechanics = hasMechanics ? await read("prompts/qq-mechanics.md") : undefined;
+  if (mechanics !== undefined && !mechanics.trim()) {
+    throw new KernelError("corrupt", "QQ 机制提示原件为空");
+  }
+  return `${qq}\n\n${
+    mechanics === undefined ? "" : `${mechanics}\n\n`
+  }${await renderScriptContracts(read)}`;
 }
 
 /** Preserve the complete identity/custom prefix; ambiguous legacy prompts require explicit repair. */

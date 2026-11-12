@@ -73,6 +73,7 @@ for (const requestedBy of ["instance", "administrator"] as const) {
       await Deno.mkdir(`${repository}/contracts`);
       const promptFiles = [
         "prompts/qq-social.md",
+        "prompts/qq-mechanics.md",
         ...[
           "phone",
           "model",
@@ -129,6 +130,8 @@ for (const requestedBy of ["instance", "administrator"] as const) {
       const identity = "你是 Eve，升级测试固定身份。\n定制身份保留。\n";
       const originalPrompt = `${identity}\n\n${await Deno.readTextFile(
         `${repository}/prompts/qq-social.md`,
+      )}\n\n${await Deno.readTextFile(
+        `${repository}/prompts/qq-mechanics.md`,
       )}\n\n${await renderScriptContracts()}`;
       await Deno.writeTextFile(`${oldPrivate}/prompt.md`, originalPrompt);
       const old: InstanceSpec = {
