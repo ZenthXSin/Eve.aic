@@ -88,6 +88,23 @@ export function phoneReceipt(status: SendStatus): PhoneActionReceipt {
     };
 }
 
+/** 群全量推送也可明确单独 @ 本机器人；不能从正文、昵称或 @ 全体推断。 */
+function directGroupMention(record: InboundRecord): boolean {
+  if (record.raw.t !== "GROUP_MESSAGE_CREATE" || record.message.destination.kind !== "group") {
+    return false;
+  }
+  const data = record.raw.d;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  const raw = data as Record<string, unknown>;
+  // /model 等系统接管后的视图已明确抑制通知，不把其派生正文重新当原消息亮屏。
+  if (raw.content !== record.message.message.text || !Array.isArray(raw.mentions)) return false;
+  return raw.mentions.some((mention: unknown) =>
+    !!mention && typeof mention === "object" && !Array.isArray(mention) &&
+    (mention as Record<string, unknown>).scope === "single" &&
+    (mention as Record<string, unknown>).is_you === true
+  );
+}
+
 export class QqPhone {
   constructor(
     readonly incoming: () => InboundRecord[],
@@ -100,7 +117,7 @@ export class QqPhone {
     readonly downloads?: QqPhoneDownloads,
   ) {}
 
-  async #snapshot() {
+  async #snapshot(options: { storedNotifications?: boolean } = {}) {
     const sources: TimelineSource[] = this.incoming().map((record) => ({
       key: `incoming:${record.seq}`,
       fingerprint: record.identity,
@@ -115,7 +132,7 @@ export class QqPhone {
           reference: { index: record.message.referenceIndex },
         }),
       },
-      notify: record.message.notify,
+      notify: record.message.notify || (!options.storedNotifications && directGroupMention(record)),
     }));
     for (const record of this.actions.records()) {
       const delivery = phoneReceipt(this.actions.status(record.actionId)!);
@@ -252,7 +269,8 @@ export class QqPhone {
 
   /** 仅供部署捕获事实边界，不输出正文、不移动阅读/通知水位、不开放为RPC。 */
   async captureNotificationBoundary(throughSeq?: number) {
-    const rows = await this.#snapshot();
+    // 首次上线边界校验的是历史原件，不随可再生通知视图增强而改变摘要。
+    const rows = await this.#snapshot({ storedNotifications: true });
     const through = throughSeq ?? rows.at(-1)?.message.seq ?? 0;
     integer(through, 0);
     if (through > (rows.at(-1)?.message.seq ?? 0)) {
