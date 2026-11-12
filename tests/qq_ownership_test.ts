@@ -453,7 +453,7 @@ async function retryFixture(options: {
     credential: oldKey,
   };
   const release = deferred();
-  const requests: Record<string, unknown>[] = [];
+  const requests: (Record<string, unknown> & { markdown?: { content: string } })[] = [];
   const sockets: WebSocket[] = [];
   let headRequests = 0;
   const platform = Deno.serve(
@@ -492,10 +492,15 @@ async function retryFixture(options: {
       assert.match(path, /^\/v2\/users\/owner-fixture\/messages$/);
       const body = await request.json();
       requests.push(body);
-      if (body.content === "head" && ++headRequests <= (options.failures ?? 4)) {
+      if (
+        (body.markdown?.content ?? body.content) === "head" &&
+        ++headRequests <= (options.failures ?? 4)
+      ) {
         await release.promise;
       }
-      return Response.json({ id: body.content === "head" ? "head-sent" : "second-sent" });
+      return Response.json({
+        id: (body.markdown?.content ?? body.content) === "head" ? "head-sent" : "second-sent",
+      });
     },
   );
   const transport = new QqClient({ appId: "fixture", appSecret: "fixture" }, {
@@ -614,7 +619,7 @@ Deno.test("QQ 无限顺序重试：真实 RPC 先超时，后台四次超时后�
     assert.ok(head && typeof head === "object" && !Array.isArray(head));
     assert.equal(head.state, "sent");
     assert.equal(head.attemptCount, 5);
-    assert.deepEqual(f.requests.map((body) => body.content), [
+    assert.deepEqual(f.requests.map((body) => body.markdown?.content ?? body.content), [
       "head",
       "head",
       "head",
@@ -661,7 +666,7 @@ for (const mode of ["pause", "draining"] as const) {
       }
       await bounded(Promise.all([firstSettled, secondSettled]));
       await waitFor(() => f.guard.status().activePermits === 0);
-      assert.deepEqual(f.requests.map((body) => body.content), ["head"]);
+      assert.deepEqual(f.requests.map((body) => body.markdown?.content ?? body.content), ["head"]);
       assert.equal(f.actions!.status(headSend.actionId)?.status, "unknown");
       const blocked = f.actions!.status(secondSend.actionId);
       assert.ok(blocked?.status === "blocked");
@@ -692,7 +697,7 @@ Deno.test("QQ 无限顺序重试：正式 service.close 在退避期间停止并
     await bounded(f.closeAdapter(), 2_000);
     await bounded(result);
     assert.equal(f.guard.status().activePermits, 0);
-    assert.deepEqual(f.requests.map((body) => body.content), ["head"]);
+    assert.deepEqual(f.requests.map((body) => body.markdown?.content ?? body.content), ["head"]);
     const restored = new QqSendActions(
       new QqClient({ appId: "fixture", appSecret: "fixture" }),
       `${f.directory}/outbox`,

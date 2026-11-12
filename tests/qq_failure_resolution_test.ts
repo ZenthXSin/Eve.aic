@@ -178,7 +178,7 @@ Deno.test("QQ排队取消：只结束零尝试后项，保留队首与其余顺�
   const contents: string[] = [];
   let reject = true;
   const local = platform(async (r) => {
-    contents.push((await r.json()).content);
+    contents.push((await r.json()).markdown.content);
     return reject ? permanentFailure() : Response.json({ id: "remaining-sent" });
   });
   let actions = new QqSendActions(local.client(), directory);
@@ -248,7 +248,7 @@ Deno.test("QQ取消保留未知事实：unknown队首可取消等待，活跃请
   const release = deferred<void>();
   const local = platform(async (r) => {
     const body = await r.json();
-    if (body.content === "inflight") {
+    if ((body.markdown?.content ?? body.content) === "inflight") {
       entered.resolve();
       await release.promise;
       return Response.json({ id: "sent" });
@@ -435,14 +435,14 @@ Deno.test("QQ显式鉴权与限流失败按原请求重试，Retry-After加基�
     assert.equal(checkpoints, 3);
     assert.deepEqual(bodies.slice(0, 3), [bodies[0], bodies[0], bodies[0]]);
     assert.deepEqual(bodies[0], {
-      content: request.text,
-      msg_type: 0,
+      markdown: { content: request.text },
+      msg_type: 2,
       msg_id: "inbound-fixed",
       msg_seq: 7,
     });
     assert.ok(times[1] - times[0] >= 20, `auth backoff ${times[1] - times[0]}`);
     assert.ok(times[2] - times[1] >= 1020, `rate backoff ${times[2] - times[1]}`);
-    assert.equal((bodies[3] as { content: string }).content, "后项");
+    assert.equal((bodies[3] as { markdown: { content: string } }).markdown.content, "后项");
     assert.equal(
       JSON.parse(await Deno.readTextFile(`${directory}/attempts/first/2.result.json`)).result.error
         .retryAfterMs,
@@ -553,7 +553,7 @@ Deno.test("QQ活跃队首重试期间可取消等待中的零尝试后项，并�
   const secondAttempt = deferred<void>();
   const contents: string[] = [];
   const local = platform(async (r) => {
-    contents.push((await r.json()).content);
+    contents.push((await r.json()).markdown.content);
     if (contents.length === 2) secondAttempt.resolve();
     return Response.json({ err_code: 100001 }, {
       status: 429,

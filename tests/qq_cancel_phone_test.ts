@@ -62,12 +62,12 @@ async function fixture(options: { pauseAfterCancelAdmission?: boolean } = {}) {
       }
       const body = await request.json();
       sends++;
-      if (body.content === "hold") {
+      if ((body.markdown?.content ?? body.content) === "hold") {
         entered.resolve();
         await release.promise;
         return Response.json({ id: "actually-sent" });
       }
-      return body.content === "unknown"
+      return (body.markdown?.content ?? body.content) === "unknown"
         ? Response.json({ code: 304023 }, { status: 202 })
         : Response.json({ code: 40010000, message: "explicit rejection" }, { status: 400 });
     },
