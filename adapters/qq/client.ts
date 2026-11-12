@@ -67,6 +67,8 @@ export class QqRequestError extends Error {
 export interface QqSendText {
   destination: { kind: "user" | "group"; openId: string };
   text: string;
+  /** Pinned at admission; absent in legacy records means plain text. */
+  format?: "plain" | "markdown";
   /** 调用方为一个动作固定序号；传输层不因失败或未知擅自递增。 */
   reply?: { messageId: string; sequence: number } | { eventId: string };
   /** 引用展示用的 ref_idx，不是被动回复用的 msg_id。 */
@@ -211,7 +213,13 @@ function textBody(request: QqSendText): Record<string, unknown> {
     !nonempty(request.destination.openId) || typeof request.text !== "string" ||
     (!nonempty(request.text) && request.attachment === undefined)
   ) requestError();
-  const body: Record<string, unknown> = { content: request.text, msg_type: 0 };
+  if (request.format !== undefined && !["plain", "markdown"].includes(request.format)) {
+    requestError();
+  }
+  if (request.attachment !== undefined && request.format === "markdown") requestError();
+  const body: Record<string, unknown> = request.format === "markdown"
+    ? { msg_type: 2, markdown: { content: request.text } }
+    : { content: request.text, msg_type: 0 };
   if (request.attachment !== undefined) {
     if (
       !object(request.attachment) || typeof request.attachment.path !== "string" ||
@@ -240,7 +248,10 @@ function textBody(request: QqSendText): Record<string, unknown> {
   }
   if (request.referenceIndex !== undefined) {
     if (!nonempty(request.referenceIndex)) requestError();
-    body.message_reference = { message_id: request.referenceIndex };
+    // Official SDK omits message_reference for Markdown; reply msg_id is retained.
+    if (request.format !== "markdown") {
+      body.message_reference = { message_id: request.referenceIndex };
+    }
   }
   if (request.wakeup !== undefined) {
     if (typeof request.wakeup !== "boolean") requestError();

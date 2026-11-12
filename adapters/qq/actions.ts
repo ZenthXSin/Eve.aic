@@ -907,6 +907,11 @@ export class QqSendActions {
   #admit(actionId: string, request: QqActionSendText): QqSendText {
     const snapshot = structuredClone(request);
     const previous = this.#records.get(actionId)?.request ?? this.#admissions.get(actionId);
+    // Freeze the wire format before the first attempt. Legacy retries stay plain.
+    if (snapshot && typeof snapshot === "object" && snapshot.format === undefined) {
+      if (previous?.format !== undefined) snapshot.format = previous.format;
+      else if (!previous && snapshot.attachment === undefined) snapshot.format = "markdown";
+    }
     const reply = snapshot?.reply;
     if (reply && typeof reply === "object" && "messageId" in reply) {
       const reserved = [
