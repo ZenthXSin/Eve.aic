@@ -1,5 +1,6 @@
 import { definePlugin, type Json, KernelError } from "../../sdk/plugin.ts";
 import { type EveConfig, EveRuntime } from "./runtime.ts";
+import { eveStopDeadlineMs } from "../../sdk/lifecycle-timeouts.ts";
 export async function readEveConfig(path: string): Promise<EveConfig> {
   const value = JSON.parse(await Deno.readTextFile(path)).eve;
   if (
@@ -21,6 +22,7 @@ export async function readEveConfig(path: string): Promise<EveConfig> {
   ) {
     throw new KernelError("rejected", "意识流启动期限无效");
   }
+  eveStopDeadlineMs(value.modelTimeoutMs);
   if (value.timeZone !== undefined && typeof value.timeZone !== "string") {
     throw new KernelError("rejected", "预算时区无效");
   }

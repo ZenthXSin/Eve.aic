@@ -1,19 +1,31 @@
 // 一个正在运行的插件版本：一个带独立权限的 worker，加上与它之间的全部往来。
 
 import {
+  type ErrorKind,
   type FromWorker,
   type Json,
   KernelError,
   type Manifest,
   type StateReply,
   type ToWorker,
+  type WireError,
 } from "./protocol.ts";
 
 export class LifecycleError extends Error {
-  constructor(readonly stage: string, readonly timedOut: boolean, message: string) {
+  constructor(
+    readonly stage: string,
+    readonly timedOut: boolean,
+    message: string,
+    readonly kind: ErrorKind = timedOut ? "timeout" : "unknown",
+  ) {
     super(message);
     this.name = "LifecycleError";
   }
+}
+
+export interface StopFailure extends WireError {
+  stage: string;
+  timedOut: boolean;
 }
 
 export interface InstanceHooks {
@@ -33,6 +45,11 @@ interface Waiter<T> {
 export class Instance {
   #worker: Worker;
   #alive = true;
+  #stopFailure?: StopFailure;
+
+  get stopFailure(): StopFailure | undefined {
+    return this.#stopFailure ? { ...this.#stopFailure } : undefined;
+  }
   #nextId = 1;
   #calls = new Map<number, Waiter<Json>>();
   #probes = new Map<number, Waiter<void>>();
@@ -108,7 +125,14 @@ export class Instance {
         if (lifecycle) {
           this.#lifecycle = undefined;
           clearTimeout(lifecycle.waiter.timer);
-          lifecycle.waiter.reject(new LifecycleError(message.stage, false, message.message));
+          lifecycle.waiter.reject(
+            new LifecycleError(
+              message.stage,
+              false,
+              message.message,
+              message.error?.kind ?? "remote",
+            ),
+          );
         } else {
           this.#fail(`${message.stage} 阶段失败：${message.message}`);
         }
@@ -253,6 +277,7 @@ export class Instance {
   async stop(): Promise<string | undefined> {
     if (!this.#alive) return undefined;
     let problem: string | undefined;
+    this.#stopFailure = undefined;
     try {
       const disabled = this.#awaitLifecycle(
         "disabled",
@@ -262,7 +287,15 @@ export class Instance {
       this.#post({ t: "disable" });
       await disabled;
     } catch (error) {
-      problem = (error as Error).message;
+      problem = error instanceof Error ? error.message : String(error);
+      this.#stopFailure = {
+        stage: error instanceof LifecycleError ? error.stage : "disable",
+        kind: error instanceof LifecycleError || error instanceof KernelError
+          ? error.kind
+          : "unknown",
+        timedOut: error instanceof LifecycleError && error.timedOut,
+        message: problem,
+      };
     }
     this.kill("已停止");
     return problem;

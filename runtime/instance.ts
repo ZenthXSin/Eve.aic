@@ -19,6 +19,7 @@ import type {
 } from "../contracts/model.ts";
 import type { OwnershipOwner, OwnershipProof } from "../contracts/ownership.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
+import { StopDiagnostics, stopErrorKind } from "./stop-diagnostics.ts";
 
 const observerTools: ToolSpec[] = [
   {
@@ -129,6 +130,8 @@ export async function startInstance(configPath: string) {
     throw new KernelError("rejected", "实例控制配置不完整，须使用共享原件与同一代际凭据");
   }
   await Deno.mkdir(c.directory, { recursive: true, mode: 0o700 });
+  const stopDiagnostics = new StopDiagnostics(`${c.directory}/stop-diagnostics`);
+  await stopDiagnostics.initialize();
   const key = (await Deno.readTextFile(c.keyFile)).trim();
   if (!/^[a-zA-Z0-9_-]{32,256}$/.test(key)) throw new KernelError("rejected", "实例控制凭据无效");
   const client = new RuntimeClient(config.runtime);
@@ -149,12 +152,19 @@ export async function startInstance(configPath: string) {
       // Only the guardian may revoke it; the supervisor grants the next epoch after stop.
       if (previous) {
         const errors = await previous.stop();
-        if (errors.length) throw new KernelError("storage", "实例停止有未完成保存，原件保留");
+        if (errors.length) {
+          const failures = previous.stopFailures;
+          await stopDiagnostics.record(c.id, c.sourceCommit, failures);
+          throw new KernelError(
+            stopErrorKind(failures),
+            `实例停止失败，原件与诊断保留：${errors.join("；")}`,
+          );
+        }
       }
       state = "standby";
     } catch (error) {
       state = "failed";
-      lastError = "storage";
+      lastError = error instanceof KernelError ? error.kind : "unknown";
       throw error;
     } finally {
       generation++;
@@ -291,6 +301,7 @@ export async function startInstance(configPath: string) {
         sourceCommit: c.sourceCommit,
         instanceId: c.id,
         error: lastError,
+        stopFailure: stopDiagnostics.last as unknown as Json,
         eve,
         plugins: kernel?.status() as unknown as Json ?? [],
       };
@@ -339,6 +350,28 @@ export async function startInstance(configPath: string) {
         kernel = undefined;
         state = errors?.length ? "failed" : "standby";
         lastError = error instanceof KernelError ? error.kind : "unknown";
+        if (errors?.length && next) {
+          const failures = [{
+            plugin: "instance",
+            stage: "activate",
+            kind: error instanceof KernelError ? error.kind : "unknown" as const,
+            timedOut: error instanceof KernelError && error.kind === "timeout",
+            message: error instanceof Error ? error.message : String(error),
+          }, ...next.stopFailures];
+          try {
+            await stopDiagnostics.record(c.id, c.sourceCommit, failures);
+          } catch (saveError) {
+            lastError = "storage";
+            throw saveError;
+          }
+          // Cleanup storage errors must not disappear behind the activation error.
+          const kind = stopErrorKind(failures);
+          lastError = kind;
+          throw new KernelError(
+            kind,
+            `实例启用失败且收尾失败，原件与诊断保留：${errors.join("；")}`,
+          );
+        }
         throw error;
       }
       return null;

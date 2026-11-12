@@ -376,6 +376,50 @@ Deno.test("固定版本宿主：优雅停止在途模型超过租期时仍保存
   }
 });
 
+Deno.test("固定版本宿主：真实镜像写入失败阻止停止，status及重启保留完整诊断", async () => {
+  const f = await fixture({ modelDelayMs: 300 });
+  try {
+    await f.call("activate");
+    await waitFor(() => f.requests.length === 1);
+    const events = `${f.directory}/eve/remote-mirror/events`;
+    const originals = new Map<string, string>();
+    for await (const entry of Deno.readDir(events)) {
+      if (entry.isFile) {
+        originals.set(entry.name, await Deno.readTextFile(`${events}/${entry.name}`));
+      }
+    }
+    // Keep the original fixture records; block the next local mirror commit.
+    await Deno.rename(events, `${f.directory}/original-mirror-events`);
+    await Deno.writeTextFile(events, "fixture停止写入错误");
+    await assert.rejects(f.call("deactivate"), /storage/);
+    const status = await f.call("status") as Record<string, Json>;
+    assert.equal(status.state, "failed");
+    assert.equal(status.error, "storage");
+    const report = status.stopFailure as {
+      persisted: boolean;
+      failures: { plugin: string; kind: string; stage: string; timedOut: boolean }[];
+    };
+    assert.equal(report.persisted, true);
+    assert.equal(report.failures[0].plugin, "eve");
+    assert.equal(report.failures[0].stage, "disable");
+    assert.equal(report.failures[0].kind, "storage");
+    assert.equal(report.failures[0].timedOut, false);
+    for (const [name, original] of originals) {
+      assert.equal(
+        await Deno.readTextFile(`${f.directory}/original-mirror-events/${name}`),
+        original,
+      );
+    }
+    await f.restart();
+    assert.deepEqual(
+      (await f.call("status") as Record<string, Json>).stopFailure,
+      status.stopFailure,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test("固定版本宿主：3387条观察原件以27页读取，保持来源链和完整快照", async () => {
   const f = await fixture();
   try {

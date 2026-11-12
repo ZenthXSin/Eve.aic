@@ -151,7 +151,9 @@ scope.onmessage = (event) => {
         .catch((error) => send({ t: "failed", stage: "enable", message: describe(error) }));
       break;
     case "disable":
-      disable().catch((error) => send({ t: "failed", stage: "disable", message: describe(error) }));
+      disable().catch((error) =>
+        send({ t: "failed", stage: "disable", message: describe(error), error: toWireError(error) })
+      );
       break;
     case "call":
       handleCall(message);

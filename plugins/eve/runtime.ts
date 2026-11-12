@@ -693,6 +693,7 @@ export class EveRuntime {
       await this.journal.append("budget_wait", { day, reason: "含感知的完整请求预算余量不足" });
       return;
     }
+    if (this.#closing) return;
     const requestId = `model_${this.journal.events.length + 1}`;
     await this.journal.append("model_start", {
       requestId,
@@ -704,6 +705,7 @@ export class EveRuntime {
     });
     let response: ModelResponse;
     try {
+      if (this.#closing) throw new KernelError("unavailable", "实例已进入停止，模型请求未派发");
       response = await this.ctx.call<Json>(
         "model",
         "complete",
@@ -755,7 +757,9 @@ export class EveRuntime {
       requestId,
       response: response as unknown as Json,
     });
-    await this.#refreshBudget();
+    // Shared accounting is already durable; refresh it on the next activation.
+    // Preserve the model receipt before any optional read during shutdown.
+    if (!this.#closing) await this.#refreshBudget();
     this.#failures = 0;
     this.#retryAt = 0;
     if (response.toolCalls.length === 0) {
