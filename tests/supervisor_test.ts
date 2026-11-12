@@ -14,7 +14,7 @@ import { pinSource, verifySource } from "../supervisor/source.ts";
 import { InstanceClient } from "../supervisor/client.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
 
-async function fixture() {
+async function fixture(options: { handoverMs?: number; confirmationMs?: number } = {}) {
   const directory = await Deno.makeTempDir({ prefix: "eve-supervisor-test-" });
   let now = 1000;
   const authority = new OwnershipAuthority(`${directory}/guardian`, 60000, () => now);
@@ -45,6 +45,7 @@ async function fixture() {
   let completeAt: number | undefined;
   let seq = 20;
   const markers: unknown[] = [];
+  const preparation: string[] = [];
   const driver: InstanceDriver = {
     ensure(instance) {
       if (!states.has(instance.id) || states.get(instance.id) === "dead") {
@@ -76,7 +77,15 @@ async function fixture() {
         );
         states.set(instance.id, "active");
       }
-      if (method === "deactivate") states.set(instance.id, "standby");
+      if (method === "deactivate") {
+        states.set(instance.id, "standby");
+        preparation.push(`${instance.id}:deactivate`);
+      }
+      if (method === "prepareObserver" && options.handoverMs !== undefined) {
+        assert.equal(states.get(instance.id), "standby");
+        await authority.renew(proofs.get(instance.id)!);
+        preparation.push(`${instance.id}:prepareObserver`);
+      }
       if (method === "observerRequest" || method === "trialRequest") {
         value = { messages: [{ role: "user", content: JSON.stringify(args) }], tools: [] };
       }
@@ -92,6 +101,14 @@ async function fixture() {
     terminate(instance) {
       states.set(instance.id, "dead");
       return Promise.resolve();
+    },
+    async handover(old, candidate) {
+      if (options.handoverMs === undefined) return;
+      assert.equal(states.get(old.id), "standby");
+      assert.equal(states.get(candidate.id), "standby");
+      preparation.push(`${old.id}:handover`);
+      now += options.handoverMs;
+      await assert.rejects(() => authority.renew(proofs.get(old.id)!), /有效在线租约/);
     },
   };
   const backend: BackendControl = {
@@ -109,12 +126,12 @@ async function fixture() {
     },
     saveNote: () => Promise.resolve({ saved: true }),
   };
-  const options = {
+  const supervisorOptions = {
     directory: `${directory}/supervisor`,
     instances,
     driver,
     backend,
-    confirmationMs: 5000,
+    confirmationMs: options.confirmationMs ?? 5000,
     now: () => now,
     guardian: {
       status: () => Promise.resolve(authority.status()),
@@ -123,7 +140,7 @@ async function fixture() {
       pause: (args) => authority.pause(args),
     } satisfies GuardianControl,
   };
-  let supervisor = new Supervisor(options);
+  let supervisor = new Supervisor(supervisorOptions);
   await supervisor.initialize();
   await supervisor.bootstrap("old");
   return {
@@ -132,6 +149,7 @@ async function fixture() {
     states,
     proofs,
     markers,
+    preparation,
     supervisor: () => supervisor,
     setResponse(value: ModelResponse) {
       response = value;
@@ -144,7 +162,7 @@ async function fixture() {
     },
     async restart() {
       await supervisor.close();
-      supervisor = new Supervisor(options);
+      supervisor = new Supervisor(supervisorOptions);
       await supervisor.initialize();
     },
     async close() {
@@ -154,6 +172,51 @@ async function fixture() {
     },
   };
 }
+Deno.test("双版本监督：先在有效旧租约内完成快照，账本交接超过租期仍安全授权候选", async () => {
+  for (const pendingExit of [false, true]) {
+    const f = await fixture({ handoverMs: 60001, confirmationMs: 120000 });
+    try {
+      const oldProof = f.proofs.get("old")!;
+      const permit = pendingExit
+        ? await f.authority.begin({
+          permitId: "c".repeat(64),
+          proof: oldProof,
+          resource: "command",
+          actionId: "handover_pending_exit",
+          requestHash: "d".repeat(64),
+        })
+        : undefined;
+      f.setResponse({
+        content: "新版健康",
+        toolCalls: [{
+          id: "confirm_slow_handover",
+          name: "confirm_upgrade",
+          args: { accept: true, reason: "快照与账本完整，候选独占租约" },
+        }],
+      });
+      await f.supervisor().upgrade("new");
+      assert.deepEqual(f.preparation.slice(0, 3), [
+        "old:deactivate",
+        "old:prepareObserver",
+        "old:handover",
+      ]);
+      if (permit) {
+        assert.equal(f.supervisor().state.upgrade?.phase, "draining");
+        assert.equal(f.authority.status().owner?.instanceId, "old");
+        assert.equal(f.states.get("new"), "standby");
+        await f.authority.finish(permit.id, "completed");
+        await f.supervisor().tick();
+      }
+      assert.equal(f.supervisor().state.current, "new");
+      assert.equal(f.supervisor().state.lastOutcome?.outcome, "confirmed");
+      assert.equal(f.authority.status().owner?.instanceId, "new");
+      assert.ok(f.authority.status().epoch > oldProof.epoch);
+      await assert.rejects(() => f.authority.renew(oldProof), /有效在线租约/);
+    } finally {
+      await f.close();
+    }
+  }
+});
 Deno.test("双版本监督：旧实例明确确认与机械健康同时满足才成功，重启保留结果", async () => {
   const f = await fixture();
   try {

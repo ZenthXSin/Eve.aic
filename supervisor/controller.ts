@@ -429,11 +429,14 @@ export class Supervisor {
         await this.#register(candidate);
         await this.#status(candidate);
         await this.options.driver.call(old, "deactivate");
-        await this.options.driver.handover?.(old, candidate, `${u.id}_mind`);
+        // The old proof is required only while taking its read-only observer snapshot.
+        // prepareObserver renews during that read; offline ledger copying may outlast
+        // the old lease, so it must follow the last operation requiring that lease.
         await this.options.driver.call(old, "prepareObserver", {
           stepId: `${u.id}_prepare`,
           upgradeId: u.id,
         });
+        await this.options.driver.handover?.(old, candidate, `${u.id}_mind`);
         u.afterSeq = await this.options.backend.watermark();
         u.phase = "draining";
         await this.#save();
