@@ -5,7 +5,7 @@ import { type ErrorKind, type Json, KernelError, toWireError } from "../../kerne
 import type { PluginContext } from "../../sdk/plugin.ts";
 import { recallQuery } from "./recall-query.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
-import { ConsciousJournal } from "./journal.ts";
+import { type ConsciousEvent, ConsciousJournal } from "./journal.ts";
 import { RemoteJournal } from "./remote-journal.ts";
 import {
   accountingDay,
@@ -457,6 +457,41 @@ export class EveRuntime {
       await this.#observations(await fingerprint(["script-job-v1", call.id]));
     }
   }
+  async #projectContext(tools: ToolSpec[]) {
+    const events = this.journal.events;
+    const previous = activeEvents(events).findLast((event) => event.kind === "context_projection");
+    const messages = render(events, this.#prompt);
+    const estimated = contextEstimate(messages, tools, this.contextCounter);
+    // 固定 epoch 只在首次迁移或值得支付一次缓存失效时前移。retain/压缩
+    // 自己的事实仍立即生效，但不因此每一轮滑动最近八批或记忆来源。
+    if (previous && estimated < 120_000) return messages;
+    const throughSeq = events.at(-1)?.seq ?? 0;
+    if (previous && (previous.data as { throughSeq: number }).throughSeq === throughSeq) {
+      return messages;
+    }
+    const preview: ConsciousEvent = {
+      schema: 1,
+      seq: throughSeq + 1,
+      at: new Date().toISOString(),
+      kind: "context_projection",
+      data: { throughSeq },
+      previous: events.at(-1)?.digest ?? "0".repeat(64),
+      digest: "preview",
+    };
+    // 完整原件构造临时视图，不写回、追加或修改任何原事件。预演不使用
+    // 已投影的 messages 作输入，避免把节选误当原件再压缩。
+    const projected = render([...events, preview], this.#prompt);
+    const projectedTokens = contextEstimate(projected, tools, this.contextCounter);
+    if (previous && estimated - projectedTokens < 8_000) return messages;
+    // 单条持久事实先提交，随后重启/回滚都从活动日志重建同一边界。
+    await this.journal.append("context_projection", {
+      throughSeq,
+      reason: previous ? "context_high_watermark" : "initial_fixed_projection",
+      estimatedBefore: estimated,
+      estimatedAfter: projectedTokens,
+    });
+    return render(this.journal.events, this.#prompt);
+  }
   async #step() {
     if (this.#closing || !this.journal.available) return;
     // 每次工具批次先完成/恢复原决定，再处理通知；新的通知不打断当前动作。
@@ -510,7 +545,8 @@ export class EveRuntime {
         await this.journal.append("notice", { source: "memory", anchor, items: recalled.items });
       }
     }
-    let messages = render(this.journal.events, this.#prompt);
+    // 必须先固定初次投影，再判断 500k 机械保护，避免旧 raw 历史误触压缩。
+    let messages = await this.#projectContext(tools);
     const compression = mechanicalCompression(
       this.journal.events,
       this.#prompt,
@@ -519,7 +555,7 @@ export class EveRuntime {
     );
     if (compression) {
       await this.journal.append("compression", { ...compression, source: "system" });
-      messages = render(this.journal.events, this.#prompt);
+      messages = await this.#projectContext(tools);
     }
     const estimated = contextEstimate(messages, tools, this.contextCounter);
     this.#contextBlocked = estimated >= 500_000;
@@ -600,7 +636,7 @@ export class EveRuntime {
       );
       if (finalCompression) {
         await this.journal.append("compression", { ...finalCompression, source: "system" });
-        messages = render(this.journal.events, this.#prompt);
+        messages = await this.#projectContext(tools);
       }
       if (contextEstimate(messages, tools, this.contextCounter) >= 500_000) {
         this.#contextBlocked = true;

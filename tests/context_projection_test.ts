@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import type { Json } from "../kernel/protocol.ts";
+import { type Json, KernelError } from "../kernel/protocol.ts";
 import type { ConsciousEvent } from "../plugins/eve/journal.ts";
 import { contextComposition, estimate, render } from "../plugins/eve/view.ts";
 
@@ -37,7 +37,9 @@ function batches(count: number): ConsciousEvent[] {
 }
 
 Deno.test("上下文投影：旧大回执可定位原件，最新八个完整工具批次不截断且调用成对", () => {
-  const events = batches(10), before = JSON.stringify(events);
+  const events = batches(10);
+  events.push(event(31, "context_projection", { throughSeq: 30 }));
+  const before = JSON.stringify(events);
   const messages = render(events, "固定身份");
   assert.equal(messages.filter((m) => m.role === "tool").length, 20);
   for (let i = 0; i < 10; i++) {
@@ -63,6 +65,7 @@ Deno.test("上下文投影：旧大回执可定位原件，最新八个完整工
 
 Deno.test("上下文投影：显式raw恢复完整旧回执，summary与omit继续由Eve决定", () => {
   const events = batches(10);
+  events.push(event(31, "context_projection", { throughSeq: 30 }));
   events.push(event(events.length + 1, "retain", { responseSeq: 1, toolIndex: 0, mode: "raw" }));
   events.push(event(events.length + 1, "retain", {
     responseSeq: 1,
@@ -98,6 +101,7 @@ Deno.test("上下文投影：相同记忆只留最新来源与强度，正文更
     }),
     event(7, "notice", { source: "phone", items: [{ text: "新消息" }], throughSeq: 101 }),
   ];
+  events.push(event(8, "context_projection", { throughSeq: 7 }));
   const before = JSON.stringify(events), messages = render(events, "身份");
   assert.equal(messages.length, 4);
   assert.equal(JSON.parse(messages[1].content).record, 5);
@@ -133,4 +137,94 @@ Deno.test("上下文组成：仅返回分类计数和明确估算，不泄露正
   assert.equal(composition.parts["notice:phone"].messages, 1);
   assert.ok(!JSON.stringify(composition).includes("秘密正文"));
   assert.ok(!JSON.stringify(composition).includes("private-id"));
+});
+
+function appendBatch(events: ConsciousEvent[]) {
+  const offset = events.length;
+  for (const item of batches(1)) {
+    const data = item.kind === "tool_result"
+      ? { ...item.data as Record<string, Json>, callId: `eve_${offset + 1}_${item.seq - 2}` }
+      : item.data;
+    events.push(event(offset + item.seq, item.kind, data));
+  }
+}
+
+Deno.test("上下文缓存：固定epoch连续追加超过八批与重启不改已有消息前缀", () => {
+  const events = batches(10);
+  events.push(event(31, "context_projection", { throughSeq: 30 }));
+  let previous = render(events, "身份");
+  const originalEstimate = estimate(previous);
+  for (let i = 0; i < 12; i++) {
+    appendBatch(events);
+    const next = render(events, "身份");
+    assert.deepEqual(next.slice(0, previous.length), previous);
+    assert.ok(next.at(-1)!.content.includes("x".repeat(6000)));
+    previous = next;
+  }
+  assert.deepEqual(render(JSON.parse(JSON.stringify(events)), "身份"), previous);
+  // 只有持久化新epoch才会节选旧尾部；当时最近八批仍完整。
+  const beforeEpochEstimate = estimate(previous);
+  events.push(event(events.length + 1, "context_projection", { throughSeq: events.length }));
+  const renewed = render(events, "身份");
+  assert.ok(estimate(renewed) < beforeEpochEstimate);
+  assert.ok(estimate(renewed) >= originalEstimate);
+  assert.equal(
+    renewed.filter((m) => m.role === "tool" && m.content.includes("x".repeat(6000))).length,
+    16,
+  );
+});
+
+Deno.test("上下文缓存：无epoch追加工具和重复召回也保持前缀，基线最新来源不被新召回替换", () => {
+  const events = batches(10);
+  const raw = render(events, "身份");
+  assert.equal(
+    raw.filter((m) => m.role === "tool" && m.content.includes("x".repeat(6000))).length,
+    20,
+  );
+  appendBatch(events);
+  assert.deepEqual(render(events, "身份").slice(0, raw.length), raw);
+  events.push(event(events.length + 1, "notice", {
+    source: "memory",
+    items: [{ id: "m", text: "任务", strength: 1 }],
+  }));
+  const firstRecall = render(events, "身份");
+  events.push(event(events.length + 1, "notice", {
+    source: "memory",
+    items: [{ id: "m", text: "任务", strength: 2 }],
+  }));
+  assert.deepEqual(render(events, "身份"), firstRecall);
+  events.push(event(events.length + 1, "context_projection", { throughSeq: events.length }));
+  const baseline = render(events, "身份");
+  assert.equal(JSON.parse(baseline.at(-1)!.content).data.items[0].strength, 2);
+  for (let i = 0; i < 10; i++) {
+    events.push(event(events.length + 1, "notice", {
+      source: "memory",
+      items: [{ id: "m", text: "任务", strength: 3 + i }],
+    }));
+    assert.deepEqual(render(events, "身份"), baseline);
+  }
+  events.push(event(events.length + 1, "notice", {
+    source: "memory",
+    items: [{ id: "m", text: "任务更新", strength: 20 }],
+  }));
+  const updated = render(events, "身份");
+  assert.deepEqual(updated.slice(0, baseline.length), baseline);
+  assert.equal(JSON.parse(updated.at(-1)!.content).data.items[0].text, "任务更新");
+});
+
+Deno.test("上下文缓存：回滚epoch恢复原投影且无效边界拒绝", () => {
+  const events = batches(10);
+  const raw = render(events, "身份");
+  events.push(event(31, "context_projection", { throughSeq: 30 }));
+  assert.notDeepEqual(render(events, "身份"), raw);
+  events.push(event(32, "upgrade_rollback", { afterSeq: 30, throughSeq: 31 }));
+  const restored = render(events, "身份");
+  assert.deepEqual(restored.slice(0, raw.length), raw);
+  for (const throughSeq of [-1, 0.5, 31, 32, Number.MAX_SAFE_INTEGER + 1]) {
+    const invalid = [...batches(10), event(31, "context_projection", { throughSeq })];
+    assert.throws(
+      () => render(invalid, "身份"),
+      (error) => error instanceof KernelError && error.kind === "corrupt",
+    );
+  }
 });

@@ -133,26 +133,42 @@ export function blocks(
     omitted: Set<string>;
   } | undefined;
   const retention = new Map<string, { mode: string; summary?: string }>();
+  // 投影边界是日志事实：后续追加经历不再滑动改写已经送进模型的前缀。
+  // 无边界的旧日志先保持原件；runtime 可在明确的新 epoch 写下固定边界。
+  let projectionThrough = 0;
+  for (const event of events) {
+    if (event.kind !== "context_projection") continue;
+    const throughSeq = (event.data as { throughSeq?: number } | null)?.throughSeq;
+    if (
+      !Number.isSafeInteger(throughSeq) || throughSeq! < 0 || throughSeq! >= event.seq
+    ) throw new KernelError("corrupt", "上下文投影事实边界无效");
+    projectionThrough = throughSeq!;
+  }
   const recentResponses: number[] = [];
   const memoryItems = new Map<number, Json[]>();
   const seenMemories = new Set<string>();
-  // 最新召回保留现有强度/来源；同一记忆的相同正文不随每次召回重复灌入。
+  const projectMemory = (event: ConsciousEvent) => {
+    const data = event.data as { source?: string; items?: Json[] };
+    if (event.kind !== "notice" || data.source !== "memory" || !Array.isArray(data.items)) return;
+    const items = data.items.filter((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+      if (typeof item.id !== "string" || typeof item.text !== "string") return true;
+      const key = JSON.stringify([item.id, item.text]);
+      if (seenMemories.has(key)) return false;
+      seenMemories.add(key);
+      return true;
+    });
+    memoryItems.set(event.seq, items);
+  };
+  // 固定基线保留当时最新来源/强度。新 epoch 以前的投影不会因后来召回而挪动。
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
     if (event.seq <= afterSeq) break;
-    if (event.kind === "notice") {
-      const data = event.data as { source?: string; items?: Json[] };
-      if (data.source !== "memory" || !Array.isArray(data.items)) continue;
-      const items = data.items.filter((item) => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return true;
-        if (typeof item.id !== "string" || typeof item.text !== "string") return true;
-        const key = JSON.stringify([item.id, item.text]);
-        if (seenMemories.has(key)) return false;
-        seenMemories.add(key);
-        return true;
-      });
-      memoryItems.set(event.seq, items);
-    }
+    if (event.seq <= projectionThrough) projectMemory(event);
+  }
+  // epoch 以后的相同正文只略过新重复项；正文更新和非标准项仍追加。
+  for (const event of events) {
+    if (event.seq > Math.max(afterSeq, projectionThrough)) projectMemory(event);
   }
   for (const event of events) {
     if (event.kind === "retain") {
@@ -164,7 +180,9 @@ export function blocks(
       };
       retention.set(`eve_${data.responseSeq}_${data.toolIndex}`, data);
     }
-    if (event.seq > afterSeq && event.kind === "model_response") {
+    if (
+      event.seq > afterSeq && event.seq <= projectionThrough && event.kind === "model_response"
+    ) {
       const response = (event.data as unknown as { response: ModelResponse }).response;
       if (response.toolCalls.length) recentResponses.push(event.seq);
     }
@@ -266,7 +284,8 @@ export function blocks(
       const policy = retention.get(data.callId);
       const content = policy?.mode === "summary"
         ? `${policy.summary}\n原始结果在意识记录 ${event.seq}`
-        : policy?.mode === "raw" || recentTools.has(Number(data.callId.split("_")[1]))
+        : policy?.mode === "raw" || event.seq > projectionThrough ||
+            recentTools.has(Number(data.callId.split("_")[1]))
         ? JSON.stringify(data.result)
         : historicalToolResult(data.result, event.seq, data.callId);
       if (current.omitted.has(data.callId)) {
