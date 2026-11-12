@@ -8,6 +8,7 @@ const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const appIds = ["qq", "files", "terminal", "notes", "memory", "browser", "tools"] as const;
 const namespaces: Record<string, typeof appIds[number]> = {
+  web: "browser",
   phone: "qq",
   files: "files",
   commands: "terminal",

@@ -5,6 +5,7 @@ import { UPGRADE_METHODS } from "../../contracts/upgrades.ts";
 
 /** Keys and each method are checked against the same ScriptApi consumed by Eve. */
 export const SCRIPT_TOOL_METHODS = {
+  web: RUNTIME_METHODS.web,
   upgrades: UPGRADE_METHODS,
   notes: RUNTIME_METHODS.notes,
   files: RUNTIME_METHODS.files,
