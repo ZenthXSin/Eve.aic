@@ -14,7 +14,9 @@ import { pinSource, verifySource } from "../supervisor/source.ts";
 import { InstanceClient } from "../supervisor/client.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
 
-async function fixture(options: { handoverMs?: number; confirmationMs?: number } = {}) {
+async function fixture(
+  options: { handoverMs?: number; confirmationMs?: number; activationMs?: number } = {},
+) {
   const directory = await Deno.makeTempDir({ prefix: "eve-supervisor-test-" });
   let now = 1000;
   const authority = new OwnershipAuthority(`${directory}/guardian`, 60000, () => now);
@@ -72,6 +74,7 @@ async function fixture(options: { handoverMs?: number; confirmationMs?: number }
       }
       if (method === "activate") {
         await authority.actorStatus(proofs.get(instance.id)!);
+        if (instance.id === "new") now += options.activationMs ?? 0;
         assert.ok(
           ![...states.entries()].some(([id, state]) => id !== instance.id && state === "active"),
         );
@@ -172,6 +175,78 @@ async function fixture(options: { handoverMs?: number; confirmationMs?: number }
     },
   };
 }
+Deno.test("双版本监督：慢准备后首次观察获得完整确认窗口，重启和试聊不续期", async () => {
+  const f = await fixture({ activationMs: 4500 });
+  try {
+    f.setResponse({
+      content: "先试聊",
+      toolCalls: [{ id: "trial1", name: "trial_candidate", args: { text: "检查新版" } }],
+    });
+    await f.supervisor().upgrade("new");
+    assert.equal(f.supervisor().state.upgrade?.phase, "observing");
+    assert.equal(f.supervisor().state.upgrade?.deadline, 10500);
+    assert.equal(f.supervisor().state.upgrade?.step, 1);
+    f.setNow(8000);
+    await f.restart();
+    assert.equal(f.supervisor().state.upgrade?.deadline, 10500);
+    await f.supervisor().tick();
+    assert.equal(f.supervisor().state.upgrade?.step, 2);
+    assert.equal(f.supervisor().state.upgrade?.deadline, 10500);
+    f.setNow(10500);
+    await f.supervisor().tick();
+    assert.equal(f.supervisor().state.lastOutcome?.outcome, "rolled_back");
+    assert.equal(f.supervisor().state.lastOutcome?.reason, "confirmation_timeout");
+  } finally {
+    await f.close();
+  }
+});
+Deno.test("双版本监督：准备窗口到期不能通过进入观察重置期限", async () => {
+  for (const activationMs of [5000, 5001]) {
+    const f = await fixture({ activationMs });
+    try {
+      f.setResponse({
+        content: "即使预置同意也不能掩盖准备超时",
+        toolCalls: [{
+          id: "yes",
+          name: "confirm_upgrade",
+          args: { accept: true, reason: "健康" },
+        }],
+      });
+      await f.supervisor().upgrade("new");
+      assert.equal(f.supervisor().state.current, "old");
+      assert.equal(f.supervisor().state.lastOutcome?.outcome, "rolled_back");
+      assert.equal(f.supervisor().state.lastOutcome?.reason, "preparation_timeout");
+    } finally {
+      await f.close();
+    }
+  }
+});
+Deno.test("双版本监督：完整新观察窗口内可确认，到期或迟到的模型接受必须回退", async () => {
+  for (const responseAt of [10499, 10500, 10501]) {
+    const f = await fixture({ activationMs: 4500 });
+    try {
+      f.completeAt(responseAt);
+      f.setResponse({
+        content: "决定",
+        toolCalls: [{
+          id: "yes",
+          name: "confirm_upgrade",
+          args: { accept: true, reason: "新版健康" },
+        }],
+      });
+      await f.supervisor().upgrade("new");
+      const accepted = responseAt < 10500;
+      assert.equal(f.supervisor().state.current, accepted ? "new" : "old");
+      assert.equal(
+        f.supervisor().state.lastOutcome?.outcome,
+        accepted ? "confirmed" : "rolled_back",
+      );
+      if (!accepted) assert.equal(f.supervisor().state.lastOutcome?.reason, "timeout");
+    } finally {
+      await f.close();
+    }
+  }
+});
 Deno.test("双版本监督：先在有效旧租约内完成快照，账本交接超过租期仍安全授权候选", async () => {
   for (const pendingExit of [false, true]) {
     const f = await fixture({ handoverMs: 60001, confirmationMs: 120000 });

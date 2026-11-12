@@ -419,8 +419,8 @@ export class Supervisor {
     if (!u) return;
     const old = this.instance(u.old), candidate = this.instance(u.candidate);
     if (u.phase !== "rollback" && this.now() >= u.deadline) {
+      u.reason = u.phase === "observing" ? "confirmation_timeout" : "preparation_timeout";
       u.phase = "rollback";
-      u.reason = "confirmation_timeout";
       await this.#save();
     }
     try {
@@ -460,9 +460,17 @@ export class Supervisor {
       if (u.phase === "activating") {
         await this.options.driver.call(candidate, "activate");
         await this.#status(candidate, true);
-        this.#state.current = candidate.id;
-        this.#state.standby = old.id;
-        u.phase = "observing";
+        if (this.now() >= u.deadline) {
+          u.phase = "rollback";
+          u.reason = "preparation_timeout";
+        } else {
+          this.#state.current = candidate.id;
+          this.#state.standby = old.id;
+          // Preparation has its own bounded window. Give the old Eve the full
+          // confirmation window only once the candidate is healthy and active.
+          u.deadline = this.now() + (this.options.confirmationMs ?? 300_000);
+          u.phase = "observing";
+        }
         await this.#save();
       }
       if (u.phase === "observing") {
