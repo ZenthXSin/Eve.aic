@@ -7,7 +7,7 @@ import { type ScriptConfig, ScriptRuntime } from "./runtime.ts";
 export const SCRIPT_TOOL: ToolSpec = {
   name: "execute_script",
   description:
-    "执行一份 TypeScript 脚本；使用 tools 的类型接口调用能力。默认异步返回任务编号，可选择同步等待；每个具体动作独立保存真实回执。脚本正文可 await 或 return。",
+    "执行一份 TypeScript 脚本；使用 tools 的类型接口调用能力。默认异步返回任务编号，可选择同步等待；每个具体动作独立保存真实回执。脚本正文可 await 或 return。已完成任务的回执含 result 返回值 JSON 文本页（最多8192字符）；若 truncated，使用原 jobId 执行 return await tools.scripts.result({jobId,startChar:nextChar,limit:2048}) 读取后续原件页，异步任务完成后也这样读取。",
   parameters: {
     type: "object",
     properties: {
@@ -88,8 +88,16 @@ export function createScriptPlugin(configPath: string) {
             } as ToolResult as unknown as Json;
           }
           const data = call.args as unknown as Omit<ScriptRequest, "requestId">;
-          const result = await current().start({ ...data, requestId: call.id });
-          return { status: "completed", output: JSON.stringify(result) };
+          const job = await current().start({ ...data, requestId: call.id });
+          // start 只返回任务摘要；必须把已持久化的真实 return 值交给原生工具调用方。
+          // 按工具说明读取2048字符原件页时，包裹后的返回值仍能完整展示。
+          const result = job.status === "completed"
+            ? current().result({ jobId: job.jobId, limit: 8192 })
+            : undefined;
+          return {
+            status: "completed",
+            output: JSON.stringify({ ...job, ...(result === undefined ? {} : { result }) }),
+          };
         },
       });
     },
