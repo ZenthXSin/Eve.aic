@@ -73,3 +73,44 @@ Deno.test("QQ splitting keeps URLs intact and is deterministic before action adm
   assert.deepEqual(splitForQQ(input), parts);
   assert.throws(() => splitForQQ("https://example.com/" + "a".repeat(40)), /不拆开 URL/);
 });
+
+Deno.test("QQ malformed link input is bounded without dropping its literal body or URLs", () => {
+  const url = "https://example.com/__raw__?x=**value**";
+  for (
+    const malformed of [
+      "[".repeat(7000) + "正文 " + url,
+      "[x](".repeat(1300) + "正文 " + url,
+      "[".repeat(200_000) + "正文 " + url,
+      "**a ".repeat(50_000) + "正文 " + url,
+    ]
+  ) {
+    const began = performance.now();
+    const output = mdToPlain(malformed);
+    assert.equal(output, malformed);
+    // A generous ceiling detects suffix rescans of the large cases without relying on
+    // millisecond benchmark ratios or the exact speed of a particular machine.
+    assert(performance.now() - began < 2000, "malformed Markdown must use bounded fallback");
+  }
+});
+
+Deno.test("QQ long-line fallback and delimiter indexing keep code, URL data and real body intact", () => {
+  const code = "# literal [".repeat(12_000) + "\nconst source = '**not markup**';";
+  assert.equal(mdToPlain("```js\n" + code + "\n```\n**结尾正文**"), code + "\n结尾正文");
+  const unmatched = "保留 " +
+    Array.from({ length: 65 }, (_, index) => "`".repeat(index + 1) + "x ").join("");
+  assert.equal(mdToPlain(unmatched), unmatched);
+  assert.equal(mdToPlain("`原样 **代码**` 和 ``包含 ` 反引号``"), "原样 **代码** 和 包含 ` 反引号");
+  const marker = "\uE000";
+  assert.equal(
+    mdToPlain(marker.repeat(4000) + " https://example.com/__raw__"),
+    marker.repeat(4000) + " https://example.com/__raw__",
+  );
+  assert.equal(
+    mdToPlain("https://example.com/" + marker + "__raw__"),
+    "https://example.com/" + marker + "__raw__",
+  );
+  assert.equal(
+    mdToPlain("https://example.com/[](https://target.com/)"),
+    "https://example.com/https://target.com/",
+  );
+});
