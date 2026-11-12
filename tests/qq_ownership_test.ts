@@ -564,7 +564,9 @@ async function retryFixture(options: {
         );
         return fact.result.error.transportReason === "timeout";
       } catch (error) {
-        if (error instanceof Deno.errors.NotFound) return false;
+        // The fixture polls while the attempt writer still owns this file. Creation can
+        // become visible before its JSON body; wait for a complete fact before closing.
+        if (error instanceof Deno.errors.NotFound || error instanceof SyntaxError) return false;
         throw error;
       }
     },
