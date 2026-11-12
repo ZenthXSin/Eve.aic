@@ -609,8 +609,8 @@ Deno.test("QQ 手机：旧回复句柄仍校验但统一主动，unknown也显�
       platformMessageId: "actual-sent-id",
     });
     assert.deepEqual(f.received, [{
-      markdown: { content: "嗯，我在" },
-      msg_type: 2,
+      content: "嗯，我在",
+      msg_type: 0,
     }]);
     assert.deepEqual(await f.client.call("send", args), receipt);
     assert.equal(f.count(), 1);
@@ -915,9 +915,9 @@ Deno.test("QQ 引用视图：真实出站回执索引可被引用，引用展示
     assert.deepEqual(incoming.quote, { platformMessageId: "outgoing-platform-id" });
     assert.equal(f.count(), 1);
     assert.deepEqual(f.received, [{
-      markdown: { content: "回复早先消息" },
-      msg_type: 2,
-      // Markdown沿用官方SDK：省略视觉引用；本机引用视图仍保留。
+      content: "回复早先消息",
+      msg_type: 0,
+      message_reference: { message_id: "incoming-index" },
     }]);
   } finally {
     await f.close();

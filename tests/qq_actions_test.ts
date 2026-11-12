@@ -41,8 +41,8 @@ Deno.test("QQ 发送动作：网络前started已落盘，同键并发只发送�
   const directory = await Deno.makeTempDir({ prefix: "eve-send-actions-" });
   const local = service(async (r) => {
     assert.deepEqual(await r.json(), {
-      markdown: { content: request.text },
-      msg_type: 2,
+      content: request.text,
+      msg_type: 0,
     });
     const persisted = JSON.parse(await Deno.readTextFile(`${directory}/records/action-1.json`));
     assert.equal(persisted.status, "started");
@@ -445,8 +445,8 @@ Deno.test("QQ明确限流按序重试：固定主动请求、真实尝试账本�
       attemptCount: 2,
     });
     assert.deepEqual(bodies, [
-      { markdown: { content: request.text }, msg_type: 2 },
-      { markdown: { content: request.text }, msg_type: 2 },
+      { content: request.text, msg_type: 0 },
+      { content: request.text, msg_type: 0 },
     ]);
     const original = new Map<string, string>();
     for (
@@ -624,7 +624,7 @@ Deno.test("QQ上传超时尚未提交消息可重试，附件成功后才发送�
     assert.equal(uploads, 2);
     assert.equal(messages.length, 2);
     assert.deepEqual(messages[0].media, { file_info: "uploaded" });
-    assert.deepEqual(messages[1].markdown, { content: "tail" });
+    assert.equal(messages[1].content, "tail");
     const path = `${directory}/attempts/attachment/1.result.json`;
     const original = await Deno.readTextFile(path);
     assert.equal(JSON.parse(original).result.status, "failed");
@@ -977,7 +977,7 @@ Deno.test("QQ尝试结果存储失败立即停止，不发下一次和排队动�
 Deno.test("主动在途被kill后新许可也不重发，未知队首取消后才能放行下一条", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-qq-active-kill-" });
   const entered = deferred<void>(), release = deferred<void>();
-  const bodies: { markdown: { content: string } }[] = [];
+  const bodies: { content: string }[] = [];
   const local = service(async (r) => {
     const body = await r.json();
     bodies.push(body);
@@ -1048,7 +1048,7 @@ Deno.test("主动在途被kill后新许可也不重发，未知队首取消后�
     });
     const sent = await restart.send("tail", { ...tail, reply: undefined });
     assert.ok(sent.status === "finished" && sent.result.status === "sent");
-    assert.deepEqual(bodies.map((body) => body.markdown.content), ["head", "tail"]);
+    assert.deepEqual(bodies.map((body) => body.content), ["head", "tail"]);
     await restart.close();
     restart = new QqSendActions(local.client(), `${directory}/data`);
     await restart.initialize();

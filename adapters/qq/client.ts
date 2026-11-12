@@ -1,6 +1,7 @@
 // 独立适配器的 QQ HTTP 传输。不依赖内核或插件，不承担身份映射、通知和行为判断。
 // 返回平台事实；持久动作记录、入站日志和所有权交接由适配器服务另行接入。
 import { Buffer } from "node:buffer";
+import { mdToPlain } from "./text-format.ts";
 import { gatewayPath, mediaUploadPath, messagePath } from "./official/routes.ts";
 import {
   QQ_API_ORIGIN,
@@ -67,7 +68,7 @@ export class QqRequestError extends Error {
 export interface QqSendText {
   destination: { kind: "user" | "group"; openId: string };
   text: string;
-  /** Pinned at admission; absent in legacy records means plain text. */
+  /** Legacy format hint retained in immutable records; all new wire messages use plain text. */
   format?: "plain" | "markdown";
   /** 兼容旧动作账本的回复来源；新发送统一主动，不写入平台被动回复字段。 */
   reply?: { messageId: string; sequence: number } | { eventId: string };
@@ -216,10 +217,9 @@ function textBody(request: QqSendText): Record<string, unknown> {
   if (request.format !== undefined && !["plain", "markdown"].includes(request.format)) {
     requestError();
   }
-  if (request.attachment !== undefined && request.format === "markdown") requestError();
-  const body: Record<string, unknown> = request.format === "markdown"
-    ? { msg_type: 2, markdown: { content: request.text } }
-    : { content: request.text, msg_type: 0 };
+  const plainText = mdToPlain(request.text);
+  if (!nonempty(plainText) && request.attachment === undefined) requestError();
+  const body: Record<string, unknown> = { content: plainText, msg_type: 0 };
   if (request.attachment !== undefined) {
     if (
       !object(request.attachment) || typeof request.attachment.path !== "string" ||
@@ -245,11 +245,8 @@ function textBody(request: QqSendText): Record<string, unknown> {
   }
   if (request.referenceIndex !== undefined) {
     if (!nonempty(request.referenceIndex)) requestError();
-    // Official SDK omits message_reference for Markdown. Plain/media retain display references;
-    // a reference is not a passive-reply msg_id and does not change proactive sending.
-    if (request.format !== "markdown") {
-      body.message_reference = { message_id: request.referenceIndex };
-    }
+    // Display references survive plain text conversion and never enable passive replies.
+    body.message_reference = { message_id: request.referenceIndex };
   }
   if (request.wakeup !== undefined) {
     if (typeof request.wakeup !== "boolean") requestError();

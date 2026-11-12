@@ -179,7 +179,7 @@ Deno.test("QQ排队取消：只结束零尝试后项，保留队首与其余顺�
   const contents: string[] = [];
   let reject = true;
   const local = platform(async (r) => {
-    contents.push((await r.json()).markdown.content);
+    contents.push((await r.json()).content);
     return reject ? permanentFailure() : Response.json({ id: "remaining-sent" });
   });
   let actions = new QqSendActions(local.client(), directory);
@@ -436,12 +436,12 @@ Deno.test("QQ显式鉴权与限流失败按原请求重试，Retry-After加基�
     assert.equal(checkpoints, 3);
     assert.deepEqual(bodies.slice(0, 3), [bodies[0], bodies[0], bodies[0]]);
     assert.deepEqual(bodies[0], {
-      markdown: { content: request.text },
-      msg_type: 2,
+      content: request.text,
+      msg_type: 0,
     });
     assert.ok(times[1] - times[0] >= 20, `auth backoff ${times[1] - times[0]}`);
     assert.ok(times[2] - times[1] >= 1020, `rate backoff ${times[2] - times[1]}`);
-    assert.equal((bodies[3] as { markdown: { content: string } }).markdown.content, "后项");
+    assert.equal((bodies[3] as { content: string }).content, "后项");
     assert.equal(
       JSON.parse(await Deno.readTextFile(`${directory}/attempts/first/2.result.json`)).result.error
         .retryAfterMs,
@@ -552,7 +552,7 @@ Deno.test("QQ活跃队首重试期间可取消等待中的零尝试后项，并�
   const secondAttempt = deferred<void>();
   const contents: string[] = [];
   const local = platform(async (r) => {
-    contents.push((await r.json()).markdown.content);
+    contents.push((await r.json()).content);
     if (contents.length === 2) secondAttempt.resolve();
     return Response.json({ err_code: 100001 }, {
       status: 429,
@@ -632,7 +632,7 @@ Deno.test("QQ主动发送已尝试HTTP超时：未知队首阻塞且重启不重
   const local = platform(async (r) => {
     const body = await r.json();
     bodies.push(body);
-    if (body.markdown.content === request.text) await release.promise;
+    if (body.content === request.text) await release.promise;
     return Response.json({ id: "platform-may-have-delivered" });
   });
   let actions = new QqSendActions(local.client(300), directory, "private", { retryDelaysMs: [0] });
@@ -672,7 +672,7 @@ Deno.test("QQ主动发送已尝试HTTP超时：未知队首阻塞且重启不重
     const next = await actions.send("follower", follower);
     assert.ok(next.status === "finished" && next.result.status === "sent");
     assert.equal(local.count(), 2);
-    assert.deepEqual(bodies.map((body) => (body.markdown as { content: string }).content), [
+    assert.deepEqual(bodies.map((body) => body.content), [
       request.text,
       follower.text,
     ]);
