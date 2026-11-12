@@ -7,6 +7,7 @@ import {
   validateFailedResolution,
 } from "./contracts.ts";
 import { panelHtml } from "./view.ts";
+import { LiveReader } from "./live.ts";
 
 const MAX_BODY = 65_536;
 const SESSION_MS = 8 * 60 * 60 * 1000;
@@ -149,6 +150,7 @@ export async function startAdminServer(
     throw new KernelError("rejected", "管理端口无效");
   }
   const tokenHash = await digest(options.token), now = options.now ?? Date.now;
+  const live = new LiveReader(backend);
   const sessions = new Map<string, { csrf: string; expires: number }>();
   let failedLogins = 0, retryAfter = 0, origin = "", host = "";
   const cookieAttributes = `HttpOnly; SameSite=Strict; Path=/${publicOrigin ? "; Secure" : ""}`;
@@ -224,6 +226,9 @@ export async function startAdminServer(
         }
         if (request.method === "GET" && path === "/api/status") {
           return response({ ok: true, value: await backend.status() });
+        }
+        if (request.method === "GET" && path === "/api/live") {
+          return response({ ok: true, value: await live.read() });
         }
         if (request.method !== "POST" || request.headers.get("x-eve-csrf") !== session.csrf) {
           return response({ ok: false, error: { message: "管理请求校验失败" } }, 403);
