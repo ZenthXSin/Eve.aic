@@ -27,6 +27,13 @@ export async function runOwnershipService(configPath: string) {
       (await Deno.readTextFile(config.exitKeyFile)).trim(),
     );
     await writeDurableJson(`${config.directory}/connection.json`, { url: rpc.url });
+    if (config.connectionFile) {
+      if (typeof config.connectionFile !== "string" || !config.connectionFile.startsWith("/")) {
+        throw new Error("守护公开连接文件需要绝对路径");
+      }
+      await writeDurableJson(config.connectionFile, { url: rpc.url });
+      await Deno.chmod(config.connectionFile, 0o644);
+    }
     Deno.addSignalListener("SIGINT", stop);
     Deno.addSignalListener("SIGTERM", stop);
     listening = true;

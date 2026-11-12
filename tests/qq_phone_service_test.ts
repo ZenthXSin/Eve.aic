@@ -450,13 +450,22 @@ Deno.test("QQ 手机：真实独立适配器子进程、网关入站与worker发
         `import {writeAtomic} from ${JSON.stringify(journalUrl)};\n` +
         `const adapter=await startQqPhoneAdapter(new QqClient({appId:"fixture",appSecret:"fixture"},{baseUrl:${
           JSON.stringify(`http://127.0.0.1:${platform.addr.port}`)
-        }}),${JSON.stringify(directory + "/data")},${JSON.stringify(KEY)});\n` +
+        }}),${JSON.stringify(directory + "/data")},${
+          JSON.stringify(KEY)
+        },undefined,undefined,{captureActivationBoundary:true});\n` +
         `let done;const stopping=new Promise(resolve=>done=resolve);const signal=()=>done();Deno.addSignalListener("SIGTERM",signal);\n` +
         `await writeAtomic(${
           JSON.stringify(endpoint)
         },{url:adapter.url});try{await Promise.race([adapter.stopped,stopping]);}finally{Deno.removeSignalListener("SIGTERM",signal);await adapter.close();}\n`,
     );
     await start();
+    const activationBoundaryBefore = await Deno.readTextFile(
+      `${directory}/data/activation-boundary.json`,
+    );
+    const startupBoundary = JSON.parse(activationBoundaryBefore);
+    assert.equal(startupBoundary.schema, 1);
+    assert.equal("items" in startupBoundary, false);
+    assert.equal("messages" in startupBoundary, false);
     const page = await waitFor(async () => {
       const value = await kernel!.call<
         {
@@ -493,6 +502,10 @@ Deno.test("QQ 手机：真实独立适配器子进程、网关入站与worker发
     await stop();
     await Deno.remove(endpoint);
     await start();
+    assert.equal(
+      await Deno.readTextFile(`${directory}/data/activation-boundary.json`),
+      activationBoundaryBefore,
+    );
     assert.deepEqual(
       await kernel!.call("phone", "history", { conversationId: "qq:user:user-a" }),
       before,

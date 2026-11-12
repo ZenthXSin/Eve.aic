@@ -3,6 +3,7 @@ import { readQqTestClient } from "../../composition/qq.ts";
 import { writeAtomic } from "./journal.ts";
 import { startQqPhoneAdapter } from "./service.ts";
 import { readQqOwnershipFence } from "../../composition/ownership.ts";
+import { writeDurableJson } from "../../sdk/durable-json.ts";
 
 export async function runQqAdapter(configPath: string, directory: string): Promise<void> {
   if (!configPath.startsWith("/") || !directory.startsWith("/")) {
@@ -25,6 +26,13 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
   }
   const client = await readQqTestClient(configPath);
   const fence = await readQqOwnershipFence(configPath, directory);
+  const startupConfig = JSON.parse(await Deno.readTextFile(configPath));
+  if (
+    startupConfig.qq?.captureActivationBoundary !== undefined &&
+    typeof startupConfig.qq.captureActivationBoundary !== "boolean"
+  ) {
+    throw new Error("QQ启动边界开关须为布尔值");
+  }
   const adapter = await startQqPhoneAdapter(
     client,
     directory,
@@ -32,6 +40,7 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     (status) =>
       console.log(JSON.stringify({ adapter: "qq", gateway: status.status, code: status.code })),
     fence,
+    { captureActivationBoundary: startupConfig.qq?.captureActivationBoundary === true },
   );
   const stop = () => {
     void adapter.close().catch(() => {});
@@ -43,6 +52,18 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     await writeAtomic(`${directory}/phone-connection.json`, {
       phone: { adapterUrl: adapter.url, adapterKeyFile: keyFile },
     });
+    const config = JSON.parse(await Deno.readTextFile(configPath));
+    if (config.phoneConnectionFile) {
+      if (
+        typeof config.phoneConnectionFile !== "string" ||
+        !config.phoneConnectionFile.startsWith("/")
+      ) {
+        throw new Error("手机公开连接文件需要绝对路径");
+      }
+      // Only the address is public. Each instance keeps its own copy of the bridge key.
+      await writeDurableJson(config.phoneConnectionFile, { phone: { adapterUrl: adapter.url } });
+      await Deno.chmod(config.phoneConnectionFile, 0o644);
+    }
     console.log(JSON.stringify({ adapterRpc: "ready", privateSendOnly: true, eveOnline: false }));
     await adapter.stopped;
   } finally {

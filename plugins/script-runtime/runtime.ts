@@ -1,9 +1,12 @@
 import { PHONE_METHODS } from "../../contracts/phone-rpc.ts";
+import { RUNTIME_METHODS } from "../../contracts/runtime.ts";
+import { UPGRADE_METHODS } from "../../contracts/upgrades.ts";
 import type { ScriptRequest, ScriptSummary } from "../../contracts/script.ts";
 import type { FromScript } from "../../contracts/script-wire.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError, toWireError, type WireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
+import { imageTextView } from "../../sdk/image-text.ts";
 import { type JobRecord, ScriptStore } from "./store.ts";
 
 interface LiveJob {
@@ -18,6 +21,7 @@ interface LiveJob {
   runner?: Promise<void>;
 }
 export interface ScriptConfig {
+  startupTimeoutMs?: number;
   directory: string;
   denoBinary: string;
   cacheDirectory: string;
@@ -185,7 +189,7 @@ export class ScriptRuntime {
       return this.start(request);
     }
     const operation = (async () => {
-      const previous = this.store.state.jobs.find((job) => job.jobId === jobId);
+      const previous = this.store.findJob(jobId);
       if (previous) {
         if (previous.fingerprint !== hash) {
           throw new KernelError("rejected", "同一脚本调用编号不能换代码或执行参数");
@@ -246,7 +250,7 @@ export class ScriptRuntime {
     const live = this.#live.get(jobId)!;
     const record = this.store.job(jobId);
     await this.store.change((state) => {
-      state.jobs.find((j) => j.jobId === jobId)!.status = "checking";
+      state.jobs[this.store.jobIndex(jobId)].status = "checking";
     });
     const apiUrl = new URL("../../contracts/script.ts", import.meta.url).href;
     const path = `${this.config.directory}/${jobId}.ts`;
@@ -293,7 +297,7 @@ export class ScriptRuntime {
       throw new KernelError("corrupt", "类型检查期间脚本原件发生变化，未执行");
     }
     await this.store.change((state) => {
-      const job = state.jobs.find((j) => j.jobId === jobId)!;
+      const job = state.jobs[this.store.jobIndex(jobId)];
       job.status = "running";
       job.scriptStarted = true;
     });
@@ -371,17 +375,31 @@ export class ScriptRuntime {
     }
     if (
       !(message.namespace === "phone" && PHONE_METHODS.includes(message.method as never)) &&
+      !(message.namespace === "upgrades" && UPGRADE_METHODS.includes(message.method as never)) &&
+      !(["notes", "files", "commands", "memory", "records"].includes(message.namespace) &&
+        (RUNTIME_METHODS[message.namespace as "notes"] as readonly string[]).includes(
+          message.method,
+        )) &&
       !(message.namespace === "scripts" &&
         ["status", "cancel", "result", "receipt"].includes(message.method)) &&
       !(message.namespace === "mind" &&
-        ["rest", "remind", "cancelReminder", "compress", "retain", "status"].includes(
+        ["rest", "remind", "watch", "cancelReminder", "compress", "retain", "status"].includes(
           message.method,
         ))
     ) throw new KernelError("rejected", "该能力不在当前契约中");
     canonical(message.args);
     const actionId = `script_${jobId}_${message.seq}`;
     const args = structuredClone(message.args);
-    if (message.namespace === "phone" && message.method === "send") {
+    if (
+      ["notes", "files", "commands", "memory", "records", "upgrades"].includes(message.namespace)
+    ) {
+      if (
+        args === null || typeof args !== "object" || Array.isArray(args) ||
+        Object.hasOwn(args, "_actionId")
+      ) throw new KernelError("rejected", "工具动作编号由脚本宿主提供");
+      args._actionId = actionId;
+    }
+    if (message.namespace === "phone" && ["send", "sendFile"].includes(message.method)) {
       if (
         args === null || typeof args !== "object" || Array.isArray(args) ||
         Object.hasOwn(args, "actionId")
@@ -397,7 +415,7 @@ export class ScriptRuntime {
     }
     live.nextSeq++;
     await this.store.change((state) =>
-      state.jobs.find((j) => j.jobId === jobId)!.actions.push({
+      state.jobs[this.store.jobIndex(jobId)].actions.push({
         seq: message.seq,
         actionId,
         namespace: message.namespace,
@@ -419,7 +437,7 @@ export class ScriptRuntime {
         });
       canonical(value);
       await this.store.change((state) => {
-        const action = state.jobs.find((j) => j.jobId === jobId)!.actions[message.seq - 1];
+        const action = state.jobs[this.store.jobIndex(jobId)].actions[message.seq - 1];
         action.status = "completed";
         delete action.error;
         action.value = value;
@@ -429,7 +447,7 @@ export class ScriptRuntime {
     } catch (error) {
       const wire = toWireError(error);
       await this.store.change((state) => {
-        const action = state.jobs.find((j) => j.jobId === jobId)!.actions[message.seq - 1];
+        const action = state.jobs[this.store.jobIndex(jobId)].actions[message.seq - 1];
         action.status =
           wire.kind === "timeout" || wire.kind === "unknown" || wire.kind === "storage"
             ? "unknown"
@@ -452,7 +470,7 @@ export class ScriptRuntime {
     } catch { /* 已停 */ }
     try {
       await this.store.change((state) => {
-        const job = state.jobs.find((j) => j.jobId === jobId)!;
+        const job = state.jobs[this.store.jobIndex(jobId)];
         const pending = job.actions.some((action) =>
           action.status === "started" || action.status === "unknown"
         );
@@ -498,7 +516,45 @@ export class ScriptRuntime {
   }
   result(args: { jobId: string; startChar?: number; limit?: number }) {
     const job = this.store.job(args.jobId);
-    return this.#page(JSON.stringify(job.result ?? null), args);
+    return this.#page(JSON.stringify(imageTextView(job.result ?? null)), args);
+  }
+  /** 宿主专用：只采用真实 phone.image 完成回执，一次最多返回一张。 */
+  observations(args: { jobId: string; afterSeq?: number }) {
+    const job = this.store.job(args.jobId);
+    const after = args.afterSeq ?? 0;
+    if (!Number.isSafeInteger(after) || after < 0 || after > job.actions.length) {
+      throw new KernelError("rejected", "图像描述回执游标无效");
+    }
+    const action = job.actions.slice(after).find((a) =>
+      a.namespace === "phone" &&
+      a.method === "image" && a.status === "completed" && a.value !== null &&
+      typeof a.value === "object" && !Array.isArray(a.value) &&
+      typeof a.value.description === "string" && a.value.provenance
+    );
+    return {
+      items: action ? [{ actionId: action.actionId, observation: action.value }] : [],
+      throughSeq: action?.seq ?? job.actions.length,
+      hasMore: action ? action.seq < job.actions.length : false,
+    };
+  }
+  /** 只有脚本明确 mode:original，且手机真实回执确认该选择时才提供原图。 */
+  images(args: { jobId: string; afterSeq?: number }) {
+    const job = this.store.job(args.jobId), after = args.afterSeq ?? 0;
+    if (!Number.isSafeInteger(after) || after < 0 || after > job.actions.length) {
+      throw new KernelError("rejected", "原图回执游标无效");
+    }
+    const action = job.actions.slice(after).find((a) =>
+      a.namespace === "phone" && a.method === "image" && a.status === "completed" &&
+      a.value !== null && typeof a.value === "object" && !Array.isArray(a.value) &&
+      a.value.selectedMode === "original" && a.value.image
+    );
+    return {
+      items: action
+        ? [{ actionId: action.actionId, image: (action.value as { image: Json }).image }]
+        : [],
+      throughSeq: action?.seq ?? job.actions.length,
+      hasMore: action ? action.seq < job.actions.length : false,
+    };
   }
   #page(text: string, args: { startChar?: number; limit?: number }) {
     const start = args.startChar ?? 0;
@@ -539,7 +595,7 @@ export class ScriptRuntime {
       : args.section === "result"
       ? action.value
       : action.error;
-    return this.#page(JSON.stringify(value ?? null), args);
+    return this.#page(JSON.stringify(imageTextView((value ?? null) as Json)), args);
   }
   completions(args: { afterSeq?: number } = {}) {
     const after = args.afterSeq ?? 0;

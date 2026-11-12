@@ -91,7 +91,8 @@ export function startPhoneRpc(
         if (
           !data.ownership || typeof data.ownership.actionId !== "string" ||
           !/^[a-zA-Z0-9_-]{1,128}$/.test(data.ownership.actionId) ||
-          (method === "send" && data.ownership.actionId !== args.actionId)
+          ((method === "send" || method === "sendFile") &&
+            data.ownership.actionId !== args.actionId)
         ) throw new QqPhoneError("request");
         // 包括读取与游标更新；旧实例不能继续消费入站消息。号码不交给 QqPhone 业务层。
         value = await fence.run(

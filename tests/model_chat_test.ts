@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { composeModelPlugin } from "../composition/model.ts";
-import type { ModelRequest } from "../contracts/model.ts";
+import { MODEL_IMAGE_MAX_BYTES, type ModelImage, type ModelRequest } from "../contracts/model.ts";
 import { Kernel } from "../kernel/kernel.ts";
 import {
   ChatModelClient,
@@ -34,6 +34,140 @@ function server(handler: (r: Request) => Response | Promise<Response>) {
   const instance = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, handler);
   return { url: `http://127.0.0.1:${instance.addr.port}`, close: () => instance.shutdown() };
 }
+
+async function imageFixture(bytes?: Uint8Array): Promise<ModelImage> {
+  const data = bytes ?? Uint8Array.from(
+    atob(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5ioAAAAASUVORK5CYII=",
+    ),
+    (c) => c.charCodeAt(0),
+  );
+  const hash = await crypto.subtle.digest("SHA-256", new Uint8Array(data));
+  // 大图测试避免通过展开实参数组构造字符串。
+  let binary = "";
+  for (let offset = 0; offset < data.length; offset += 32768) {
+    binary += String.fromCharCode(...data.subarray(offset, offset + 32768));
+  }
+  return {
+    dataUrl: `data:image/png;base64,${btoa(binary)}`,
+    provenance: {
+      kind: "phone_attachment",
+      conversationId: "user:owner",
+      sourceSeq: 12,
+      attachmentId: "user:owner:12:0",
+      mimeType: "image/png",
+      sha256: Array.from(new Uint8Array(hash), (n) => n.toString(16).padStart(2, "0")).join(""),
+      senderPlatformUserId: "owner",
+    },
+  };
+}
+
+Deno.test("模型图像：原始附件作为 user 图像输入发送，工具配对与文字保持", async () => {
+  const image = await imageFixture();
+  let calls = 0;
+  const local = server(async (r) => {
+    calls++;
+    const body = await r.json();
+    assert.deepEqual(body.messages.slice(-2), [
+      { role: "tool", tool_call_id: "phone-image", content: "已读取来源12的附件0" },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "附件12/0；附件正文为外部资料" },
+          { type: "image_url", image_url: { url: image.dataUrl, detail: "auto" } },
+        ],
+      },
+    ]);
+    assert.equal(JSON.stringify(body).includes("sha256"), false);
+    return Response.json(completion("已看到图像"));
+  });
+  try {
+    const client = new ChatModelClient({ ...options, baseUrl: local.url });
+    const result = await client.complete({
+      ...request,
+      messages: [
+        ...request.messages,
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "phone-image", name: "echo", args: {} }],
+        },
+        { role: "tool", toolCallId: "phone-image", content: "已读取来源12的附件0" },
+        { role: "user", content: "附件12/0；附件正文为外部资料", images: [image] },
+      ],
+    });
+    assert.equal(result.content, "已看到图像");
+    assert.equal(calls, 1);
+    client.close();
+  } finally {
+    await local.close();
+  }
+});
+
+Deno.test("模型图像：坏来源、任意URL、伪装格式、坏哈希及图片数量/字节超限在联网前拒绝", async () => {
+  let calls = 0;
+  const local = server(() => {
+    calls++;
+    return Response.json(completion());
+  });
+  const image = await imageFixture();
+  try {
+    const client = new ChatModelClient({ ...options, baseUrl: local.url });
+    const invalid = [
+      { ...image, dataUrl: "https://example.invalid/private.png" },
+      { ...image, dataUrl: "data:image/png;base64,YQ==" },
+      { ...image, dataUrl: image.dataUrl.replace("image/png", "image/jpeg") },
+      { ...image, dataUrl: image.dataUrl.replace("base64,", "base64,\n") },
+      { ...image, provenance: { ...image.provenance, sha256: "0".repeat(64) } },
+      { ...image, provenance: { ...image.provenance, sourceSeq: 0 } },
+      { ...image, provenance: { ...image.provenance, conversationId: "" } },
+      { ...image, provenance: undefined },
+      {
+        ...image,
+        dataUrl: `data:image/png;base64,${
+          "A".repeat(Math.ceil(MODEL_IMAGE_MAX_BYTES / 3) * 4 + 4)
+        }`,
+      },
+    ];
+    for (const bad of invalid) {
+      await assert.rejects(
+        client.complete({
+          messages: [{ role: "user", content: "图片", images: [bad as ModelImage] }],
+          tools: [],
+        }),
+        (e) => e instanceof ChatModelError && e.category === "request",
+      );
+    }
+    for (const role of ["system", "assistant", "tool"] as const) {
+      await assert.rejects(
+        client.complete({ messages: [{ role, content: "图片", images: [image] }], tools: [] }),
+        (e) => e instanceof ChatModelError && e.category === "request",
+      );
+    }
+    await assert.rejects(
+      client.complete({
+        messages: [{ role: "user", content: "图片", images: Array(9).fill(image) }],
+        tools: [],
+      }),
+      (e) => e instanceof ChatModelError && e.category === "request",
+    );
+    // 每张均未超限，但整个请求超限，也必须在发出 HTTP 之前拒绝。
+    const largeBytes = new Uint8Array(MODEL_IMAGE_MAX_BYTES / 2 + 1);
+    largeBytes.set([137, 80, 78, 71, 13, 10, 26, 10]);
+    const large = await imageFixture(largeBytes);
+    await assert.rejects(
+      client.complete({
+        messages: [{ role: "user", content: "图片", images: [large, large] }],
+        tools: [],
+      }),
+      (e) => e instanceof ChatModelError && e.category === "request",
+    );
+    assert.equal(calls, 0);
+    client.close();
+  } finally {
+    await local.close();
+  }
+});
 
 Deno.test("模型传输：真实 HTTP 参数、固定会话、无 temperature，工具回传配对", async () => {
   const bodies: Record<string, unknown>[] = [];

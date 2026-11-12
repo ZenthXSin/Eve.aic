@@ -5,6 +5,12 @@ export const MIND = "mind";
 export interface MindApi {
   rest(args: { wakeAt?: string; text?: string }): Promise<{ requestId: string; queued: true }>;
   remind(args: { at: string; text: string }): Promise<{ requestId: string; queued: true }>;
+  /** 无模型调用的条件提醒。code 是 async 函数体，return boolean；可读 facts 与只读 tools。
+   * tools: files.read/list/search、commands.poll、notes.get/list/search、records.page/text。
+   * 检查使用隔离 worker；失败保留提醒并在 status 中报告，下次继续检查。 */
+  watch(
+    args: { code: string; text: string; everyMs?: number },
+  ): Promise<{ requestId: string; queued: true }>;
   cancelReminder(args: { reminderId: string }): Promise<{ requestId: string; queued: true }>;
   compress(
     args: { throughSeq: number; summary: string },
@@ -22,7 +28,16 @@ export interface MindApi {
 export interface MindEvent {
   seq: number;
   requestId: string;
-  kind: "rest" | "remind" | "cancelReminder" | "compress" | "retain" | "alarm";
+  kind:
+    | "rest"
+    | "remind"
+    | "watch"
+    | "cancelReminder"
+    | "compress"
+    | "retain"
+    | "alarm"
+    | "condition_error"
+    | "condition_recovered";
   args: Json;
   at: string;
 }

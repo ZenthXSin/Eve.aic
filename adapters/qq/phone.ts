@@ -5,12 +5,18 @@ import type {
   PhoneActionReceipt,
   PhoneMessage,
   PhoneSend,
+  PhoneSendFile,
 } from "../../contracts/phone.ts";
 import { historyScreen, messageScreen, messageTextPage } from "../../sdk/phone-view.ts";
 import { QqSendActions, type SendStatus } from "./actions.ts";
 import type { InboundRecord } from "./journal.ts";
 import { QqTimeline, type TimelineSource } from "./timeline.ts";
 import { QqPhoneReading } from "./reading.ts";
+import { QqPhoneDevice } from "./device.ts";
+import { QqPhoneDownloads } from "./downloads.ts";
+import { KernelError } from "../../kernel/protocol.ts";
+import { fingerprint } from "../../kernel/calls.ts";
+import type { Json } from "../../kernel/protocol.ts";
 
 const SCREEN = { pageSize: 8, previewCharacters: 160, attachmentPageSize: 4 };
 const NOTICE = { ...SCREEN, previewCharacters: 80 };
@@ -60,6 +66,8 @@ export class QqPhone {
     readonly self: { id: string; displayName: string },
     readonly reading: QqPhoneReading,
     readonly now: () => number = Date.now,
+    readonly device?: QqPhoneDevice,
+    readonly downloads?: QqPhoneDownloads,
   ) {}
 
   async #snapshot() {
@@ -83,6 +91,14 @@ export class QqPhone {
           sender: { platformUserId: this.self.id, displayName: this.self.displayName },
           direction: "outgoing",
           text: record.request.text,
+          ...(record.request.attachment
+            ? {
+              attachments: [{
+                kind: record.request.attachment.kind,
+                name: record.request.attachment.path.split("/").at(-1),
+              }],
+            }
+            : {}),
           delivery,
           ...(delivery.platformMessageId === undefined ? {} : {
             platformMessageId: delivery.platformMessageId,
@@ -99,7 +115,7 @@ export class QqPhone {
   }
 
   async conversations(args: {
-    cursor?: { snapshotThroughSeq: number; beforeLastSeq: number };
+    cursor?: { snapshotThroughSeq: number; beforeLastSeq: number; beforePinned?: boolean };
   } = {}) {
     const rows = await this.#snapshot();
     const through = args.cursor?.snapshotThroughSeq ?? rows.at(-1)?.message.seq ?? 0;
@@ -107,15 +123,26 @@ export class QqPhone {
     if (args.cursor) {
       integer(through, 0);
       integer(args.cursor.beforeLastSeq, 1);
+      if (args.cursor.beforePinned !== undefined && typeof args.cursor.beforePinned !== "boolean") {
+        throw new QqPhoneError("request");
+      }
       if (args.cursor.beforeLastSeq > through) throw new QqPhoneError("request");
     }
     const latest = new Map<string, PhoneMessage>();
     for (const { message } of rows) {
       if (message.seq <= through) latest.set(message.conversationId, message);
     }
-    const eligible = [...latest.values()].filter((message) =>
-      args.cursor === undefined || message.seq < args.cursor.beforeLastSeq
-    ).sort((a, b) => b.seq - a.seq);
+    const pinned = (id: string) => this.device?.get(id).pinned ?? false;
+    const eligible = [...latest.values()].filter((message) => {
+      if (!args.cursor) return true;
+      const wasPinned = args.cursor.beforePinned ?? false;
+      const isPinned = pinned(message.conversationId);
+      return wasPinned
+        ? (!isPinned || message.seq < args.cursor.beforeLastSeq)
+        : (!isPinned && message.seq < args.cursor.beforeLastSeq);
+    }).sort((a, b) =>
+      Number(pinned(b.conversationId)) - Number(pinned(a.conversationId)) || b.seq - a.seq
+    );
     const page = eligible.slice(0, SCREEN.pageSize);
     const pending = new Map<string, number>();
     for (const row of rows) {
@@ -132,15 +159,49 @@ export class QqPhone {
         conversationId: message.conversationId,
         kind: message.conversationId.startsWith("qq:user:") ? "user" : "group",
         latest: messageScreen(message, SCREEN, this.now()),
-        pendingNotifications: pending.get(message.conversationId) ?? 0,
+        pendingNotifications: this.device?.get(message.conversationId).muted
+          ? 0
+          : pending.get(message.conversationId) ?? 0,
         reading: this.reading.get(message.conversationId),
+        settings: {
+          muted: this.device?.get(message.conversationId).muted ?? false,
+          pinned: pinned(message.conversationId),
+          hasDraft: !!this.device?.get(message.conversationId).draft,
+        },
       })),
       snapshotThroughSeq: through,
       ...(eligible.length > page.length
         ? {
-          older: { snapshotThroughSeq: through, beforeLastSeq: page.at(-1)!.seq },
+          older: {
+            snapshotThroughSeq: through,
+            beforeLastSeq: page.at(-1)!.seq,
+            ...(pinned(page.at(-1)!.conversationId) ? { beforePinned: true } : {}),
+          },
         }
         : {}),
+    };
+  }
+
+  /** 仅供部署捕获事实边界，不输出正文、不移动阅读/通知水位、不开放为RPC。 */
+  async captureNotificationBoundary(throughSeq?: number) {
+    const rows = await this.#snapshot();
+    const through = throughSeq ?? rows.at(-1)?.message.seq ?? 0;
+    integer(through, 0);
+    if (through > (rows.at(-1)?.message.seq ?? 0)) {
+      throw new KernelError("corrupt", "启动边界高于当前手机事实，原件保留");
+    }
+    const included = rows.filter((row) => row.message.seq <= through);
+    const metadata = included.map((row) => ({
+      seq: row.message.seq,
+      key: row.key,
+      conversationId: row.message.conversationId,
+      notify: row.notify,
+    }));
+    return {
+      throughSeq: through,
+      count: included.length,
+      notificationCount: included.filter((row) => row.notify).length,
+      digest: await fingerprint(metadata as unknown as Json),
     };
   }
 
@@ -250,6 +311,7 @@ export class QqPhone {
     if (after > (rows.at(-1)?.message.seq ?? 0)) throw new QqPhoneError("request");
     const eligible = rows.filter((row) =>
       row.notify && row.message.seq > after &&
+      !(this.device?.get(row.message.conversationId).muted ?? false) &&
       row.message.seq > (this.reading.get(row.message.conversationId)?.notificationThroughSeq ?? 0)
     );
     const page = eligible.slice(0, SCREEN.pageSize);
@@ -263,7 +325,7 @@ export class QqPhone {
     };
   }
 
-  async send(args: PhoneSend) {
+  async send(args: PhoneSend & { attachment?: { path: string; kind: "image" | "file" } }) {
     conversation(args.conversationId);
     const match = /^qq:(user|group):(.+)$/.exec(args.conversationId)!;
     let reply: { messageId: string; sequence: number } | undefined;
@@ -282,6 +344,7 @@ export class QqPhone {
     const result = await this.actions.send(args.actionId, {
       destination: { kind: match[1] as "user" | "group", openId: match[2] },
       text: args.text,
+      ...(args.attachment === undefined ? {} : { attachment: args.attachment }),
       ...(reply ? { reply } : {}),
       ...(args.referenceIndex === undefined ? {} : { referenceIndex: args.referenceIndex }),
       ...(args.wakeup === undefined ? {} : { wakeup: args.wakeup }),
@@ -294,5 +357,79 @@ export class QqPhone {
   action(args: { actionId: string }) {
     const result = this.actions.status(args.actionId);
     return result ? phoneReceipt(result) : null;
+  }
+
+  async settings(
+    args: { conversationId: string; muted?: boolean; pinned?: boolean; draft?: string },
+  ) {
+    conversation(args.conversationId);
+    if (!this.device) throw new KernelError("unavailable", "手机设置存储未接入");
+    if (
+      Object.keys(args).some((key) =>
+        !["conversationId", "muted", "pinned", "draft"].includes(key)
+      ) ||
+      (args.muted !== undefined && typeof args.muted !== "boolean") ||
+      (args.pinned !== undefined && typeof args.pinned !== "boolean") ||
+      (args.draft !== undefined &&
+        (typeof args.draft !== "string" || new TextEncoder().encode(args.draft).length > 65_536))
+    ) throw new QqPhoneError("request");
+    const patch = {
+      ...(args.muted === undefined ? {} : { muted: args.muted }),
+      ...(args.pinned === undefined ? {} : { pinned: args.pinned }),
+      ...(args.draft === undefined ? {} : { draft: args.draft }),
+    };
+    return Object.keys(patch).length
+      ? await this.device.update(args.conversationId, patch)
+      : this.device.get(args.conversationId);
+  }
+
+  async download(args: { handle: { conversationId: string; seq: number }; index: number }) {
+    integer(args.index, 1);
+    if (!this.downloads) throw new KernelError("unavailable", "附件下载存储未接入");
+    const message = await this.#message(args.handle);
+    const rows = await this.#snapshot();
+    if (message.direction !== "incoming" || !message.attachments?.[args.index - 1]) {
+      throw new QqPhoneError("not_found");
+    }
+    const row = rows.find((row) => row.message.seq === args.handle.seq)!;
+    const incomingSeq = Number(row.key.slice("incoming:".length));
+    const original = this.incoming().find((record) => record.seq === incomingSeq);
+    const raw = original?.raw.d as { attachments?: { url?: unknown }[] } | undefined;
+    const url = raw?.attachments?.[args.index - 1]?.url;
+    if (typeof url !== "string") {
+      throw new KernelError("unavailable", "平台没有提供附件下载地址，原始元信息仍保留");
+    }
+    return await this.downloads.download({
+      kind: "phone_attachment",
+      conversationId: message.conversationId,
+      sourceSeq: message.seq,
+      attachmentId: `${message.conversationId}:${message.seq}:${args.index}`,
+      senderPlatformUserId: message.sender.platformUserId,
+    }, url);
+  }
+
+  async image(args: { handle: { conversationId: string; seq: number }; index: number }) {
+    const downloaded = await this.download(args);
+    return await this.downloads!.image(downloaded);
+  }
+  async file(
+    args: {
+      handle: { conversationId: string; seq: number };
+      index: number;
+      offsetBytes?: number;
+      limitBytes?: number;
+      encoding?: "utf8" | "base64";
+    },
+  ) {
+    const download = await this.download(args);
+    return await this.downloads!.file(download, args);
+  }
+
+  async sendFile(args: PhoneSendFile) {
+    return await this.send({
+      ...args,
+      text: args.text ?? "",
+      attachment: { path: args.path, kind: args.kind },
+    });
   }
 }

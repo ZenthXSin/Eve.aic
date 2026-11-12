@@ -1,0 +1,41 @@
+/** 界面仅用 textContent 展示原记录，记录正文不会作为 HTML 或脚本执行。 */
+export function panelHtml(nonce: string) {
+  return String.raw`<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Eve 管理</title><style nonce="${nonce}">
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151d;color:#e2e9f2}body{max-width:1100px;margin:0 auto;padding:28px}h1{font-size:25px}h2{font-size:18px}button,input,select{font:inherit;border:1px solid #415164;border-radius:7px;padding:9px;background:#1c2735;color:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}input{min-width:0}button:hover{border-color:#99c5f7}nav,.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}section,article{border:1px solid #2d3b4d;border-radius:10px;padding:18px;margin:18px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.6;margin:0}.muted{color:#99a9bd}#message{min-height:1.5em;color:#ffbf8a}label{display:flex;gap:8px;align-items:center}.hidden,[hidden]{display:none!important}#login input{width:min(100%,520px)}#items article{margin:10px 0}.item-head{margin-bottom:10px;display:flex;justify-content:space-between;gap:12px}dialog{background:#17212d;color:inherit;border:1px solid #50647c;border-radius:12px;width:min(850px,85vw);max-height:85vh}dialog::backdrop{background:#000a}#detail{margin-top:16px}footer{font-size:12px;color:#99a9bd;margin-top:25px}
+</style></head><body><header><h1>Eve 管理</h1><p class="muted">查看记录与运行状态。暂停、恢复和预算直接交由独立运行管理者处理。</p></header>
+<p id="message" role="status" aria-live="polite"></p>
+<section id="login"><h2>登录</h2><form id="loginForm"><label>管理口令 <input id="token" type="password" autocomplete="current-password" required maxlength="256"></label><p><button>登录</button></p></form></section>
+<main id="app" hidden><nav><button id="refresh">刷新状态</button><button id="pause">暂停</button><button id="resume">恢复</button><button id="logout">退出</button></nav>
+<section><h2>运行状态</h2><pre id="status"></pre><form id="budgetForm"><p class="row"><label>每日 token 预算 <input id="budget" type="number" min="0" step="1" required></label><button>保存预算</button></p></form></section>
+<section><h2>记录</h2><form id="searchForm" class="row"><label>查看 <select id="resource"><option value="timeline">意识流</option><option value="notes">便签</option><option value="memory">记忆</option><option value="receipts">动作回执</option></select></label><input id="query" type="search" placeholder="搜索文字" aria-label="搜索文字" maxlength="4096"><button>搜索</button><button type="button" id="clear">查看全部</button></form><div id="items"></div><button id="more" hidden>下一页</button></section></main>
+<dialog id="dialog"><button id="closeDetail">关闭</button><button id="detailMore" hidden>继续读取</button><button id="versions" hidden>查看版本</button><pre id="detail"></pre></dialog>
+<footer>记录保留原有时间、版本与关联编号。语义检索模型接入待办。</footer>
+<script nonce="${nonce}">
+'use strict';
+const el=id=>document.getElementById(id);let csrf='',currentResource='timeline',currentOperation='page',next=null,detailArgs=null,detailOperation='get',busy=false;
+const pretty=value=>JSON.stringify(value,null,2);
+function message(text){el('message').textContent=text||'';}
+async function api(path,body){const response=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'content-type':'application/json','x-eve-csrf':csrf},body:body===undefined?undefined:JSON.stringify(body),credentials:'same-origin',cache:'no-store'});const wire=await response.json();if(!wire.ok){if(response.status===401)showLogin();throw new Error(wire.error?.message||'请求失败');}return wire.value;}
+function showLogin(){csrf='';el('app').hidden=true;el('login').hidden=false;el('status').textContent='';el('items').replaceChildren();el('detail').textContent='';if(el('dialog').open)el('dialog').close();}
+async function run(work){if(busy)return;busy=true;document.querySelectorAll('button').forEach(button=>button.disabled=true);message('');try{await work();}catch(error){message(error.message);}finally{busy=false;document.querySelectorAll('button').forEach(button=>button.disabled=false);}}
+async function status(){const value=await api('/api/status');el('status').textContent=pretty(value);const amount=value?.runtime?.budget?.dailyTokenBudget??value?.budget?.dailyTokenBudget??value?.dailyTokenBudget;if(Number.isSafeInteger(amount))el('budget').value=String(amount);}
+async function entered(){el('token').value='';el('login').hidden=true;el('app').hidden=false;await status();await page({});}
+async function page(args,append=false){const value=await api('/api/query',{resource:currentResource,operation:currentOperation,args});if(!append)el('items').replaceChildren();const items=Array.isArray(value?.items)?value.items:[value];for(const item of items){const article=document.createElement('article'),head=document.createElement('div'),pre=document.createElement('pre');head.className='item-head';const title=document.createElement('span');title.textContent=String(item?.title??item?.kind??item?.id??item?.seq??'记录');head.append(title);if(item&&typeof item==='object'&&(item.id!==undefined||item.seq!==undefined)){const button=document.createElement('button');button.textContent='详情';button.addEventListener('click',()=>run(()=>detail(item.id!==undefined?{id:item.id}:{seq:item.seq})));head.append(button);}pre.textContent=pretty(item);article.append(head,pre);el('items').append(article);}next=value?.next??null;el('more').hidden=!next;if(items.length===0){const p=document.createElement('p');p.className='muted';p.textContent='没有记录';el('items').append(p);}}
+async function detail(args,append=false,operation='get'){const value=await api('/api/query',{resource:currentResource,operation,args});detailOperation=operation;if(!append)el('detail').textContent='';el('detail').textContent+=(append?'\n':'')+pretty(value);detailArgs=value?.next??(value?.nextChar!==undefined?{...args,startChar:value.nextChar}:null);el('detailMore').hidden=!detailArgs;el('versions').hidden=currentResource!=='notes'||!args.id;el('versions').dataset.id=args.id??'';if(!el('dialog').open)el('dialog').showModal();}
+el('loginForm').addEventListener('submit',event=>{event.preventDefault();run(async()=>{const value=await api('/api/login',{token:el('token').value});csrf=value.csrf;await entered();});});
+el('refresh').addEventListener('click',()=>run(status));
+for(const action of ['pause','resume'])el(action).addEventListener('click',()=>run(async()=>{await api('/api/control',{action,args:{}});await status();message(action==='pause'?'已暂停':'已恢复');}));
+el('budgetForm').addEventListener('submit',event=>{event.preventDefault();run(async()=>{const amount=Number(el('budget').value);if(!Number.isSafeInteger(amount)||amount<0)throw new Error('预算必须是非负整数');await api('/api/control',{action:'budget',args:{dailyTokenBudget:amount}});await status();message('预算已保存');});});
+el('logout').addEventListener('click',()=>run(async()=>{await api('/api/logout',{});showLogin();}));
+el('resource').addEventListener('change',()=>run(async()=>{currentResource=el('resource').value;currentOperation='page';el('query').value='';await page({});}));
+el('searchForm').addEventListener('submit',event=>{event.preventDefault();run(async()=>{const query=el('query').value.trim();currentOperation=query?'search':'page';await page(query?{query}:{});});});
+el('clear').addEventListener('click',()=>run(async()=>{el('query').value='';currentOperation='page';await page({});}));
+el('more').addEventListener('click',()=>run(()=>page(next,true)));
+el('closeDetail').addEventListener('click',()=>el('dialog').close());
+el('detailMore').addEventListener('click',()=>run(()=>detail(detailArgs,true,detailOperation)));
+el('versions').addEventListener('click',()=>run(()=>detail({id:el('versions').dataset.id},false,'versions')));
+run(async()=>{try{const session=await api('/api/session');csrf=session.csrf;await entered();}catch(error){showLogin();if(error.message!=='请先登录')message(error.message);}});
+</script></body></html>`;
+}

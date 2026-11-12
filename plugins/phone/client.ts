@@ -32,6 +32,7 @@ export class PhoneRpcClient {
     readonly key: string,
     readonly timeoutMs = 120_000,
     readonly ownershipProof?: () => Promise<OwnershipProof>,
+    readonly resolveUrl?: () => Promise<string>,
   ) {
     const parsed = new URL(url);
     if (
@@ -46,12 +47,27 @@ export class PhoneRpcClient {
     const captured = structuredClone(args);
     const proof = method === "health" ? undefined : await this.ownershipProof?.();
     const actionId =
-      method === "send" && captured && typeof captured === "object" && !Array.isArray(captured)
+      (method === "send" || method === "sendFile") && captured && typeof captured === "object" &&
+        !Array.isArray(captured)
         ? captured.actionId
         : `read_${crypto.randomUUID()}`;
     const signal = AbortSignal.any([this.#controller.signal, AbortSignal.timeout(this.timeoutMs)]);
     try {
-      const response = await fetch(this.url, {
+      let url = this.url;
+      if (this.resolveUrl) {
+        try {
+          url = await this.resolveUrl();
+          const parsed = new URL(url);
+          if (
+            parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" || !parsed.port ||
+            parsed.pathname !== "/rpc" || parsed.username || parsed.password || parsed.search ||
+            parsed.hash
+          ) throw new Error();
+        } catch {
+          throw new PhoneRpcError("unavailable");
+        }
+      }
+      const response = await fetch(url, {
         method: "POST",
         headers: { authorization: `Bearer ${this.key}`, "content-type": "application/json" },
         body: JSON.stringify({
@@ -74,7 +90,12 @@ export class PhoneRpcClient {
           const next = await reader.read();
           if (next.done) break;
           size += next.value.length;
-          if (size > 131_072) {
+          const limit = method === "image"
+            ? 16_777_216
+            : ["file", "settings"].includes(method)
+            ? 1_048_576
+            : 131_072;
+          if (size > limit) {
             await reader.cancel();
             throw new PhoneRpcError("invalid_response");
           }
@@ -98,7 +119,7 @@ export class PhoneRpcClient {
     } catch (error) {
       if (error instanceof PhoneRpcError) {
         if (
-          (method === "send" || method === "open") &&
+          ["send", "sendFile", "open", "settings", "download", "image", "file"].includes(method) &&
           ["transport", "invalid_response", "internal"].includes(error.category)
         ) {
           throw new PhoneRpcError("unknown");
@@ -106,7 +127,11 @@ export class PhoneRpcClient {
         throw error;
       }
       // 请求可能已经到达适配器；发送/打开超时不能声称动作没有执行。
-      throw new PhoneRpcError(method === "send" || method === "open" ? "unknown" : "transport");
+      throw new PhoneRpcError(
+        ["send", "sendFile", "open", "settings", "download", "image", "file"].includes(method)
+          ? "unknown"
+          : "transport",
+      );
     }
   }
 

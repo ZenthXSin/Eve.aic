@@ -1,0 +1,391 @@
+import type { ModelImage, ModelRequest, ModelResponse } from "../../contracts/model.ts";
+import { RUNTIME_METHODS } from "../../contracts/runtime.ts";
+import { canonical, fingerprint } from "../../kernel/calls.ts";
+import { type Json, KernelError, toWireError, type WireError } from "../../kernel/protocol.ts";
+import { FactJournal } from "../../sdk/fact-journal.ts";
+import { type CommandIdentity, CommandSessions } from "./commands.ts";
+import { SharedBudget } from "./budget.ts";
+import { FileTools } from "./files.ts";
+import { type FileRuntime, RestrictedFileTools } from "./restricted-files.ts";
+import { NoteStore, textPage } from "./notes.ts";
+import { MemoryStore } from "./memory.ts";
+import type { LocalSemantic } from "./embedding.ts";
+import { describedImage, imageDescriptionRequest, imageProvenance } from "./vision.ts";
+
+interface RequestRecord {
+  id: string;
+  hash: string;
+  namespace: string;
+  method: string;
+  recovery: Json;
+  value?: Json;
+  error?: WireError;
+  terminal: boolean;
+}
+interface Options {
+  directory: string;
+  workspace: string;
+  allowedRoots?: string[];
+  settingsFile: string;
+  model: { complete(args: ModelRequest): Promise<ModelResponse>; close(): void };
+  maxOutputTokens: number;
+  modelName?: string;
+  commandIdentity?: CommandIdentity;
+  commandUseSystemd?: boolean;
+  fileRuntime?: FileRuntime;
+  semantic?: Pick<LocalSemantic, "embed" | "count">;
+}
+/** 真实执行与回执不随内核/插件回退；令牌校验由独立 HTTP 出口包围整个执行。 */
+export class RuntimeEngine {
+  readonly records: FactJournal;
+  readonly transactions: FactJournal;
+  readonly modelResponses: FactJournal;
+  readonly notes: NoteStore;
+  readonly memory: MemoryStore;
+  readonly files: FileTools;
+  readonly commands: CommandSessions;
+  readonly budget: SharedBudget;
+  #requests = new Map<string, RequestRecord>();
+  #live = new Map<string, Promise<Json>>();
+  #timelineTail: Promise<unknown> = Promise.resolve();
+  #closing = false;
+  constructor(readonly options: Options) {
+    const directory = options.directory;
+    const embed = options.semantic
+      ? (text: string, purpose?: "query" | "passage") => options.semantic!.embed(text, purpose)
+      : undefined;
+    this.records = new FactJournal(`${directory}/consciousness`);
+    this.transactions = new FactJournal(`${directory}/actions`);
+    this.modelResponses = new FactJournal(`${directory}/model-responses`);
+    this.notes = new NoteStore(`${directory}/notes`, embed, this.records);
+    this.memory = new MemoryStore(`${directory}/memory`, this.records, embed);
+    this.files = options.commandIdentity
+      ? new RestrictedFileTools(
+        options.workspace,
+        options.allowedRoots,
+        options.commandIdentity,
+        options.fileRuntime,
+      )
+      : new FileTools(options.workspace, options.allowedRoots);
+    this.commands = new CommandSessions(
+      `${directory}/commands`,
+      this.files,
+      options.commandIdentity,
+      options.commandUseSystemd,
+    );
+    this.budget = new SharedBudget(`${directory}/budget`, options.settingsFile);
+  }
+  get available() {
+    return !this.#closing && this.transactions.available && this.records.available &&
+      this.notes.journal.available && this.memory.journal.available &&
+      this.budget.journal.available;
+  }
+  async initialize() {
+    await Deno.mkdir(this.options.workspace, { recursive: true, mode: 0o700 });
+    try {
+      for (
+        const service of [
+          this.records,
+          this.transactions,
+          this.modelResponses,
+          this.notes,
+          this.memory,
+          this.commands,
+          this.budget,
+        ]
+      ) await service.initialize();
+      const responseIds = new Set<string>();
+      for (const event of this.modelResponses.events) {
+        const data = event.data as unknown as { id: string; response: ModelResponse };
+        if (
+          event.kind !== "response" || !data || typeof data.id !== "string" ||
+          responseIds.has(data.id) || !data.response || typeof data.response.content !== "string" ||
+          !Array.isArray(data.response.toolCalls)
+        ) {
+          throw new KernelError("corrupt", "模型响应原件索引无效，保留现场");
+        }
+        responseIds.add(data.id);
+        // 原响应已落盘而预算结算前中断时，用原用量补记；不再调用模型或重复强化记忆。
+        await this.budget.response(data.id, data.response);
+      }
+      for (const event of this.transactions.events) {
+        const data = event.data as unknown as RequestRecord;
+        if (event.kind === "request") {
+          if (
+            !data || typeof data.id !== "string" || !/^[a-f0-9]{64}$/.test(data.hash) ||
+            this.#requests.has(data.id)
+          ) throw new KernelError("corrupt", "执行请求索引异常");
+          this.#requests.set(data.id, { ...data, terminal: false });
+        } else if (event.kind === "result") {
+          const previous = this.#requests.get(data.id);
+          if (
+            !previous || previous.terminal ||
+            data.error === undefined && !Object.hasOwn(data, "value")
+          ) throw new KernelError("corrupt", "执行回执缺少原请求");
+          Object.assign(previous, data, { terminal: true });
+        } else throw new KernelError("corrupt", "未知执行记录");
+      }
+      for (const r of this.#requests.values()) {
+        if (!r.terminal) {
+          let value: Json | undefined;
+          if (r.namespace === "notes") {
+            value = this.notes.receipt(r.id) as unknown as Json | undefined;
+          }
+          if (r.namespace === "memory" && r.method === "remember") {
+            value = this.memory.receipt(r.id) as unknown as Json | undefined;
+          }
+          if (r.namespace === "model" && r.method === "complete") value = this.#modelResult(r.id);
+          if (r.namespace === "model" && r.method === "describeImage") {
+            const response = this.#modelResult(r.id);
+            if (response !== undefined) {
+              value = describedImage(
+                response as unknown as ModelResponse,
+                (r.recovery as unknown as { provenance: ModelImage["provenance"] }).provenance,
+                (r.recovery as { modelName?: string }).modelName,
+              ) as unknown as Json;
+            }
+          }
+          if (r.namespace === "timeline" && r.method === "append") {
+            const recovery = r.recovery as { expectedSeq: number; digest: string };
+            const event = this.records.events[recovery.expectedSeq];
+            if (event && await fingerprint([event.kind, event.data]) === recovery.digest) {
+              value = event as unknown as Json;
+            }
+          }
+          await this.#result(
+            r,
+            value === undefined
+              ? { error: { kind: "unknown", message: "宿主中断时结果未确认，原请求不重放" } }
+              : { value },
+          );
+        }
+      }
+    } catch (error) {
+      await this.close().catch(() => {});
+      throw error;
+    }
+  }
+  async #result(record: RequestRecord, result: { value?: Json; error?: WireError }) {
+    await this.transactions.append("result", { id: record.id, ...result } as unknown as Json);
+    Object.assign(record, result, { terminal: true });
+  }
+  #value(record: RequestRecord): Json {
+    if (!record.terminal) throw new KernelError("unknown", "原动作正在执行或尚未核对");
+    if (record.error) throw new KernelError(record.error.kind, record.error.message);
+    return structuredClone(record.value!);
+  }
+  receipt(id: string) {
+    const record = this.#requests.get(id);
+    return record?.terminal ? structuredClone(record) : undefined;
+  }
+  async dispatch(
+    namespace: string,
+    method: string,
+    args: Record<string, Json>,
+    id: string,
+  ): Promise<Json> {
+    if (!this.available) throw new KernelError("unavailable", "执行服务不可用");
+    if (
+      !(namespace in RUNTIME_METHODS) ||
+      !(RUNTIME_METHODS[namespace as keyof typeof RUNTIME_METHODS] as readonly string[]).includes(
+        method,
+      )
+    ) throw new KernelError("rejected", "该能力不在契约内");
+    const captured = structuredClone(args),
+      hash = await fingerprint({ namespace, method, args: captured });
+    const recovery = (namespace === "timeline" && method === "append"
+      ? {
+        expectedSeq: captured.expectedSeq,
+        digest: await fingerprint([captured.kind, captured.data]),
+      }
+      : namespace === "model" && method === "describeImage"
+      ? {
+        provenance: imageProvenance((captured.image as unknown as ModelImage)?.provenance),
+        ...(this.options.modelName ? { modelName: this.options.modelName } : {}),
+      }
+      : null) as unknown as Json;
+    const old = this.#requests.get(id);
+    if (old && old.hash !== hash) throw new KernelError("rejected", "同一动作编号不能改变参数");
+    if (old) return this.#live.has(id) ? await this.#live.get(id)! : this.#value(old);
+    const operation = (async () => {
+      const record: RequestRecord = { id, namespace, method, hash, recovery, terminal: false };
+      this.#requests.set(id, record);
+      await this.transactions.append("request", record as unknown as Json);
+      try {
+        const value = await this.#invoke(namespace, method, captured, id);
+        canonical(value);
+        await this.#result(record, { value });
+        return value;
+      } catch (error) {
+        if (!(error instanceof KernelError && ["storage", "corrupt"].includes(error.kind))) {
+          await this.#result(record, { error: toWireError(error) });
+        }
+        throw error;
+      }
+    })();
+    this.#live.set(id, operation);
+    try {
+      return await operation;
+    } finally {
+      this.#live.delete(id);
+    }
+  }
+  #modelResult(id: string): Json | undefined {
+    return (this.modelResponses.events.find((e) => (e.data as { id: string }).id === id)?.data as {
+      response?: Json;
+    } | undefined)?.response;
+  }
+  async #invoke(
+    namespace: string,
+    method: string,
+    args: Record<string, Json>,
+    id: string,
+  ): Promise<Json> {
+    if (namespace === "timeline") {
+      if (method === "page") return this.#recordPage(args, true) as unknown as Json;
+      if (args.kind === "upgrade_rollback") {
+        throw new KernelError("rejected", "回滚范围只能由独立监督写入，实例不能伪造");
+      }
+      const operation = this.#timelineTail.then(async () => {
+        if (
+          args.expectedSeq !== this.records.events.length ||
+          args.expectedPrevious !== (this.records.events.at(-1)?.digest ?? "0".repeat(64)) ||
+          typeof args.kind !== "string" || !args.kind || args.kind.length > 128
+        ) throw new KernelError("rejected", "意识流前件已变化，拒绝旧视图写入");
+        return await this.records.append(args.kind, args.data);
+      });
+      this.#timelineTail = operation.catch(() => {});
+      return await operation as unknown as Json;
+    }
+    if (namespace === "records") {
+      if (method === "page") return this.#recordPage(args, false) as unknown as Json;
+      if (!Number.isSafeInteger(args.seq) || Number(args.seq) < 1) {
+        throw new KernelError("rejected", "需要原记录编号");
+      }
+      const event = this.records.events[Number(args.seq) - 1];
+      if (!event) throw new KernelError("not_found", "没有该原记录");
+      return {
+        ...textPage(JSON.stringify(event), args.startChar as number, args.limit as number),
+        seq: event.seq,
+        digest: event.digest,
+      };
+    }
+    if (namespace === "notes") {
+      const value = method === "create" || method === "update"
+        ? await this.notes.change(method, args, id)
+        : await this.notes[method as "get" | "list" | "versions" | "search"](args as never);
+      if (method === "create" || method === "update") {
+        await this.memory.observe(JSON.stringify(args));
+      }
+      return value as unknown as Json;
+    }
+    if (namespace === "files") {
+      return await this.files[method as "read" | "write" | "replace" | "list" | "search"](
+        args as never,
+      ) as unknown as Json;
+    }
+    if (namespace === "commands") {
+      if (method === "start") {
+        const started = await this.commands.start(args as never, id);
+        // 对调用方可以先返回会话，出口许可始终持到真实进程和输出保存结束。
+        await started.done;
+        return await this.commands.poll({ sessionId: started.sessionId }) as unknown as Json;
+      }
+      return await this.commands[method as "poll" | "write" | "cancel" | "completions"](
+        args as never,
+      ) as unknown as Json;
+    }
+    if (namespace === "memory") {
+      return (method === "remember"
+        ? await this.memory.remember(args as never, id)
+        : await this.memory[method as "recall" | "used" | "list" | "get"](
+          args as never,
+        )) as unknown as Json;
+    }
+    if (namespace === "model") {
+      if (method === "budget") return await this.budget.status() as unknown as Json;
+      if (method === "result") {
+        const result = this.#modelResult(String(args.requestId));
+        if (result === undefined) throw new KernelError("not_found", "没有该模型请求回执");
+        return result;
+      }
+      const description = method === "describeImage";
+      const image = description ? args.image as unknown as ModelImage : undefined;
+      const request = description
+        ? imageDescriptionRequest(image!)
+        : args as unknown as ModelRequest;
+      const amount = new TextEncoder().encode(JSON.stringify(request)).length +
+        request.messages.length * 64 + this.options.maxOutputTokens;
+      await this.budget.reserve(id, amount);
+      const response = await this.options.model.complete(request);
+      await this.modelResponses.append("response", { id, response } as unknown as Json);
+      await this.budget.response(id, response);
+      if (description) {
+        return describedImage(
+          response,
+          image!.provenance,
+          this.options.modelName,
+        ) as unknown as Json;
+      }
+      await this.memory.observe(response.content + JSON.stringify(response.toolCalls));
+      return response as unknown as Json;
+    }
+    throw new KernelError("rejected", "未知出口");
+  }
+  #recordPage(args: Record<string, Json>, full: boolean) {
+    const after = args.afterSeq ?? 0;
+    if (
+      !Number.isSafeInteger(after) || Number(after) < 0 ||
+      Number(after) > this.records.events.length
+    ) throw new KernelError("rejected", "原记录游标无效");
+    const page = [];
+    let bytes = 0;
+    for (
+      let index = Number(after);
+      index < this.records.events.length && page.length < 8;
+      index++
+    ) {
+      const event = this.records.events[index];
+      const size = full ? new TextEncoder().encode(JSON.stringify(event)).length : 0;
+      if (page.length && bytes + size > 12_000_000) break;
+      page.push(event);
+      bytes += size;
+    }
+    return {
+      items: full
+        ? structuredClone(page)
+        : page.map(({ seq, at, kind, digest }) => ({ seq, at, kind, digest })),
+      throughSeq: page.at(-1)?.seq ?? after,
+      hasMore: Number(after) + page.length < this.records.events.length,
+    };
+  }
+  async close() {
+    this.#closing = true;
+    const errors = [];
+    try {
+      await this.commands.close();
+    } catch (e) {
+      errors.push(e);
+    }
+    await Promise.allSettled([...this.#live.values()]);
+    for (
+      const service of [
+        this.budget,
+        this.memory,
+        this.notes,
+        this.modelResponses,
+        this.transactions,
+        this.records,
+        this.files,
+      ]
+    ) {
+      try {
+        await service.close();
+      } catch (e) {
+        errors.push(e);
+      }
+    }
+    this.options.model.close();
+    if (errors.length) throw new KernelError("storage", "执行服务停止有失败，原件保留");
+  }
+}

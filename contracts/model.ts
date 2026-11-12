@@ -9,11 +9,37 @@ export interface ToolCall {
   args: Json;
 }
 
+export const MODEL_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+export const MODEL_IMAGE_MAX_COUNT = 8;
+
+/** 已读取的原始附件；传输层直接编码为图像输入，不把 base64 作为文字交给模型。 */
+export interface ModelImage {
+  dataUrl: string;
+  provenance: {
+    kind: "phone_attachment";
+    conversationId: string;
+    sourceSeq: number;
+    attachmentId: string;
+    sha256: string;
+    mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+    senderPlatformUserId?: string;
+  };
+}
+
+/** 默认由同一配置模型先独立描述附件，再把文字与来源交给主意识。 */
+export interface ImageDescription {
+  description: string;
+  provenance: ModelImage["provenance"];
+  model?: string;
+}
+
 export interface Message {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   toolCalls?: ToolCall[];
   toolCallId?: string;
+  /** 仅 user 消息允许；工具结果中的图片须在全部工具配对后作为 user 图像输入。 */
+  images?: ModelImage[];
 }
 
 export interface ToolSpec {

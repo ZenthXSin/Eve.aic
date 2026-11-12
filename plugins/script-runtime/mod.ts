@@ -26,7 +26,10 @@ export async function readScriptConfig(path: string): Promise<ScriptConfig> {
     [value.directory, value.denoBinary, value.cacheDirectory].some((v) =>
       typeof v !== "string" || !v.startsWith("/")
     ) ||
-    !Number.isSafeInteger(value.defaultTimeoutMs) || value.defaultTimeoutMs < 1
+    !Number.isSafeInteger(value.defaultTimeoutMs) || value.defaultTimeoutMs < 1 ||
+    (value.startupTimeoutMs !== undefined &&
+      (!Number.isSafeInteger(value.startupTimeoutMs) || value.startupTimeoutMs < 1 ||
+        value.startupTimeoutMs > 2_147_483_647))
   ) {
     throw new Error("脚本配置需要绝对目录、Deno路径与有效期限");
   }
@@ -35,6 +38,7 @@ export async function readScriptConfig(path: string): Promise<ScriptConfig> {
     denoBinary: value.denoBinary,
     cacheDirectory: value.cacheDirectory,
     defaultTimeoutMs: value.defaultTimeoutMs,
+    ...(value.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: value.startupTimeoutMs }),
   };
 }
 export function createScriptPlugin(configPath: string) {
@@ -49,6 +53,10 @@ export function createScriptPlugin(configPath: string) {
         start: (args) =>
           current().start(args as unknown as ScriptRequest) as unknown as Promise<Json>,
         status: (args) => current().status(args as { jobId: string }) as unknown as Json,
+        observations: (args) =>
+          current().observations(args as { jobId: string; afterSeq?: number }) as unknown as Json,
+        images: (args) =>
+          current().images(args as { jobId: string; afterSeq?: number }) as unknown as Json,
         cancel: (args) => current().cancel(args as { jobId: string }) as unknown as Promise<Json>,
         result: (args) =>
           current().result(

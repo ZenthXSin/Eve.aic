@@ -14,6 +14,13 @@ export async function readEveConfig(path: string): Promise<EveConfig> {
       value.dailyTokenBudget,
     ].some((v) => !Number.isSafeInteger(v) || v < 1)
   ) throw new KernelError("rejected", "意识流配置不完整");
+  if (
+    value.startupTimeoutMs !== undefined &&
+    (!Number.isSafeInteger(value.startupTimeoutMs) || value.startupTimeoutMs < 1 ||
+      value.startupTimeoutMs > 2_147_483_647)
+  ) {
+    throw new KernelError("rejected", "意识流启动期限无效");
+  }
   if (value.timeZone !== undefined && typeof value.timeZone !== "string") {
     throw new KernelError("rejected", "预算时区无效");
   }

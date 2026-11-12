@@ -12,6 +12,11 @@ export const PHONE_METHODS = [
   "notifications",
   "send",
   "action",
+  "settings",
+  "download",
+  "image",
+  "file",
+  "sendFile",
 ] as const;
 export type PhoneMethod = typeof PHONE_METHODS[number];
 export interface PhoneRpcRequest {

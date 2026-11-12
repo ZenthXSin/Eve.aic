@@ -20,7 +20,15 @@ export async function composeScriptPlugin(directory: string, configPath: string)
         version: "1.0.0",
         provides: { scripts: "1.0.0", tools: "1.0.0" },
         requires: { phone: "^1.0.0" },
-        optional: { mind: "^1.0.0" },
+        optional: {
+          upgrades: "^1.0.0",
+          mind: "^1.0.0",
+          notes: "^1.0.0",
+          files: "^1.0.0",
+          commands: "^1.0.0",
+          memory: "^1.0.0",
+          records: "^1.0.0",
+        },
         permissions: {
           read: [
             configPath,
@@ -31,7 +39,7 @@ export async function composeScriptPlugin(directory: string, configPath: string)
           write: [config.directory, config.cacheDirectory],
           run: [config.denoBinary],
         },
-        deadlines: { enableMs: 10_000, disableMs: 10_000 },
+        deadlines: { enableMs: config.startupTimeoutMs ?? 300_000, disableMs: 10_000 },
       },
       null,
       2,

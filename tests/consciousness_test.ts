@@ -65,6 +65,7 @@ const script = (code: string) => ({
 async function fixture(
   handler: (body: Record<string, Json>, index: number) => Response | Promise<Response>,
   limit = 200_000_000,
+  imageDescription?: string,
 ) {
   const directory = await Deno.makeTempDir({ prefix: "eve-consciousness-" });
   let sends = 0;
@@ -159,6 +160,20 @@ async function fixture(
   await composeMindPlugin(`${directory}/mind-plugin`, `${directory}/mind`);
   await composePhonePlugin(`${directory}/phone-plugin`, configPath);
   await composeModelPlugin(`${directory}/model-plugin`, configPath);
+  if (imageDescription) {
+    await Deno.writeTextFile(
+      `${directory}/model-plugin/mod.ts`,
+      `import {createChatModelPlugin} from ${
+        JSON.stringify(new URL("../plugins/model-chat/mod.ts", import.meta.url).href)
+      };
+const plugin=createChatModelPlugin(${
+        JSON.stringify(configPath)
+      });const load=plugin.load;plugin.load=(ctx)=>load({...ctx,provide:(contract,handlers)=>ctx.provide(contract,{...handlers,describeImage:(args)=>({description:${
+        JSON.stringify(imageDescription)
+      },provenance:args.image.provenance})})});export default plugin;`,
+    );
+  }
+
   await composeScriptPlugin(`${directory}/scripts-plugin`, configPath);
   await composeEvePlugin(`${directory}/eve-plugin`, configPath);
   let kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 20000 });
@@ -187,6 +202,7 @@ async function fixture(
     directory,
     messages,
     journal,
+    phone,
     actions,
     kernel: () => kernel,
     records,
@@ -684,5 +700,163 @@ Deno.test("意识流：工具恢复故障通知保留时间与来源，渲染时
   } finally {
     await journal.close();
     await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("意识流：手机模型描述进入下一轮主意识文字，原图不进入Eve人格上下文", async () => {
+  const payload =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aMRsAAAAASUVORK5CYII=";
+  const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+  const sha256 = Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+    (n) => n.toString(16).padStart(2, "0"),
+  ).join("");
+  const f = await fixture(
+    (_body, index) =>
+      Response.json(
+        index === 1
+          ? script(
+            'await tools.phone.image({handle:{conversationId:"qq:user:user-a",seq:1},index:1}); return "我已经点开了图片";',
+          )
+          : completion(),
+      ),
+    200_000_000,
+    "客观描述：白色背景中有一个小圆点；这是外部图片的模型描述，细节可能有误",
+  );
+  const source = {
+    kind: "phone_attachment" as const,
+    conversationId: "qq:user:user-a",
+    sourceSeq: 1,
+    attachmentId: "qq:user:user-a:1:0",
+    senderPlatformUserId: "user-a",
+  };
+  let reads = 0;
+  f.phone.image = () => {
+    reads++;
+    return Promise.resolve({
+      image: {
+        dataUrl: `data:image/png;base64,${payload}`,
+        provenance: { ...source, sha256, mimeType: "image/png" as const },
+      },
+      download: {
+        path: "/fixture/image.png",
+        sizeBytes: bytes.length,
+        sha256,
+        mimeType: "image/png",
+        source,
+      },
+    });
+  };
+  try {
+    await f.pulse();
+    await f.pulse();
+    await f.pulse();
+    assert.equal(reads, 1);
+    assert.equal(f.messages.length, 2);
+    const messages = f.messages[1].messages as unknown as {
+      role: string;
+      content: unknown;
+      images?: unknown;
+    }[];
+    assert.equal(JSON.stringify(messages).includes(payload), false);
+    assert.equal(messages.some((message) => message.images !== undefined), false);
+    assert.equal(JSON.stringify(messages).includes("image_url"), false);
+    assert.ok(JSON.stringify(messages).includes("客观描述：白色背景中有一个小圆点"));
+    assert.ok(JSON.stringify(messages).includes("phone_attachment"));
+    const imageNotices = (await f.records()).filter((e) =>
+      e.kind === "notice" && (e.data as { source?: string }).source === "image_description"
+    );
+    assert.equal(imageNotices.length, 1);
+    await f.restart();
+    await f.pulse();
+    assert.equal(reads, 1);
+    assert.equal(f.messages.length, 2);
+    assert.equal(
+      (await f.records()).filter((e) =>
+        e.kind === "notice" && (e.data as { source?: string }).source === "image_description"
+      ).length,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("意识流：Eve明确选择original时才将真实原图交给主模型，文本不重复base64", async () => {
+  const payload =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aMRsAAAAASUVORK5CYII=";
+  const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+  const sha256 = Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+    (n) => n.toString(16).padStart(2, "0"),
+  ).join("");
+  const f = await fixture((_body, index) =>
+    Response.json(
+      index === 1
+        ? script(
+          'await tools.phone.image({handle:{conversationId:"qq:user:user-a",seq:1},index:1,mode:"original"}); return "我选了看原图";',
+        )
+        : completion(),
+    )
+  );
+  const source = {
+    kind: "phone_attachment" as const,
+    conversationId: "qq:user:user-a",
+    sourceSeq: 1,
+    attachmentId: "qq:user:user-a:1:0",
+    senderPlatformUserId: "user-a",
+  };
+  let reads = 0;
+  f.phone.image = () => {
+    reads++;
+    return Promise.resolve({
+      image: {
+        dataUrl: `data:image/png;base64,${payload}`,
+        provenance: { ...source, sha256, mimeType: "image/png" as const },
+      },
+      download: {
+        path: "/fixture/image.png",
+        sizeBytes: bytes.length,
+        sha256,
+        mimeType: "image/png",
+        source,
+      },
+    });
+  };
+  try {
+    await f.pulse();
+    await f.pulse();
+    await f.pulse();
+    assert.equal(reads, 1);
+    assert.equal(f.messages.length, 2);
+    const messages = f.messages[1].messages as unknown as {
+      role: string;
+      content: string | { type: string; text?: string; image_url?: { url: string } }[];
+    }[];
+    const imageMessage = messages.find((m) =>
+      Array.isArray(m.content) && m.content.some((p) => p.type === "image_url")
+    );
+    assert.ok(imageMessage);
+    assert.equal(imageMessage.role, "user");
+    const parts = imageMessage.content as {
+      type: string;
+      text?: string;
+      image_url?: { url: string };
+    }[];
+    assert.equal(
+      parts.find((p) => p.type === "image_url")?.image_url?.url,
+      `data:image/png;base64,${payload}`,
+    );
+    assert.equal(
+      parts.filter((p) => p.type === "text").some((p) => p.text?.includes(payload)),
+      false,
+    );
+    assert.ok(JSON.stringify(parts).includes("Eve明确选择"));
+    await f.restart();
+    await f.pulse();
+    assert.equal(reads, 1);
+    assert.equal(f.messages.length, 2);
+  } finally {
+    await f.close();
   }
 });

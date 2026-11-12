@@ -5,6 +5,9 @@ import { QqReceiver, type QqReceiverStatus } from "./receiver.ts";
 import { startPhoneRpc } from "./rpc.ts";
 import { QqTimeline } from "./timeline.ts";
 import { QqPhoneReading } from "./reading.ts";
+import { QqPhoneDevice } from "./device.ts";
+import { QqPhoneDownloads } from "./downloads.ts";
+import { ensurePhoneActivationBoundary } from "./activation.ts";
 import type { OwnershipFence } from "../../sdk/ownership-fence.ts";
 import { fingerprint } from "../../kernel/calls.ts";
 import { phoneReceipt } from "./phone.ts";
@@ -17,11 +20,14 @@ export async function startQqPhoneAdapter(
   key: string,
   onStatus?: (status: QqReceiverStatus) => void,
   fence?: OwnershipFence,
+  options: { captureActivationBoundary?: boolean } = {},
 ) {
   const controller = new AbortController();
   const actions = new QqSendActions(client, `${directory}/outbox`);
   const timeline = new QqTimeline(`${directory}/timeline`);
   const reading = new QqPhoneReading(`${directory}/phone-reading`);
+  const device = new QqPhoneDevice(`${directory}/phone-device`);
+  const downloads = new QqPhoneDownloads(`${directory}/downloads`);
   const receiver = new QqReceiver(client, directory);
   let rpc: ReturnType<typeof startPhoneRpc> | undefined;
   let failure: unknown;
@@ -35,6 +41,9 @@ export async function startQqPhoneAdapter(
     await actions.initialize();
     await timeline.initialize();
     await reading.initialize();
+    await device.initialize();
+    await downloads.initialize();
+    client.useDownloadedAttachmentReader((path) => downloads.readBytes(path));
     // 只有原发送账本的真实记录可补结算；无证据的 admitted 读取仍保持待核对。
     await fence?.reconcile(async (permit) => {
       const saved = actions.status(permit.actionId);
@@ -61,15 +70,26 @@ export async function startQqPhoneAdapter(
         throw new Error("QQ 接收器未就绪就停止");
       }),
     ]);
-    rpc = startPhoneRpc(
-      new QqPhone(() => receiver.messages(), actions, timeline, {
+    const phone = new QqPhone(
+      () => receiver.messages(),
+      actions,
+      timeline,
+      {
         id: self.id,
         displayName: self.username ?? "",
-      }, reading),
+      },
+      reading,
+      Date.now,
+      device,
+      downloads,
+    );
+    if (options.captureActivationBoundary) await ensurePhoneActivationBoundary(phone, directory);
+    rpc = startPhoneRpc(
+      phone,
       key,
       () => ({
         available: failure === undefined && !controller.signal.aborted && actions.available &&
-          timeline.available && reading.available,
+          timeline.available && reading.available && device.available && downloads.available,
         gateway: status,
         replyScope: "private",
       }),
@@ -93,6 +113,8 @@ export async function startQqPhoneAdapter(
               () => actions.close(),
               () => timeline.close(),
               () => reading.close(),
+              () => device.close(),
+              () => downloads.close(),
             ]
           ) {
             try {
@@ -116,6 +138,8 @@ export async function startQqPhoneAdapter(
     await actions.close().catch(() => {});
     await timeline.close().catch(() => {});
     await reading.close().catch(() => {});
+    await device.close().catch(() => {});
+    await downloads.close().catch(() => {});
     throw error;
   }
 }

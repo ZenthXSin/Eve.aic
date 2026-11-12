@@ -18,13 +18,18 @@ export async function composePhonePlugin(directory: string, configPath: string):
         name: "phone",
         version: "1.0.0",
         provides: { phone: "1.0.0" },
+        ...(config.describeImages
+          ? { requires: { model: "^1.0.0" } }
+          : { optional: { model: "^1.0.0" } }),
         permissions: {
-          net: [new URL(config.adapterUrl).host],
+          net: [config.connectionFile ? "127.0.0.1" : new URL(config.adapterUrl).host],
           read: [
             configPath,
             config.adapterKeyFile,
+            ...(config.connectionFile ? [config.connectionFile] : []),
             ...(config.ownershipProofFile ? [config.ownershipProofFile] : []),
             new URL("../plugins/phone/", import.meta.url).pathname,
+            new URL("../kernel/calls.ts", import.meta.url).pathname,
           ],
         },
       },

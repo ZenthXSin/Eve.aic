@@ -122,7 +122,11 @@ export class QqTimeline {
         }
         return this.#entries.map((entry) => {
           const source = byKey.get(entry.key)!;
-          return { message: { ...source.message, seq: entry.seq }, notify: source.notify };
+          return {
+            key: entry.key,
+            message: { ...source.message, seq: entry.seq },
+            notify: source.notify,
+          };
         });
       } catch (error) {
         this.#failed = true;

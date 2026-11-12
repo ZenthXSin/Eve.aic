@@ -3,11 +3,15 @@ import type { MindEvent } from "../../contracts/mind.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
+import { imageTextView } from "../../sdk/image-text.ts";
 import { ConsciousJournal } from "./journal.ts";
+import { RemoteJournal } from "./remote-journal.ts";
 import {
   accountingDay,
+  activeEvents,
   blocks,
   budget,
+  type ContextCounter,
   contextEstimate,
   mechanicalCompression,
   type PendingTool,
@@ -16,6 +20,7 @@ import {
 } from "./view.ts";
 
 export interface EveConfig {
+  startupTimeoutMs?: number;
   directory: string;
   promptFile: string;
   sourceCommit: string;
@@ -25,9 +30,10 @@ export interface EveConfig {
   defaultSleepMs: number;
   dailyTokenBudget: number;
   timeZone?: string;
+  remoteRecords?: boolean;
 }
 export class EveRuntime {
-  readonly journal: ConsciousJournal;
+  readonly journal: ConsciousJournal | RemoteJournal;
   #prompt = "";
   #running = false;
   #closing = false;
@@ -36,6 +42,8 @@ export class EveRuntime {
   #wake = 0;
   #phoneThrough = 0;
   #scriptThrough = 0;
+  #commandThrough = 0;
+  #imageActions = new Set<string>();
   #mindThrough = 0;
   #failures = 0;
   #retryAt = 0;
@@ -43,20 +51,42 @@ export class EveRuntime {
   #restApplied = false;
   #phoneFresh = false;
   #alarmFresh = false;
+  #commandFresh = false;
   #contextBlocked = false;
   #fatal = false;
-  constructor(readonly ctx: PluginContext, readonly config: EveConfig) {
-    this.journal = new ConsciousJournal(config.directory);
+  #sharedBudget?: {
+    dailyTokenBudget: number;
+    timeZone: string;
+    paused: boolean;
+    day: string;
+    knownNoncachedTokens: number;
+    unknownReservedTokens: number;
+    safetyTotal: number;
+    safeRemaining: number;
+  };
+  constructor(
+    readonly ctx: PluginContext,
+    readonly config: EveConfig,
+    readonly contextCounter?: ContextCounter,
+  ) {
+    this.journal = config.remoteRecords
+      ? new RemoteJournal(ctx, config.directory)
+      : new ConsciousJournal(config.directory);
   }
   async initialize() {
     this.#prompt = await Deno.readTextFile(this.config.promptFile);
     if (!this.#prompt.trim()) throw new KernelError("rejected", "需要稳定身份与真实能力说明");
     await this.journal.initialize();
-    for (const event of this.journal.events) {
+    for (const event of activeEvents(this.journal.events)) {
       const data = event.data as Record<string, Json>;
       if (event.kind === "notice") {
+        if (
+          ["image", "image_description"].includes(String(data.source)) &&
+          typeof data.actionId === "string"
+        ) this.#imageActions.add(data.actionId);
         if (data.source === "phone") this.#phoneThrough = Number(data.throughSeq);
         if (data.source === "scripts") this.#scriptThrough = Number(data.throughSeq);
+        if (data.source === "commands") this.#commandThrough = Number(data.throughSeq);
         if ((Array.isArray(data.items) && data.items.length) || data.source === "reminder") {
           this.#wake = 0;
         }
@@ -79,16 +109,27 @@ export class EveRuntime {
         if ((data.response as unknown as ModelResponse).toolCalls.length) this.#wake = 0;
       }
     }
-    const responded = new Set(
-      this.journal.events.filter((e) =>
-        e.kind === "model_response" || e.kind === "model_failure" || e.kind === "recovery"
-      ).map((e) => (e.data as { requestId: string }).requestId),
-    );
-    for (const event of [...this.journal.events]) {
+    const responded = new Set<string>();
+    for (const event of activeEvents(this.journal.events)) {
+      if (["model_response", "model_failure", "recovery"].includes(event.kind)) {
+        responded.add((event.data as { requestId: string }).requestId);
+      }
+    }
+    for (const event of activeEvents(this.journal.events)) {
       if (
         event.kind === "model_start" &&
         !responded.has((event.data as { requestId: string }).requestId)
       ) {
+        if (this.config.remoteRecords) {
+          try {
+            const requestId = (event.data as { requestId: string }).requestId;
+            const response = await this.ctx.call("model", "result", { requestId });
+            await this.journal.append("model_response", { requestId, response, adopted: true });
+            continue;
+          } catch (error) {
+            if (!(error instanceof KernelError && error.kind === "not_found")) throw error;
+          }
+        }
         await this.journal.append("recovery", {
           requestId: (event.data as { requestId: string }).requestId,
           result: "模型请求在宿主中断时未确认；费用与结果未知，未重放任何工具动作",
@@ -102,7 +143,7 @@ export class EveRuntime {
         reason: "新基座首次启动，没有导入旧聊天记忆",
       });
     }
-    if (this.#failures) this.#wake = 0;
+    if (this.#failures || pendingTools(this.journal.events).length) this.#wake = 0;
   }
   start() {
     if (this.#closing) throw new KernelError("unavailable", "意识流已停止");
@@ -150,10 +191,34 @@ export class EveRuntime {
       this.#schedule(this.config.pollMs);
     }
   }
+  async #refreshBudget() {
+    if (this.config.remoteRecords) {
+      const shared = await this.ctx.call("model", "budget", {}) as unknown as {
+        dailyTokenBudget: number;
+        timeZone: string;
+        paused: boolean;
+        day: string;
+        knownNoncachedTokens: number;
+        unknownReservedTokens: number;
+        safetyTotal: number;
+        safeRemaining: number;
+      };
+      const changed = canonical((this.#sharedBudget ?? null) as unknown as Json) !==
+        canonical(shared as unknown as Json);
+      this.#sharedBudget = shared;
+      this.config.dailyTokenBudget = shared.dailyTokenBudget;
+      this.config.timeZone = shared.timeZone;
+      if (changed) {
+        await this.ctx.call("mind", "update", { dailyBudget: shared.dailyTokenBudget, ...shared });
+      }
+    }
+  }
   async #notices(): Promise<boolean> {
+    await this.#refreshBudget();
     this.#restApplied = false;
     this.#phoneFresh = false;
     this.#alarmFresh = false;
+    this.#commandFresh = false;
     let fresh = false;
     const phone = await this.ctx.call<Json>("phone", "notifications", {
       afterSeq: this.#phoneThrough,
@@ -179,7 +244,7 @@ export class EveRuntime {
     const completion = tasks as unknown as { items: Json[]; throughSeq: number };
     if (completion.throughSeq > this.#scriptThrough) {
       const observed = new Map<string, string>();
-      for (const event of this.journal.events) {
+      for (const event of activeEvents(this.journal.events)) {
         if (event.kind === "tool_result") {
           const output = (event.data as { result?: { output?: string } }).result?.output;
           if (typeof output !== "string") continue;
@@ -191,6 +256,10 @@ export class EveRuntime {
             ) observed.set(summary.jobId, summary.status);
           } catch { /* 非脚本结果原样保留 */ }
         }
+      }
+      for (const item of completion.items) {
+        const job = (item as { job?: { jobId?: string } }).job;
+        if (job?.jobId) await this.#observations(job.jobId);
       }
       const newItems = completion.items.filter((item) => {
         const job = (item as { job?: { jobId?: string; status?: string } }).job;
@@ -208,12 +277,30 @@ export class EveRuntime {
         this.#wake = 0;
       }
     }
+    if (this.config.remoteRecords) {
+      const completed = await this.ctx.call("commands", "completions", {
+        afterSeq: this.#commandThrough,
+      }) as unknown as { items: Json[]; throughSeq: number };
+      if (completed.throughSeq > this.#commandThrough) {
+        await this.journal.append("notice", {
+          source: "commands",
+          throughSeq: completed.throughSeq,
+          items: completed.items,
+        });
+        this.#commandThrough = completed.throughSeq;
+        if (completed.items.length) {
+          fresh = true;
+          this.#commandFresh = true;
+          this.#wake = 0;
+        }
+      }
+    }
     const controls = await this.ctx.call<Json>("mind", "poll", { afterSeq: this.#mindThrough });
     const events = controls as unknown as { items: MindEvent[]; throughSeq: number };
     for (const event of events.items) {
       let wakeAt: number | undefined;
       let outcome: Json = { status: "applied" };
-      if (event.kind === "alarm") {
+      if (["alarm", "condition_error", "condition_recovered"].includes(event.kind)) {
         await this.journal.append("notice", {
           source: "reminder",
           event: event as unknown as Json,
@@ -271,6 +358,44 @@ export class EveRuntime {
     }
     return fresh;
   }
+  async #observations(jobId: string) {
+    const known = this.#imageActions;
+    const callId = this.journal.events.find((event) => {
+      if (event.kind !== "tool_result") return false;
+      try {
+        return JSON.parse((event.data as { result: { output: string } }).result.output).jobId ===
+          jobId;
+      } catch {
+        return false;
+      }
+    })?.data as { callId?: string } | undefined;
+    for (const method of ["observations", "images"]) {
+      let afterSeq = 0;
+      do {
+        const page = await this.ctx.call("scripts", method, { jobId, afterSeq }) as unknown as {
+          items: { actionId: string; observation?: Json; image?: Json }[];
+          throughSeq: number;
+          hasMore: boolean;
+        };
+        for (const item of page.items) {
+          if (!known.has(item.actionId)) {
+            await this.journal.append("notice", {
+              source: method === "images" ? "image" : "image_description",
+              selectedMode: method === "images" ? "original" : "describe",
+              jobId,
+              ...(callId?.callId ? { callId: callId.callId } : {}),
+              ...item,
+            });
+            known.add(item.actionId);
+          }
+        }
+        if (!page.hasMore) break;
+        if (page.throughSeq <= afterSeq) throw new KernelError("corrupt", "图像回执游标未推进");
+        afterSeq = page.throughSeq;
+      } while (true);
+    }
+  }
+
   async #tool(pending: PendingTool) {
     const call = pending.call;
     if (!pending.started) {
@@ -288,6 +413,7 @@ export class EveRuntime {
         const summary = await this.ctx.call<Json>("scripts", "status", { jobId });
         result = { status: "completed", output: JSON.stringify(summary), adopted: true };
         await this.journal.append("tool_result", { callId: call.id, result });
+        await this.#observations(jobId);
         return;
       } catch (error) {
         if (!(error instanceof KernelError && error.kind === "not_found")) throw error;
@@ -309,6 +435,9 @@ export class EveRuntime {
       if (wire.kind === "storage") throw error;
     }
     await this.journal.append("tool_result", { callId: call.id, result });
+    if (call.name === "execute_script") {
+      await this.#observations(await fingerprint(["script-job-v1", call.id]));
+    }
   }
   async #step() {
     if (this.#closing || !this.journal.available) return;
@@ -322,7 +451,7 @@ export class EveRuntime {
       return;
     }
     const fresh = await this.#notices();
-    if (this.#restApplied && !this.#phoneFresh && !this.#alarmFresh) return;
+    if (this.#restApplied && !this.#phoneFresh && !this.#alarmFresh && !this.#commandFresh) return;
     if (fresh) {
       this.#wake = 0;
       await this.journal.append("wake", { reason: "新的未观察通知" });
@@ -331,13 +460,51 @@ export class EveRuntime {
     if (Date.now() < this.#retryAt) return;
     if (!fresh && Date.now() < this.#wake) return;
     const tools = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
+    if (this.config.remoteRecords) {
+      if (this.#sharedBudget?.paused) return;
+      const query = JSON.stringify(
+        activeEvents(this.journal.events).slice(-4).map((e) => imageTextView(e.data)),
+      ).slice(-16000);
+      const anchor = activeEvents(this.journal.events).findLast((e) =>
+        e.kind === "model_response" || e.kind === "tool_result" ||
+        e.kind === "notice" && (e.data as { source?: string }).source !== "memory"
+      )?.seq ?? 0;
+      const lastRecall = activeEvents(this.journal.events).findLast((e) =>
+        e.kind === "notice" && (e.data as { source?: string }).source === "memory"
+      );
+      if (query && (lastRecall?.data as { anchor?: number } | undefined)?.anchor !== anchor) {
+        let recalled: { items: Json[] };
+        try {
+          recalled = await this.ctx.call("memory", "recall", {
+            query,
+            limit: 3,
+            _actionId: `recall_${anchor}`,
+          }) as {
+            items: Json[];
+          };
+        } catch (error) {
+          if (
+            !(error instanceof KernelError && ["unavailable", "not_found"].includes(error.kind))
+          ) {
+            throw error;
+          }
+          recalled = { items: [] };
+        }
+        await this.journal.append("notice", { source: "memory", anchor, items: recalled.items });
+      }
+    }
     let messages = render(this.journal.events, this.#prompt);
-    const compression = mechanicalCompression(this.journal.events, this.#prompt, tools);
+    const compression = mechanicalCompression(
+      this.journal.events,
+      this.#prompt,
+      tools,
+      this.contextCounter,
+    );
     if (compression) {
       await this.journal.append("compression", { ...compression, source: "system" });
       messages = render(this.journal.events, this.#prompt);
     }
-    const estimated = contextEstimate(messages, tools);
+    const estimated = contextEstimate(messages, tools, this.contextCounter);
     this.#contextBlocked = estimated >= 500_000;
     if (this.#contextBlocked) {
       if (this.journal.events.at(-1)?.kind !== "context_wait") {
@@ -348,12 +515,15 @@ export class EveRuntime {
       }
       return;
     }
-    const day = accountingDay(this.config.timeZone);
-    const usage = budget(this.journal.events, day);
+    const day = this.#sharedBudget?.day ?? accountingDay(this.config.timeZone);
+    const usage = this.#sharedBudget ?? budget(this.journal.events, day);
     let reservation = new TextEncoder().encode(JSON.stringify({ messages, tools })).length +
       messages.length * 32 + this.config.maxOutputTokens;
     const state = {
       at: new Date().toISOString(),
+      paused: false,
+      contextCounting: this.contextCounter?.description ??
+        "字符与图像估算，未验证为当前模型精确分词",
       sourceCommit: this.config.sourceCommit,
       contextEstimatedTokens: estimated,
       contextReminder: estimated >= 275_000 ? "已达到275k提醒线，是否整理由你决定" : null,
@@ -377,28 +547,39 @@ export class EveRuntime {
     }
     // 感知追加一次，避免时间/用量改动稳定身份。没有固定QQ开场或自动消息。
     const band = Math.floor(estimated / 25_000);
-    const last = this.journal.events.filter((event) => event.kind === "perception").at(-1);
+    const last = activeEvents(this.journal.events).filter((event) => event.kind === "perception")
+      .at(-1);
     if (
       !last || (last.data as { contextBand: number }).contextBand !== band ||
-      (last.data as { day: string }).day !== day
+      (last.data as { day: string }).day !== day ||
+      (last.data as { remainingBand: number }).remainingBand !==
+        Math.floor(state.safeRemaining / 10_000_000) ||
+      (last.data as { dailyBudget?: number }).dailyBudget !== this.config.dailyTokenBudget
     ) {
       await this.journal.append("perception", {
         contextBand: band,
         day,
         sourceCommit: this.config.sourceCommit,
         remainingBand: Math.floor(state.safeRemaining / 10_000_000),
+        dailyBudget: this.config.dailyTokenBudget,
+        counting: this.contextCounter?.description ?? "字符与图像估算，未验证为当前模型精确分词",
         reminder: state.contextReminder,
       });
       messages = render(this.journal.events, this.#prompt);
     }
     // 感知本身也属于请求；不能在刚低于触线时追加后直接发出超线请求。
-    if (contextEstimate(messages, tools) >= 500_000) {
-      const finalCompression = mechanicalCompression(this.journal.events, this.#prompt, tools);
+    if (contextEstimate(messages, tools, this.contextCounter) >= 500_000) {
+      const finalCompression = mechanicalCompression(
+        this.journal.events,
+        this.#prompt,
+        tools,
+        this.contextCounter,
+      );
       if (finalCompression) {
         await this.journal.append("compression", { ...finalCompression, source: "system" });
         messages = render(this.journal.events, this.#prompt);
       }
-      if (contextEstimate(messages, tools) >= 500_000) {
+      if (contextEstimate(messages, tools, this.contextCounter) >= 500_000) {
         this.#contextBlocked = true;
         await this.journal.append("context_wait", { reason: "最终完整请求仍超出估算触线" });
         return;
@@ -415,7 +596,7 @@ export class EveRuntime {
       requestId,
       day,
       reservation,
-      estimatedTokens: contextEstimate(messages, tools),
+      estimatedTokens: contextEstimate(messages, tools, this.contextCounter),
       sourceCommit: this.config.sourceCommit,
     });
     let response: ModelResponse;
@@ -423,7 +604,11 @@ export class EveRuntime {
       response = await this.ctx.call<Json>(
         "model",
         "complete",
-        { messages, tools } as unknown as Json,
+        {
+          messages,
+          tools,
+          ...(this.config.remoteRecords ? { _actionId: requestId } : {}),
+        } as unknown as Json,
         { timeoutMs: this.config.modelTimeoutMs },
       ) as unknown as ModelResponse;
       if (!response || typeof response.content !== "string" || !Array.isArray(response.toolCalls)) {
@@ -455,6 +640,7 @@ export class EveRuntime {
       requestId,
       response: response as unknown as Json,
     });
+    await this.#refreshBudget();
     this.#failures = 0;
     this.#retryAt = 0;
     if (response.toolCalls.length === 0) {
@@ -474,9 +660,11 @@ export class EveRuntime {
       records: this.journal.events.length,
       phoneThroughSeq: this.#phoneThrough,
       scriptThroughSeq: this.#scriptThrough,
+      commandThroughSeq: this.#commandThrough,
       mindThroughSeq: this.#mindThrough,
       wakeAt: this.#wake,
-      budget: budget(this.journal.events, accountingDay(this.config.timeZone)),
+      budget: this.#sharedBudget ??
+        budget(this.journal.events, accountingDay(this.config.timeZone)),
       lastError: this.#lastError ?? null,
       contextBlocked: this.#contextBlocked,
     };

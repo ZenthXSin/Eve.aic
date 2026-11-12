@@ -1,5 +1,12 @@
 // Chat Completions 传输。配置与凭据捕获一次，单一稳定会话，不设置 temperature。
-import type { ModelRequest, ModelResponse, ToolCall } from "../../contracts/model.ts";
+import {
+  MODEL_IMAGE_MAX_BYTES,
+  MODEL_IMAGE_MAX_COUNT,
+  type ModelImage,
+  type ModelRequest,
+  type ModelResponse,
+  type ToolCall,
+} from "../../contracts/model.ts";
 
 export interface ChatModelOptions {
   baseUrl: string;
@@ -35,7 +42,54 @@ function fail(category: ChatModelError["category"]): never {
   throw new ChatModelError(category);
 }
 
-function requestBody(request: ModelRequest, config: ChatModelOptions): Record<string, unknown> {
+function imageBytes(value: unknown): { image: ModelImage; bytes: Uint8Array<ArrayBuffer> } {
+  if (!record(value) || typeof value.dataUrl !== "string" || !record(value.provenance)) {
+    fail("request");
+  }
+  const p = value.provenance;
+  if (
+    p.kind !== "phone_attachment" || typeof p.conversationId !== "string" ||
+    !p.conversationId || p.conversationId.length > 512 ||
+    !Number.isSafeInteger(p.sourceSeq) || (p.sourceSeq as number) < 1 ||
+    typeof p.attachmentId !== "string" || !p.attachmentId || p.attachmentId.length > 1024 ||
+    typeof p.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(p.sha256) ||
+    (p.senderPlatformUserId !== undefined &&
+      (typeof p.senderPlatformUserId !== "string" || !p.senderPlatformUserId ||
+        p.senderPlatformUserId.length > 512))
+  ) fail("request");
+  // 仅接受内嵌附件；禁止上游代取任意 URL，并在解码前限制长度。
+  const maxEncoded = Math.ceil(MODEL_IMAGE_MAX_BYTES / 3) * 4;
+  if (value.dataUrl.length > maxEncoded + 64) fail("request");
+  const match = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]*={0,2})$/.exec(
+    value.dataUrl,
+  );
+  if (!match || match[1] !== p.mimeType || !match[2] || match[2].length % 4 !== 0) {
+    fail("request");
+  }
+  let raw: string;
+  try {
+    raw = atob(match[2]);
+  } catch {
+    fail("request");
+  }
+  if (raw.length > MODEL_IMAGE_MAX_BYTES || btoa(raw) !== match[2]) fail("request");
+  const bytes = Uint8Array.from(raw, (character) => character.charCodeAt(0));
+  const starts = (...prefix: number[]) => prefix.every((byte, index) => bytes[index] === byte);
+  const signature = match[1] === "image/png"
+    ? starts(137, 80, 78, 71, 13, 10, 26, 10)
+    : match[1] === "image/jpeg"
+    ? starts(255, 216, 255)
+    : match[1] === "image/gif"
+    ? raw.startsWith("GIF87a") || raw.startsWith("GIF89a")
+    : raw.startsWith("RIFF") && raw.slice(8, 12) === "WEBP";
+  if (!signature) fail("request");
+  return { image: value as unknown as ModelImage, bytes };
+}
+
+async function requestBody(
+  request: ModelRequest,
+  config: ChatModelOptions,
+): Promise<Record<string, unknown>> {
   if (!record(request) || !Array.isArray(request.messages) || !Array.isArray(request.tools)) {
     fail("request");
   }
@@ -54,11 +108,27 @@ function requestBody(request: ModelRequest, config: ChatModelOptions): Record<st
   });
   const pending = new Set<string>();
   const seenIds = new Set<string>();
+  let imageCount = 0;
+  let imageSize = 0;
+  const imageChecks: { sha256: string; bytes: Uint8Array<ArrayBuffer> }[] = [];
   const messages = request.messages.map((message) => {
     if (
       !record(message) || !["system", "user", "assistant", "tool"].includes(message.role) ||
       typeof message.content !== "string"
     ) fail("request");
+    let imageContent: Record<string, unknown>[] | undefined;
+    if (message.images !== undefined) {
+      if (message.role !== "user" || !Array.isArray(message.images)) fail("request");
+      imageCount += message.images.length;
+      if (imageCount > MODEL_IMAGE_MAX_COUNT) fail("request");
+      imageContent = message.images.map((value) => {
+        const { image, bytes } = imageBytes(value);
+        imageSize += bytes.length;
+        if (imageSize > MODEL_IMAGE_MAX_BYTES) fail("request");
+        imageChecks.push({ sha256: image.provenance.sha256, bytes });
+        return { type: "image_url", image_url: { url: image.dataUrl, detail: "auto" } };
+      });
+    }
     if (message.role === "tool") {
       if (typeof message.toolCallId !== "string" || !pending.delete(message.toolCallId)) {
         fail("request");
@@ -85,11 +155,22 @@ function requestBody(request: ModelRequest, config: ChatModelOptions): Record<st
     });
     return {
       role: message.role,
-      content: wireCalls.length > 0 && message.content === "" ? null : message.content,
+      content: imageContent?.length
+        ? [{ type: "text", text: message.content }, ...imageContent]
+        : wireCalls.length > 0 && message.content === ""
+        ? null
+        : message.content,
       ...(wireCalls.length > 0 ? { tool_calls: wireCalls } : {}),
     };
   });
   if (messages.length === 0 || pending.size > 0) fail("request");
+  await Promise.all(imageChecks.map(async ({ sha256, bytes }) => {
+    const hash = await crypto.subtle.digest("SHA-256", bytes);
+    const digest = Array.from(new Uint8Array(hash), (n) => n.toString(16).padStart(2, "0")).join(
+      "",
+    );
+    if (digest !== sha256) fail("request");
+  }));
   return {
     model: config.model,
     messages,
@@ -226,7 +307,7 @@ export class ChatModelClient {
     let body: string;
     try {
       snapshot = structuredClone(request);
-      body = JSON.stringify(requestBody(snapshot, this.#config));
+      body = JSON.stringify(await requestBody(snapshot, this.#config));
     } catch (error) {
       if (error instanceof ChatModelError) throw error;
       fail("request");

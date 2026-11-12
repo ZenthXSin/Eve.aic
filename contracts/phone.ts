@@ -117,10 +117,51 @@ export interface PhoneSend {
   wakeup?: boolean;
 }
 
+export interface PhoneConversationSettings {
+  muted: boolean;
+  pinned: boolean;
+  /** 仅存在本机，不自动发送。空串表示没有草稿。 */
+  draft: string;
+}
+export interface PhoneDownload {
+  path: string;
+  sizeBytes: number;
+  sha256: string;
+  mimeType: string;
+  source: {
+    kind: "phone_attachment";
+    conversationId: string;
+    sourceSeq: number;
+    attachmentId: string;
+    senderPlatformUserId: string;
+  };
+}
+export interface PhoneSendFile {
+  actionId: string;
+  conversationId: string;
+  path: string;
+  kind: "image" | "file";
+  text?: string;
+  replyTo?: { seq: number; sequence: number };
+}
+
+/** 两种看图方式由 Eve 明确选择；默认描述，任何失败都不自动切换。 */
+export type PhoneImage = {
+  selectedMode: "describe";
+  description: string;
+  provenance: import("./model.ts").ModelImage["provenance"];
+  download: PhoneDownload;
+} | {
+  selectedMode: "original";
+  image: import("./model.ts").ModelImage;
+  provenance: import("./model.ts").ModelImage["provenance"];
+  download: PhoneDownload;
+};
+
 /** 脚本可用的手机接口。只有 open 更新本机会话通知水位，历史/搜索只浏览。 */
 export interface PhoneApi {
   conversations(args?: {
-    cursor?: { snapshotThroughSeq: number; beforeLastSeq: number };
+    cursor?: { snapshotThroughSeq: number; beforeLastSeq: number; beforePinned?: boolean };
   }): Promise<{
     items: {
       conversationId: string;
@@ -128,9 +169,10 @@ export interface PhoneApi {
       latest: MessageScreen;
       pendingNotifications: number;
       reading: PhoneReadingState | null;
+      settings: { muted: boolean; pinned: boolean; hasDraft: boolean };
     }[];
     snapshotThroughSeq: number;
-    older?: { snapshotThroughSeq: number; beforeLastSeq: number };
+    older?: { snapshotThroughSeq: number; beforeLastSeq: number; beforePinned?: boolean };
   }>;
   /** 打开最新一屏，先持久保存本会话通知水位；上方未展示内容不算实际读过。 */
   open(args: { conversationId: string }): Promise<OpenedConversation>;
@@ -156,4 +198,36 @@ export interface PhoneApi {
   }>;
   send(args: PhoneSend): Promise<PhoneActionReceipt>;
   action(args: { actionId: string }): Promise<PhoneActionReceipt | null>;
+  /** 只改变明确提供的字段；省略所有字段时只读取。本机设置随重启保留。 */
+  settings(args: {
+    conversationId: string;
+    muted?: boolean;
+    pinned?: boolean;
+    draft?: string;
+  }): Promise<PhoneConversationSettings>;
+  /** 显式点开才下载，返回原始来源与校验值；不会自动读入上下文。 */
+  download(args: {
+    handle: { conversationId: string; seq: number };
+    /** 使用屏幕显示的附件index，从1开始。 */
+    index: number;
+  }): Promise<PhoneDownload>;
+  /** 默认由相同模型客观描述；mode:original 明确选择直接看原图。两路费用均计入共享预算。 */
+  image(args: {
+    handle: { conversationId: string; seq: number };
+    /** 使用屏幕显示的附件index，从1开始。 */
+    index: number;
+    mode?: "describe" | "original";
+  }): Promise<PhoneImage>;
+  sendFile(args: PhoneSendFile): Promise<PhoneActionReceipt>;
+  /** 手机内的附件分页读取，无需把下载目录开放给普通工作空间。 */
+  file(args: {
+    handle: { conversationId: string; seq: number };
+    /** 使用屏幕显示的附件index，从1开始。 */
+    index: number;
+    offsetBytes?: number;
+    limitBytes?: number;
+    encoding?: "utf8" | "base64";
+  }): Promise<
+    { download: PhoneDownload; offsetBytes: number; text: string; nextOffsetBytes?: number }
+  >;
 }

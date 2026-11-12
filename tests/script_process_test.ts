@@ -99,9 +99,14 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
       });await kernel.register(${
         JSON.stringify(directory + "/scripts-plugin")
       });await kernel.start();\n` +
-      `await kernel.call("scripts","start",${
-        JSON.stringify(request)
-      });await new Promise(()=>{});\n`,
+      `const job=await kernel.call("scripts","start",${JSON.stringify(request)});
+      for(;;){const receipts=await kernel.call("scripts","receipts",{jobId:job.jobId});
+      if(receipts.items.length===2 && receipts.items[1].status==="started"){
+      const firstResult=await kernel.call("scripts","receipt",{jobId:job.jobId,seq:1,section:"result",limit:8192});
+      await Deno.writeTextFile(${
+        JSON.stringify(directory + "/before-kill.json")
+      },JSON.stringify({job,receipts,firstResult}));break;}
+      await new Promise(done=>setTimeout(done,5));}await new Promise(()=>{});\n`,
   );
   let child: Deno.ChildProcess | undefined;
   let stderr: Promise<string> | undefined;
@@ -128,9 +133,21 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
         throw new Error(`脚本进程提前退出${status.code}: ${await stderr}`);
       }),
     ]);
-    const path = `${directory}/scripts/ledger/index.json`;
-    const original = JSON.parse(await Deno.readTextFile(path));
-    const job = original.jobs[0];
+    let original: {
+      job: ScriptSummary;
+      receipts: { items: { status: string; actionId: string }[] };
+      firstResult: Json;
+    } | undefined;
+    await wait(async () => {
+      try {
+        original = JSON.parse(await Deno.readTextFile(`${directory}/before-kill.json`));
+        return true;
+      } catch (error) {
+        if (error instanceof Deno.errors.NotFound || error instanceof SyntaxError) return false;
+        throw error;
+      }
+    });
+    const job = { jobId: original!.job.jobId, actions: original!.receipts.items };
     assert.equal(job.actions[0].status, "completed");
     assert.equal(job.actions[1].status, "started");
     child.kill("SIGKILL");
@@ -152,10 +169,23 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
     });
     assert.equal(restored.status, "unknown");
     assert.equal(restored.actions, 2);
-    const after = JSON.parse(await Deno.readTextFile(path));
-    assert.deepEqual(after.jobs[0].actions[0], job.actions[0]);
-    assert.equal(after.jobs[0].actions[1].status, "unknown");
-    assert.equal(after.jobs[0].actions[1].actionId, job.actions[1].actionId);
+    const after = await kernel.call<{ items: { status: string; actionId: string }[] }>(
+      "scripts",
+      "receipts",
+      { jobId: job.jobId },
+    );
+    assert.deepEqual(after.items[0], job.actions[0]);
+    assert.deepEqual(
+      await kernel.call("scripts", "receipt", {
+        jobId: job.jobId,
+        seq: 1,
+        section: "result",
+        limit: 8192,
+      }),
+      original!.firstResult,
+    );
+    assert.equal(after.items[1].status, "unknown");
+    assert.equal(after.items[1].actionId, job.actions[1].actionId);
     assert.equal(
       (await kernel.call<ScriptSummary & Json>("scripts", "start", request)).status,
       "unknown",

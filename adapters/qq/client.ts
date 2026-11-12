@@ -1,5 +1,6 @@
 // 独立适配器的 QQ HTTP 传输。不依赖内核或插件，不承担身份映射、通知和行为判断。
 // 返回平台事实；持久动作记录、入站日志和所有权交接由适配器服务另行接入。
+import { Buffer } from "node:buffer";
 
 export interface QqCredentials {
   appId: string;
@@ -7,6 +8,8 @@ export interface QqCredentials {
 }
 
 export interface QqClientOptions {
+  /** 生产必须由组合层注入低权限文件读取器；缺省拒绝本机路径上传。 */
+  attachmentReader?: (path: string) => Promise<Uint8Array>;
   /** 正式环境使用官方 HTTPS 地址；HTTP 只允许本机测试地址。 */
   baseUrl?: string;
   timeoutMs?: number;
@@ -50,6 +53,8 @@ export interface QqSendText {
   /** 引用展示用的 ref_idx，不是被动回复用的 msg_id。 */
   referenceIndex?: string;
   wakeup?: boolean;
+  /** 先上传平台取得 file_info，再提交媒体消息。任何阶段都不擅自重试。 */
+  attachment?: { path: string; kind: "image" | "file" };
 }
 
 /** 鉴权动作只把凭据写入适配器自己的连接，不返回 token 给外部调用方。 */
@@ -163,9 +168,18 @@ function textBody(request: QqSendText): Record<string, unknown> {
   if (
     !object(request) || !object(request.destination) ||
     !["user", "group"].includes(request.destination.kind) ||
-    !nonempty(request.destination.openId) || !nonempty(request.text)
+    !nonempty(request.destination.openId) || typeof request.text !== "string" ||
+    (!nonempty(request.text) && request.attachment === undefined)
   ) requestError();
   const body: Record<string, unknown> = { content: request.text, msg_type: 0 };
+  if (request.attachment !== undefined) {
+    if (
+      !object(request.attachment) || typeof request.attachment.path !== "string" ||
+      !request.attachment.path.startsWith("/") || request.attachment.path.includes("\0") ||
+      !["image", "file"].includes(request.attachment.kind)
+    ) requestError();
+    body.msg_type = 7;
+  }
   if (request.reply !== undefined) {
     if (!object(request.reply)) requestError();
     const reply: Record<string, unknown> = request.reply;
@@ -191,7 +205,9 @@ function textBody(request: QqSendText): Record<string, unknown> {
   if (request.wakeup !== undefined) {
     if (typeof request.wakeup !== "boolean") requestError();
     if (request.wakeup) {
-      if (request.reply || request.destination.kind !== "user") requestError();
+      if (request.reply || request.destination.kind !== "user" || request.attachment) {
+        requestError();
+      }
       body.is_wakeup = true;
     }
   }
@@ -213,6 +229,8 @@ export class QqClient {
   #refresh?: Promise<string>;
   #scope: "all" | "private";
   #closed = new AbortController();
+  #attachmentReader?: (path: string) => Promise<Uint8Array>;
+  #downloadedReader?: (path: string) => Promise<Uint8Array | undefined>;
 
   constructor(credentials: QqCredentials, options: QqClientOptions = {}) {
     if (!nonempty(credentials.appId) || !nonempty(credentials.appSecret)) requestError();
@@ -236,6 +254,12 @@ export class QqClient {
     this.#limit = limit;
     this.#now = options.now ?? Date.now;
     this.#scope = options.sendScope ?? "all";
+    this.#attachmentReader = options.attachmentReader;
+  }
+
+  /** 独立手机存储只允许自己的完整下载回执原件，不允许任意root路径。 */
+  useDownloadedAttachmentReader(reader: (path: string) => Promise<Uint8Array | undefined>) {
+    this.#downloadedReader = reader;
   }
 
   async #request(path: string, init: RequestInit): Promise<ResponseInfo> {
@@ -399,8 +423,65 @@ export class QqClient {
       return { status: "failed", attempted: false, error: (error as QqRequestError).info };
     }
     let response: ResponseInfo;
+    const resource = request.destination.kind === "user" ? "users" : "groups";
+    if (request.attachment) {
+      let bytes: Uint8Array;
+      try {
+        const downloaded = await this.#downloadedReader?.(request.attachment.path);
+        if (downloaded) bytes = downloaded;
+        else if (this.#attachmentReader) {
+          bytes = await this.#attachmentReader(request.attachment.path);
+        } else requestError();
+      } catch {
+        return { status: "failed", attempted: false, error: { category: "request" } };
+      }
+      let upload: ResponseInfo;
+      try {
+        upload = await this.#request(
+          `/v2/${resource}/${encodeURIComponent(request.destination.openId)}/files`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `QQBot ${token}`,
+              "Content-Type": "application/json; charset=utf-8",
+            },
+            body: JSON.stringify({
+              file_type: request.attachment.kind === "image" ? 1 : 4,
+              file_data: Buffer.from(bytes).toString("base64"),
+              srv_send_msg: false,
+            }),
+          },
+        );
+      } catch (error) {
+        return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
+      }
+      let code: number | undefined;
+      try {
+        code = codeOf(upload.data);
+      } catch (error) {
+        return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
+      }
+      if (upload.httpStatus !== 200 || (code !== undefined && code !== 0)) {
+        return {
+          status: upload.httpStatus >= 500 ? "unknown" : "failed",
+          attempted: true,
+          error: errorInfo(upload, code),
+        };
+      }
+      if (!nonempty(upload.data.file_info)) {
+        return {
+          status: "unknown",
+          attempted: true,
+          error: {
+            category: "invalid_response",
+            httpStatus: upload.httpStatus,
+            traceId: upload.traceId,
+          },
+        };
+      }
+      body.media = { file_info: upload.data.file_info };
+    }
     try {
-      const resource = request.destination.kind === "user" ? "users" : "groups";
       response = await this.#request(
         `/v2/${resource}/${encodeURIComponent(request.destination.openId)}/messages`,
         {

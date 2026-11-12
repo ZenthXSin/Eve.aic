@@ -132,13 +132,14 @@ Deno.test("脚本：一个原生工具经类型接口发送，每个动作当场
     assert.equal(job.scriptStarted, true);
     assert.equal(job.actions, 2);
     assert.equal(f.count(), 2);
-    const stored = JSON.parse(await Deno.readTextFile(`${f.directory}/scripts/ledger/index.json`));
-    assert.equal(stored.jobs[0].actions.length, 2);
-    assert.equal(
-      stored.jobs[0].actions.every((a: { status: string }) => a.status === "completed"),
-      true,
+    const stored = await f.kernel().call<{ items: { status: string; actionId: string }[] }>(
+      "scripts",
+      "receipts",
+      { jobId: job.jobId },
     );
-    const ids = stored.jobs[0].actions.map((a: { actionId: string }) => a.actionId);
+    assert.equal(stored.items.length, 2);
+    assert.equal(stored.items.every((a) => a.status === "completed"), true);
+    const ids = stored.items.map((a) => a.actionId);
     assert.equal(new Set(ids).size, 2);
     assert.equal(ids.every((id: string) => f.actions.status(id)?.status === "finished"), true);
     const result = await f.kernel().call<{ text: string }>("scripts", "result", {
@@ -435,10 +436,13 @@ Deno.test("脚本：取消等待中的真实动作保留未知，迟到回执存
     const job = await f.kernel().call<ScriptSummary & Json>("scripts", "start", request);
     await entered.promise;
     assert.equal(f.count(), 1);
-    const disk = JSON.parse(await Deno.readTextFile(`${f.directory}/scripts/ledger/index.json`))
-      .jobs[0];
-    assert.equal(disk.actions[0].status, "started");
-    const actionId = disk.actions[0].actionId;
+    const pending = await f.kernel().call<{ items: { status: string; actionId: string }[] }>(
+      "scripts",
+      "receipts",
+      { jobId: job.jobId },
+    );
+    assert.equal(pending.items[0].status, "started");
+    const actionId = pending.items[0].actionId;
     const cancelled = await f.kernel().call<ScriptSummary & Json>("scripts", "cancel", {
       jobId: job.jobId,
     });

@@ -31,6 +31,9 @@ export async function composeEvePlugin(directory: string, configPath: string): P
           scripts: "^1.0.0",
           phone: "^1.0.0",
           mind: "^1.0.0",
+          ...(config.remoteRecords
+            ? { timeline: "^1.0.0", memory: "^1.0.0", commands: "^1.0.0" }
+            : {}),
         },
         permissions: {
           read: [
@@ -42,7 +45,7 @@ export async function composeEvePlugin(directory: string, configPath: string): P
           ],
           write: [config.directory],
         },
-        deadlines: { enableMs: 15000, disableMs: 10000 },
+        deadlines: { enableMs: config.startupTimeoutMs ?? 300_000, disableMs: 10000 },
       },
       null,
       2,
@@ -67,6 +70,7 @@ export async function composeMindPlugin(directory: string, dataDirectory: string
         name: "mind-controls",
         version: "1.0.0",
         provides: { mind: "1.0.0" },
+        optional: { files: "^1.0.0", commands: "^1.0.0", notes: "^1.0.0", records: "^1.0.0" },
         permissions: {
           read: [
             dataDirectory,
