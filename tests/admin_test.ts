@@ -469,6 +469,7 @@ Deno.test("admin status fills budget from the actual supervisor envelope", async
           addEventListener() {},
           replaceChildren() {},
           close() {},
+          setAttribute() {},
         });
       }
       return elements.get(id)!;
@@ -494,4 +495,70 @@ Deno.test("admin status fills budget from the actual supervisor envelope", async
   const refresh = new Function("document", "fetch", `${script}\nreturn status;`)(document, fetch);
   await refresh();
   assert.equal(document.getElementById("budget").value, "123456789");
+});
+
+Deno.test("admin charts exclude unknown cache usage and distinguish the average target", () => {
+  const script = panelHtml("chart").match(/<script nonce="chart">([\s\S]*?)<\/script>/)![1];
+  const elements = new Map<string, ReturnType<typeof element>>();
+  function element() {
+    return {
+      textContent: "",
+      hidden: false,
+      open: false,
+      value: "",
+      dataset: {},
+      children: [] as unknown[],
+      append(...children: unknown[]) {
+        this.children.push(...children);
+      },
+      replaceChildren(...children: unknown[]) {
+        this.children = children;
+      },
+      setAttribute() {},
+      addEventListener() {},
+      close() {},
+    };
+  }
+  const document = {
+    getElementById(id: string) {
+      if (!elements.has(id)) elements.set(id, element());
+      return elements.get(id)!;
+    },
+    createElement: element,
+    createElementNS: element,
+    querySelectorAll: () => [],
+  };
+  const fetch = () =>
+    Promise.resolve({
+      status: 401,
+      json: () => Promise.resolve({ ok: false, error: { message: "请先登录" } }),
+    });
+  const paint = new Function("document", "fetch", `${script}\nreturn paintUsage;`)(document, fetch);
+  paint(
+    [
+      {
+        at: "2026-11-12T00:00:00Z",
+        id: "model_1",
+        usage: { inputTokens: 100000, cachedInputTokens: 90000 },
+      },
+      { at: "2026-11-12T00:01:00Z", id: "model_2", usage: { inputTokens: 200000 } },
+      {
+        at: "2026-11-12T00:02:00Z",
+        id: "model_3",
+        usage: { inputTokens: 300000, cachedInputTokens: 400000 },
+      },
+    ],
+    4,
+    80,
+  );
+  assert.equal(document.getElementById("inputAverage").textContent, "200,000");
+  assert.equal(document.getElementById("cacheHit").textContent, "90.0%");
+  assert.match(document.getElementById("usageInsight").textContent, /高于 150k 目标 50,000/);
+  assert.match(document.getElementById("usageInsight").textContent, /覆盖 1\/3/);
+  assert.match(document.getElementById("usageRange").textContent, /1 次响应未提供可用用量/);
+  assert.equal(document.getElementById("usageTable").children.length, 3);
+  paint([], 0, 80);
+  assert.equal(document.getElementById("inputAverage").textContent, "—");
+  assert.equal(document.getElementById("cacheHit").textContent, "未报告");
+  assert.equal(document.getElementById("usageChart").hidden, true);
 });
