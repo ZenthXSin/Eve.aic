@@ -118,6 +118,9 @@ Deno.test("脚本：一个原生工具经类型接口发送，每个动作当场
       name: "execute_script",
       args: {
         mode: "sync",
+        // This checks action reuse, not execution timing. Include cold type checking
+        // and worker startup in the isolated, unprivileged validation environment.
+        timeoutMs: 10_000,
         code:
           'const results = await Promise.all([tools.phone.send({conversationId:"qq:user:friend",text:"一个意思"}),tools.phone.send({conversationId:"qq:user:friend",text:"另一个意思"})]); return results;',
       },
