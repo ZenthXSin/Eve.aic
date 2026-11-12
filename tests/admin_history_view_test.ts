@@ -33,7 +33,7 @@ function fixture(storage = new Storage(), now = Date.now()) {
     "localStorage",
     "Date",
     historyScript + `
-    return {init:initBrowserHistory,merge:mergeBrowserHistory,clear:clearBrowserHistory,info:browserHistoryInfo};
+    return {init:initBrowserHistory,merge:mergeBrowserHistory,clear:clearBrowserHistory,info:browserHistoryInfo,load:loadBrowserHistoryPage,hasMore:browserHistoryHasMore};
   `,
   )(storage, Clock);
   return {
@@ -77,7 +77,12 @@ Deno.test("browser history restores authenticated previews and labels retained e
   first.history.merge(snapshot(1));
   const second = fixture(first.storage);
   assert.equal(second.history.init(scope).restored, true);
-  const fresh = snapshot(2), merged = second.history.merge(fresh);
+  const fresh = snapshot(2), initial = second.history.merge(fresh);
+  assert.deepEqual(initial.events.map((e: { seq: number }) => e.seq), [2]);
+  assert.equal(initial.workspace.operations.length, 1);
+  assert.equal(second.history.hasMore(), true);
+  second.history.load();
+  const merged = second.history.merge(fresh);
   assert.deepEqual(merged.events.map((e: { seq: number }) => e.seq), [1, 2]);
   assert.equal(merged.events[0].retained, true);
   assert.equal(merged.events[1].retained, undefined);
@@ -111,6 +116,8 @@ Deno.test("browser history resets reused journal identities but tolerates mutabl
   history.merge(snapshot(2));
   const amended = snapshot(2);
   Object.assign(amended.events[0], { thoughtWrite: true });
+  assert.equal(history.merge(amended).browserHistory.events, 2);
+  history.load();
   assert.equal(history.merge(amended).events.length, 2);
   const different = snapshot(2);
   different.events[0].at = "different-log-time";
@@ -144,8 +151,9 @@ Deno.test("browser history is bounded by entry count, TTL and storage bytes and 
     }),
   );
   const merged = history.merge(value);
-  assert.ok(merged.events.length <= 500);
-  assert.ok(merged.workspace.operations.length <= 200);
+  assert.ok(merged.browserHistory.events <= 500);
+  assert.ok(merged.browserHistory.operations <= 200);
+  assert.equal(merged.events.length, value.events.length);
   const serialized = [...storage.values.values()][0];
   assert.ok(serialized.length * 2 <= 2 * 1024 * 1024);
   assert.doesNotMatch(serialized, /sensitive|imageData|data:image/);
@@ -191,4 +199,53 @@ Deno.test("browser history writes changed previews once and skips unchanged live
   assert.match([...storage.values.values()][0], /completed|新结果/);
   restored.history.merge(updated);
   assert.equal(storage.writes, 2);
+});
+
+Deno.test("browser history presents older activities and tools only when explicitly paged", () => {
+  const { history, storage } = fixture();
+  history.init(scope);
+  const old = snapshot(100);
+  old.events = Array.from({ length: 100 }, (_, i) => ({
+    seq: i + 1,
+    at: "time-" + i,
+    kind: "model_response",
+    text: "记录 " + i,
+  }));
+  old.workspace.operations = Array.from({ length: 100 }, (_, i) => ({
+    id: "older-" + i,
+    namespace: "files",
+    method: "read",
+    appId: "files",
+    at: String(i),
+    result: { text: "工具 " + i },
+  }));
+  history.merge(old);
+  const reloaded = fixture(storage);
+  reloaded.history.init(scope);
+  const latest = snapshot(101);
+  let rendered = reloaded.history.merge(latest);
+  assert.equal(rendered.events.length, 1);
+  assert.equal(rendered.workspace.apps.tools.items.length, 1);
+  assert.equal(rendered.browserHistory.hiddenEvents, 100);
+  assert.equal(rendered.browserHistory.hiddenOperations, 100);
+  const writes = storage.writes;
+  reloaded.history.load();
+  rendered = reloaded.history.merge(latest);
+  assert.equal(rendered.events.length, 41);
+  assert.equal(rendered.events[0].seq, 61);
+  assert.equal(rendered.events.at(-1).seq, 101);
+  assert.equal(rendered.workspace.apps.tools.items.length, 33);
+  assert.equal(rendered.browserHistory.hiddenEvents, 60);
+  assert.equal(rendered.browserHistory.hiddenOperations, 68);
+  assert.equal(storage.writes, writes);
+  reloaded.history.load();
+  reloaded.history.load();
+  reloaded.history.load();
+  rendered = reloaded.history.merge(latest);
+  assert.equal(rendered.events.length, 101);
+  assert.equal(rendered.workspace.apps.tools.items.length, 101);
+  assert.equal(reloaded.history.hasMore(), false);
+  const refreshed = fixture(storage);
+  refreshed.history.init(scope);
+  assert.equal(refreshed.history.merge(latest).events.length, 1);
 });
