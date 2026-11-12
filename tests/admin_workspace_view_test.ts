@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { Json } from "../kernel/protocol.ts";
 import { TOOL_CATALOG } from "../services/admin/tool-catalog.ts";
 import { workspaceScript, workspaceSocketScript } from "../services/admin/workspace-view.ts";
 
@@ -36,7 +37,17 @@ class Element {
     return [];
   }
 }
-function viewFixture(api: (path: string, body: any) => Promise<any> = async () => ({})) {
+type HistoryQuery = {
+  resource: "qqHistory";
+  operation: "page";
+  args: {
+    conversationId: string;
+    cursor?: { snapshotThroughSeq: number; beforeSeq: number };
+  };
+};
+function viewFixture(
+  api: (path: string, body: HistoryQuery) => Promise<Json> = () => Promise.resolve({}),
+) {
   const elements = new Map<string, Element>();
   const el = (id: string) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -298,12 +309,12 @@ Deno.test("workspace websocket applies snapshots, preserves errors, reconnects a
   assert.equal(socket.url.href, "wss://eve.example.com/api/live/ws");
   socket.readyState = 1;
   socket.onopen!();
-  assert.equal(transport.stalled(),false);
+  assert.equal(transport.stalled(), false);
   transport.age();
-  assert.equal(transport.stalled(),true);
+  assert.equal(transport.stalled(), true);
   socket.onmessage!({ data: JSON.stringify({ type: "snapshot", value: { throughSeq: 4 } }) });
   assert.equal(applied, 1);
-  assert.equal(transport.stalled(),false);
+  assert.equal(transport.stalled(), false);
   socket.onmessage!({ data: JSON.stringify({ type: "error", error: { message: "不可读" } }) });
   assert.equal(failed, 1);
   socket.onclose!({ code: 1011 });
@@ -360,18 +371,65 @@ Deno.test("every catalog method and unknown future tool has a readable parameter
 
 Deno.test("tools use readable cards for known APIs and preserve non-object inputs", () => {
   const { renderer, el } = viewFixture();
-  const visibleText = (element: Element): string => element.tag === "details" ? "" : element.ownText + element.children.map(visibleText).join("");
-  const paint = (namespace: string, method: string, args: unknown, result: unknown, status = "completed") => {
-    renderer.paint({ events: [], workspace: { asOf: at, currentApp: { appId: "tools", operation: namespace + "." + method }, apps: { tools: { available: true, items: [{ id: namespace + method, namespace, method, args, result, status, at }] } } } });
+  const visibleText = (element: Element): string =>
+    element.tag === "details" ? "" : element.ownText + element.children.map(visibleText).join("");
+  const paint = (
+    namespace: string,
+    method: string,
+    args: unknown,
+    result: unknown,
+    status = "completed",
+  ) => {
+    renderer.paint({
+      events: [],
+      workspace: {
+        asOf: at,
+        currentApp: { appId: "tools", operation: namespace + "." + method },
+        apps: {
+          tools: {
+            available: true,
+            items: [{ id: namespace + method, namespace, method, args, result, status, at }],
+          },
+        },
+      },
+    });
     return visibleText(el("workspaceApp"));
   };
-  assert.match(paint("files", "read", { path: "/eve.txt" }, { text: "实际文件正文", sizeBytes: 23 }), /文件阅读.*实际文件正文/);
-  assert.match(paint("commands", "completions", {}, { items: [{ sessionId: "cmd-9", state: "completed", exitCode: 7 }], throughSeq: 8 }), /终端完成记录.*cmd-9.*退出码 7/);
-  assert.match(paint("notes", "get", {}, { note: { alias: "daily", revision: 2 }, text: "便签真实正文" }), /@daily.*版本 2.*便签真实正文/);
+  assert.match(
+    paint("files", "read", { path: "/eve.txt" }, { text: "实际文件正文", sizeBytes: 23 }),
+    /文件阅读.*实际文件正文/,
+  );
+  assert.match(
+    paint("commands", "completions", {}, {
+      items: [{ sessionId: "cmd-9", state: "completed", exitCode: 7 }],
+      throughSeq: 8,
+    }),
+    /终端完成记录.*cmd-9.*退出码 7/,
+  );
+  assert.match(
+    paint("notes", "get", {}, { note: { alias: "daily", revision: 2 }, text: "便签真实正文" }),
+    /@daily.*版本 2.*便签真实正文/,
+  );
   assert.match(paint("memory", "used", {}, { reinforced: ["m-1"] }), /记忆强化回执.*m-1/);
-  assert.match(paint("phone", "settings", {}, { muted: true, pinned: false, draft: "尚未发出的草稿" }), /已静音.*未置顶.*尚未发送.*尚未发出的草稿/);
-  assert.match(paint("phone", "send", { text: "请求正文" }, { actionId: "a-1", state: "unknown" }), /拟发送内容.*请求正文.*结果未知/);
-  assert.match(paint("phone", "listSendQueue", {}, { items: [{ sequence: 1, actionId: "a-2", receipt: { actionId: "a-2", state: "blocked", blockedBy: "a-1" }, canCancel: true }] }), /等待队列.*等待前序.*a-1.*是否可取消/);
+  assert.match(
+    paint("phone", "settings", {}, { muted: true, pinned: false, draft: "尚未发出的草稿" }),
+    /已静音.*未置顶.*尚未发送.*尚未发出的草稿/,
+  );
+  assert.match(
+    paint("phone", "send", { text: "请求正文" }, { actionId: "a-1", state: "unknown" }),
+    /拟发送内容.*请求正文.*结果未知/,
+  );
+  assert.match(
+    paint("phone", "listSendQueue", {}, {
+      items: [{
+        sequence: 1,
+        actionId: "a-2",
+        receipt: { actionId: "a-2", state: "blocked", blockedBy: "a-1" },
+        canCancel: true,
+      }],
+    }),
+    /等待队列.*等待前序.*a-1.*是否可取消/,
+  );
   assert.match(
     paint("phone", "history", {}, {
       messages: [{
@@ -384,74 +442,176 @@ Deno.test("tools use readable cards for known APIs and preserve non-object input
     }),
     /附件.txt.*已保存 · Eve 可使用.*\/tmp\/附件.txt/,
   );
-  assert.match(paint("phone", "image", {}, { selectedMode: "describe", description: "返回的图片描述", download: { path: "/image.png" } }), /描述模式.*返回的图片描述.*下载路径/);
-  const original = paint("phone", "image", {}, { selectedMode: "original", image: { dataUrl: "data:image/png;base64,秘密原图" } });
+  assert.match(
+    paint("phone", "image", {}, {
+      selectedMode: "describe",
+      description: "返回的图片描述",
+      download: { path: "/image.png" },
+    }),
+    /描述模式.*返回的图片描述.*下载路径/,
+  );
+  const original = paint("phone", "image", {}, {
+    selectedMode: "original",
+    image: { dataUrl: "data:image/png;base64,秘密原图" },
+  });
   assert.match(original, /原图模式.*仅展示附件元数据/);
   assert(!original.includes("秘密原图"));
-  assert.match(paint("phone", "file", { offsetBytes: 64 }, { text: "附件实际片段", offsetBytes: 64, nextOffsetBytes: 96 }), /附件实际片段.*字节偏移 64.*后续字节位置 96/);
-  assert.match(paint("mind", "remind", { text: "提醒正文", at }, { requestId: "r-1", queued: true }), /提醒申请.*提醒正文.*已排队.*不表示请求已经应用/);
+  assert.match(
+    paint("phone", "file", { offsetBytes: 64 }, {
+      text: "附件实际片段",
+      offsetBytes: 64,
+      nextOffsetBytes: 96,
+    }),
+    /附件实际片段.*字节偏移 64.*后续字节位置 96/,
+  );
+  assert.match(
+    paint("mind", "remind", { text: "提醒正文", at }, { requestId: "r-1", queued: true }),
+    /提醒申请.*提醒正文.*已排队.*不表示请求已经应用/,
+  );
   assert.match(paint("mind", "status", {}, [{ at, text: "实际提醒项目" }]), /实际提醒项目/);
-  assert.match(paint("upgrades", "status", {}, { state: "submitted", outcome: "rolled_back", phase: "candidate", reason: "真实回退原因" }), /已提交.*真实回退原因.*当前阶段.*candidate.*最终结果.*rolled_back/);
-  assert.match(paint("scripts", "status", {}, { jobId: "j-1", status: "running", actions: 4 }), /脚本任务.*进行中.*j-1.*实际动作数4/);
-  assert.match(paint("scripts", "result", {}, { text: '{"answer":"实际脚本输出"}', truncated: false }), /answer实际脚本输出/);
-  assert.match(paint("scripts", "result", {}, { text: '{"jobId":"business-job","status":"custom","answer":"真实用户结果"}', truncated: false }), /真实用户结果/);
-  assert.match(paint("records", "page", {}, { items: [{ seq: 99, kind: "model_response", digest: "实际摘要" }] }), /意识记录目录.*记录 #99.*实际摘要/);
-  assert.match(paint("records", "text", { startChar: 20 }, { text: "原文片段", nextChar: 40 }), /实际返回的记录原文.*原文片段.*字符偏移 20.*后续位置 40/);
+  assert.match(
+    paint("upgrades", "status", {}, {
+      state: "submitted",
+      outcome: "rolled_back",
+      phase: "candidate",
+      reason: "真实回退原因",
+    }),
+    /已提交.*真实回退原因.*当前阶段.*candidate.*最终结果.*rolled_back/,
+  );
+  assert.match(
+    paint("scripts", "status", {}, { jobId: "j-1", status: "running", actions: 4 }),
+    /脚本任务.*进行中.*j-1.*实际动作数4/,
+  );
+  assert.match(
+    paint("scripts", "result", {}, { text: '{"answer":"实际脚本输出"}', truncated: false }),
+    /answer实际脚本输出/,
+  );
+  assert.match(
+    paint("scripts", "result", {}, {
+      text: '{"jobId":"business-job","status":"custom","answer":"真实用户结果"}',
+      truncated: false,
+    }),
+    /真实用户结果/,
+  );
+  assert.match(
+    paint("records", "page", {}, {
+      items: [{ seq: 99, kind: "model_response", digest: "实际摘要" }],
+    }),
+    /意识记录目录.*记录 #99.*实际摘要/,
+  );
+  assert.match(
+    paint("records", "text", { startChar: 20 }, { text: "原文片段", nextChar: 40 }),
+    /实际返回的记录原文.*原文片段.*字符偏移 20.*后续位置 40/,
+  );
   paint("native", "execute_script", "非法原始参数", false);
   assert(el("workspaceApp").textContent.includes("非法原始参数"));
   assert.match(paint("future", "method", ["原始数组"], 0), /原始数组.*实际回执0/);
-  assert.match(paint("phone", "futureMethod", { query: "未来参数" }, { answer: "未来方法回执" }), /未来参数.*未来方法回执/);
-  assert.match(paint("native", "write_thought", {}, undefined, "failed"), /随记动作.*失败.*未取得有效随记正文/);
+  assert.match(
+    paint("phone", "futureMethod", { query: "未来参数" }, { answer: "未来方法回执" }),
+    /未来参数.*未来方法回执/,
+  );
+  assert.match(
+    paint("native", "write_thought", {}, undefined, "failed"),
+    /随记动作.*失败.*未取得有效随记正文/,
+  );
   const pending = paint("future", "method", "原始字符串", undefined, "started");
   assert.match(pending, /调用尚待结果/);
 });
 
 Deno.test("manual QQ refreshes even Eve's active conversation and retains good messages on failure", async () => {
-  let text="新的来信",fail=false,calls=0;
-  const {renderer,el}=viewFixture(async (_path,body)=>{
+  let text = "新的来信", fail = false, calls = 0;
+  const { renderer, el } = viewFixture((_path, body) => {
     calls++;
-    assert.equal(body.resource,"qqHistory");
-    assert.deepEqual(body.args,{conversationId:"qq:group:one"});
-    if(fail)throw new Error("临时断线");
-    return {messages:[{handle:{seq:1},body:{text},direction:"incoming"}]};
+    assert.equal(body.resource, "qqHistory");
+    assert.deepEqual(body.args, { conversationId: "qq:group:one" });
+    if (fail) return Promise.reject(new Error("临时断线"));
+    return Promise.resolve({
+      messages: [{ handle: { seq: 1 }, body: { text }, direction: "incoming" }],
+    });
   });
-  renderer.paint({events:[],workspace:{asOf:at,currentApp:{appId:"qq"},apps:{qq:{available:true,activeConversationId:"qq:group:one",conversations:[{conversationId:"qq:group:one"}],messages:[{body:{text:"旧屏幕"}}]}}}});
+  renderer.paint({
+    events: [],
+    workspace: {
+      asOf: at,
+      currentApp: { appId: "qq" },
+      apps: {
+        qq: {
+          available: true,
+          activeConversationId: "qq:group:one",
+          conversations: [{ conversationId: "qq:group:one" }],
+          messages: [{ body: { text: "旧屏幕" } }],
+        },
+      },
+    },
+  });
   await renderer.load("qq:group:one");
-  assert.equal(calls,1);
-  assert.match(el("workspaceApp").textContent,/新的来信/);
-  assert.doesNotMatch(el("workspaceApp").textContent,/旧屏幕/);
-  text="同一水位下的新状态";
+  assert.equal(calls, 1);
+  assert.match(el("workspaceApp").textContent, /新的来信/);
+  assert.doesNotMatch(el("workspaceApp").textContent, /旧屏幕/);
+  text = "同一水位下的新状态";
   await renderer.refresh();
-  assert.match(el("workspaceApp").textContent,/同一水位下的新状态/);
-  fail=true;
+  assert.match(el("workspaceApp").textContent, /同一水位下的新状态/);
+  fail = true;
   await renderer.refresh();
-  assert.match(el("workspaceApp").textContent,/同一水位下的新状态.*临时断线/);
+  assert.match(el("workspaceApp").textContent, /同一水位下的新状态.*临时断线/);
 });
-Deno.test("late QQ request after logout cannot restore private content",async()=>{
-  let finish!:(value:any)=>void;
-  const {renderer,el}=viewFixture(()=>new Promise(resolve=>{finish=resolve;}));
-  renderer.paint({events:[],workspace:{apps:{qq:{available:true,conversations:[],messages:[]}}}});
-  const pending=renderer.load("qq:group:one");
+Deno.test("late QQ request after logout cannot restore private content", async () => {
+  let finish!: (value: Json) => void;
+  const { renderer, el } = viewFixture(() =>
+    new Promise((resolve) => {
+      finish = resolve;
+    })
+  );
+  renderer.paint({
+    events: [],
+    workspace: { apps: { qq: { available: true, conversations: [], messages: [] } } },
+  });
+  const pending = renderer.load("qq:group:one");
   renderer.logout();
-  finish({messages:[{body:{text:"过期的私密正文"}}]});
+  finish({ messages: [{ body: { text: "过期的私密正文" } }] });
   await pending;
-  assert.equal(el("workspaceApp").textContent,"");
+  assert.equal(el("workspaceApp").textContent, "");
 });
 
-Deno.test("QQ older pages retain the requested older content at the bounded limit and can return latest",async()=>{
-  const make=(start:number,end:number)=>Array.from({length:end-start+1},(_,i)=>({handle:{seq:start+i},body:{text:'消息['+(start+i)+']'},direction:'incoming'}));
-  const {renderer,el}=viewFixture(async(_path,body)=>{
-    const before=body.args.cursor?.beforeSeq??441;
-    return {messages:make(Math.max(1,before-40),before-1),...(before>41?{older:{snapshotThroughSeq:440,beforeSeq:before-40}}:{})};
+Deno.test("QQ older pages retain the requested older content at the bounded limit and can return latest", async () => {
+  const make = (start: number, end: number) =>
+    Array.from(
+      { length: end - start + 1 },
+      (_, i) => ({
+        handle: { seq: start + i },
+        body: { text: "消息[" + (start + i) + "]" },
+        direction: "incoming",
+      }),
+    );
+  const { renderer, el } = viewFixture((_path, body) => {
+    const before = body.args.cursor?.beforeSeq ?? 441;
+    return Promise.resolve({
+      messages: make(Math.max(1, before - 40), before - 1),
+      ...(before > 41 ? { older: { snapshotThroughSeq: 440, beforeSeq: before - 40 } } : {}),
+    });
   });
-  renderer.paint({events:[],workspace:{apps:{qq:{available:true,activeConversationId:'qq:group:one',conversations:[],messages:[]}}}});
-  await renderer.load('qq:group:one');
-  for(let before=401;before>=41;before-=40)await renderer.older('qq:group:one',{snapshotThroughSeq:440,beforeSeq:before});
-  assert.match(el('workspaceApp').textContent,/消息\[1\]/);
-  assert.match(el('workspaceApp').textContent,/正在回看历史/);
+  renderer.paint({
+    events: [],
+    workspace: {
+      apps: {
+        qq: {
+          available: true,
+          activeConversationId: "qq:group:one",
+          conversations: [],
+          messages: [],
+        },
+      },
+    },
+  });
+  await renderer.load("qq:group:one");
+  for (let before = 401; before >= 41; before -= 40) {
+    await renderer.older("qq:group:one", { snapshotThroughSeq: 440, beforeSeq: before });
+  }
+  assert.match(el("workspaceApp").textContent, /消息\[1\]/);
+  assert.match(el("workspaceApp").textContent, /正在回看历史/);
   await renderer.refresh();
-  assert.match(el('workspaceApp').textContent,/消息\[1\]/);
-  await renderer.load('qq:group:one');
-  assert.match(el('workspaceApp').textContent,/消息\[440\]/);
-  assert.doesNotMatch(el('workspaceApp').textContent,/消息\[1\]/);
+  assert.match(el("workspaceApp").textContent, /消息\[1\]/);
+  await renderer.load("qq:group:one");
+  assert.match(el("workspaceApp").textContent, /消息\[440\]/);
+  assert.doesNotMatch(el("workspaceApp").textContent, /消息\[1\]/);
 });

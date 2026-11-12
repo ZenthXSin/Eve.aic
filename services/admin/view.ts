@@ -1,5 +1,10 @@
 import { historyScript } from "./history-view.ts";
-import { workspaceCss, workspaceMarkup, workspaceScript, workspaceSocketScript } from "./workspace-view.ts";
+import {
+  workspaceCss,
+  workspaceMarkup,
+  workspaceScript,
+  workspaceSocketScript,
+} from "./workspace-view.ts";
 
 /** 所有业务内容均以文本节点显示；不将记录作为 HTML 执行。 */
 export function panelHtml(nonce: string) {
