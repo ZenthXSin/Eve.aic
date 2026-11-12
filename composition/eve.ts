@@ -5,7 +5,8 @@ import { nightlySchedule, type NightlySelfCheck } from "../plugins/mind-controls
 export async function writeEvePrompt(path: string): Promise<void> {
   const identity = await Deno.readTextFile(new URL("../prompts/identity.md", import.meta.url));
   const qq = await Deno.readTextFile(new URL("../prompts/qq-social.md", import.meta.url));
-  const prompt = `${identity}\n\n${qq}\n\n${await renderScriptContracts()}`;
+  const mechanics = await Deno.readTextFile(new URL("../prompts/qq-mechanics.md", import.meta.url));
+  const prompt = `${identity}\n\n${qq}\n\n${mechanics}\n\n${await renderScriptContracts()}`;
   await Deno.writeTextFile(path, prompt, { mode: 0o600 });
 }
 export async function composeEvePlugin(directory: string, configPath: string): Promise<void> {
