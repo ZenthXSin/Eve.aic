@@ -63,7 +63,12 @@ async function fixture(response: ModelResponse) {
       if (address === "tools.list") result = [SCRIPT_TOOL];
       else if (address === "model.complete") {
         const request = args as { tools: { name: string }[] };
-        assert.deepEqual(request.tools.map((t) => t.name), ["execute_script", "write_thought"]);
+        assert.deepEqual(request.tools.map((t) => t.name), [
+          "execute_script",
+          "write_thought",
+          "inspect_context",
+          "compress_context",
+        ]);
         result = ++modelCalls === 1 ? response : { content: "先休息。", toolCalls: [] };
       } else if (address === "tools.execute") {
         dispatched.push(args as unknown as ToolCall);
