@@ -60,6 +60,22 @@ export function phoneReceipt(status: SendStatus): PhoneActionReceipt {
   if (status.status === "unknown") {
     return { actionId: status.actionId, state: "unknown", reason: "interrupted", ...attempts };
   }
+  if (status.status === "cancelled") {
+    const result = status.originalResult;
+    return {
+      actionId: status.actionId,
+      state: "cancelled",
+      ...attempts,
+      resolution: {
+        kind: status.resolution.kind,
+        actor: status.resolution.actor,
+        at: status.resolution.resolvedAt,
+      },
+      ...(result && result.status !== "sent"
+        ? { attempted: result.attempted, error: result.error }
+        : {}),
+    };
+  }
   const result = status.result;
   return result.status === "sent"
     ? { actionId: status.actionId, state: "sent", platformMessageId: result.messageId, ...attempts }
@@ -412,6 +428,29 @@ export class QqPhone {
   action(args: { actionId: string }) {
     const result = this.actions.status(args.actionId);
     return result ? phoneReceipt(result) : null;
+  }
+  async listSendQueue(
+    args: { conversationId?: string; afterSequence?: number; limit?: number } = {},
+  ) {
+    if (
+      Object.keys(args).some((key) => !["conversationId", "afterSequence", "limit"].includes(key))
+    ) throw new QqPhoneError("request");
+    const page = await this.actions.listSendQueue(args);
+    return {
+      ...page,
+      items: page.items.map(({ status, ...item }) => ({ ...item, receipt: phoneReceipt(status) })),
+    };
+  }
+  async cancelSend(
+    args: import("./actions.ts").SendCancellation,
+    options: { beforeAttempt?: () => Promise<void> } = {},
+  ) {
+    const result = await this.actions.cancelSend(args, {
+      actor: "eve",
+      checkpoint: options.beforeAttempt,
+    });
+    await this.#snapshot();
+    return phoneReceipt(result);
   }
 
   async settings(

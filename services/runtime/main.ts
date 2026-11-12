@@ -7,6 +7,8 @@ import { RuntimeEngine } from "./engine.ts";
 import { LocalSemantic } from "./embedding.ts";
 import { startRuntimeRpc } from "./rpc.ts";
 import { startRuntimeAdmin } from "./admin.ts";
+import { ModelSelection } from "./model-selection.ts";
+import { startRuntimeModelControl, validateModelControlConfig } from "./model-control.ts";
 
 export async function runRuntimeService(configPath: string) {
   const config = JSON.parse(await Deno.readTextFile(configPath));
@@ -34,10 +36,15 @@ export async function runRuntimeService(configPath: string) {
   }
   if (c.commandUseSystemd !== true) throw new Error("生产命令出口必须启用逐命令进程组监督");
   const model = await readPrivateModelConfig(configPath);
-  const client = new ChatModelClient({
+  const modelOptions = {
     ...model,
     apiKey: (await Deno.readTextFile(model.apiKeyFile)).trim(),
-  });
+  };
+  const client = new ChatModelClient(modelOptions);
+  const selection = c.modelControl
+    ? new ModelSelection(`${c.directory}/model-selection`, modelOptions)
+    : undefined;
+  if (c.modelControl) validateModelControlConfig(c.modelControl);
   const semantic = c.semantic
     ? new LocalSemantic(c.semantic.connectionFile, c.semantic.keyFile, `${c.directory}/vectors`)
     : undefined;
@@ -49,6 +56,7 @@ export async function runRuntimeService(configPath: string) {
     model: client,
     maxOutputTokens: model.maxOutputTokens,
     modelName: model.model,
+    modelSelection: selection,
     semantic,
     commandIdentity: c.commandIdentity,
     commandUseSystemd: true,
@@ -58,12 +66,14 @@ export async function runRuntimeService(configPath: string) {
     "runtime",
     new FileOwnershipExit(c.guardianConnectionFile, c.exitKeyFile),
   );
-  await engine.initialize();
   let rpc: Awaited<ReturnType<typeof startRuntimeRpc>> | undefined;
   let admin: ReturnType<typeof startRuntimeAdmin> | undefined;
+  let modelControl: ReturnType<typeof startRuntimeModelControl> | undefined;
   let resolve!: () => void;
   const done = new Promise<void>((r) => resolve = r), stop = () => resolve();
   try {
+    await selection?.initialize();
+    await engine.initialize();
     await fence.initialize();
     rpc = await startRuntimeRpc(engine, (await Deno.readTextFile(c.keyFile)).trim(), fence);
     const adminKey = (await Deno.readTextFile(c.adminKeyFile)).trim();
@@ -71,6 +81,19 @@ export async function runRuntimeService(configPath: string) {
       throw new Error("管理与实例凭据必须独立");
     }
     admin = startRuntimeAdmin(engine, adminKey, () => rpc!.quiesce());
+    if (selection) {
+      const modelKey = (await Deno.readTextFile(c.modelControl.keyFile)).trim();
+      if ([adminKey, (await Deno.readTextFile(c.keyFile)).trim()].includes(modelKey)) {
+        throw new Error("模型控制凭据必须独立");
+      }
+      modelControl = startRuntimeModelControl(
+        selection,
+        modelKey,
+        c.modelControl.ownerPlatformUserId,
+        (result) => engine.modelSelectionChanged(result),
+      );
+      await writeDurableJson(c.modelControl.connectionFile, { url: modelControl.url });
+    }
     await writeDurableJson(`${c.directory}/connection.json`, { url: rpc.url });
     if (c.connectionFile) {
       if (typeof c.connectionFile !== "string" || !c.connectionFile.startsWith("/")) {
@@ -86,12 +109,14 @@ export async function runRuntimeService(configPath: string) {
   } finally {
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
+    if (modelControl) await modelControl.close();
     if (admin) await admin.close();
     if (rpc) await rpc.close();
     else {
       await fence.close();
       await engine.close();
     }
+    await selection?.close();
   }
 }
 if (import.meta.main) {

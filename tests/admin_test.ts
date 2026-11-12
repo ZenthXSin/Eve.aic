@@ -266,7 +266,7 @@ async function proxyRequest(
     const [statusLine, ...lines] = raw.slice(0, split).split("\r\n");
     const responseHeaders = new Headers(lines.map((line) => {
       const colon = line.indexOf(":");
-      return [line.slice(0, colon), line.slice(colon + 1).trim()];
+      return [line.slice(0, colon), line.slice(colon + 1).trim()] as [string, string];
     }));
     let text = raw.slice(split + 4);
     if (responseHeaders.get("transfer-encoding") === "chunked") {

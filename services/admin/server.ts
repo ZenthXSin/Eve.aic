@@ -1,5 +1,11 @@
 import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
-import { ADMIN_READS, type AdminBackend, type AdminControl, type AdminQuery } from "./contracts.ts";
+import {
+  ADMIN_READS,
+  type AdminBackend,
+  type AdminControl,
+  type AdminQuery,
+  validateFailedResolution,
+} from "./contracts.ts";
 import { panelHtml } from "./view.ts";
 
 const MAX_BODY = 65_536;
@@ -54,10 +60,28 @@ export function validateQuery(body: Record<string, Json>): AdminQuery {
     !(ADMIN_READS[resource] as readonly Json[]).includes(body.operation) ||
     !body.args || typeof body.args !== "object" || Array.isArray(body.args)
   ) throw new KernelError("rejected", "不支持的管理查询");
+  if (resource === "qqFailures") {
+    const args = body.args as Record<string, Json>;
+    if (
+      Object.keys(args).some((key) => !["afterSequence", "limit"].includes(key)) ||
+      (args.afterSequence !== undefined &&
+        (!Number.isSafeInteger(args.afterSequence) || Number(args.afterSequence) < 0)) ||
+      (args.limit !== undefined &&
+        (!Number.isSafeInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 32))
+    ) {
+      throw new KernelError("rejected", "QQ 失败队首分页参数无效");
+    }
+  }
   return body as unknown as AdminQuery;
 }
 
 export function validateControl(body: Record<string, Json>): AdminControl {
+  if (
+    body.action === "resolveQqFailure" && body.args && typeof body.args === "object" &&
+    !Array.isArray(body.args)
+  ) {
+    return { action: "resolveQqFailure", args: validateFailedResolution(body.args) };
+  }
   if (
     body.action === "resumeModel" && body.args && typeof body.args === "object" &&
     !Array.isArray(body.args) && Object.keys(body.args).length === 1 &&

@@ -48,7 +48,7 @@ function gatewayServer(onConnection: (socket: WebSocket, connection: number) => 
       if (path === "/app/getAppAccessToken") {
         return Response.json({ access_token: "fixture-gateway-secret", expires_in: 7200 });
       }
-      if (path === "/gateway/bot") {
+      if (path === "/gateway") {
         identities++;
         assert.equal(request.headers.get("Authorization"), "QQBot fixture-gateway-secret");
         return Response.json({

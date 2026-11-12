@@ -69,6 +69,9 @@ export function startPhoneRpc(
         throw new QqPhoneError("request");
       }
       const method = data.method as PhoneMethod;
+      if (method === "cancelSend" && !fence) {
+        throw new KernelError("unavailable", "取消发送需要当前所有权许可");
+      }
       // 仅固定契约方法可达，不允许取构造器、内部全量原件或任意成员。
       const invoke = async (checkpoint?: () => Promise<void>) => {
         try {
@@ -77,6 +80,9 @@ export function startPhoneRpc(
           }
           if (method === "sendFile") {
             return await phone.sendFile(args as never, { beforeAttempt: checkpoint });
+          }
+          if (method === "cancelSend") {
+            return await phone.cancelSend(args as never, { beforeAttempt: checkpoint });
           }
           return await (phone[method] as (args: never) => unknown).call(phone, args as never);
         } catch (error) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { QQ_OFFICIAL_PROTOCOL } from "../adapters/qq/official/protocol.ts";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
 import { QqInboundJournal } from "../adapters/qq/journal.ts";
@@ -267,7 +268,7 @@ Deno.test("QQ 正式服务组合传递 fence；真实 worker 只能携实例凭�
         return Response.json({ access_token: "fixture", expires_in: 7200 });
       }
       if (path === "/users/@me") return Response.json({ id: "actual-bot", username: "Eve" });
-      if (path === "/gateway/bot") {
+      if (path === "/gateway") {
         return Response.json({
           url: `ws://127.0.0.1:${platform.addr.port}/websocket`,
           session_start_limit: { remaining: 100 },
@@ -389,6 +390,7 @@ Deno.test("QQ 正式服务组合传递 fence；真实 worker 只能携实例凭�
       assert.deepEqual(await keyless.call("health"), {
         available: true,
         gateway: { status: "ready" },
+        officialProtocol: QQ_OFFICIAL_PROTOCOL,
         replyScope: "private",
         ownershipFenced: true,
       });
@@ -462,7 +464,7 @@ async function retryFixture(options: {
         return Response.json({ access_token: "fixture", expires_in: 7200 });
       }
       if (path === "/users/@me") return Response.json({ id: "retry-bot", username: "Eve" });
-      if (path === "/gateway/bot") {
+      if (path === "/gateway") {
         return Response.json({
           url: `ws://127.0.0.1:${platform.addr.port}/websocket`,
           session_start_limit: { remaining: 100 },

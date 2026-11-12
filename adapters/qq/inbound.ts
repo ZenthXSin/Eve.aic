@@ -34,7 +34,7 @@ function identifier(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 512;
 }
 
-function extension(data: Record<string, unknown>, name: string): string | undefined {
+function legacyExtension(data: Record<string, unknown>, name: string): string | undefined {
   const scene = data.message_scene;
   if (scene === undefined) return undefined;
   if (!object(scene) || !Array.isArray(scene.ext)) throw new TypeError("QQ 消息场景结构不合法");
@@ -46,7 +46,48 @@ function extension(data: Record<string, unknown>, name: string): string | undefi
   return value;
 }
 
-function attachments(raw: unknown): PhoneAttachment[] | undefined {
+/** v1 必须保持原投影，旧原件不能因适配器升级而被判为损坏。 */
+export type QqProjectionVersion = 1 | 2;
+
+function extension(data: Record<string, unknown>, name: "msg_idx" | "ref_msg_idx") {
+  const scene = data.message_scene;
+  if (scene === undefined) return undefined;
+  if (!object(scene) || (scene.ext !== undefined && !Array.isArray(scene.ext))) {
+    throw new TypeError("QQ 消息场景结构不合法");
+  }
+  const prefixes = name === "msg_idx" ? ["msg_idx=", "msgIdx:"] : ["ref_msg_idx=", "refMsgIdx:"];
+  const values: string[] = [];
+  for (const item of (scene.ext as unknown[] | undefined) ?? []) {
+    if (typeof item !== "string") continue;
+    const prefix = prefixes.find((prefix) => item.startsWith(prefix));
+    if (prefix === undefined) continue;
+    const value = item.slice(prefix.length).trim();
+    if (!identifier(value)) throw new TypeError("QQ 消息索引不合法");
+    values.push(value);
+  }
+  // 两种官方前缀同时给出相同值可以合并，不接受相互矛盾的身份。
+  if (new Set(values).size > 1) throw new TypeError("QQ 消息索引重复");
+  return values[0];
+}
+
+function quoteIndex(data: Record<string, unknown>): string | undefined {
+  const type = data.message_type ?? data.msg_type;
+  if (
+    data.message_type !== undefined && data.msg_type !== undefined &&
+    data.message_type !== data.msg_type
+  ) throw new TypeError("QQ 消息类型相互矛盾");
+  if (type !== 103) return undefined;
+  if (data.msg_elements === undefined) return undefined;
+  if (!Array.isArray(data.msg_elements)) throw new TypeError("QQ 引用元素结构不合法");
+  const first = data.msg_elements[0];
+  if (first === undefined) return undefined;
+  if (!object(first)) throw new TypeError("QQ 引用元素结构不合法");
+  if (first.msg_idx === undefined) return undefined;
+  if (!identifier(first.msg_idx)) throw new TypeError("QQ 引用索引不合法");
+  return first.msg_idx;
+}
+
+function attachments(raw: unknown, version: QqProjectionVersion): PhoneAttachment[] | undefined {
   if (raw === undefined) return undefined;
   if (!Array.isArray(raw)) throw new TypeError("QQ 附件结构不合法");
   return raw.map((item) => {
@@ -58,7 +99,8 @@ function attachments(raw: unknown): PhoneAttachment[] | undefined {
       ? "audio"
       : mime.startsWith("video/")
       ? "video"
-      : mime === "file"
+      : mime === "file" ||
+          (version === 2 && (mime.startsWith("application/") || mime.startsWith("text/")))
       ? "file"
       : "other";
     if (item.filename !== undefined && typeof item.filename !== "string") {
@@ -78,7 +120,10 @@ function attachments(raw: unknown): PhoneAttachment[] | undefined {
 }
 
 /** 未支持事件返回 undefined；支持事件若损坏则报错，不能确认网关消费成功。 */
-export function qqMessage(dispatch: QqDispatch): InboundQqMessage | undefined {
+export function qqMessage(
+  dispatch: QqDispatch,
+  version: QqProjectionVersion = 2,
+): InboundQqMessage | undefined {
   if (
     !["C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"].includes(dispatch.t)
   ) {
@@ -102,15 +147,19 @@ export function qqMessage(dispatch: QqDispatch): InboundQqMessage | undefined {
   }
   const kind = privateMessage ? "user" : "group";
   const conversationId = `qq:${kind}:${destinationId}`;
-  const messageIndex = extension(data, "msg_idx");
-  const referenceIndex = extension(data, "ref_msg_idx");
+  const messageIndex = version === 1
+    ? legacyExtension(data, "msg_idx")
+    : extension(data, "msg_idx");
+  const referenceIndex = version === 1
+    ? legacyExtension(data, "ref_msg_idx")
+    : quoteIndex(data) ?? extension(data, "ref_msg_idx");
   if (
     data.msg_seq !== undefined &&
     (!Number.isSafeInteger(data.msg_seq) || (data.msg_seq as number) < 0)
   ) {
     throw new TypeError("QQ 消息序号不合法");
   }
-  const cards = attachments(data.attachments);
+  const cards = attachments(data.attachments, version);
   return {
     deduplication: {
       conversationId,

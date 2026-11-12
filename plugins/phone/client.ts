@@ -7,6 +7,7 @@ import {
 } from "../../contracts/phone-rpc.ts";
 import { KernelError } from "../../sdk/plugin.ts";
 import type { OwnershipProof } from "../../contracts/ownership.ts";
+import { fingerprint } from "../../kernel/calls.ts";
 
 export class PhoneRpcError extends KernelError {
   readonly attachment?: PhoneAttachmentFailure;
@@ -62,11 +63,12 @@ export class PhoneRpcClient {
   async call(method: PhoneMethod | "health", args: Json = {}): Promise<Json> {
     const captured = structuredClone(args);
     const proof = method === "health" ? undefined : await this.ownershipProof?.();
-    const actionId =
-      (method === "send" || method === "sendFile") && captured && typeof captured === "object" &&
-        !Array.isArray(captured)
-        ? captured.actionId
-        : `read_${crypto.randomUUID()}`;
+    const actionId = method === "cancelSend"
+      ? `cancel_${await fingerprint(captured)}`
+      : (method === "send" || method === "sendFile") && captured && typeof captured === "object" &&
+          !Array.isArray(captured)
+      ? captured.actionId
+      : `read_${crypto.randomUUID()}`;
     const signal = AbortSignal.any([this.#controller.signal, AbortSignal.timeout(this.timeoutMs)]);
     try {
       let url = this.url;
@@ -135,7 +137,8 @@ export class PhoneRpcClient {
     } catch (error) {
       if (error instanceof PhoneRpcError) {
         if (
-          ["send", "sendFile", "open", "settings", "download", "image", "file"].includes(method) &&
+          ["send", "sendFile", "cancelSend", "open", "settings", "download", "image", "file"]
+            .includes(method) &&
           ["transport", "invalid_response", "internal"].includes(error.category)
         ) {
           throw new PhoneRpcError("unknown");
@@ -144,7 +147,8 @@ export class PhoneRpcClient {
       }
       // 请求可能已经到达适配器；发送/打开超时不能声称动作没有执行。
       throw new PhoneRpcError(
-        ["send", "sendFile", "open", "settings", "download", "image", "file"].includes(method)
+        ["send", "sendFile", "cancelSend", "open", "settings", "download", "image", "file"]
+            .includes(method)
           ? "unknown"
           : "transport",
       );

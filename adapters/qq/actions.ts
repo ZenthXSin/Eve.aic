@@ -16,6 +16,32 @@ export interface SendRecord {
   policy?: { kind: "until_sent_v1"; sequence: number };
 }
 
+export interface SendResolution {
+  schema: 1;
+  kind: "failed_retained" | "queued_cancelled";
+  actionId: string;
+  fingerprint: string;
+  receiptDigest: string;
+  actor: "admin" | "eve";
+  resolvedAt: string;
+  blockedBy?: string;
+}
+export interface SendQueueItem {
+  actionId: string;
+  fingerprint: string;
+  receiptDigest?: string;
+  sequence: number;
+  conversationId: string;
+  status: SendStatus;
+  canCancel: boolean;
+  cancelBlockedReason?: "running" | "unknown" | "not_waiting";
+}
+export interface SendCancellation {
+  actionId: string;
+  expectedFingerprint: string;
+  expectedReceiptDigest: string;
+}
+
 interface SendAttempt {
   schema: 1;
   actionId: string;
@@ -34,6 +60,12 @@ export type SendStatus =
     | { actionId: string; status: "blocked"; blockedBy: string }
     | { actionId: string; status: "unknown"; reason: "interrupted" }
     | { actionId: string; status: "finished"; result: QqSendResult }
+    | {
+      actionId: string;
+      status: "cancelled";
+      resolution: SendResolution;
+      originalResult?: QqSendResult;
+    }
   )
   & { attemptCount?: number };
 
@@ -95,6 +127,17 @@ function validResult(value: unknown): value is QqSendResult {
     r.error.elapsedMs !== undefined &&
     (!Number.isSafeInteger(r.error.elapsedMs) || r.error.elapsedMs < 0)
   ) return false;
+  if (
+    r.error.retryAfterMs !== undefined &&
+    (!Number.isSafeInteger(r.error.retryAfterMs) || r.error.retryAfterMs < 0 ||
+      r.error.retryAfterMs > 3_600_000)
+  ) return false;
+  if (
+    r.error.failureStage !== undefined &&
+    !["auth", "upload", "message"].includes(r.error.failureStage)
+  ) {
+    return false;
+  }
   return r.error.traceId === undefined ||
     (typeof r.error.traceId === "string" && /^[a-zA-Z0-9_.:-]{1,256}$/.test(r.error.traceId));
 }
@@ -102,6 +145,11 @@ function protectedText(request: QqSendText): boolean {
   return !request.attachment && request.reply !== undefined && "messageId" in request.reply;
 }
 function retryable(request: QqSendText, result: QqSendResult): boolean {
+  if (
+    result.status === "failed" && ["authentication", "rate_limit"].includes(result.error.category)
+  ) {
+    return true;
+  }
   return result.status !== "sent" && result.error.category === "transport" &&
     result.error.transportReason === "timeout" && (!result.attempted || protectedText(request));
 }
@@ -132,6 +180,28 @@ export class QqSendActions {
   #conversations = new Map<string, Promise<void>>();
   #queues = new Map<string, Map<string, number>>();
   #attempts = new Map<string, SendAttempt[]>();
+  #resolutions = new Map<string, SendResolution>();
+  #resolutionTail: Promise<unknown> = Promise.resolve();
+  #resolving = new Set<string>();
+  #queueWake = new Map<string, () => void>();
+  #queueListeners = new Set<() => void>();
+
+  /** 已落盘的取消或真实送达释放队列后，通知调用方用原动作编号重新核对等待项。 */
+  onQueueChange(listener: () => void): () => void {
+    this.#queueListeners.add(listener);
+    return () => {
+      this.#queueListeners.delete(listener);
+    };
+  }
+  #queueChanged() {
+    queueMicrotask(() => {
+      for (const listener of this.#queueListeners) {
+        try {
+          listener();
+        } catch { /* 观察者不能改变发送事实或取消回执。 */ }
+      }
+    });
+  }
   #nextSequence = 1;
   #retryDelays: readonly number[];
   #stop = new AbortController();
@@ -182,6 +252,15 @@ export class QqSendActions {
     return count > 1 ? { ...status, attemptCount: count } : status;
   }
   #savedStatus(record: SendRecord): SendStatus {
+    const resolution = this.#resolutions.get(record.actionId);
+    if (resolution) {
+      return this.#summary({
+        actionId: record.actionId,
+        status: "cancelled",
+        resolution: structuredClone(resolution),
+        ...(record.result ? { originalResult: structuredClone(record.result) } : {}),
+      });
+    }
     if (record.status === "finished") {
       return this.#summary({
         actionId: record.actionId,
@@ -199,6 +278,11 @@ export class QqSendActions {
         : { actionId: record.actionId, status: "unknown", reason: "interrupted" },
     );
   }
+  #isQueued(record: SendRecord): boolean {
+    return record.status === "started" && !!record.policy &&
+      !(this.#attempts.get(record.actionId)?.length) &&
+      this.#savedStatus(record).status === "blocked";
+  }
   status(actionId: string): SendStatus | undefined {
     this.#available();
     validateId(actionId);
@@ -212,6 +296,314 @@ export class QqSendActions {
   records(): SendRecord[] {
     this.#available();
     return Array.from(this.#records.values(), (record) => structuredClone(record));
+  }
+  async #receipt(record: SendRecord): Promise<string> {
+    try {
+      const path = `${this.directory}/records/${record.actionId}.json`;
+      const stat = await Deno.lstat(path);
+      if (!stat.isFile || stat.isSymlink || stat.size > 2_097_152) throw new Error();
+      const bytes = await Deno.readFile(path);
+      if (canonical(JSON.parse(new TextDecoder().decode(bytes))) !== canonical(record)) {
+        throw new Error();
+      }
+      const hash = await crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
+    } catch {
+      if (
+        (this.#inflight.has(record.actionId) && !this.#isQueued(record)) ||
+        this.#records.get(record.actionId) !== record
+      ) {
+        throw new QqActionError("conflict");
+      }
+      this.#failed = true;
+      throw new QqActionError("corrupt");
+    }
+  }
+  async #verifyAttempts(record: SendRecord) {
+    const attempts = this.#attempts.get(record.actionId) ?? [];
+    const expected = new Map<string, unknown>();
+    for (const attempt of attempts) {
+      const common = {
+        schema: 1,
+        actionId: record.actionId,
+        fingerprint: record.fingerprint,
+        attempt: attempt.attempt,
+      };
+      expected.set(`${attempt.attempt}.started.json`, { ...common, startedAt: attempt.startedAt });
+      if (attempt.result) {
+        expected.set(`${attempt.attempt}.result.json`, {
+          ...common,
+          finishedAt: attempt.finishedAt,
+          result: attempt.result,
+        });
+      }
+      if (attempt.interruptedAt) {
+        expected.set(`${attempt.attempt}.interrupted.json`, {
+          ...common,
+          interruptedAt: attempt.interruptedAt,
+        });
+      }
+    }
+    try {
+      const path = `${this.directory}/attempts/${record.actionId}`;
+      const stat = await Deno.lstat(path);
+      if (!stat.isDirectory || stat.isSymlink) throw new Error();
+      const actual = new Set<string>();
+      for await (const entry of Deno.readDir(path)) {
+        if (
+          !entry.isFile || !expected.has(entry.name) ||
+          canonical(await this.#read(`${path}/${entry.name}`)) !==
+            canonical(expected.get(entry.name))
+        ) throw new Error();
+        actual.add(entry.name);
+      }
+      if (actual.size !== expected.size) throw new Error();
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound && !expected.size) return;
+      this.#failed = true;
+      throw new QqActionError("corrupt");
+    }
+  }
+  #eligibility(
+    record: SendRecord,
+    reserved = false,
+  ): {
+    kind?: SendResolution["kind"];
+    reason?: SendQueueItem["cancelBlockedReason"];
+    blockedBy?: string;
+  } {
+    if (
+      (this.#inflight.has(record.actionId) && !this.#isQueued(record)) ||
+      (!reserved && this.#resolving.has(record.actionId))
+    ) return { reason: "running" };
+    if (
+      record.status === "finished" && record.result?.status === "failed" && record.policy &&
+      this.#head(record.request) === record.actionId
+    ) return { kind: "failed_retained" };
+    const status = this.#savedStatus(record);
+    if (
+      record.status === "started" && record.policy && status.status === "blocked" &&
+      !(this.#attempts.get(record.actionId)?.length)
+    ) return { kind: "queued_cancelled", blockedBy: status.blockedBy };
+    return {
+      reason: status.status === "unknown" || record.result?.status === "unknown"
+        ? "unknown"
+        : "not_waiting",
+    };
+  }
+  async listSendQueue(
+    args: {
+      afterSequence?: number;
+      limit?: number;
+      conversationId?: string;
+      failedHeadsOnly?: boolean;
+    } = {},
+  ) {
+    this.#available();
+    const after = args.afterSequence ?? 0, limit = args.limit ?? 8;
+    if (
+      !Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 ||
+      limit > 32 ||
+      (args.conversationId !== undefined && !/^qq:(user|group):.{1,512}$/.test(args.conversationId))
+    ) throw new QqActionError("request");
+    const eligible = [...this.#records.values()].filter((record) => {
+      if (
+        !record.policy || record.policy.sequence <= after ||
+        this.#resolutions.has(record.actionId) || record.result?.status === "sent"
+      ) return false;
+      if (
+        args.conversationId !== undefined &&
+        args.conversationId !==
+          `qq:${record.request.destination.kind}:${record.request.destination.openId}`
+      ) return false;
+      return !args.failedHeadsOnly ||
+        (record.status === "finished" && record.result?.status === "failed" &&
+          this.#head(record.request) === record.actionId);
+    }).sort((a, b) => a.policy!.sequence - b.policy!.sequence);
+    const items: SendQueueItem[] = [];
+    for (let record of eligible.slice(0, limit)) {
+      let receiptDigest: string | undefined;
+      for (;;) {
+        if (this.#inflight.has(record.actionId) && !this.#isQueued(record)) break;
+        try {
+          receiptDigest = await this.#receipt(record);
+          break;
+        } catch (error) {
+          if (!(error instanceof QqActionError) || error.category !== "conflict") throw error;
+          record = this.#records.get(record.actionId)!;
+        }
+      }
+      const eligibility = this.#eligibility(record);
+      items.push({
+        actionId: record.actionId,
+        fingerprint: record.fingerprint,
+        ...(receiptDigest ? { receiptDigest } : {}),
+        sequence: record.policy!.sequence,
+        conversationId:
+          `qq:${record.request.destination.kind}:${record.request.destination.openId}`,
+        status: this.#savedStatus(record),
+        canCancel: !!eligibility.kind && !!receiptDigest,
+        ...(eligibility.reason ? { cancelBlockedReason: eligibility.reason } : {}),
+      });
+    }
+    return {
+      items,
+      ...(eligible.length > limit
+        ? { next: { ...args, afterSequence: items.at(-1)!.sequence } }
+        : {}),
+    };
+  }
+  cancelSend(
+    args: SendCancellation,
+    options: {
+      actor?: "admin" | "eve";
+      failedHeadOnly?: boolean;
+      checkpoint?: () => Promise<void>;
+    } = {},
+  ): Promise<SendStatus> {
+    const operation = this.#resolutionTail.then(async () => {
+      this.#available();
+      if (
+        !args || !validId(args.actionId) || typeof args.expectedFingerprint !== "string" ||
+        typeof args.expectedReceiptDigest !== "string" ||
+        !/^[a-f0-9]{64}$/.test(args.expectedFingerprint) ||
+        !/^[a-f0-9]{64}$/.test(args.expectedReceiptDigest) || Object.keys(args).some((key) =>
+          !["actionId", "expectedFingerprint", "expectedReceiptDigest"].includes(key)
+        )
+      ) {
+        throw new QqActionError("request");
+      }
+      const record = this.#records.get(args.actionId);
+      if (!record || record.fingerprint !== args.expectedFingerprint) {
+        throw new QqActionError("conflict");
+      }
+      if (this.#inflight.has(record.actionId) && !this.#isQueued(record)) {
+        throw new QqActionError("conflict");
+      }
+      this.#resolving.add(args.actionId);
+      try {
+        const receiptDigest = await this.#receipt(record);
+        if (receiptDigest !== args.expectedReceiptDigest) {
+          throw new QqActionError("conflict");
+        }
+        await this.#verifyAttempts(record);
+        const previous = this.#resolutions.get(args.actionId);
+        if (previous) {
+          return this.#savedStatus(record);
+        }
+        const eligibility = this.#eligibility(record, true);
+        if (
+          !eligibility.kind || (options.failedHeadOnly && eligibility.kind !== "failed_retained")
+        ) {
+          throw new QqActionError("conflict");
+        }
+        await options.checkpoint?.();
+        const resolution: SendResolution = {
+          schema: 1,
+          kind: eligibility.kind,
+          actionId: record.actionId,
+          fingerprint: record.fingerprint,
+          receiptDigest,
+          actor: options.actor ?? "eve",
+          resolvedAt: new Date().toISOString(),
+          ...(eligibility.blockedBy ? { blockedBy: eligibility.blockedBy } : {}),
+        };
+        const path = `${this.directory}/resolutions/${record.actionId}.json`;
+        try {
+          const file = await Deno.open(path, { createNew: true, write: true, mode: 0o600 });
+          try {
+            const bytes = new TextEncoder().encode(JSON.stringify(resolution) + "\n");
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = await file.write(bytes.subarray(offset));
+              if (!count) {
+                throw new Error();
+              }
+              offset += count;
+            }
+            await file.sync();
+          } finally {
+            file.close();
+          }
+          const directory = await Deno.open(`${this.directory}/resolutions`, { read: true });
+          try {
+            await directory.sync();
+          } finally {
+            directory.close();
+          }
+        } catch {
+          this.#failed = true;
+          throw new QqActionError("storage");
+        }
+        this.#resolutions.set(record.actionId, resolution);
+        this.#queues.get(conversation(record.request))?.delete(record.actionId);
+        this.#queueWake.get(record.actionId)?.();
+        this.#queueChanged();
+        return this.#savedStatus(record);
+      } finally {
+        this.#resolving.delete(args.actionId);
+      }
+    });
+    this.#resolutionTail = operation.catch(() => {});
+    return operation;
+  }
+  async #restoreResolutions() {
+    const directory = `${this.directory}/resolutions`;
+    await Deno.mkdir(directory, { recursive: true, mode: 0o700 });
+    const resolutions: SendResolution[] = [];
+    for await (const entry of Deno.readDir(directory)) {
+      if (!entry.isFile || !/^[a-zA-Z0-9_-]{1,128}\.json$/.test(entry.name)) {
+        throw new QqActionError("corrupt");
+      }
+      const resolution: SendResolution = await this.#read(`${directory}/${entry.name}`);
+      const record = this.#records.get(resolution.actionId);
+      if (
+        !record?.policy || entry.name !== `${record.actionId}.json` || resolution.schema !== 1 ||
+        !["failed_retained", "queued_cancelled"].includes(resolution.kind) ||
+        !["admin", "eve"].includes(resolution.actor) ||
+        !Number.isFinite(Date.parse(resolution.resolvedAt)) ||
+        resolution.fingerprint !== record.fingerprint ||
+        resolution.receiptDigest !== await this.#receipt(record) ||
+        Object.keys(resolution).some((key) =>
+          ![
+            "schema",
+            "kind",
+            "actionId",
+            "fingerprint",
+            "receiptDigest",
+            "actor",
+            "resolvedAt",
+            "blockedBy",
+          ].includes(key)
+        )
+      ) throw new QqActionError("corrupt");
+      if (resolution.kind === "failed_retained") {
+        if (
+          record.status !== "finished" || record.result?.status !== "failed" ||
+          resolution.blockedBy !== undefined
+        ) throw new QqActionError("corrupt");
+      } else {
+        const preceding = this.#records.get(resolution.blockedBy ?? "");
+        if (
+          record.status !== "started" || (this.#attempts.get(record.actionId)?.length ?? 0) !== 0 ||
+          !preceding?.policy || preceding.policy.sequence >= record.policy.sequence ||
+          conversation(preceding.request) !== conversation(record.request)
+        ) throw new QqActionError("corrupt");
+      }
+      resolutions.push(resolution);
+    }
+    resolutions.sort((a, b) =>
+      this.#records.get(a.actionId)!.policy!.sequence -
+      this.#records.get(b.actionId)!.policy!.sequence
+    );
+    for (const resolution of resolutions) {
+      const record = this.#records.get(resolution.actionId)!;
+      if (resolution.kind === "failed_retained" && this.#head(record.request) !== record.actionId) {
+        throw new QqActionError("corrupt");
+      }
+      this.#resolutions.set(record.actionId, resolution);
+      this.#queues.get(conversation(record.request))?.delete(record.actionId);
+    }
   }
   async initialize(): Promise<void> {
     if (this.#lock || this.#failed || this.#closing) throw new QqActionError("unavailable");
@@ -269,6 +661,7 @@ export class QqSendActions {
           record.attemptCount !== (this.#attempts.get(record.actionId)?.length ?? 0)
         ) throw new QqActionError("corrupt");
       }
+      await this.#restoreResolutions();
       this.#lock = lock;
     } catch (error) {
       lock?.close();
@@ -479,7 +872,12 @@ export class QqSendActions {
       attempts[n - 1] = finished;
       if (aborted(result)) return undefined;
       if (!retryable(started.request, result)) return settledResult(attempts);
-      if (!await this.#wait(this.#retryDelays[Math.min(n - 1, this.#retryDelays.length - 1)])) {
+      const baseDelay = this.#retryDelays[Math.min(n - 1, this.#retryDelays.length - 1)];
+      if (
+        !await this.#wait(
+          baseDelay + (result.status === "failed" ? result.error.retryAfterMs ?? 0 : 0),
+        )
+      ) {
         return undefined;
       }
     }
@@ -492,6 +890,10 @@ export class QqSendActions {
   ): Promise<SendStatus> {
     this.#available();
     validateId(actionId);
+    if (this.#resolving.has(actionId)) {
+      await this.#resolutionTail;
+      return await this.send(actionId, request, options);
+    }
     const snapshot = structuredClone(request);
     try {
       validateQqSendText(snapshot);
@@ -517,9 +919,15 @@ export class QqSendActions {
       this.#enqueue({ actionId, request: snapshot, policy });
     }
     const preceding = this.#conversations.get(key);
+    let wake!: () => void;
+    const cancelled = new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+    this.#queueWake.set(actionId, wake);
     const operation = (async (): Promise<SendStatus> => {
       const hash = await fingerprint(snapshot);
       if (previous && previous.fingerprint !== hash) throw new QqActionError("conflict");
+      if (previous && this.#resolutions.has(actionId)) return this.#savedStatus(previous);
       if (previous && (previous.status === "finished" || !previous.policy)) {
         return this.#summary(
           previous.status === "finished"
@@ -539,7 +947,9 @@ export class QqSendActions {
         };
       // 排队动作在等待前序之前落盘，重启仍可按同步预留序号恢复屏障。
       if (!previous) await this.#save(started);
-      await preceding;
+      await Promise.race([preceding, cancelled]);
+      if (this.#resolving.has(actionId)) await this.#resolutionTail;
+      if (this.#resolutions.has(actionId)) return this.#savedStatus(started);
       if (this.#failed) throw new QqActionError("storage");
       const head = this.#head(snapshot);
       if (head && head !== actionId) {
@@ -557,7 +967,10 @@ export class QqSendActions {
         result,
         attemptCount: this.#attempts.get(actionId)?.length ?? 0,
       });
-      if (result.status === "sent") this.#queues.get(key)?.delete(actionId);
+      if (result.status === "sent") {
+        this.#queues.get(key)?.delete(actionId);
+        this.#queueChanged();
+      }
       return this.#summary({ actionId, status: "finished", result: structuredClone(result) });
     })();
     const tail = operation.then(() => {}, () => {});
@@ -567,6 +980,7 @@ export class QqSendActions {
       return await operation;
     } finally {
       this.#inflight.delete(actionId);
+      this.#queueWake.delete(actionId);
       if (this.#conversations.get(key) === tail) this.#conversations.delete(key);
     }
   }
@@ -577,6 +991,7 @@ export class QqSendActions {
   }
   async close(): Promise<void> {
     this.requestStop();
+    await this.#resolutionTail;
     this.client.close();
     const results = await Promise.allSettled([...this.#inflight.values()]);
     this.#lock?.close();

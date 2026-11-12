@@ -12,6 +12,8 @@ export const PHONE_METHODS = [
   "notifications",
   "send",
   "action",
+  "listSendQueue",
+  "cancelSend",
   "settings",
   "download",
   "image",

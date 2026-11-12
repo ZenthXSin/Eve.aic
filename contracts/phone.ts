@@ -113,7 +113,9 @@ export const PHONE = "phone";
 
 export interface PhoneActionReceipt {
   actionId: string;
-  state: "running" | "blocked" | "sent" | "failed" | "unknown";
+  state: "running" | "blocked" | "sent" | "failed" | "unknown" | "cancelled";
+  /** 逻辑结束保留原始失败/未尝试记录；绝不表示已发送。 */
+  resolution?: { kind: "failed_retained" | "queued_cancelled"; actor: "admin" | "eve"; at: string };
   /** 同会话未成功的队首动作；不得用新动作越过。 */
   blockedBy?: string;
   attempted?: boolean;
@@ -131,6 +133,8 @@ export interface PhoneActionReceipt {
     /** 包括建连/等待响应头，或读取响应正文；不证明请求是否已经送达。 */
     phase?: "headers" | "body";
     elapsedMs?: number;
+    retryAfterMs?: number;
+    failureStage?: "auth" | "upload" | "message";
   };
 }
 
@@ -226,6 +230,26 @@ export interface PhoneApi {
   }>;
   send(args: PhoneSend): Promise<PhoneActionReceipt>;
   action(args: { actionId: string }): Promise<PhoneActionReceipt | null>;
+  /** 队列分页不发送任何消息。running/unknown不可取消；只有canCancel且有receiptDigest可提交取消。 */
+  listSendQueue(
+    args?: { conversationId?: string; afterSequence?: number; limit?: number },
+  ): Promise<{
+    items: {
+      actionId: string;
+      fingerprint: string;
+      receiptDigest?: string;
+      sequence: number;
+      conversationId: string;
+      receipt: PhoneActionReceipt;
+      canCancel: boolean;
+      cancelBlockedReason?: "running" | "unknown" | "not_waiting";
+    }[];
+    next?: { conversationId?: string; afterSequence: number; limit?: number };
+  }>;
+  /** 明确逻辑取消：保留原件，不重发。只允许已失败终态或零尝试的blocked等待项；陈旧回执拒绝。 */
+  cancelSend(
+    args: { actionId: string; expectedFingerprint: string; expectedReceiptDigest: string },
+  ): Promise<PhoneActionReceipt>;
   /** 只改变明确提供的字段；省略所有字段时只读取。本机设置随重启保留。 */
   settings(args: {
     conversationId: string;

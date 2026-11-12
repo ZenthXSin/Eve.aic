@@ -1,8 +1,15 @@
 // 独立适配器的只追加入站日志。先完整持久化，再允许网关提交消费水位。
-import { type InboundQqMessage, type QqDispatch, qqMessage } from "./inbound.ts";
+import {
+  type InboundQqMessage,
+  type QqDispatch,
+  qqMessage,
+  type QqProjectionVersion,
+} from "./inbound.ts";
 
 export interface InboundRecord {
   schema: 1;
+  /** 缺省是历史 v1；版本只决定原件校验，不迁移旧身份或正文。 */
+  projectionVersion?: QqProjectionVersion;
   seq: number;
   receivedAt: string;
   identity: string;
@@ -64,6 +71,8 @@ export async function writeAtomic(path: string, data: unknown): Promise<void> {
 /** 一个进程持有日志目录；正式部署还须独立守护/所有权令牌约束多进程写入。 */
 export class QqInboundJournal {
   #records = new Map<string, InboundRecord>();
+  // 仅在内存关联新版平台索引；原始 identity 仍用于落盘与手机 source fingerprint。
+  #currentIdentities = new Map<string, InboundRecord[]>();
   #seq = 0;
   #tail: Promise<unknown> = Promise.resolve();
   #failed = false;
@@ -90,16 +99,23 @@ export class QqInboundJournal {
         if (file.isSymlink || file.size > 2_097_152) throw new QqJournalError("corrupt");
         const record: InboundRecord = JSON.parse(await Deno.readTextFile(path));
         if (
-          record.schema !== 1 || record.seq !== this.#seq + 1 ||
+          record.schema !== 1 ||
+          (record.projectionVersion !== undefined &&
+            record.projectionVersion !== 1 && record.projectionVersion !== 2) ||
+          record.seq !== this.#seq + 1 ||
           name !== `${String(record.seq).padStart(16, "0")}-${record.identity}.json` ||
           await digest(record.message.deduplication) !== record.identity ||
           this.#records.has(record.identity) || typeof record.receivedAt !== "string" ||
           !Number.isFinite(Date.parse(record.receivedAt))
         ) throw new QqJournalError("corrupt");
-        if (canonical(qqMessage(record.raw)) !== canonical(record.message)) {
+        if (
+          canonical(qqMessage(record.raw, record.projectionVersion ?? 1)) !==
+            canonical(record.message)
+        ) {
           throw new QqJournalError("corrupt");
         }
         this.#records.set(record.identity, record);
+        await this.#indexCurrentIdentity(record);
         this.#seq = record.seq;
       }
       this.#initialized = true;
@@ -108,6 +124,21 @@ export class QqInboundJournal {
       if (error instanceof QqJournalError) throw error;
       throw new QqJournalError("corrupt");
     }
+  }
+
+  async #indexCurrentIdentity(record: InboundRecord): Promise<void> {
+    let projection;
+    try {
+      projection = qqMessage(record.raw);
+    } catch {
+      // v1 曾忽略的新字段可能非法：不能使经过 v1 校验的历史原件恢复失败。
+      return;
+    }
+    if (projection === undefined) return;
+    const identity = await digest(projection.deduplication);
+    const records = this.#currentIdentities.get(identity) ?? [];
+    records.push(record);
+    this.#currentIdentities.set(identity, records);
   }
 
   async append(
@@ -122,17 +153,27 @@ export class QqInboundJournal {
         throw new QqJournalError("conflict");
       }
       const identity = await digest(snapshot.message.deduplication);
-      const previous = this.#records.get(identity);
-      if (previous) {
-        if (canonical(previous.message) !== canonical(snapshot.message)) {
+      const candidates = new Set(this.#currentIdentities.get(identity) ?? []);
+      const exact = this.#records.get(identity);
+      if (exact) candidates.add(exact);
+      for (const previous of candidates) {
+        let projection;
+        try {
+          projection = qqMessage(previous.raw);
+        } catch {
+          projection = previous.message;
+        }
+        if (canonical(projection) !== canonical(snapshot.message)) {
           // 同一身份正文不同不能选择性相信一份，阻止消费水位前进并保留原件。
           this.#failed = true;
           throw new QqJournalError("conflict");
         }
-        return { record: structuredClone(previous), fresh: false };
       }
+      const previous = candidates.values().next().value;
+      if (previous) return { record: structuredClone(previous), fresh: false };
       const record: InboundRecord = {
         schema: 1,
+        projectionVersion: 2,
         seq: this.#seq + 1,
         receivedAt: new Date().toISOString(),
         identity,
@@ -152,6 +193,7 @@ export class QqInboundJournal {
       }
       this.#seq = record.seq;
       this.#records.set(identity, record);
+      await this.#indexCurrentIdentity(record);
       return { record: structuredClone(record), fresh: true };
     });
     this.#tail = operation.catch(() => {});

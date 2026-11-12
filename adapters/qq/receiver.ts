@@ -3,7 +3,7 @@ import { QqClient } from "./client.ts";
 import { FileGatewayCheckpoint } from "./checkpoint.ts";
 import { QqGateway } from "./gateway.ts";
 import { qqMessage } from "./inbound.ts";
-import { QqInboundJournal } from "./journal.ts";
+import { type InboundRecord, QqInboundJournal } from "./journal.ts";
 
 export interface QqReceiverStatus {
   status: "connecting" | "connected" | "hello" | "ready" | "resumed" | "disconnected";
@@ -13,7 +13,14 @@ export interface QqReceiverStatus {
 export class QqReceiver {
   #running = false;
   #journal: QqInboundJournal;
-  constructor(readonly client: QqClient, readonly directory: string) {
+  constructor(
+    readonly client: QqClient,
+    readonly directory: string,
+    readonly hooks: {
+      initialized?: (records: InboundRecord[]) => Promise<void>;
+      persisted?: (record: InboundRecord) => void;
+    } = {},
+  ) {
     this.#journal = new QqInboundJournal(`${directory}/inbound`);
   }
 
@@ -37,13 +44,18 @@ export class QqReceiver {
       if (!(await lock.tryLock(true))) throw new Error("已有 QQ 接收器持有此目录");
       this.#journal = new QqInboundJournal(`${this.directory}/inbound`);
       await this.#journal.initialize();
+      await this.hooks.initialized?.(this.#journal.records());
       const gateway = new QqGateway(this.client, {
         intents: 1 << 25,
         checkpoint: new FileGatewayCheckpoint(`${this.directory}/gateway/session.json`),
         onStatus,
         onDispatch: async (event) => {
           const message = qqMessage(event);
-          if (message) await this.#journal.append(message, event);
+          if (message) {
+            const { record } = await this.#journal.append(message, event);
+            // 持久化完成后只入本地工作队列；模型调用与发送不能阻塞网关心跳。
+            this.hooks.persisted?.(record);
+          }
         },
       });
       await gateway.run(signal);

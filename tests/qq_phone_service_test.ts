@@ -345,7 +345,7 @@ Deno.test("QQ 手机：真实独立适配器子进程、网关入站与worker发
       if (path === "/users/@me") {
         return Response.json({ id: "actual-fixture-bot", username: "Eve fixture" });
       }
-      if (path === "/gateway/bot") {
+      if (path === "/gateway") {
         return Response.json({
           url: `ws://127.0.0.1:${platform.addr.port}/websocket`,
           session_start_limit: { remaining: 100 },
@@ -966,7 +966,7 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
         return Response.json({ access_token: "fixture-token", expires_in: 7200 });
       }
       if (path === "/users/@me") return Response.json({ id: "scope-bot", username: "Eve" });
-      if (path === "/gateway/bot") {
+      if (path === "/gateway") {
         return Response.json({
           url: `ws://127.0.0.1:${platform.addr.port}/websocket`,
           session_start_limit: { remaining: 100 },

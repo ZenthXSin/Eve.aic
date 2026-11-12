@@ -1,8 +1,10 @@
-// 独立适配器入口，沿用本机私有 QQ 配置；不启动 Eve 模型或发送聊天消息。
+// 独立适配器入口；不启动 Eve 模型循环，系统指令回执经过持久发送队列。
 import { readQqTestClient } from "../../composition/qq.ts";
 import { writeAtomic } from "./journal.ts";
+import { startQqAdminServer } from "./admin.ts";
 import { startQqPhoneAdapter } from "./service.ts";
 import { readQqOwnershipFence } from "../../composition/ownership.ts";
+import { RuntimeModelControlClient } from "../../services/runtime/model-control.ts";
 import { writeDurableJson } from "../../sdk/durable-json.ts";
 
 export async function runQqAdapter(configPath: string, directory: string): Promise<void> {
@@ -24,8 +26,6 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     ).join("");
     await Deno.writeTextFile(keyFile, key + "\n", { createNew: true, mode: 0o600 });
   }
-  const client = await readQqTestClient(configPath);
-  const fence = await readQqOwnershipFence(configPath, directory);
   const startupConfig = JSON.parse(await Deno.readTextFile(configPath));
   if (
     startupConfig.qq?.captureActivationBoundary !== undefined &&
@@ -33,6 +33,38 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
   ) {
     throw new Error("QQ启动边界开关须为布尔值");
   }
+  const modelControl = startupConfig.qq?.modelControl;
+  const control = modelControl === undefined
+    ? undefined
+    : new RuntimeModelControlClient(modelControl);
+  const adminControl = startupConfig.qq?.adminControl;
+  let adminKey: string | undefined;
+  if (adminControl !== undefined) {
+    if (
+      !adminControl || typeof adminControl.keyFile !== "string" ||
+      !adminControl.keyFile.startsWith("/") || typeof adminControl.connectionFile !== "string" ||
+      !adminControl.connectionFile.startsWith("/") ||
+      [
+        adminControl.keyFile,
+        keyFile,
+        configPath,
+        startupConfig.phoneConnectionFile,
+        modelControl?.connectionFile,
+        modelControl?.keyFile,
+      ].includes(adminControl.connectionFile)
+    ) {
+      throw new Error("QQ 管理出口使用独立的绝对私有连接路径");
+    }
+    adminKey = (await Deno.readTextFile(adminControl.keyFile)).trim();
+    if (!/^[a-zA-Z0-9_-]{32,256}$/.test(adminKey) || adminKey === key) {
+      throw new Error("QQ 管理密钥格式无效或未独立于手机桥密钥");
+    }
+    if (modelControl && adminKey === (await Deno.readTextFile(modelControl.keyFile)).trim()) {
+      throw new Error("QQ 管理密钥必须独立于模型切换密钥");
+    }
+  }
+  const client = await readQqTestClient(configPath);
+  const fence = await readQqOwnershipFence(configPath, directory);
   const adapter = await startQqPhoneAdapter(
     client,
     directory,
@@ -40,14 +72,24 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     (status) =>
       console.log(JSON.stringify({ adapter: "qq", gateway: status.status, code: status.code })),
     fence,
-    { captureActivationBoundary: startupConfig.qq?.captureActivationBoundary === true },
+    {
+      captureActivationBoundary: startupConfig.qq?.captureActivationBoundary === true,
+      ...(modelControl === undefined ? {} : {
+        modelCommands: { ownerPlatformUserId: modelControl.ownerPlatformUserId, control },
+      }),
+    },
   );
+  let admin: ReturnType<typeof startQqAdminServer> | undefined;
   const stop = () => {
     void adapter.close().catch(() => {});
   };
   Deno.addSignalListener("SIGTERM", stop);
   Deno.addSignalListener("SIGINT", stop);
   try {
+    if (adminKey) {
+      admin = startQqAdminServer(adapter.actions, adminKey);
+      await writeDurableJson(adminControl.connectionFile, { url: admin.url });
+    }
     // 仅连接参数；主人身份配置仍由手机组合层另行加入，不由适配器决定。
     await writeAtomic(`${directory}/phone-connection.json`, {
       phone: { adapterUrl: adapter.url, adapterKeyFile: keyFile },
@@ -74,7 +116,11 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
   } finally {
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
-    await adapter.close();
+    try {
+      await admin?.close();
+    } finally {
+      await adapter.close();
+    }
   }
 }
 

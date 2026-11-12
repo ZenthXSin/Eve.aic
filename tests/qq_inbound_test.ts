@@ -280,3 +280,183 @@ Deno.test("QQ 入站日志：写入失败不返回 fresh，后续不能伪装保
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("QQ 官方 1.0.5：两种索引前缀和 103 引用元素兼容，不从普通正文猜引用", () => {
+  for (const prefix of ["message_type", "msg_type"]) {
+    const raw = event({
+      content: "正文不删也不重写 <@!bot> refMsgIdx:fake",
+      message_scene: { ext: ["msgIdx: legacy-own ", "refMsgIdx: legacy-quote "] },
+      [prefix]: 103,
+      msg_elements: [{ msg_idx: "actual-quote", content: "引用原话" }],
+    });
+    const projected = qqMessage(raw)!;
+    assert.equal(projected.deduplication.messageIndex, "legacy-own");
+    assert.equal(projected.referenceIndex, "actual-quote");
+    assert.equal(projected.message.text, (raw.d as Record<string, unknown>).content);
+    assert.equal(projected.message.quote, undefined);
+    assert.equal(
+      qqMessage({ ...raw, d: { ...(raw.d as object), [prefix]: 0 } })!.referenceIndex,
+      "legacy-quote",
+    );
+  }
+  assert.equal(
+    qqMessage(event({
+      message_scene: {},
+      content: "refMsgIdx:pretend",
+      msg_elements: [{ msg_idx: "not-a-reference" }],
+    }))!.referenceIndex,
+    undefined,
+  );
+  const dual = qqMessage(event({
+    message_scene: { ext: ["msg_idx=same", "msgIdx:same", "ref_msg_idx=quoted"] },
+  }))!;
+  assert.equal(dual.deduplication.messageIndex, "same");
+  assert.throws(() =>
+    qqMessage(event({
+      message_scene: { ext: ["msg_idx=one", "msgIdx:other"] },
+    })), /索引重复/);
+  assert.throws(() =>
+    qqMessage(event({
+      message_type: 103,
+      msg_type: 0,
+    })), /类型相互矛盾/);
+  assert.throws(() => qqMessage(event({ message_type: 103, msg_elements: [null] })), TypeError);
+  // 只有第一个引用元素是官方 utils 定义的引用，不搜索后续元素猜测目标。
+  assert.equal(
+    qqMessage(event({
+      message_type: 103,
+      msg_elements: [{ content: "正文" }, { msg_idx: "later" }],
+    }))!.referenceIndex,
+    undefined,
+  );
+});
+
+Deno.test("QQ 官方附件 MIME：文件、图片、语音和视频保留顺序及元信息，URL只留原件", () => {
+  const raw = event({
+    attachments: [
+      { content_type: "application/pdf", filename: "文档.pdf", size: 17, url: "https://private/1" },
+      { content_type: "text/plain", filename: "笔记.txt", size: 0 },
+      { content_type: "file", filename: "压缩包" },
+      { content_type: "image/jpeg", filename: "照片.jpg", size: 100 },
+      { content_type: "audio/silk", filename: "语音" },
+      { content_type: "voice" },
+      { content_type: "video/mp4", filename: "视频" },
+      { content_type: "unknown/custom" },
+    ],
+  });
+  assert.deepEqual(qqMessage(raw)!.message.attachments, [
+    { kind: "file", name: "文档.pdf", sizeBytes: 17 },
+    { kind: "file", name: "笔记.txt", sizeBytes: 0 },
+    { kind: "file", name: "压缩包" },
+    { kind: "image", name: "照片.jpg", sizeBytes: 100 },
+    { kind: "audio", name: "语音" },
+    { kind: "audio" },
+    { kind: "video", name: "视频" },
+    { kind: "other" },
+  ]);
+  assert.equal(JSON.stringify(qqMessage(raw)).includes("https://private"), false);
+  assert.equal(qqMessage(raw, 1)!.message.attachments![0].kind, "other");
+});
+
+async function oldRecord(directory: string, raw: QqDispatch) {
+  const message = qqMessage(raw, 1)!;
+  function canonical(value: unknown): string {
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    const object = value as Record<string, unknown>;
+    return `{${
+      Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`)
+        .join(",")
+    }}`;
+  }
+  const bytes = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(canonical(message.deduplication)),
+  );
+  const identity = Array.from(new Uint8Array(bytes), (v) => v.toString(16).padStart(2, "0")).join(
+    "",
+  );
+  const record = { schema: 1, seq: 1, identity, receivedAt: "2026-11-11T15:00:00Z", message, raw };
+  const path = `${directory}/0000000000000001-${identity}.json`;
+  const original = JSON.stringify(record) + "\n";
+  await Deno.writeTextFile(path, original);
+  return { record, path, original };
+}
+
+Deno.test("QQ 投影升级：无版本旧原件按 v1 恢复，legacy/native 重放均复用原身份且不重写", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-inbound-" });
+  try {
+    const raw = event({
+      msg_seq: 8,
+      message_scene: { ext: ["msgIdx:own", "refMsgIdx:ext-quote"] },
+      message_type: 103,
+      msg_elements: [{ msg_idx: "element-quote" }],
+      attachments: [{ content_type: "application/pdf", filename: "资料.pdf", size: 42 }],
+    });
+    const stored = await oldRecord(directory, raw);
+    const log = new QqInboundJournal(directory);
+    await log.initialize();
+    assert.deepEqual(log.records(), [stored.record]);
+    assert.equal(log.records()[0].message.message.attachments![0].kind, "other");
+    const replay = await log.append(qqMessage(raw)!, { ...raw, s: 15, id: "resent" });
+    assert.equal(replay.fresh, false);
+    assert.equal(replay.record.identity, stored.record.identity);
+    assert.equal(replay.record.projectionVersion, undefined);
+    const native = {
+      ...raw,
+      s: 16,
+      d: { ...(raw.d as object), message_scene: { ext: ["msg_idx=own", "ref_msg_idx=ext-quote"] } },
+    };
+    assert.equal((await log.append(qqMessage(native)!, native)).fresh, false);
+    assert.equal(await Deno.readTextFile(stored.path), stored.original);
+    const next = event({
+      message_scene: { ext: ["msgIdx:next"] },
+      attachments: [{ content_type: "text/plain" }],
+    });
+    const fresh = await log.append(qqMessage(next)!, next);
+    assert.equal(fresh.fresh, true);
+    assert.equal(fresh.record.projectionVersion, 2);
+    assert.equal(fresh.record.message.message.attachments![0].kind, "file");
+    const restart = new QqInboundJournal(directory);
+    await restart.initialize();
+    assert.equal(restart.records().length, 2);
+    assert.equal(
+      (await restart.append(qqMessage(native)!, native)).record.identity,
+      stored.record.identity,
+    );
+    const changed = { ...native, d: { ...(native.d as object), content: "同身份被篡改的正文" } };
+    await assert.rejects(
+      restart.append(qqMessage(changed)!, changed),
+      (e) => e instanceof QqJournalError && e.category === "conflict",
+    );
+    assert.equal(await Deno.readTextFile(stored.path), stored.original);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("QQ 投影升级：旧版忽略的新字段不合法仍可恢复，但未知投影版本拒绝", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-inbound-" });
+  try {
+    const stored = await oldRecord(
+      directory,
+      event({
+        message_scene: { ext: ["msgIdx:"] },
+        message_type: 103,
+        msg_elements: [null],
+      }),
+    );
+    const log = new QqInboundJournal(directory);
+    await log.initialize();
+    assert.deepEqual(log.records(), [stored.record]);
+    const invalidVersion = JSON.stringify({ ...stored.record, projectionVersion: 99 });
+    await Deno.writeTextFile(stored.path, invalidVersion);
+    await assert.rejects(
+      new QqInboundJournal(directory).initialize(),
+      (e) => e instanceof QqJournalError && e.category === "corrupt",
+    );
+    assert.equal(await Deno.readTextFile(stored.path), invalidVersion);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});

@@ -11,6 +11,7 @@ import { NoteStore, textPage } from "./notes.ts";
 import { MemoryStore } from "./memory.ts";
 import type { LocalSemantic } from "./embedding.ts";
 import { describedImage, imageDescriptionRequest, imageProvenance } from "./vision.ts";
+import type { ModelSelection, ModelSelectionResult, ModelSnapshot } from "./model-selection.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 
 interface RequestRecord {
@@ -31,6 +32,7 @@ interface Options {
   model: { complete(args: ModelRequest): Promise<ModelResponse>; close(): void };
   maxOutputTokens: number;
   modelName?: string;
+  modelSelection?: Pick<ModelSelection, "snapshot" | "current">;
   commandIdentity?: CommandIdentity;
   commandUseSystemd?: boolean;
   fileRuntime?: FileRuntime;
@@ -49,8 +51,9 @@ export class RuntimeEngine {
   #requests = new Map<string, RequestRecord>();
   #live = new Map<string, Promise<Json>>();
   #timelineTail: Promise<unknown> = Promise.resolve();
+  #modelSelectionTail: Promise<unknown> = Promise.resolve();
   #closing = false;
-  #modelBlocked: ModelBlock | null = null;
+  #modelBlocked: (ModelBlock & { modelName?: string; modelRevision?: number }) | null = null;
   constructor(readonly options: Options) {
     const directory = options.directory;
     const embed = options.semantic
@@ -182,7 +185,9 @@ export class RuntimeEngine {
         const status = data.error
           ? providerRejection(new KernelError(data.error.kind, data.error.message))
           : undefined;
-        if (status !== undefined) this.#blockModel(data.id, status, event.at);
+        if (status !== undefined) {
+          this.#blockModel(data.id, status, event.at, request.recovery);
+        }
       }
     } catch (error) {
       await this.close().catch(() => {});
@@ -190,17 +195,67 @@ export class RuntimeEngine {
     }
   }
   modelStatus() {
-    return { blocked: this.#modelBlocked ? structuredClone(this.#modelBlocked) : null };
+    return {
+      blocked: this.#modelBlocked ? structuredClone(this.#modelBlocked) : null,
+      ...(this.options.modelSelection ? { current: this.options.modelSelection.current() } : {}),
+    };
   }
-  #blockModel(requestId: string, httpStatus: number, at = new Date().toISOString()) {
-    if (this.#modelBlocked) return;
-    const blocked: ModelBlock = {
+  #blockModel(
+    requestId: string,
+    httpStatus: number,
+    at = new Date().toISOString(),
+    recovery?: Json,
+  ) {
+    const captured = recovery as { modelName?: string; modelRevision?: number } | undefined;
+    const modelName = captured?.modelName ?? this.options.modelName;
+    const modelRevision = captured?.modelRevision ?? 0;
+    const current = this.options.modelSelection?.current();
+    // A late permanent rejection from a previous selection cannot stop the new model.
+    if (current && (current.model !== modelName || current.revision !== modelRevision)) return;
+    if (
+      this.#modelBlocked && (!current ||
+        this.#modelBlocked.modelName === modelName &&
+          this.#modelBlocked.modelRevision === modelRevision)
+    ) return;
+    const blocked: ModelBlock & { modelName?: string; modelRevision?: number } = {
       category: "provider_rejected",
       httpStatus,
       requestId,
       at,
+      ...(this.options.modelSelection ? { modelName, modelRevision } : {}),
     };
     this.#modelBlocked = blocked;
+  }
+  async modelSelectionChanged(result: ModelSelectionResult) {
+    const work = this.#modelSelectionTail.then(async () => {
+      const current = this.options.modelSelection?.current(), blocked = this.#modelBlocked;
+      if (
+        !current || !result.changed || result.model !== current.model ||
+        result.revision !== current.revision || !blocked ||
+        blocked.modelName === current.model && blocked.modelRevision === current.revision
+      ) return;
+      // Receipts may be queried concurrently or after a lost HTTP response. Apply exactly once.
+      const applied = this.records.events.some((event) => {
+        const data = event.data as { reason?: string; actionId?: string; requestId?: string };
+        return event.kind === "model_resume" && data.reason === "owner_explicit_model_switch" &&
+          data.actionId === result.actionId && data.requestId === blocked.requestId;
+      });
+      if (!applied) {
+        await this.records.append("model_resume", {
+          requestId: blocked.requestId,
+          reason: "owner_explicit_model_switch",
+          actionId: result.actionId,
+          previousModel: blocked.modelName ?? this.options.modelName ?? "",
+          previousRevision: blocked.modelRevision ?? 0,
+          model: result.model,
+          modelRevision: result.revision,
+          actionsThroughSeq: this.transactions.events.length,
+        });
+      }
+      if (this.#modelBlocked === blocked) this.#modelBlocked = null;
+    });
+    this.#modelSelectionTail = work.catch(() => {});
+    await work;
   }
   async resumeModel(expectedRequestId: string) {
     if (!this.#modelBlocked || this.#modelBlocked.requestId !== expectedRequestId) {
@@ -249,6 +304,15 @@ export class RuntimeEngine {
         method,
       )
     ) throw new KernelError("rejected", "该能力不在契约内");
+    // Capture before the first await: an admitted request keeps its original client and provenance.
+    const selected = namespace === "model" && ["complete", "describeImage"].includes(method)
+      ? this.options.modelSelection?.snapshot() ?? {
+        client: this.options.model,
+        modelName: this.options.modelName ?? "",
+        maxOutputTokens: this.options.maxOutputTokens,
+        revision: 0,
+      }
+      : undefined;
     const captured = structuredClone(args),
       hash = await fingerprint({ namespace, method, args: captured });
     const recovery = (namespace === "timeline" && method === "append"
@@ -259,8 +323,12 @@ export class RuntimeEngine {
       : namespace === "model" && method === "describeImage"
       ? {
         provenance: imageProvenance((captured.image as unknown as ModelImage)?.provenance),
-        ...(this.options.modelName ? { modelName: this.options.modelName } : {}),
+        ...(selected?.modelName
+          ? { modelName: selected.modelName, modelRevision: selected.revision }
+          : {}),
       }
+      : namespace === "model" && method === "complete" && selected
+      ? { modelName: selected.modelName, modelRevision: selected.revision }
       : null) as unknown as Json;
     const old = this.#requests.get(id);
     if (old && old.hash !== hash) throw new KernelError("rejected", "同一动作编号不能改变参数");
@@ -270,7 +338,7 @@ export class RuntimeEngine {
       this.#requests.set(id, record);
       await this.transactions.append("request", record as unknown as Json);
       try {
-        const value = await this.#invoke(namespace, method, captured, id);
+        const value = await this.#invoke(namespace, method, captured, id, selected);
         canonical(value);
         await this.#result(record, { value });
         return value;
@@ -282,7 +350,7 @@ export class RuntimeEngine {
             namespace === "model" && method === "complete" &&
             /^model_[1-9][0-9]*$/.test(id) && status !== undefined
           ) {
-            this.#blockModel(id, status);
+            this.#blockModel(id, status, undefined, recovery);
           }
         }
         throw error;
@@ -305,6 +373,7 @@ export class RuntimeEngine {
     method: string,
     args: Record<string, Json>,
     id: string,
+    selected?: ModelSnapshot,
   ): Promise<Json> {
     if (namespace === "timeline") {
       if (method === "page") return this.#recordPage(args, true) as unknown as Json;
@@ -377,10 +446,13 @@ export class RuntimeEngine {
         return result;
       }
       const description = method === "describeImage";
-      if (method === "complete" && /^model_[1-9][0-9]*$/.test(id) && this.#modelBlocked) {
+      const blocked = this.#modelBlocked;
+      const appliesToSelected = blocked && (!this.options.modelSelection ||
+        selected?.modelName === blocked.modelName && selected?.revision === blocked.modelRevision);
+      if (method === "complete" && /^model_[1-9][0-9]*$/.test(id) && appliesToSelected) {
         throw new KernelError(
           "rejected",
-          `模型请求未完成：provider_rejected (${this.#modelBlocked.httpStatus})`,
+          `模型请求未完成：provider_rejected (${blocked.httpStatus})`,
         );
       }
       const image = description ? args.image as unknown as ModelImage : undefined;
@@ -389,16 +461,22 @@ export class RuntimeEngine {
         ? imageDescriptionRequest(image!)
         : modelArgs as unknown as ModelRequest;
       const amount = new TextEncoder().encode(JSON.stringify(request)).length +
-        request.messages.length * 64 + this.options.maxOutputTokens;
+        request.messages.length * 64 + (selected?.maxOutputTokens ?? this.options.maxOutputTokens);
       await this.budget.reserve(id, amount);
-      const response = await this.options.model.complete(request);
-      await this.modelResponses.append("response", { id, response } as unknown as Json);
+      const response = await (selected?.client ?? this.options.model).complete(request);
+      await this.modelResponses.append("response", {
+        id,
+        response,
+        ...(selected?.modelName
+          ? { modelName: selected.modelName, modelRevision: selected.revision }
+          : {}),
+      } as unknown as Json);
       await this.budget.response(id, response);
       if (description) {
         return describedImage(
           response,
           image!.provenance,
-          this.options.modelName,
+          selected?.modelName || this.options.modelName,
         ) as unknown as Json;
       }
       if (purpose === "online") {
@@ -443,7 +521,7 @@ export class RuntimeEngine {
     } catch (e) {
       errors.push(e);
     }
-    await Promise.allSettled([...this.#live.values()]);
+    await Promise.allSettled([...this.#live.values(), this.#modelSelectionTail]);
     for (
       const service of [
         this.budget,

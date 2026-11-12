@@ -1,4 +1,5 @@
 import type { ModelResponse } from "../contracts/model.ts";
+import { QqAdminClient } from "../adapters/qq/admin.ts";
 import { OwnershipRpcClient } from "../guardian/rpc.ts";
 import { type Json, KernelError, toWireError } from "../kernel/protocol.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
@@ -29,6 +30,7 @@ export interface SupervisorConfig {
     instanceRuntimeDirectory?: string;
     commandIdentity?: { uid: number; gid: number };
     instanceIdentities?: { uid: number; gid: number }[];
+    qqAdmin?: { connectionFile: string; keyFile: string };
   };
   instances: InstanceSpec[];
   runtimeAdmin: { connectionFile: string; keyFile: string };
@@ -53,6 +55,14 @@ export async function startSupervisor(configPath: string) {
     ].some((p) => typeof p !== "string" || !p.startsWith("/")) ||
     !Number.isSafeInteger(c.tickMs ?? 1000) || (c.tickMs ?? 1000) < 50
   ) throw new KernelError("rejected", "独立监督私有配置不完整");
+  if (
+    c.qqAdmin &&
+    ![c.qqAdmin.connectionFile, c.qqAdmin.keyFile].every((path) =>
+      typeof path === "string" && path.startsWith("/")
+    )
+  ) {
+    throw new KernelError("rejected", "QQ 管理连接与密钥必须为绝对路径");
+  }
   if (
     !config.instances.every((i) =>
       i.identity && [i.identity.uid, i.identity.gid].every((n) => Number.isSafeInteger(n) && n > 0)
@@ -85,9 +95,17 @@ export async function startSupervisor(configPath: string) {
       async (path) => (await Deno.readTextFile(path)).trim(),
     ),
   );
+  const qqAdminKey = c.qqAdmin ? (await Deno.readTextFile(c.qqAdmin.keyFile)).trim() : undefined;
+  const controlKeys = [
+    key,
+    adminKey,
+    guardianKey,
+    runtimeAdminKey,
+    ...(qqAdminKey ? [qqAdminKey] : []),
+  ];
   if (
-    new Set([key, adminKey, guardianKey, runtimeAdminKey]).size !== 4 ||
-    ![key, adminKey, guardianKey, runtimeAdminKey].every((k) => /^[a-zA-Z0-9_-]{32,256}$/.test(k))
+    new Set(controlKeys).size !== controlKeys.length ||
+    !controlKeys.every((k) => /^[a-zA-Z0-9_-]{32,256}$/.test(k)) || (c.qqAdmin && !qqAdminKey)
   ) throw new KernelError("rejected", "监督与各管理接口凭据必须彼此独立");
   const guardianCall = async <T>(method: string, args: unknown = {}) => {
     const connection = JSON.parse(await Deno.readTextFile(c.guardianConnectionFile));
@@ -105,6 +123,7 @@ export async function startSupervisor(configPath: string) {
     pause: (args) => guardianCall("pause", args),
   };
   const runtime = new RuntimeAdminClient(config.runtimeAdmin);
+  const qqAdmin = c.qqAdmin ? new QqAdminClient(c.qqAdmin) : undefined;
   const driver = new LocalInstanceDriver(
     c.deno,
     `${c.directory}/processes`,
@@ -201,9 +220,19 @@ export async function startSupervisor(configPath: string) {
         ownership: await guardian.status() as unknown as Json,
       };
     },
-    query: (request) => runtime.query(request),
+    query: (request) => {
+      if (request.resource === "qqFailures") {
+        if (!qqAdmin) throw new KernelError("unavailable", "QQ 失败队列管理尚未配置");
+        return qqAdmin.failedHeads(request.args);
+      }
+      return runtime.query(request);
+    },
     control(request) {
       return serialControl(async () => {
+        if (request.action === "resolveQqFailure") {
+          if (!qqAdmin) throw new KernelError("unavailable", "QQ 失败队列管理尚未配置");
+          return await qqAdmin.resolveFailed(request.args);
+        }
         if (request.action === "pause") {
           await changePause(true);
         } else if (request.action === "resume") {

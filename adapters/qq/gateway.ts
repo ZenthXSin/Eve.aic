@@ -27,6 +27,8 @@ export interface QqGatewayOptions {
   connectTimeoutMs?: number;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
+  rateLimitBackoffMs?: number;
+  stableConnectionMs?: number;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -53,9 +55,11 @@ export class QqGateway {
 
   constructor(readonly client: QqClient, options: QqGatewayOptions) {
     this.#options = {
-      connectTimeoutMs: 15_000,
+      connectTimeoutMs: 30_000,
       initialBackoffMs: 1000,
-      maxBackoffMs: 30_000,
+      maxBackoffMs: 60_000,
+      rateLimitBackoffMs: 60_000,
+      stableConnectionMs: 5_000,
       ...options,
     };
     if (!Number.isSafeInteger(options.intents) || options.intents < 0) {
@@ -66,6 +70,8 @@ export class QqGateway {
         this.#options.connectTimeoutMs,
         this.#options.initialBackoffMs,
         this.#options.maxBackoffMs,
+        this.#options.rateLimitBackoffMs,
+        this.#options.stableConnectionMs,
       ]
     ) {
       if (!Number.isSafeInteger(duration) || duration < 1 || duration > 2_147_483_647) {
@@ -111,7 +117,8 @@ export class QqGateway {
   async #connection(
     connection: QqGatewayConnection,
     signal: AbortSignal,
-  ): Promise<{ code: number; ready: boolean }> {
+  ): Promise<{ code: number; ready: boolean; livedMs: number }> {
+    const startedAt = performance.now();
     const socket = connection.socket;
     let ready = false;
     let hello = false;
@@ -256,7 +263,7 @@ export class QqGateway {
       // 断线不能中断已开始的落盘；等完成后才允许下一连接恢复序号。
       await queue;
       if (fatal) throw fatal;
-      return { code, ready };
+      return { code, ready, livedMs: performance.now() - startedAt };
     } finally {
       clearInterval(interval);
       clearTimeout(timeout);
@@ -274,6 +281,7 @@ export class QqGateway {
     const stopRequests = () => this.client.close();
     signal.addEventListener("abort", stopRequests, { once: true });
     let delay = this.#options.initialBackoffMs;
+    let quickDisconnects = 0;
     try {
       try {
         this.#session = await this.#options.checkpoint.load();
@@ -282,27 +290,44 @@ export class QqGateway {
       }
       while (!signal.aborted) {
         this.#options.onStatus?.({ status: "connecting" });
-        let result: { code: number; ready: boolean };
+        let result: { code: number; ready: boolean; livedMs: number };
+        let platformDelay = 0;
         try {
           result = await this.#connection(await this.client.openGateway(), signal);
         } catch (error) {
           if (signal.aborted && error instanceof QqRequestError) break;
           if (
             !(error instanceof QqRequestError) ||
-            !["transport", "rate_limit"].includes(error.info.category)
+            !["transport", "rate_limit", "authentication"].includes(error.info.category)
           ) throw error;
-          result = { code: 1006, ready: false };
+          if (error.info.category === "authentication") this.client.invalidateToken();
+          if (error.info.category === "rate_limit") {
+            platformDelay = Math.max(
+              this.#options.rateLimitBackoffMs,
+              error.info.retryAfterMs ?? 0,
+            );
+          }
+          result = { code: 1006, ready: false, livedMs: 0 };
         }
         if (signal.aborted) break;
         this.#options.onStatus?.({ status: "disconnected", code: result.code });
-        if ([4001, 4002, 4004, 4010, 4011, 4012, 4013, 4014, 4914, 4915].includes(result.code)) {
+        if ([4001, 4002, 4010, 4011, 4012, 4013, 4014, 4914, 4915].includes(result.code)) {
           throw new QqGatewayError("closed", result.code);
         }
+        if (result.code === 4004) this.client.invalidateToken();
+        if (result.code === 4008) platformDelay = this.#options.rateLimitBackoffMs;
         if ([4006, 4007].includes(result.code) || (result.code >= 4900 && result.code <= 4913)) {
           await this.#checkpoint(undefined);
+          this.client.invalidateToken();
         }
-        if (result.ready) delay = this.#options.initialBackoffMs;
-        await wait(delay, signal);
+        if (result.ready && result.livedMs >= this.#options.stableConnectionMs) {
+          delay = this.#options.initialBackoffMs;
+          quickDisconnects = 0;
+        } else if (++quickDisconnects >= 3) {
+          platformDelay = Math.max(platformDelay, this.#options.rateLimitBackoffMs);
+          quickDisconnects = 0;
+        }
+        await wait(Math.max(delay, platformDelay), signal);
         delay = Math.min(this.#options.maxBackoffMs, delay * 2);
       }
     } finally {

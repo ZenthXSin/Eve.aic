@@ -1,6 +1,14 @@
 // 独立适配器的 QQ HTTP 传输。不依赖内核或插件，不承担身份映射、通知和行为判断。
 // 返回平台事实；持久动作记录、入站日志和所有权交接由适配器服务另行接入。
 import { Buffer } from "node:buffer";
+import { gatewayPath, mediaUploadPath, messagePath } from "./official/routes.ts";
+import {
+  QQ_API_ORIGIN,
+  QQ_REQUEST_TIMEOUT_MS,
+  QQ_TOKEN_ORIGIN,
+  QQ_TOKEN_TIMEOUT_MS,
+  QQ_UPLOAD_TIMEOUT_MS,
+} from "./official/protocol.ts";
 
 export interface QqCredentials {
   appId: string;
@@ -12,7 +20,10 @@ export interface QqClientOptions {
   attachmentReader?: (path: string) => Promise<Uint8Array>;
   /** 正式环境使用官方 HTTPS 地址；HTTP 只允许本机测试地址。 */
   baseUrl?: string;
+  tokenBaseUrl?: string;
   timeoutMs?: number;
+  uploadTimeoutMs?: number;
+  tokenTimeoutMs?: number;
   maxResponseBytes?: number;
   now?: () => number;
   /** 缺省仅私信；显式 all 才允许群聊，在认证或发送请求前落实。 */
@@ -40,6 +51,9 @@ export interface QqErrorInfo {
   /** headers 包括建连及等待响应头；不据此猜测请求是否已经送达。 */
   phase?: "headers" | "body";
   elapsedMs?: number;
+  /** Platform-declared delay, bounded to one hour; never inferred from free-form messages. */
+  retryAfterMs?: number;
+  failureStage?: "auth" | "upload" | "message";
 }
 
 export class QqRequestError extends Error {
@@ -83,6 +97,7 @@ interface ResponseInfo {
   httpStatus: number;
   data: Record<string, unknown>;
   traceId?: string;
+  retryAfterMs?: number;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -122,12 +137,32 @@ function traceOf(data: Record<string, unknown>, header: string | null): string |
 }
 
 function errorInfo(response: ResponseInfo, code?: number): QqErrorInfo {
-  const category = response.httpStatus === 429 || code === 100001 || code === 40034100
+  const category = response.httpStatus === 429 || code === 100001 || code === 40034100 ||
+      code === 22009
     ? "rate_limit"
     : response.httpStatus === 401 || code === 100016 || code === 11243
     ? "authentication"
     : "platform";
-  return { category, httpStatus: response.httpStatus, code, traceId: response.traceId };
+  return {
+    category,
+    httpStatus: response.httpStatus,
+    code,
+    traceId: response.traceId,
+    ...(response.retryAfterMs === undefined ? {} : { retryAfterMs: response.retryAfterMs }),
+  };
+}
+
+function retryAfter(value: string | null, now: number): number | undefined {
+  if (!value) return undefined;
+  const delay = /^\d+$/.test(value.trim()) ? Number(value.trim()) * 1000 : Date.parse(value) - now;
+  return Number.isFinite(delay) && delay >= 0 ? Math.min(3_600_000, Math.ceil(delay)) : undefined;
+}
+
+/** Same policy as the official SDK's FILE upload: send a basename, not a local pathname. */
+function fileName(path: string): string {
+  // Explicitly strip control bytes from the filename accepted by the upstream FILE API.
+  // deno-lint-ignore no-control-regex
+  return path.split("/").at(-1)!.replace(/[\x00-\x1f\x7f\\/:*?"<>|]/g, "_").slice(0, 255) || "file";
 }
 
 async function readObject(response: Response, limit: number): Promise<Record<string, unknown>> {
@@ -226,8 +261,11 @@ export function validateQqSendText(request: QqSendText): void {
 
 export class QqClient {
   #base: URL;
+  #tokenBase: URL;
   #credentials: QqCredentials;
   #timeout: number;
+  #uploadTimeout: number;
+  #tokenTimeout: number;
   #limit: number;
   #now: () => number;
   #token?: { value: string; expiresAt: number };
@@ -239,23 +277,39 @@ export class QqClient {
 
   constructor(credentials: QqCredentials, options: QqClientOptions = {}) {
     if (!nonempty(credentials.appId) || !nonempty(credentials.appSecret)) requestError();
-    const base = new URL(options.baseUrl ?? "https://api.bot.qq.com");
+    const base = new URL(options.baseUrl ?? QQ_API_ORIGIN);
     const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(base.hostname);
     if (
       base.username || base.password || base.search || base.hash || base.pathname !== "/" ||
       (base.protocol !== "https:" && !(base.protocol === "http:" && loopback))
     ) requestError();
-    const timeout = options.timeoutMs ?? 20_000;
+    const tokenBase = new URL(options.tokenBaseUrl ?? (options.baseUrl ?? QQ_TOKEN_ORIGIN));
+    if (
+      tokenBase.username || tokenBase.password || tokenBase.search || tokenBase.hash ||
+      tokenBase.pathname !== "/" || (tokenBase.protocol !== "https:" &&
+        !(tokenBase.protocol === "http:" &&
+          ["127.0.0.1", "localhost", "[::1]"].includes(tokenBase.hostname)))
+    ) requestError();
+    const timeout = options.timeoutMs ?? QQ_REQUEST_TIMEOUT_MS;
+    const uploadTimeout = options.uploadTimeoutMs ?? options.timeoutMs ?? QQ_UPLOAD_TIMEOUT_MS;
+    const tokenTimeout = options.tokenTimeoutMs ?? options.timeoutMs ?? QQ_TOKEN_TIMEOUT_MS;
     const limit = options.maxResponseBytes ?? 1_048_576;
     if (options.sendScope !== undefined && !["all", "private"].includes(options.sendScope)) {
       requestError();
     }
-    if (!Number.isFinite(timeout) || timeout <= 0 || !Number.isSafeInteger(limit) || limit < 1) {
+    if (
+      [timeout, uploadTimeout, tokenTimeout].some((ms) =>
+        !Number.isSafeInteger(ms) || ms < 1 || ms > 2_147_483_647
+      ) || !Number.isSafeInteger(limit) || limit < 1
+    ) {
       requestError();
     }
     this.#base = base;
+    this.#tokenBase = tokenBase;
     this.#credentials = { ...credentials };
     this.#timeout = timeout;
+    this.#uploadTimeout = uploadTimeout;
+    this.#tokenTimeout = tokenTimeout;
     this.#limit = limit;
     this.#now = options.now ?? Date.now;
     this.#scope = options.sendScope ?? "private";
@@ -271,23 +325,36 @@ export class QqClient {
     this.#downloadedReader = reader;
   }
 
-  async #request(path: string, init: RequestInit): Promise<ResponseInfo> {
+  async #request(
+    path: string,
+    init: RequestInit,
+    options: { origin?: URL; timeoutMs?: number } = {},
+  ): Promise<ResponseInfo> {
     const startedAt = performance.now();
-    const timeout = AbortSignal.timeout(this.#timeout);
+    const timeout = AbortSignal.timeout(options.timeoutMs ?? this.#timeout);
     const signal = AbortSignal.any([this.#closed.signal, timeout]);
     let phase: "headers" | "body" = "headers";
     try {
-      const response = await fetch(new URL(path, this.#base), {
+      const response = await fetch(new URL(path, options.origin ?? this.#base), {
         ...init,
         redirect: "manual",
         signal,
       });
       phase = "body";
-      const data = await readObject(response, this.#limit);
+      let data: Record<string, unknown>;
+      try {
+        data = await readObject(response, this.#limit);
+      } catch (error) {
+        // A known HTTP rejection remains useful even when a gateway serves HTML.
+        // A body timeout still retains the unknown delivery boundary.
+        if (!(error instanceof QqRequestError) || response.status < 400) throw error;
+        data = {};
+      }
       return {
         httpStatus: response.status,
         data,
         traceId: traceOf(data, response.headers.get("X-Tps-trace-ID")),
+        retryAfterMs: retryAfter(response.headers.get("Retry-After"), this.#now()),
       };
     } catch (error) {
       if (error instanceof QqRequestError) throw error;
@@ -311,10 +378,10 @@ export class QqClient {
         appId: this.#credentials.appId,
         clientSecret: this.#credentials.appSecret,
       }),
-    });
+    }, { origin: this.#tokenBase, timeoutMs: this.#tokenTimeout });
     const code = codeOf(response.data);
     if (response.httpStatus !== 200 || (code !== undefined && code !== 0)) {
-      throw new QqRequestError(errorInfo(response, code));
+      throw new QqRequestError({ ...errorInfo(response, code), failureStage: "auth" });
     }
     const token = response.data.access_token;
     const rawExpiry = response.data.expires_in;
@@ -345,10 +412,15 @@ export class QqClient {
     this.#closed.abort();
   }
 
+  /** A definite platform auth rejection permits the next attempt to obtain a new token. */
+  invalidateToken(): void {
+    this.#token = undefined;
+  }
+
   /** 获取官方接入点并创建连接；Hello 到达后由网关处理器调用鉴权。 */
   async openGateway(): Promise<QqGatewayConnection> {
     const token = await this.#accessToken();
-    const response = await this.#request("/gateway/bot", {
+    const response = await this.#request(gatewayPath(), {
       headers: { Authorization: `QQBot ${token}` },
     });
     const code = codeOf(response.data);
@@ -364,7 +436,8 @@ export class QqClient {
     const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
     // 当前官方 HTTPS 响应仍可能返回旧的 api.sgroup.qq.com 网关；只允许明确列出的官方主机。
     const trustedHost = url.hostname === this.#base.hostname ||
-      (this.#base.hostname === "api.bot.qq.com" && url.hostname === "api.sgroup.qq.com");
+      (["api.bot.qq.com", "api.sgroup.qq.com"].includes(this.#base.hostname) &&
+        ["api.bot.qq.com", "api.sgroup.qq.com"].includes(url.hostname));
     if (
       url.username || url.password || url.hash || !trustedHost ||
       (url.protocol !== "wss:" &&
@@ -444,7 +517,8 @@ export class QqClient {
       return { status: "failed", attempted: false, error: (error as QqRequestError).info };
     }
     let response: ResponseInfo;
-    const resource = request.destination.kind === "user" ? "users" : "groups";
+    const scope = request.destination.kind === "user" ? "c2c" : "group";
+    const target = encodeURIComponent(request.destination.openId);
     if (request.attachment) {
       let bytes: Uint8Array;
       try {
@@ -459,7 +533,7 @@ export class QqClient {
       let upload: ResponseInfo;
       try {
         upload = await this.#request(
-          `/v2/${resource}/${encodeURIComponent(request.destination.openId)}/files`,
+          mediaUploadPath(scope, target),
           {
             method: "POST",
             headers: {
@@ -470,11 +544,19 @@ export class QqClient {
               file_type: request.attachment.kind === "image" ? 1 : 4,
               file_data: Buffer.from(bytes).toString("base64"),
               srv_send_msg: false,
+              ...(request.attachment.kind === "file"
+                ? { file_name: fileName(request.attachment.path) }
+                : {}),
             }),
           },
+          { timeoutMs: this.#uploadTimeout },
         );
       } catch (error) {
-        return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
+        return {
+          status: "unknown",
+          attempted: true,
+          error: { ...(error as QqRequestError).info, failureStage: "upload" },
+        };
       }
       let code: number | undefined;
       try {
@@ -483,10 +565,12 @@ export class QqClient {
         return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
       }
       if (upload.httpStatus !== 200 || (code !== undefined && code !== 0)) {
+        const error = { ...errorInfo(upload, code), failureStage: "upload" as const };
+        if (error.category === "authentication") this.invalidateToken();
         return {
           status: upload.httpStatus >= 500 ? "unknown" : "failed",
           attempted: true,
-          error: errorInfo(upload, code),
+          error,
         };
       }
       if (!nonempty(upload.data.file_info)) {
@@ -504,7 +588,7 @@ export class QqClient {
     }
     try {
       response = await this.#request(
-        `/v2/${resource}/${encodeURIComponent(request.destination.openId)}/messages`,
+        messagePath(scope, target),
         {
           method: "POST",
           headers: {
@@ -523,7 +607,8 @@ export class QqClient {
     } catch (error) {
       return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
     }
-    const error = errorInfo(response, code);
+    const error: QqErrorInfo = { ...errorInfo(response, code), failureStage: "message" };
+    if (error.category === "authentication") this.invalidateToken();
     // 异步审核没有送达回执；去重也不能替代查询原动作，尤其不能换序号再发送。
     if ([304023, 304024].includes(code ?? -1) || [201, 202].includes(response.httpStatus)) {
       return { status: "unknown", attempted: true, error: { ...error, category: "pending" } };

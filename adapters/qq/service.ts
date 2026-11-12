@@ -1,3 +1,5 @@
+import { QQ_OFFICIAL_PROTOCOL } from "./official/protocol.ts";
+import { type QqModelCommandOptions, QqModelCommands } from "./model-command.ts";
 import { QqSendActions } from "./actions.ts";
 import { QqClient } from "./client.ts";
 import { QqPhone } from "./phone.ts";
@@ -20,7 +22,7 @@ export async function startQqPhoneAdapter(
   key: string,
   onStatus?: (status: QqReceiverStatus) => void,
   fence?: OwnershipFence,
-  options: { captureActivationBoundary?: boolean } = {},
+  options: { captureActivationBoundary?: boolean; modelCommands?: QqModelCommandOptions } = {},
 ) {
   const controller = new AbortController();
   const actions = new QqSendActions(client, `${directory}/outbox`, client.sendScope);
@@ -28,7 +30,21 @@ export async function startQqPhoneAdapter(
   const reading = new QqPhoneReading(`${directory}/phone-reading`);
   const device = new QqPhoneDevice(`${directory}/phone-device`);
   const downloads = new QqPhoneDownloads(`${directory}/downloads`);
-  const receiver = new QqReceiver(client, directory);
+  const modelCommands = options.modelCommands === undefined ? undefined : new QqModelCommands(
+    `${directory}/model-commands`,
+    actions,
+    options.modelCommands,
+  );
+  const receiver = new QqReceiver(
+    client,
+    directory,
+    modelCommands
+      ? {
+        initialized: (records) => modelCommands.initialize(records),
+        persisted: (record) => modelCommands.offer(record),
+      }
+      : {},
+  );
   let rpc: ReturnType<typeof startPhoneRpc> | undefined;
   let failure: unknown;
   let status: QqReceiverStatus = { status: "connecting" };
@@ -71,7 +87,7 @@ export async function startQqPhoneAdapter(
       }),
     ]);
     const phone = new QqPhone(
-      () => receiver.messages(),
+      () => receiver.messages().map((record) => modelCommands?.project(record) ?? record),
       actions,
       timeline,
       {
@@ -89,8 +105,10 @@ export async function startQqPhoneAdapter(
       key,
       () => ({
         available: failure === undefined && !controller.signal.aborted && actions.available &&
-          timeline.available && reading.available && device.available && downloads.available,
+          timeline.available && reading.available && device.available && downloads.available &&
+          (!modelCommands || modelCommands.available),
         gateway: status,
+        officialProtocol: QQ_OFFICIAL_PROTOCOL,
         replyScope: client.sendScope,
       }),
       fence,
@@ -98,9 +116,11 @@ export async function startQqPhoneAdapter(
     let closing: Promise<void> | undefined;
     return {
       url: rpc.url,
+      actions,
       stopped: receive,
       close: () => {
         closing ??= (async () => {
+          modelCommands?.requestStop();
           actions.requestStop();
           controller.abort();
           client.close();
@@ -110,6 +130,7 @@ export async function startQqPhoneAdapter(
             const task of [
               () => rpc!.close(),
               () => receive!,
+              () => modelCommands?.close(),
               () => fence?.close(),
               () => actions.close(),
               () => timeline.close(),
@@ -132,10 +153,12 @@ export async function startQqPhoneAdapter(
       },
     };
   } catch (error) {
+    modelCommands?.requestStop();
     actions.requestStop();
     controller.abort();
     client.close();
     await Promise.allSettled([rpc?.close(), receive]);
+    await modelCommands?.close().catch(() => {});
     await fence?.close().catch(() => {});
     await actions.close().catch(() => {});
     await timeline.close().catch(() => {});
