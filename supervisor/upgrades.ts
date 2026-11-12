@@ -12,6 +12,7 @@ import { refreshUpgradePrompt } from "./prompt.ts";
 
 export interface UpgradeReceipt {
   actionId: string;
+  requestedBy?: "instance" | "administrator";
   commit: string;
   state: "preparing" | "submitted" | "failed";
   instanceId?: string;
@@ -35,14 +36,18 @@ export interface UpgradeOptions {
   instanceIdentities: { uid: number; gid: number }[];
 }
 
-/** 只有当前在线实例可申请源码升级，没有守护替换/管理凭据能力。 */
+/** 实例入口校验当前在线代际；独立控制入口另验管理密钥，复用同一升级与确认流程。 */
 export class UpgradeRequests {
   #journal: FactJournal;
   #receipts = new Map<string, UpgradeReceipt>();
   #tail: Promise<unknown> = Promise.resolve();
   #work?: Promise<void>;
   #closed = false;
-  constructor(readonly options: UpgradeOptions, readonly supervisor: Supervisor) {
+  constructor(
+    readonly options: UpgradeOptions,
+    readonly supervisor: Supervisor,
+    private readonly administratorKey?: string,
+  ) {
     this.#journal = new FactJournal(`${options.directory}/requests`);
   }
   async initialize() {
@@ -52,7 +57,9 @@ export class UpgradeRequests {
       if (
         event.kind !== "receipt" || typeof item?.actionId !== "string" ||
         !/^[a-f0-9]{40}$/.test(item.commit) ||
-        !["preparing", "submitted", "failed"].includes(item.state)
+        !["preparing", "submitted", "failed"].includes(item.state) ||
+        (item.requestedBy !== undefined &&
+          !["instance", "administrator"].includes(item.requestedBy))
       ) throw new KernelError("corrupt", "升级申请原件损坏");
       this.#receipts.set(item.actionId, item);
     }
@@ -92,11 +99,16 @@ export class UpgradeRequests {
   }
   async invoke(data: Record<string, Json>, authorization: string | null): Promise<Json> {
     if (this.#closed) throw new KernelError("unavailable", "升级申请器已关闭");
+    if (Object.keys(data).some((key) => !["method", "args", "ownership"].includes(key))) {
+      throw new KernelError("rejected", "实例升级信封不接受管理标记");
+    }
     const ownership = data.ownership as unknown as { proof: OwnershipProof; actionId: string };
     const proof = ownership?.proof;
     if (
       !proof || authorization !== `Bearer ${proof.credential}` ||
-      typeof ownership.actionId !== "string" || !/^[a-zA-Z0-9_.:-]{1,256}$/.test(ownership.actionId)
+      typeof ownership.actionId !== "string" ||
+      !/^[a-zA-Z0-9_.:-]{1,256}$/.test(ownership.actionId) ||
+      ownership.actionId.startsWith("administrator_")
     ) throw new KernelError("rejected", "升级需要当前实例证明与稳定申请编号");
     const connection = JSON.parse(await Deno.readTextFile(this.options.guardianConnectionFile));
     const rpc = new OwnershipRpcClient(connection.url, proof.credential);
@@ -124,6 +136,7 @@ export class UpgradeRequests {
       const upgrade = state.upgrade?.id === item.upgradeId ? state.upgrade : undefined;
       return {
         ...item,
+        requestedBy: item.requestedBy ?? "instance",
         ...(typeof item.error === "string"
           ? { error: { kind: item.error, message: "升级准备未完成，请按原申请核对" } }
           : {}),
@@ -139,23 +152,46 @@ export class UpgradeRequests {
     }
     if (
       data.method !== "request" || typeof args?.commit !== "string" ||
-      !/^[a-f0-9]{40}$/.test(args.commit)
+      !/^[a-f0-9]{40}$/.test(args.commit) || Object.keys(args).some((key) => key !== "commit")
     ) throw new KernelError("rejected", "升级只接受固定完整Git提交");
+    return await this.#submit(args.commit, ownership.actionId, "instance");
+  }
+  /** 只供独立监督控制入口调用；没有实例证明豁免标记或脚本契约。 */
+  async requestAdministrator(args: Json, authorization: string | null): Promise<Json> {
+    if (!this.administratorKey || authorization !== `Bearer ${this.administratorKey}`) {
+      throw new KernelError("rejected", "管理员升级需要独立监督控制凭据");
+    }
+    if (
+      !args || typeof args !== "object" || Array.isArray(args) ||
+      Object.keys(args).some((key) => !["commit", "requestId"].includes(key)) ||
+      typeof args.commit !== "string" || !/^[a-f0-9]{40}$/.test(args.commit) ||
+      typeof args.requestId !== "string" || !/^[a-zA-Z0-9_.:-]{1,64}$/.test(args.requestId)
+    ) throw new KernelError("rejected", "管理员升级需要完整Git提交和1至64字符稳定申请编号");
+    return await this.#submit(args.commit, `administrator_${args.requestId}`, "administrator");
+  }
+  async #submit(
+    commit: string,
+    actionId: string,
+    requestedBy: "instance" | "administrator",
+  ): Promise<Json> {
+    if (this.#closed) throw new KernelError("unavailable", "升级申请器已关闭");
     const operation = this.#tail.then(async () => {
-      const old = this.#receipts.get(ownership.actionId);
+      const old = this.#receipts.get(actionId);
       if (old) {
-        if (old.commit !== args.commit) throw new KernelError("rejected", "同一申请不能换提交");
+        if ((old.requestedBy ?? "instance") !== requestedBy) {
+          throw new KernelError("rejected", "同一申请不能更换发起来源");
+        }
+        if (old.commit !== commit) throw new KernelError("rejected", "同一申请不能换提交");
         return old;
       }
       if (this.#work || this.supervisor.state.upgrade || this.supervisor.state.paused) {
         throw new KernelError("unavailable", "已有升级或暂停尚未完成");
       }
-      const instanceId = `candidate_${
-        (await fingerprint([ownership.actionId, args.commit])).slice(0, 32)
-      }`;
+      const instanceId = `candidate_${(await fingerprint([actionId, commit])).slice(0, 32)}`;
       const receipt: UpgradeReceipt = {
-        actionId: ownership.actionId,
-        commit: String(args.commit),
+        actionId,
+        requestedBy,
+        commit,
         state: "preparing",
         instanceId,
       };

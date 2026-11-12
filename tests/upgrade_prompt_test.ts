@@ -5,7 +5,11 @@ import type { Json } from "../kernel/protocol.ts";
 import { refreshUpgradePrompt } from "../supervisor/prompt.ts";
 import type { SourceArtifact } from "../supervisor/source.ts";
 
-async function fixture(directory: string, version: string): Promise<SourceArtifact> {
+async function fixture(
+  directory: string,
+  version: string,
+  nativeThoughts = false,
+): Promise<SourceArtifact> {
   await Deno.mkdir(`${directory}/contracts`, { recursive: true });
   await Deno.mkdir(`${directory}/prompts`);
   const contents: Record<string, string> = { "prompts/qq-social.md": `QQ ${version}\n` };
@@ -13,6 +17,10 @@ async function fixture(directory: string, version: string): Promise<SourceArtifa
     const name of ["phone", "model", "script", "mind", "notes", "workspace", "memory", "upgrades"]
   ) {
     contents[`contracts/${name}.ts`] = `export interface ${name} { ${version}: string; }\n`;
+  }
+  if (nativeThoughts) {
+    contents["contracts/script.ts"] = "export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;\n" +
+      contents["contracts/script.ts"];
   }
   // A candidate generator is code, not a privileged deployment entrypoint.
   await Deno.mkdir(`${directory}/composition`);
@@ -84,17 +92,30 @@ Deno.test("升级提示：610版固定生成说明可刷新到新能力，并保
   const directory = await Deno.makeTempDir({ prefix: "eve-upgrade-legacy-prompt-" });
   try {
     const active = await fixture(`${directory}/old`, "legacy610");
-    const candidate = await fixture(`${directory}/new`, "newStatus");
+    const candidate = await fixture(`${directory}/new`, "newStatus", true);
     const identity = await Deno.readTextFile(new URL("../prompts/identity.md", import.meta.url));
     const generated = await renderScriptContracts((p) =>
       Deno.readTextFile(`${active.directory}/${p}`)
     );
     const sections = generated.slice(generated.indexOf("接口来源：contracts/"));
+    // 使用610冻结前言独立比对，防止新版renderer悄悄改变旧源码生成区。
+    assert.equal(generated, legacyPreamble + sections);
     const prompt = `${identity}\n\nQQ legacy610\n\n\n${legacyPreamble}${sections}`;
     const result = await refreshUpgradePrompt(prompt, active, candidate);
     assert.ok(result.startsWith(`${identity}\n\nQQ newStatus`));
     assert.ok(result.includes("interface upgrades { newStatus: string; }"));
     assert.equal(result.includes("legacy610: string"), false);
+    assert.ok(result.includes("原生工具有 execute_script 与 write_thought。"));
+    assert.ok(result.includes("execute_script 可选参数 thought"));
+    assert.ok(result.includes("同一内容不重复记录"));
+    assert.equal(result.includes("唯一原生工具 execute_script"), false);
+    assert.equal(result.indexOf(identity), 0);
+    assert.equal(result.lastIndexOf(identity), 0);
+    // 新版同样能再升级；身份前缀不因能力标记改变而丢失或重复。
+    const next = await fixture(`${directory}/next`, "next", true);
+    const refreshed = await refreshUpgradePrompt(result, candidate, next);
+    assert.ok(refreshed.startsWith(`${identity}\n\nQQ next`));
+    assert.equal(refreshed.includes("newStatus: string"), false);
   } finally {
     await Deno.remove(directory, { recursive: true });
   }

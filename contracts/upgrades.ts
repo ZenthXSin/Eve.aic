@@ -11,6 +11,8 @@ export type UpgradeFailure = {
 
 export interface UpgradeReceipt {
   actionId: string;
+  /** 旧回执未记录来源时按 instance 理解，管理员申请始终明确标注。 */
+  requestedBy?: "instance" | "administrator";
   commit: string;
   state: "preparing" | "submitted" | "failed";
   instanceId?: string;

@@ -13,16 +13,24 @@ export async function renderScriptContracts(
     new URL("../contracts/upgrades.ts", import.meta.url),
   ];
   const sections: string[] = [];
+  let nativeThoughts = false;
   for (const file of files) {
+    const path = `contracts/${file.pathname.split("/").at(-1)}`;
+    const source = await (readSource ? readSource(path) : Deno.readTextFile(file));
+    // 旧源码没有该声明，必须逐字复原旧前言来识别现役提示生成区。
+    // 源码仅作为已固定的数据读取；绝不 import 候选生成器或执行标记表达式。
+    if (path === "contracts/script.ts") {
+      nativeThoughts = /^export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
+    }
     sections.push(
-      `接口来源：contracts/${
-        file.pathname.split("/").at(-1)
-      }\n\`\`\`ts\n${await (readSource
-        ? readSource(`contracts/${file.pathname.split("/").at(-1)}`)
-        : Deno.readTextFile(file))}\`\`\``,
+      `接口来源：contracts/${file.pathname.split("/").at(-1)}\n\`\`\`ts\n${source}\`\`\``,
     );
   }
-  return "唯一原生工具 execute_script 的 code 是异步函数正文。当前参数名 tools，类型为 ScriptApi；可 await 和 return。\n" +
+  const preamble = nativeThoughts
+    ? "原生工具有 execute_script 与 write_thought。execute_script 的 code 是异步函数正文。当前参数名 tools，类型为 ScriptApi；可 await 和 return。\n" +
+      "execute_script 可选参数 thought 用于留下此刻愿意表达的简短随记、感受或打算；没有脚本动作时可单独调用 write_thought({thought})。随记进入自己的上下文，不自动发送QQ，不要求逐步内部推演；普通文字、thought 和 write_thought 选择合适入口，同一内容不重复记录。\n"
+    : "唯一原生工具 execute_script 的 code 是异步函数正文。当前参数名 tools，类型为 ScriptApi；可 await 和 return。\n";
+  return preamble +
     "脚本默认异步返回持久任务编号，具体动作编号由宿主生成。不要把同一任务重新写成新调用来猜结果；查 scripts.status/receipt 或 phone.action。\n" +
     "mode:sync 等待完成后，原生回执的 result 是脚本 return 值的 JSON 文本页；result.truncated 为 true 时保留原 jobId，按 nextChar 分页读取。tools.scripts.result 的 limit 为 1 至 8192；用 return await tools.scripts.result(...) 将该页交回主意识。\n" +
     "upgrades.request 只提交完整 Git commit，独立监督校验并由旧 Eve 明确确认；回执 actionId 用于 upgrades.status，不以 submitted 冒充升级完成。\n" +

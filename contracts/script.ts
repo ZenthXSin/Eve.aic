@@ -7,6 +7,16 @@ import type { MemoryApi, RecordApi } from "./memory.ts";
 import type { UpgradeApi } from "./upgrades.ts";
 
 export const SCRIPTS = "scripts";
+/** 固定源码能力标记；可信提示生成器只读取此声明，不执行候选代码。 */
+export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;
+/** 原生随记工具 write_thought 的参数，不属于脚本 tools 对象中的接口。 */
+export interface NativeThoughtArguments {
+  thought: string;
+}
+/** 原生 execute_script 的输入；thought 留在意识流，不传入脚本任务。 */
+export type NativeScriptArguments = Omit<ScriptRequest, "requestId"> & {
+  thought?: string;
+};
 export interface ScriptRequest {
   /** 原生工具调用的真实编号；意识流须先保存，不由重试生成新编号。 */
   requestId: string;

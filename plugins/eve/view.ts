@@ -2,6 +2,7 @@ import type { Message, ModelResponse, ToolCall, ToolSpec } from "../../contracts
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { imageTextView } from "../../sdk/image-text.ts";
 import type { ConsciousEvent } from "./journal.ts";
+import { projectThoughts, withoutThought } from "./thoughts.ts";
 
 interface ActiveIndex {
   scanned: number;
@@ -259,20 +260,21 @@ export function blocks(
       else result.push({ throughSeq: event.seq, messages: [message] });
     } else if (event.kind === "model_response") {
       const response = (event.data as unknown as { response: ModelResponse }).response;
-      const allCalls = response.toolCalls.map((_, i) => callFor(event, i));
+      const projected = projectThoughts(response);
+      const allCalls = response.toolCalls.map((_, i) => withoutThought(callFor(event, i)));
       const omitted = new Set(
         allCalls.filter((c) => retention.get(c.id)?.mode === "omit").map((c) => c.id),
       );
       const calls = allCalls.filter((c) => !omitted.has(c.id));
       const message: Message = {
         role: "assistant",
-        content: response.content,
+        content: projected.content,
         ...(calls.length ? { toolCalls: calls } : {}),
       };
       if (allCalls.length) {
         current = {
           throughSeq: event.seq,
-          messages: response.content || calls.length ? [message] : [],
+          messages: projected.content || calls.length ? [message] : [],
           deferred: [],
           expected: new Set(allCalls.map((c) => c.id)),
           omitted,

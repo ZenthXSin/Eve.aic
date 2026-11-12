@@ -184,17 +184,21 @@ export async function startSupervisor(configPath: string) {
   // 守护先暂停时 bootstrap 只保留睡眠，永不自动越过主人开关。
   await controller.bootstrap(c.initialInstance);
   const upgrades = c.repository
-    ? new UpgradeRequests({
-      directory: c.directory,
-      repository: c.repository,
-      artifactDirectory: c.artifactDirectory!,
-      instancePrivateDirectory: c.instancePrivateDirectory!,
-      instanceRuntimeDirectory: c.instanceRuntimeDirectory!,
-      guardianConnectionFile: c.guardianConnectionFile,
-      deno: c.deno,
-      commandIdentity: c.commandIdentity!,
-      instanceIdentities: c.instanceIdentities!,
-    }, controller)
+    ? new UpgradeRequests(
+      {
+        directory: c.directory,
+        repository: c.repository,
+        artifactDirectory: c.artifactDirectory!,
+        instancePrivateDirectory: c.instancePrivateDirectory!,
+        instanceRuntimeDirectory: c.instanceRuntimeDirectory!,
+        guardianConnectionFile: c.guardianConnectionFile,
+        deno: c.deno,
+        commandIdentity: c.commandIdentity!,
+        instanceIdentities: c.instanceIdentities!,
+      },
+      controller,
+      key,
+    )
     : undefined;
   if (upgrades) await upgrades.initialize();
   let controlTail: Promise<unknown> = Promise.resolve();
@@ -267,6 +271,16 @@ export async function startSupervisor(configPath: string) {
         return new Response(null, { status: 403 });
       }
       if (data.method === "status") return Response.json({ ok: true, value: controller.state });
+      if (data.method === "requestUpgrade") {
+        if (!upgrades) throw new KernelError("unavailable", "自升级尚未配置固定源码来源");
+        const value = await serialControl(() =>
+          upgrades.requestAdministrator(
+            data.args,
+            request.headers.get("authorization"),
+          )
+        );
+        return Response.json({ ok: true, value });
+      }
       if (data.method === "pause") await serialControl(() => changePause(true));
       else if (data.method === "resume") await serialControl(() => changePause(false));
       else if (

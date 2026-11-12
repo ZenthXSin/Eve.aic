@@ -7,6 +7,7 @@ import { recallQuery } from "./recall-query.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 import { type ConsciousEvent, ConsciousJournal } from "./journal.ts";
 import { RemoteJournal } from "./remote-journal.ts";
+import { thoughtForCall, withoutThought, WRITE_THOUGHT_TOOL } from "./thoughts.ts";
 import {
   accountingDay,
   activeEvents,
@@ -421,10 +422,27 @@ export class EveRuntime {
         responseSeq: pending.responseSeq,
         index: pending.index,
         callId: call.id,
-        call: call as unknown as Json,
+        call: withoutThought(call) as unknown as Json,
       });
     }
     let result: Json;
+    if (call.name === WRITE_THOUGHT_TOOL.name) {
+      const valid = thoughtForCall(call) !== undefined &&
+        Object.keys(call.args as Record<string, Json>).every((key) => key === "thought");
+      result = valid
+        ? {
+          status: "completed",
+          output: JSON.stringify({
+            recorded: true,
+            responseSeq: pending.responseSeq,
+            toolIndex: pending.index,
+          }),
+        }
+        : { status: "failed", output: "需要非空的简短thought字符串，且不接受其他参数" };
+      // 正文已经在对应 model_response 原件中。重启只补齐这条工具回执。
+      await this.journal.append("tool_result", { callId: call.id, result });
+      return;
+    }
     if (pending.started && call.name === "execute_script") {
       const jobId = await fingerprint(["script-job-v1", call.id]);
       try {
@@ -437,10 +455,30 @@ export class EveRuntime {
         if (!(error instanceof KernelError && error.kind === "not_found")) throw error;
       }
     }
-    try {
-      result = await this.ctx.call<Json>("tools", "execute", call as unknown as Json, {
-        timeoutMs: this.config.modelTimeoutMs,
+    if (
+      call.name === "execute_script" && call.args && typeof call.args === "object" &&
+      !Array.isArray(call.args) && "thought" in call.args && thoughtForCall(call) === undefined
+    ) {
+      // 不静默丢弃模型明确要求记录的内容，也不重写原始响应。
+      // 若旧版本已启动同一任务，上面的恢复查询仍优先保留真实执行状态。
+      await this.journal.append("tool_result", {
+        callId: call.id,
+        result: {
+          status: "failed",
+          output: "thought参数无效：需要不超过4000字符的非空字符串；本次未派发脚本",
+        },
       });
+      return;
+    }
+    try {
+      result = await this.ctx.call<Json>(
+        "tools",
+        "execute",
+        withoutThought(call) as unknown as Json,
+        {
+          timeoutMs: this.config.modelTimeoutMs,
+        },
+      );
     } catch (error) {
       const wire = toWireError(error);
       result = {
@@ -513,7 +551,11 @@ export class EveRuntime {
     if (this.#modelBlocked) return;
     if (Date.now() < this.#retryAt) return;
     if (!fresh && Date.now() < this.#wake) return;
-    const tools = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
+    const providedTools = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
+    if (providedTools.some((tool) => tool.name === WRITE_THOUGHT_TOOL.name)) {
+      throw new KernelError("rejected", "write_thought由意识流原生提供，外部工具不能覆盖");
+    }
+    const tools = [...providedTools, WRITE_THOUGHT_TOOL];
     if (this.config.remoteRecords) {
       if (this.#sharedBudget?.paused) return;
       const query = recallQuery(activeEvents(this.journal.events));

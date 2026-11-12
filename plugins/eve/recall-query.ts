@@ -1,4 +1,6 @@
 import type { Json } from "../../kernel/protocol.ts";
+import type { ModelResponse } from "../../contracts/model.ts";
+import { projectThoughts } from "./thoughts.ts";
 
 const LIMIT = 16_000;
 const TEXT = new Set(["text", "content", "description", "observation", "output"]);
@@ -45,7 +47,13 @@ export function recallQuery(events: readonly { kind: string; data: Json }[]): st
     };
     if (event.kind === "model_response") {
       const response = event.data.response;
-      if (object(response) && typeof response.content === "string") text(response.content);
+      if (object(response) && typeof response.content === "string") {
+        text(
+          Array.isArray(response.toolCalls)
+            ? projectThoughts(response as unknown as ModelResponse).content
+            : response.content,
+        );
+      }
     } else if (event.kind === "tool_result") {
       const result = event.data.result;
       if (object(result) && typeof result.output === "string") collect(result.output, "output");

@@ -1,5 +1,7 @@
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import type { AdminBackend } from "./contracts.ts";
+import type { ToolCall } from "../../contracts/model.ts";
+import { projectThoughts } from "../../plugins/eve/thoughts.ts";
 
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): ObjectValue =>
@@ -19,6 +21,8 @@ export interface LiveEvent {
   requestId?: string;
   callId?: string;
   tool?: string;
+  /** 写随记的调用状态保留在 API，阅读流不重复展示成功保存动作。 */
+  thoughtWrite?: boolean;
   wakeAt?: number;
   retryAt?: number;
 }
@@ -50,20 +54,25 @@ export function liveEvent(value: unknown): LiveEvent {
     case "model_response": {
       event.category = "thought";
       event.title = "Eve 留下了新的文字记录";
-      event.text = clip(response.content);
-      event.hasText = Boolean(event.text.trim()) && e.truncated !== true;
       const calls = Array.isArray(response.toolCalls) ? response.toolCalls : [];
+      const projected = projectThoughts({
+        content: string(response.content),
+        toolCalls: calls as ToolCall[],
+      }).content;
+      event.text = clip(projected);
+      event.hasText = Boolean(event.text.trim()) && e.truncated !== true;
       if (!event.text.trim()) {
         event.text = calls.length
           ? "本次未留下文字，返回了工具调用：" + calls.map((c) => string(object(c).name)).join("、")
           : "本次没有可展示的文字。";
       }
-      event.truncated ||= string(response.content).length > 4000;
+      event.truncated ||= projected.length > 4000;
       break;
     }
     case "tool_start":
       event.category = "action";
       event.tool = string(call.name);
+      if (event.tool === "write_thought") event.thoughtWrite = true;
       event.title = "工具调用开始";
       event.text = event.tool === "execute_script"
         ? "正在执行脚本工具，等待调用回执。"
@@ -285,6 +294,16 @@ export class LiveReader {
         }
       }
       if (cursor !== end) throw new KernelError("corrupt", "实时记录窗口超出读取上限");
+      // 仅由窗口中的真实 start 关联原生随记回执；窗口外的孤立回执不猜测归属。
+      const thoughtCalls = new Set(
+        events.filter((e) => e.kind === "tool_start" && e.thoughtWrite && e.callId)
+          .map((e) => e.callId!),
+      );
+      for (const event of events) {
+        if (event.kind === "tool_result" && event.callId && thoughtCalls.has(event.callId)) {
+          event.thoughtWrite = true;
+        }
+      }
       this.#events = events.slice(-80);
       this.#through = end;
     }

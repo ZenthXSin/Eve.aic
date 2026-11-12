@@ -14,6 +14,13 @@ export const SCRIPT_TOOL: ToolSpec = {
       code: { type: "string" },
       mode: { type: "string", enum: ["async", "sync"] },
       timeoutMs: { type: "integer", minimum: 1 },
+      thought: {
+        type: "string",
+        minLength: 1,
+        maxLength: 4000,
+        description:
+          "可选：此刻愿意留下的简短随记、感受或打算；由意识流记录进上下文，不属于脚本或QQ消息。同一内容不用在普通文字或write_thought重复写，不要求逐步内部推演。",
+      },
     },
     required: ["code"],
     additionalProperties: false,
@@ -88,7 +95,12 @@ export function createScriptPlugin(configPath: string) {
             } as ToolResult as unknown as Json;
           }
           const data = call.args as unknown as Omit<ScriptRequest, "requestId">;
-          const job = await current().start({ ...data, requestId: call.id });
+          const job = await current().start({
+            code: data.code,
+            ...(data.mode === undefined ? {} : { mode: data.mode }),
+            ...(data.timeoutMs === undefined ? {} : { timeoutMs: data.timeoutMs }),
+            requestId: call.id,
+          });
           // start 只返回任务摘要；必须把已持久化的真实 return 值交给原生工具调用方。
           // 按工具说明读取2048字符原件页时，包裹后的返回值仍能完整展示。
           const result = job.status === "completed"
