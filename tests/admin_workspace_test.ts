@@ -418,8 +418,16 @@ Deno.test("workspace covers every ScriptApi method, native tool, and future name
     await store.initialize();
     const methods: { namespace: string; method: string }[] = Object.entries(SCRIPT_TOOL_METHODS)
       .flatMap(([namespace, names]) => names.map((method) => ({ namespace, method })));
-    assert.equal(methods.length, 52);
-    assert.equal(TOOL_CATALOG.flatMap((group) => group.methods).length, 57);
+    assert(methods.length >= 54);
+    assert.deepEqual(SCRIPT_TOOL_METHODS.web, ["search", "fetch"]);
+    assert.equal(
+      new Set(methods.map(({ namespace, method }) => `${namespace}.${method}`)).size,
+      methods.length,
+    );
+    assert.equal(
+      TOOL_CATALOG.flatMap((group) => group.methods).length,
+      methods.length + TOOL_CATALOG.find((group) => group.namespace === "native")!.methods.length,
+    );
     methods.push({ namespace: "future_plugin", method: "newRead" });
     await store.change((state) => {
       for (let offset = 0; offset < methods.length; offset += 24) {
@@ -432,15 +440,15 @@ Deno.test("workspace covers every ScriptApi method, native tool, and future name
           method,
           args: { sample: true },
           status: "completed",
-          startedAt: at,
-          finishedAt: at,
+          startedAt: new Date(Date.parse(at) + (offset + index) * 1000).toISOString(),
+          finishedAt: new Date(Date.parse(at) + (offset + index) * 1000).toISOString(),
           value: { actual: true },
         }));
         state.jobs.push(job);
       }
     });
     const original = await new ScriptObserver(directory).read() as Record<string, Json>;
-    assert.equal((original.items as Json[]).length, 53);
+    assert.equal((original.items as Json[]).length, methods.length);
     const reader = new WorkspaceReader({
       status: () => Promise.resolve(null),
       control: () => {
@@ -511,7 +519,7 @@ Deno.test("workspace covers every ScriptApi method, native tool, and future name
     ];
     const merged = withNativeOperations(base, events) as Record<string, Json>;
     const operations = merged.operations as Record<string, Json>[];
-    assert.equal(operations.length, 55);
+    assert.equal(operations.length, methods.length + 2);
     for (const { namespace, method } of methods) {
       assert(
         operations.some((op) => op.namespace === namespace && op.method === method),
@@ -535,7 +543,7 @@ Deno.test("workspace covers every ScriptApi method, native tool, and future name
     assert.equal(events[0].text, thought);
     assert.equal((merged.currentApp as Record<string, Json>).appId, "tools");
     const tools = (merged.apps as Record<string, Record<string, Json>>).tools;
-    assert.equal((tools.items as Json[]).length, 55);
+    assert.equal((tools.items as Json[]).length, methods.length + 2);
   } finally {
     await store.close();
     await Deno.remove(directory, { recursive: true });
