@@ -29,9 +29,10 @@ function platform(handler: (r: Request) => Response | Promise<Response>) {
     return handler(r);
   });
   return {
-    client: () =>
+    client: (timeoutMs?: number) =>
       new QqClient({ appId: "fixture", appSecret: "fixture" }, {
         baseUrl: `http://127.0.0.1:${server.addr.port}`,
+        timeoutMs,
       }),
     count: () => count,
     close: () => server.shutdown(),
@@ -437,8 +438,6 @@ Deno.test("QQ显式鉴权与限流失败按原请求重试，Retry-After加基�
     assert.deepEqual(bodies[0], {
       markdown: { content: request.text },
       msg_type: 2,
-      msg_id: "inbound-fixed",
-      msg_seq: 7,
     });
     assert.ok(times[1] - times[0] >= 20, `auth backoff ${times[1] - times[0]}`);
     assert.ok(times[2] - times[1] >= 1020, `rate backoff ${times[2] - times[1]}`);
@@ -621,6 +620,65 @@ Deno.test("QQ活跃队首重试期间可取消等待中的零尝试后项，并�
     await actions.close();
     await head;
     await follower;
+    await local.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("QQ主动发送已尝试HTTP超时：未知队首阻塞且重启不重放，取消仅释放等待", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-resolution-active-timeout-" });
+  const release = deferred<void>();
+  const bodies: Record<string, unknown>[] = [];
+  const local = platform(async (r) => {
+    const body = await r.json();
+    bodies.push(body);
+    if (body.markdown.content === request.text) await release.promise;
+    return Response.json({ id: "platform-may-have-delivered" });
+  });
+  let actions = new QqSendActions(local.client(300), directory, "private", { retryDelaysMs: [0] });
+  const follower = { ...request, text: "未知结束后的后项" };
+  try {
+    await actions.initialize();
+    const unknown = await actions.send("head", request);
+    assert.ok(unknown.status === "finished" && unknown.result.status === "unknown");
+    assert.equal(unknown.result.attempted, true);
+    assert.equal(unknown.result.error.category, "transport");
+    assert.equal(unknown.result.error.transportReason, "timeout");
+    assert.equal(unknown.attemptCount ?? 1, 1);
+    assert.equal(local.count(), 1);
+    assert.equal(bodies[0].msg_id, undefined);
+    assert.equal(bodies[0].msg_seq, undefined);
+    assert.equal(bodies[0].event_id, undefined);
+    assert.deepEqual(await actions.send("follower", follower), {
+      actionId: "follower",
+      status: "blocked",
+      blockedBy: "head",
+    });
+    const records = await snapshot(`${directory}/records`);
+    const attempts = await snapshot(`${directory}/attempts`);
+    await actions.close();
+    actions = new QqSendActions(local.client(300), directory, "private", { retryDelaysMs: [0] });
+    await actions.initialize();
+    assert.deepEqual(await actions.send("head", request), unknown);
+    assert.equal(local.count(), 1);
+    const head = (await actions.listSendQueue()).items.find((item) => item.actionId === "head")!;
+    assert.equal(head.canCancel, true);
+    const cancelled = await actions.cancelSend(cancellation(head));
+    assert.ok(cancelled.status === "cancelled");
+    assert.equal(cancelled.resolution.kind, "unknown_retained");
+    assert.deepEqual(cancelled.originalResult, unknown.result);
+    assert.deepEqual(await snapshot(`${directory}/records`), records);
+    assert.deepEqual(await snapshot(`${directory}/attempts`), attempts);
+    const next = await actions.send("follower", follower);
+    assert.ok(next.status === "finished" && next.result.status === "sent");
+    assert.equal(local.count(), 2);
+    assert.deepEqual(bodies.map((body) => (body.markdown as { content: string }).content), [
+      request.text,
+      follower.text,
+    ]);
+  } finally {
+    release.resolve();
+    await actions.close();
     await local.close();
     await Deno.remove(directory, { recursive: true });
   }

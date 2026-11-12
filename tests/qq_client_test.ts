@@ -155,14 +155,14 @@ Deno.test("等待凭证期间调用方修改参数，不改变已开始的动作
     releaseAuth();
     assert.equal((await sending).status, "sent");
     assert.equal(path, "/v2/users/fixture-user/messages");
-    assert.deepEqual(body, { content: message.text, msg_type: 0, msg_id: "inbound-1", msg_seq: 2 });
+    assert.deepEqual(body, { content: message.text, msg_type: 0 });
   } finally {
     releaseAuth();
     await local.close();
   }
 });
 
-Deno.test("发送保留全文、引用与固定序号，只凭真实编号返回 sent", async () => {
+Deno.test("主动发送保留全文与展示引用，不携带旧被动回复字段，只凭真实编号返回 sent", async () => {
   const bodies: unknown[] = [];
   const paths: string[] = [];
   const local = await server(async (r) => {
@@ -197,11 +197,9 @@ Deno.test("发送保留全文、引用与固定序号，只凭真实编号返回
       {
         content: message.text,
         msg_type: 0,
-        msg_id: "inbound-1",
-        msg_seq: 2,
         message_reference: { message_id: "ref-inbound" },
       },
-      { content: "群里的消息", msg_type: 0, event_id: "event-1" },
+      { content: "群里的消息", msg_type: 0 },
     ]);
   } finally {
     await local.close();
@@ -224,7 +222,8 @@ for (
     const local = await server(async (r) => {
       if (new URL(r.url).pathname === "/app/getAppAccessToken") return token();
       sends++;
-      assert.equal((await r.json()).msg_seq, 2);
+      const sent = await r.json();
+      for (const field of ["msg_id", "msg_seq", "event_id"]) assert.equal(sent[field], undefined);
       return Response.json(body, { status });
     });
     try {
@@ -238,13 +237,13 @@ for (
   });
 }
 
-Deno.test("回复断线和超时保留未知，不重发也不改主动消息", async () => {
+Deno.test("主动消息提交超时保留未知，不重发或添加被动回复字段", async () => {
   let sends = 0;
   const local = await server(async (r) => {
     if (new URL(r.url).pathname === "/app/getAppAccessToken") return token();
     sends++;
     const body = await r.json();
-    assert.equal(body.msg_id, "inbound-1");
+    for (const field of ["msg_id", "msg_seq", "event_id"]) assert.equal(body[field], undefined);
     assert.equal(body.is_wakeup, undefined);
     await new Promise((resolve) => setTimeout(resolve, 100));
     return Response.json({ id: "late-message" });
@@ -376,7 +375,7 @@ Deno.test("超大回包和无效 JSON 保留未知", async () => {
   }
 });
 
-Deno.test("请求无效在网络前拒绝，序号和回复身份不得自动补写", async () => {
+Deno.test("请求无效在网络前拒绝，旧回复元数据仍校验而不写入发送请求", async () => {
   let calls = 0;
   const local = await server(() => {
     calls++;
@@ -389,7 +388,6 @@ Deno.test("请求无效在网络前拒绝，序号和回复身份不得自动补
         { ...message, reply: { messageId: "inbound-1", sequence: 0 } },
         { ...message, reply: { messageId: "inbound-1" } },
         { ...message, reply: { messageId: "inbound-1", sequence: 1, eventId: "event" } },
-        { ...message, wakeup: true },
         { ...message, destination: { kind: "group", openId: "g" }, reply: undefined, wakeup: true },
         { ...message, text: "" },
       ]
@@ -481,6 +479,156 @@ Deno.test("网关登录额度耗尽保留平台 reset_after 毫秒及 Retry-Afte
       });
     }
     assert.equal(sockets, 0);
+  } finally {
+    client.close();
+    await local.close();
+  }
+});
+
+Deno.test("统一主动发送兼容旧reply，私信唤醒仍按主动规则校验", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const local = server(async (r) => {
+    if (new URL(r.url).pathname === "/app/getAppAccessToken") return token();
+    bodies.push(await r.json());
+    return Response.json({ id: "proactive" });
+  });
+  const client = new QqClient(credentials, { baseUrl: local.url });
+  try {
+    assert.equal((await client.sendText({ ...message, wakeup: true })).status, "sent");
+    assert.deepEqual(bodies, [{ content: message.text, msg_type: 0, is_wakeup: true }]);
+  } finally {
+    client.close();
+    await local.close();
+  }
+});
+
+Deno.test("群聊和私信的图片及文件统一主动发送，展示引用独立保留", async () => {
+  let messages = 0, uploads = 0;
+  const local = server(async (r) => {
+    const path = new URL(r.url).pathname;
+    if (path === "/app/getAppAccessToken") return token();
+    const body = await r.json();
+    if (path.endsWith("/files")) {
+      uploads++;
+      assert.equal(body.srv_send_msg, false);
+      assert.equal(body.file_data, "AQID");
+      assert.ok([1, 4].includes(body.file_type));
+      return Response.json({ file_info: "resource", ttl: 300 });
+    }
+    messages++;
+    assert.deepEqual(body, {
+      content: "附件原文",
+      msg_type: 7,
+      media: { file_info: "resource" },
+      message_reference: { message_id: "display-reference" },
+    });
+    return Response.json({ id: "media-" + messages });
+  });
+  const client = new QqClient(credentials, {
+    baseUrl: local.url,
+    sendScope: "all",
+    attachmentReader: () => Promise.resolve(new Uint8Array([1, 2, 3])),
+  });
+  try {
+    for (const kind of ["user", "group"] as const) {
+      for (const mediaKind of ["image", "file"] as const) {
+        const result = await client.sendText({
+          destination: { kind, openId: "destination" },
+          text: "附件原文",
+          reply: kind === "user"
+            ? { messageId: "legacy-message", sequence: 9 }
+            : { eventId: "legacy-event" },
+          referenceIndex: "display-reference",
+          attachment: { kind: mediaKind, path: "/tmp/file" },
+        });
+        assert.equal(result.status, "sent");
+      }
+    }
+    assert.equal(uploads, 4);
+    assert.equal(messages, 4);
+  } finally {
+    client.close();
+    await local.close();
+  }
+});
+
+for (
+  const [label, status, body] of [
+    ["拒绝", 400, { code: 40034031 }],
+    ["服务端错误", 500, { code: 100001 }],
+    ["错误字段格式不对", 200, { code: "0" }],
+    ["没有文件回执", 200, {}],
+    ["无效JSON", 200, "{invalid"],
+  ] as const
+) {
+  Deno.test(`srv_send_msg:false上传${label}确认未尝试发消息`, async () => {
+    let messages = 0;
+    const local = server(async (r) => {
+      const path = new URL(r.url).pathname;
+      if (path === "/app/getAppAccessToken") return token();
+      if (!path.endsWith("/files")) {
+        messages++;
+        return Response.json({ id: "must-not-send" });
+      }
+      assert.equal((await r.json()).srv_send_msg, false);
+      return new Response(typeof body === "string" ? body : JSON.stringify(body), { status });
+    });
+    const client = new QqClient(credentials, {
+      baseUrl: local.url,
+      attachmentReader: () => Promise.resolve(new Uint8Array([1])),
+    });
+    try {
+      const result = await client.sendText({
+        ...message,
+        attachment: { kind: "file", path: "/tmp/file" },
+      });
+      assert.equal(result.status, "failed");
+      assert.equal(result.attempted, false);
+      assert.equal(result.error.failureStage, "upload");
+      assert.equal(messages, 0);
+    } finally {
+      client.close();
+      await local.close();
+    }
+  });
+}
+
+Deno.test("上传超时为未发送失败，上传成功后消息提交超时仍为送达未知", async () => {
+  let delayUpload = true, uploads = 0, messages = 0;
+  const local = server(async (r) => {
+    const path = new URL(r.url).pathname;
+    if (path === "/app/getAppAccessToken") return token();
+    await r.json();
+    if (path.endsWith("/files")) {
+      uploads++;
+      if (delayUpload) await new Promise((resolve) => setTimeout(resolve, 100));
+      return Response.json({ file_info: "uploaded" });
+    }
+    messages++;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return Response.json({ id: "late-message" });
+  });
+  const client = new QqClient(credentials, {
+    baseUrl: local.url,
+    timeoutMs: 30,
+    tokenTimeoutMs: 1000,
+    uploadTimeoutMs: 30,
+    attachmentReader: () => Promise.resolve(new Uint8Array([1])),
+  });
+  try {
+    await client.authenticate();
+    const request: QqSendText = { ...message, attachment: { kind: "file", path: "/tmp/file" } };
+    const uploadFailed = await client.sendText(request);
+    assert.equal(uploadFailed.status, "failed");
+    assert.equal(uploadFailed.attempted, false);
+    assert.equal(uploadFailed.error.failureStage, "upload");
+    assert.equal(uploadFailed.error.transportReason, "timeout");
+    assert.equal(messages, 0);
+    delayUpload = false;
+    const messageUnknown = await client.sendText(request);
+    assertTransport(messageUnknown, "timeout", "headers");
+    assert.equal(messages, 1);
+    assert.equal(uploads, 2);
   } finally {
     client.close();
     await local.close();

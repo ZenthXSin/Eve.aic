@@ -469,7 +469,6 @@ export class QqPhone {
   ) {
     conversation(args.conversationId);
     const match = /^qq:(user|group):(.+)$/.exec(args.conversationId)!;
-    let reply: { messageId: string; sequence?: number } | undefined;
     if (args.replyTo !== undefined) {
       integer(args.replyTo.seq, 1);
       if (args.replyTo.sequence !== undefined) integer(args.replyTo.sequence, 1);
@@ -480,16 +479,12 @@ export class QqPhone {
       if (message.direction !== "incoming" || !message.platformMessageId) {
         throw new QqPhoneError("request");
       }
-      reply = {
-        messageId: message.platformMessageId,
-        ...(args.replyTo.sequence === undefined ? {} : { sequence: args.replyTo.sequence }),
-      };
+      // 旧调用只验证本会话入站句柄；所有新发送统一主动，不再携带被动锚点或序号。
     }
     const result = await this.actions.send(args.actionId, {
       destination: { kind: match[1] as "user" | "group", openId: match[2] },
       text: args.text,
       ...(args.attachment === undefined ? {} : { attachment: args.attachment }),
-      ...(reply ? { reply } : {}),
       ...(args.referenceIndex === undefined ? {} : { referenceIndex: args.referenceIndex }),
       ...(args.wakeup === undefined ? {} : { wakeup: args.wakeup }),
     }, options);

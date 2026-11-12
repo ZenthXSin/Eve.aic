@@ -13,8 +13,8 @@
   [全量群消息事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_message_create.html)。
 - WebSocket 支持 Identify、Resume 和心跳。恢复序号应在事件处理之后记录，否则可能跳过尚未保存的事件。
   [WebSocket 接入](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/event-emit/websocket.html)。
-- 单聊与群聊分别使用 `/v2/users/{openid}/messages`、`/v2/groups/{openid}/messages`。 被动回复使用
-  `msg_id` 或 `event_id`；`msg_seq` 关联回复去重，不能在结果未知时换序号重发。 引用展示使用
+- 单聊与群聊分别使用 `/v2/users/{openid}/messages`、`/v2/groups/{openid}/messages`。 平台被动回复使用
+  `msg_id` 或 `event_id`；Eve 已统一主动发送，不发送这些绑定字段或 `msg_seq`。提交后的超时保留未知，不自动重发。引用展示使用
   `message_reference`，其索引与被动回复的 ID 不同。
   [发送单聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages.post.html)、[发送群聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)。
 - 平台会限制回复次数、频率和主动消息，用户也可拒收主动消息。能力存在不证明当前机器人有权限或剩余额度。

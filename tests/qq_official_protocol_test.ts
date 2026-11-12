@@ -15,7 +15,7 @@ const request = {
   reply: { messageId: "source", sequence: 3 },
 };
 
-Deno.test("官方1.0.5：认证独立源、文件名及上传独立期限，消息序号保持调用方固定值", async () => {
+Deno.test("官方1.0.5：认证独立源、文件名及上传独立期限，主动媒体不携带旧被动字段", async () => {
   let tokens = 0, uploads = 0, messages = 0;
   const auth = serve(async (r) => {
     tokens++;
@@ -46,8 +46,6 @@ Deno.test("官方1.0.5：认证独立源、文件名及上传独立期限，消�
     assert.deepEqual(body, {
       content: "same text",
       msg_type: 7,
-      msg_id: "source",
-      msg_seq: 3,
       media: { file_info: "uploaded-file" },
     });
     return Response.json({ id: "delivered" });
@@ -108,7 +106,7 @@ Deno.test("官方超频22009和HTML429保留结构化限流，未知40034031仍�
   }
 });
 
-Deno.test("明确鉴权拒绝使下一次尝试刷新凭据，同一请求正文与序号不变", async () => {
+Deno.test("明确鉴权拒绝使下一次尝试刷新凭据，同一主动请求正文不变", async () => {
   let auths = 0;
   const bodies: unknown[] = [];
   const local = serve(async (r) => {

@@ -430,7 +430,7 @@ async function until(check: () => Promise<boolean>): Promise<void> {
   throw new Error("QQ 尝试事实没有在5秒内出现");
 }
 
-/** 真实 HTTP 头超时，不伪造 client 返回；原平台处理器留至 finally 才释放。 */
+/** 真实 HTTP 明确限流失败；仅在平台确认未发送时安全续接队首。 */
 async function retryFixture(options: {
   failures?: number;
   retryDelaysMs?: readonly number[];
@@ -452,7 +452,6 @@ async function retryFixture(options: {
     epoch: granted.owner.epoch,
     credential: oldKey,
   };
-  const release = deferred();
   const requests: (Record<string, unknown> & { markdown?: { content: string } })[] = [];
   const sockets: WebSocket[] = [];
   let headRequests = 0;
@@ -496,7 +495,7 @@ async function retryFixture(options: {
         (body.markdown?.content ?? body.content) === "head" &&
         ++headRequests <= (options.failures ?? 4)
       ) {
-        await release.promise;
+        return Response.json({ err_code: 100001 }, { status: 429 });
       }
       return Response.json({
         id: (body.markdown?.content ?? body.content) === "head" ? "head-sent" : "second-sent",
@@ -529,7 +528,7 @@ async function retryFixture(options: {
     adapter = await startQqPhoneAdapter(transport, directory, bridgeKey, undefined, fence);
   } else {
     actions = new QqSendActions(transport, `${directory}/outbox`, "private", {
-      retryDelaysMs: options.retryDelaysMs ?? [10],
+      retryDelaysMs: options.retryDelaysMs ?? [100],
     });
     timeline = new QqTimeline(`${directory}/timeline`);
     reading = new QqPhoneReading(`${directory}/reading`);
@@ -562,7 +561,7 @@ async function retryFixture(options: {
             `${directory}/outbox/attempts/retry-head/1.result.json`,
           ),
         );
-        return fact.result.error.transportReason === "timeout";
+        return fact.result.status === "failed" && fact.result.error.category === "rate_limit";
       } catch (error) {
         // The fixture polls while the attempt writer still owns this file. Creation can
         // become visible before its JSON body; wait for a complete fact before closing.
@@ -573,7 +572,6 @@ async function retryFixture(options: {
     async close() {
       actions?.requestStop();
       transport.close();
-      release.resolve();
       if (adapter) await adapter.close();
       else {
         await rpc!.close();
@@ -603,7 +601,7 @@ const secondSend = {
   replyTo: { seq: 1, sequence: 2 },
 };
 
-Deno.test("QQ 无限顺序重试：真实 RPC 先超时，后台四次超时后队首送达才发送第二条", async () => {
+Deno.test("QQ 无限顺序重试：真实 RPC 先超时，后台四次明确限流后队首送达才发送第二条", async () => {
   const f = await retryFixture();
   const short = new PhoneRpcClient(f.url, bridgeKey, 60, () => Promise.resolve(f.proof));
   const patient = new PhoneRpcClient(f.url, bridgeKey, 5_000, () => Promise.resolve(f.proof));
@@ -630,8 +628,9 @@ Deno.test("QQ 无限顺序重试：真实 RPC 先超时，后台四次超时后�
       "second",
     ]);
     for (const body of f.requests.slice(0, 5)) {
-      assert.equal(body.msg_id, "inbound-1");
-      assert.equal(body.msg_seq, 1);
+      assert.equal(body.msg_id, undefined);
+      assert.equal(body.msg_seq, undefined);
+      assert.equal(body.event_id, undefined);
     }
     await waitFor(() => f.guard.status().activePermits === 0);
   } finally {
@@ -690,7 +689,7 @@ for (const mode of ["pause", "draining"] as const) {
   });
 }
 
-Deno.test("QQ 无限顺序重试：正式 service.close 在退避期间停止并排空，不等待无限 handler", async () => {
+Deno.test("QQ 无限顺序重试：正式 service.close 在明确限流退避期间停止并排空", async () => {
   const f = await retryFixture({ failures: Infinity, formalService: true });
   const client = new PhoneRpcClient(f.url, bridgeKey, 5_000, () => Promise.resolve(f.proof));
   const result = Promise.allSettled([client.call("send", headSend)]);

@@ -21,5 +21,5 @@
     "src/protocol/gateway/gateway-connection.ts",
     "src/protocol/gateway/constants.ts"
   ],
-  "policy": "Caller supplies durable msg_seq. getNextMsgSeq is retained as upstream source but never used for retries."
+  "policy": "Eve sends all QQ text and media proactively, without msg_id, msg_seq or event_id. Legacy reply metadata is accepted only for durable-history compatibility; getNextMsgSeq is retained as upstream source and never used for sending or retries."
 }

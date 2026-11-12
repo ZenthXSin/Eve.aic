@@ -130,7 +130,7 @@ export interface PhoneActionReceipt {
   /** 同会话未成功的队首动作；不得用新动作越过。 */
   blockedBy?: string;
   attempted?: boolean;
-  /** 仅多次真实尝试时提供；超时自动重试仍使用相同消息及被动回复序号。 */
+  /** 仅多次真实尝试时提供；仅在确认尚未提交或明确拒绝时自动重试原主动消息。 */
   attemptCount?: number;
   platformMessageId?: string;
   reason?: "interrupted";
@@ -149,11 +149,12 @@ export interface PhoneActionReceipt {
   };
 }
 
+/** QQ 文字统一主动发送；引用展示不改变发送模式。 */
 export interface PhoneSend {
   actionId: string;
   conversationId: string;
   text: string;
-  /** 明确指定本会话入站编号；省略 sequence 时为新动作分配未占用序号，重试保持原值。 */
+  /** @deprecated 兼容旧调用：仅校验本会话入站句柄，发送统一主动，不使用被动锚点或序号。 */
   replyTo?: { seq: number; sequence?: number };
   /** 平台已提供的引用索引；不是平台消息编号。 */
   referenceIndex?: string;
@@ -179,12 +180,14 @@ export interface PhoneDownload {
     senderPlatformUserId: string;
   };
 }
+/** QQ 附件统一主动发送。 */
 export interface PhoneSendFile {
   actionId: string;
   conversationId: string;
   path: string;
   kind: "image" | "file";
   text?: string;
+  /** @deprecated 兼容旧调用：仅校验本会话入站句柄，文件发送统一主动。 */
   replyTo?: { seq: number; sequence?: number };
 }
 

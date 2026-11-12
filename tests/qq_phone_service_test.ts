@@ -33,7 +33,7 @@ function event(seq: number, user = "user-a", text = `消息-${seq}`, group?: str
     },
   };
 }
-async function fixture() {
+async function fixture(options: { attachmentReader?: (path: string) => Promise<Uint8Array> } = {}) {
   const directory = await Deno.makeTempDir({ prefix: "eve-phone-service-" });
   let sends = 0;
   let result: unknown = { id: "actual-sent-id" };
@@ -48,7 +48,9 @@ async function fixture() {
       sends++;
       received.push(await r.json());
       await beforeReply?.();
-      return Response.json(result);
+      return Response.json(
+        new URL(r.url).pathname.endsWith("/files") ? { file_info: "fixture-upload-info" } : result,
+      );
     },
   );
   const journal = new QqInboundJournal(`${directory}/incoming`);
@@ -56,6 +58,7 @@ async function fixture() {
   const actions = new QqSendActions(
     new QqClient({ appId: "fixture", appSecret: "fixture" }, {
       baseUrl: `http://127.0.0.1:${platform.addr.port}`,
+      attachmentReader: options.attachmentReader,
     }),
     `${directory}/actions`,
   );
@@ -588,7 +591,7 @@ Deno.test("QQ 手机：会话列表翻页不漏或挤动，通知有界且普通
   }
 });
 
-Deno.test("QQ 手机：明确回复位置与实际回执，unknown也显示且不重发，不能跨会话引用", async () => {
+Deno.test("QQ 手机：旧回复句柄仍校验但统一主动，unknown也显示且不重发", async () => {
   const f = await fixture();
   try {
     await f.append(event(1));
@@ -608,8 +611,6 @@ Deno.test("QQ 手机：明确回复位置与实际回执，unknown也显示且�
     assert.deepEqual(f.received, [{
       markdown: { content: "嗯，我在" },
       msg_type: 2,
-      msg_id: "platform-1",
-      msg_seq: 1,
     }]);
     assert.deepEqual(await f.client.call("send", args), receipt);
     assert.equal(f.count(), 1);
@@ -883,7 +884,7 @@ Deno.test("QQ 引用视图：旧入站原件按同会话索引解析，未知/�
   }
 });
 
-Deno.test("QQ 引用视图：真实出站回执索引可被引用，发送引用与被动回复保持独立", async () => {
+Deno.test("QQ 引用视图：真实出站回执索引可被引用，引用展示不改变主动发送", async () => {
   const f = await fixture();
   try {
     const raw = event(1);
@@ -916,9 +917,7 @@ Deno.test("QQ 引用视图：真实出站回执索引可被引用，发送引用
     assert.deepEqual(f.received, [{
       markdown: { content: "回复早先消息" },
       msg_type: 2,
-      msg_id: "platform-1",
-      msg_seq: 1,
-      // Markdown follows the official SDK: reply anchor retained, visual reference omitted.
+      // Markdown沿用官方SDK：省略视觉引用；本机引用视图仍保留。
     }]);
   } finally {
     await f.close();
@@ -975,7 +974,9 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
       if (path.startsWith("/v2/")) {
         paths.push(path);
         const body = await r.json();
-        assert.equal(body.msg_seq, 1);
+        assert.equal(body.msg_seq, undefined);
+        assert.equal(body.msg_id, undefined);
+        assert.equal(body.event_id, undefined);
         return Response.json({ id: `real-scope-send-${paths.length}` });
       }
       assert.equal(path, "/websocket");
@@ -1090,7 +1091,7 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
   }
 });
 
-Deno.test("手机回复自动序号：省略sequence的不同新回复不碰撞，同action重入不重复发送", async () => {
+Deno.test("手机主动发送：旧sequence忽略，不同动作无被动字段，同action重入不重复发送", async () => {
   const f = await fixture();
   try {
     await f.append(event(1));
@@ -1110,16 +1111,97 @@ Deno.test("手机回复自动序号：省略sequence的不同新回复不碰撞�
     );
     assert.equal((await f.client.call("send", args) as { state: string }).state, "sent");
     assert.equal(f.count(), 2);
-    assert.deepEqual(f.received.map((r) => (r as { msg_seq: number }).msg_seq), [1, 2]);
+    assert.equal(
+      (await f.client.call("send", {
+        ...args,
+        actionId: "legacy-explicit",
+        replyTo: { ...args.replyTo, sequence: 1 },
+      }) as { state: string }).state,
+      "sent",
+    );
+    // 同一动作即使旧被动序号改变，仍返回原回执，不增加发送。
+    assert.equal(
+      (await f.client.call("send", {
+        ...args,
+        replyTo: { ...args.replyTo, sequence: 99 },
+      }) as { state: string }).state,
+      "sent",
+    );
+    assert.equal(f.count(), 3);
+    for (const received of f.received as Record<string, unknown>[]) {
+      assert.equal(received.msg_seq, undefined);
+      assert.equal(received.msg_id, undefined);
+      assert.equal(received.event_id, undefined);
+    }
     await assert.rejects(
       f.client.call("send", {
         ...args,
-        actionId: "bad-explicit",
-        replyTo: { ...args.replyTo, sequence: 1 },
+        actionId: "invalid-sequence",
+        replyTo: { ...args.replyTo, sequence: 0 },
       }),
-      (e) => e instanceof PhoneRpcError && e.category === "conflict",
+      PhoneRpcError,
     );
-    assert.equal(f.count(), 2);
+    assert.equal(f.count(), 3);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("手机主动发送：唤醒兼容旧回复句柄，附件上传与最终消息均无被动字段", async () => {
+  const uploadedPaths: string[] = [];
+  const f = await fixture({
+    attachmentReader: (path) => {
+      uploadedPaths.push(path);
+      return Promise.resolve(new Uint8Array([1, 2, 3]));
+    },
+  });
+  try {
+    await f.append(event(1));
+    const wakeup = await f.phone.send({
+      actionId: "active-wakeup",
+      conversationId: "qq:user:user-a",
+      text: "回来看看",
+      wakeup: true,
+      replyTo: { seq: 1, sequence: 9 },
+    });
+    assert.equal(wakeup.state, "sent");
+    assert.equal((f.received[0] as Record<string, unknown>).is_wakeup, true);
+    for (const kind of ["image", "file"] as const) {
+      const path = `/fixture/attachment.${kind === "image" ? "png" : "txt"}`;
+      const sent = await f.phone.sendFile({
+        actionId: `active-${kind}`,
+        conversationId: "qq:user:user-a",
+        path,
+        kind,
+        text: "附件",
+        replyTo: { seq: 1, sequence: 1 },
+      });
+      assert.equal(sent.state, "sent");
+      const upload = f.received.at(-2) as Record<string, unknown>;
+      assert.equal(upload.srv_send_msg, false);
+      const wire = f.received.at(-1) as Record<string, unknown>;
+      assert.equal(wire.msg_type, 7);
+      assert.deepEqual(wire.media, { file_info: "fixture-upload-info" });
+      // 文件动作重入不再次上传或发送，旧序号变化也不改变动作。
+      assert.deepEqual(
+        await f.phone.sendFile({
+          actionId: `active-${kind}`,
+          conversationId: "qq:user:user-a",
+          path,
+          kind,
+          text: "附件",
+          replyTo: { seq: 1, sequence: 77 },
+        }),
+        sent,
+      );
+    }
+    assert.deepEqual(uploadedPaths, ["/fixture/attachment.png", "/fixture/attachment.txt"]);
+    assert.equal(f.count(), 5);
+    for (const wire of f.received as Record<string, unknown>[]) {
+      assert.equal(wire.msg_id, undefined);
+      assert.equal(wire.msg_seq, undefined);
+      assert.equal(wire.event_id, undefined);
+    }
   } finally {
     await f.close();
   }

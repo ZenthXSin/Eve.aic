@@ -1,7 +1,7 @@
 import { QqClient, type QqSendResult, type QqSendText, validateQqSendText } from "./client.ts";
 import { writeAtomic } from "./journal.ts";
 
-/** 序号只在新动作准入时分配，持久账本和传输始终使用已经固定的数字。 */
+/** 兼容旧调用方的回复参数；新动作统一主动发送，不再分配被动回复序号。 */
 export type QqActionSendText = Omit<QqSendText, "reply"> & {
   reply?: { messageId: string; sequence?: number } | { eventId: string };
 };
@@ -146,17 +146,23 @@ function validResult(value: unknown): value is QqSendResult {
   return r.error.traceId === undefined ||
     (typeof r.error.traceId === "string" && /^[a-zA-Z0-9_.:-]{1,256}$/.test(r.error.traceId));
 }
-function protectedText(request: QqSendText): boolean {
+function legacyProtectedText(request: QqSendText): boolean {
   return !request.attachment && request.reply !== undefined && "messageId" in request.reply;
 }
-function retryable(request: QqSendText, result: QqSendResult): boolean {
+function retryable(result: QqSendResult): boolean {
   if (
     result.status === "failed" && ["authentication", "rate_limit"].includes(result.error.category)
   ) {
     return true;
   }
   return result.status !== "sent" && result.error.category === "transport" &&
-    result.error.transportReason === "timeout" && (!result.attempted || protectedText(request));
+    result.error.transportReason === "timeout" && !result.attempted;
+}
+/** Only validates immutable historical attempt chains; never authorizes a new send. */
+function legacyRetryable(request: QqSendText, result: QqSendResult): boolean {
+  return retryable(result) ||
+    result.status !== "sent" && result.error.category === "transport" &&
+      result.error.transportReason === "timeout" && legacyProtectedText(request);
 }
 function aborted(result: QqSendResult): boolean {
   return result.status !== "sent" && result.error.category === "transport" &&
@@ -181,7 +187,7 @@ function conversation(request: QqSendText): string {
 /** 一个会话只允许队首先成功；许可暂停、未知和永久失败都保留屏障。 */
 export class QqSendActions {
   #records = new Map<string, SendRecord>();
-  // 首个异步哈希/落盘前同步预留，避免不同动作并发抢到同一平台去重键。
+  // 首个异步哈希/落盘前同步预留，保证并发动作准入及会话顺序稳定。
   #admissions = new Map<string, QqSendText>();
   #inflight = new Map<string, Promise<SendStatus>>();
   #conversations = new Map<string, Promise<void>>();
@@ -737,11 +743,12 @@ export class QqSendActions {
       for (let n = 1; n <= starts.size; n++) {
         const start = starts.get(n), previous = attempts[n - 2];
         if (
-          !start || (n > 1 && !(previous.result && retryable(record.request, previous.result)) &&
+          !start ||
+          (n > 1 && !(previous.result && legacyRetryable(record.request, previous.result)) &&
             !(record.policy &&
-              ((protectedText(record.request) && previous.interruptedAt) ||
+              ((legacyProtectedText(record.request) && previous.interruptedAt) ||
                 (previous.result && aborted(previous.result) && previous.result.status !== "sent" &&
-                  (!previous.result.attempted || protectedText(record.request))))))
+                  (!previous.result.attempted || legacyProtectedText(record.request))))))
         ) throw new QqActionError("corrupt");
         const result = results.get(n), interruptedAt = interrupted.get(n);
         if (result && interruptedAt) throw new QqActionError("corrupt");
@@ -843,20 +850,31 @@ export class QqSendActions {
     this.#attempts.set(started.actionId, attempts);
     const last = attempts.at(-1);
     if (last) {
-      if (last.result && !retryable(started.request, last.result) && !aborted(last.result)) {
-        return settledResult(attempts);
-      }
       if (!last.result) {
         if (!last.interruptedAt) {
           const interrupted = { ...last, interruptedAt: new Date().toISOString() };
           await this.#attemptFact(interrupted, "interrupted");
           attempts[attempts.length - 1] = interrupted;
         }
-        if (!protectedText(started.request)) return undefined;
-      } else if (
-        aborted(last.result) && !protectedText(started.request) && last.result.status !== "sent" &&
-        last.result.attempted
-      ) return undefined;
+        return undefined;
+      }
+      const outcome = settledResult(attempts);
+      // A durable platform receipt is authoritative even if the process died
+      // before the action's final summary was committed.
+      if (outcome?.status === "sent") return outcome;
+      // Legacy passive retries could end in an explicit auth/rate rejection after
+      // an earlier unknown send. A later rejection cannot prove that earlier
+      // attempt was not delivered, and active sending has no safe replay key.
+      if (
+        attempts.some((attempt) =>
+          attempt.interruptedAt || !attempt.result || attempt.result.status === "unknown" ||
+          (attempt.result.status === "failed" && attempt.result.attempted &&
+            aborted(attempt.result))
+        )
+      ) {
+        return outcome?.status === "unknown" ? outcome : undefined;
+      }
+      if (!retryable(last.result) && !aborted(last.result)) return settledResult(attempts);
     }
     if (this.sendScope !== "all" && started.request.destination.kind !== "user") {
       return attempts.length
@@ -892,7 +910,7 @@ export class QqSendActions {
       await this.#attemptFact(finished, "result");
       attempts[n - 1] = finished;
       if (aborted(result)) return undefined;
-      if (!retryable(started.request, result)) return settledResult(attempts);
+      if (!retryable(result)) return settledResult(attempts);
       const baseDelay = this.#retryDelays[Math.min(n - 1, this.#retryDelays.length - 1)];
       if (
         !await this.#wait(
@@ -912,42 +930,23 @@ export class QqSendActions {
       if (previous?.format !== undefined) snapshot.format = previous.format;
       else if (!previous && snapshot.attachment === undefined) snapshot.format = "markdown";
     }
-    const reply = snapshot?.reply;
-    if (reply && typeof reply === "object" && "messageId" in reply) {
-      const reserved = [
-        ...Array.from(
-          this.#records.values(),
-          (record) => [record.actionId, record.request] as const,
-        ),
-        ...this.#admissions.entries(),
-      ];
-      const sameReply = (other: QqSendText) =>
-        canonical(other.destination) === canonical(snapshot.destination) && other.reply &&
-        "messageId" in other.reply && other.reply.messageId === reply.messageId;
-      if (reply.sequence === undefined) {
-        if (previous && sameReply(previous) && previous.reply && "sequence" in previous.reply) {
-          reply.sequence = previous.reply.sequence;
-        } else {
-          let sequence = 1;
-          for (const [, other] of reserved) {
-            if (sameReply(other) && other.reply && "sequence" in other.reply) {
-              sequence = Math.max(sequence, other.reply.sequence + 1);
-            }
-          }
-          reply.sequence = sequence;
-        }
-      }
-      validateQqSendText(snapshot as QqSendText);
-      if (
-        !previous &&
-        reserved.some(([id, other]) =>
-          id !== actionId && sameReply(other) && other.reply && "sequence" in other.reply &&
-          other.reply.sequence === reply.sequence
-        )
-      ) throw new QqActionError("conflict");
-    } else validateQqSendText(snapshot as QqSendText);
-    if (previous && canonical(previous) !== canonical(snapshot)) {
-      throw new QqActionError("conflict");
+    // Validate legacy-shaped caller input before ignoring its passive reply metadata.
+    const validation = structuredClone(snapshot);
+    if (
+      validation?.reply && typeof validation.reply === "object" &&
+      "messageId" in validation.reply && validation.reply.sequence === undefined
+    ) {
+      validation.reply.sequence = 1;
+    }
+    validateQqSendText(validation as QqSendText);
+    delete snapshot.reply;
+    if (previous) {
+      const activePrevious = structuredClone(previous);
+      delete activePrevious.reply;
+      if (canonical(activePrevious) !== canonical(snapshot)) throw new QqActionError("conflict");
+      // Existing fingerprints are immutable. An upgraded caller omitting reply still
+      // addresses the original finished, cancelled or interrupted action.
+      return structuredClone(previous);
     }
     return snapshot as QqSendText;
   }

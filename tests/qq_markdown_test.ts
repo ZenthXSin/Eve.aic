@@ -24,7 +24,7 @@ function fixture() {
       new QqClient({ appId: "fixture", appSecret: "fixture" }, {
         baseUrl: `http://127.0.0.1:${server.addr.port}`,
         sendScope: "all",
-        attachmentReader: async () => new Uint8Array([1, 2, 3]),
+        attachmentReader: () => Promise.resolve(new Uint8Array([1, 2, 3])),
       }),
   };
 }
@@ -37,15 +37,11 @@ Deno.test("Markdown: client wire body, legacy plain, proactive/group/event and f
     assert.deepEqual(f.bodies[0], {
       msg_type: 2,
       markdown: { content: request.text },
-      msg_id: "incoming",
-      msg_seq: 4,
     });
     await c.sendText({ ...request, format: undefined });
     assert.deepEqual(f.bodies[1], {
       msg_type: 0,
       content: request.text,
-      msg_id: "incoming",
-      msg_seq: 4,
       message_reference: { message_id: "ref" },
     });
     await c.sendText({
@@ -57,7 +53,6 @@ Deno.test("Markdown: client wire body, legacy plain, proactive/group/event and f
     assert.deepEqual(f.bodies[2], {
       msg_type: 2,
       markdown: { content: request.text },
-      event_id: "event",
     });
     await c.sendText({ ...request, format: "markdown", reply: undefined, wakeup: true });
     assert.deepEqual(f.bodies[3], {

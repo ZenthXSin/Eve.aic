@@ -321,10 +321,6 @@ export class QqModelCommands {
     const job = this.actions.send(`qq_model_reply_${inbound.identity}`, {
       destination: inbound.message.destination,
       text: saved.reply!,
-      reply: {
-        messageId: inbound.message.deduplication.messageId,
-        ...(saved.replySequence === undefined ? {} : { sequence: saved.replySequence }),
-      },
     });
     this.#replies.add(job);
     void job.then((status) => {

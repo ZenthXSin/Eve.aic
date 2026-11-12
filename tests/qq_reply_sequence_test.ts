@@ -20,13 +20,88 @@ const request: QqActionSendText = {
   reply: { messageId: "source" },
 };
 const conflict = (e: unknown) => e instanceof QqActionError && e.category === "conflict";
-function sequence(request: QqSendText) {
-  assert.ok(request.reply && "sequence" in request.reply);
-  return request.reply.sequence;
+function canonical(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${
+    Object.keys(record).filter((k) => record[k] !== undefined).sort().map((k) =>
+      `${JSON.stringify(k)}:${canonical(record[k])}`
+    ).join(",")
+  }}`;
+}
+const timeout: QqSendResult = {
+  status: "unknown",
+  attempted: true,
+  error: { category: "transport", transportReason: "timeout" },
+};
+async function legacyFixture(
+  directory: string,
+  interrupted = false,
+  mixed?: "unknown_rate_limit" | "interrupted_auth" | "aborted_auth" | "unknown_sent",
+) {
+  const old: QqSendText = { ...request, reply: { messageId: "source", sequence: 7 } };
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical(old)));
+  const fingerprint = Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join(
+    "",
+  );
+  const at = new Date().toISOString(), actionId = "legacy";
+  await Deno.mkdir(`${directory}/records`, { recursive: true });
+  await Deno.mkdir(`${directory}/attempts/legacy`, { recursive: true });
+  const record = {
+    schema: 1,
+    actionId,
+    fingerprint,
+    request: old,
+    startedAt: at,
+    policy: { kind: "until_sent_v1", sequence: 1 },
+    ...(interrupted || mixed ? { status: "started" } : {
+      status: "finished",
+      finishedAt: at,
+      result: timeout,
+      attemptCount: 2,
+    }),
+  };
+  await Deno.writeTextFile(`${directory}/records/legacy.json`, JSON.stringify(record));
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const common = { schema: 1, actionId, fingerprint, attempt };
+    await Deno.writeTextFile(
+      `${directory}/attempts/legacy/${attempt}.started.json`,
+      JSON.stringify({ ...common, startedAt: at }),
+    );
+    if (mixed === "interrupted_auth" && attempt === 1) {
+      await Deno.writeTextFile(
+        `${directory}/attempts/legacy/${attempt}.interrupted.json`,
+        JSON.stringify({ ...common, interruptedAt: at }),
+      );
+    } else if (!interrupted || attempt === 1 || mixed) {
+      const result: QqSendResult = mixed && attempt === 2
+        ? mixed === "unknown_sent" ? { status: "sent", messageId: "legacy-receipt" } : {
+          status: "failed",
+          attempted: true,
+          error: { category: mixed === "unknown_rate_limit" ? "rate_limit" : "authentication" },
+        }
+        : mixed === "aborted_auth"
+        ? {
+          status: "unknown",
+          attempted: true,
+          error: {
+            category: "transport",
+            transportReason: "aborted",
+          },
+        }
+        : timeout;
+      await Deno.writeTextFile(
+        `${directory}/attempts/legacy/${attempt}.result.json`,
+        JSON.stringify({ ...common, finishedAt: at, result }),
+      );
+    }
+  }
+  return old;
 }
 
-Deno.test("QQ回复序号：并发新动作自动分配，同动作重入/重启固定原序号，显式碰撞不落盘", async () => {
-  const directory = await Deno.makeTempDir({ prefix: "eve-qq-sequences-" });
+Deno.test("QQ主动准入：忽略有效旧回复参数，不再分配被动序号，同动作幂等及重启不重发", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-qq-active-admission-" });
   const client = new Client();
   let actions = new QqSendActions(client, directory);
   try {
@@ -34,148 +109,256 @@ Deno.test("QQ回复序号：并发新动作自动分配，同动作重入/重启
     await Promise.all([
       actions.send("first", request),
       actions.send("second", { ...request, text: "second" }),
-      actions.send("first", request),
+      actions.send("first", { ...request, reply: undefined }),
     ]);
-    assert.deepEqual(client.requests.map(sequence), [1, 2]);
-    await assert.rejects(
-      actions.send("collision", { ...request, reply: { messageId: "source", sequence: 1 } }),
-      conflict,
-    );
-    await assert.rejects(Deno.stat(`${directory}/records/collision.json`), Deno.errors.NotFound);
-    await assert.rejects(actions.send("first", { ...request, text: "changed" }), conflict);
-    await actions.close();
-    actions = new QqSendActions(client, directory);
-    await actions.initialize();
-    await actions.send("first", request);
     assert.equal(client.requests.length, 2);
-    await actions.send("third", { ...request, text: "third" });
-    assert.deepEqual(client.requests.map(sequence), [1, 2, 3]);
-    await actions.send("different-source", { ...request, reply: { messageId: "other" } });
-    await actions.send("different-user", {
-      ...request,
-      destination: { kind: "user", openId: "other" },
-    });
-    assert.deepEqual(client.requests.slice(-2).map(sequence), [1, 1]);
-  } finally {
-    await actions.close();
-    await Deno.remove(directory, { recursive: true });
-  }
-});
-
-Deno.test("QQ回复序号：并发显式抢同序号只接纳一个，未知取消后仍保留占用，重启不重发", async () => {
-  const directory = await Deno.makeTempDir({ prefix: "eve-qq-sequence-conflict-" });
-  const client = new Client(() => ({
-    status: "unknown",
-    attempted: true,
-    error: { category: "duplicate" },
-  }));
-  let actions = new QqSendActions(client, directory);
-  const explicit = { ...request, reply: { messageId: "source", sequence: 7 } };
-  try {
-    await actions.initialize();
-    const results = await Promise.allSettled([
-      actions.send("first", explicit),
-      actions.send("second", explicit),
-    ]);
-    assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
-    const failed = results.find((r) => r.status === "rejected");
-    assert.ok(failed?.status === "rejected" && conflict(failed.reason));
-    const head = (await actions.listSendQueue()).items[0];
-    const record = await Deno.readTextFile(`${directory}/records/${head.actionId}.json`);
-    const attempts = await Deno.readTextFile(
-      `${directory}/attempts/${head.actionId}/1.result.json`,
-    );
-    const args = {
-      actionId: head.actionId,
-      expectedFingerprint: head.fingerprint,
-      expectedReceiptDigest: head.receiptDigest!,
-    };
-    const cancelled = await actions.cancelSend(args);
-    assert.ok(
-      cancelled.status === "cancelled" && cancelled.resolution.kind === "unknown_retained" &&
-        cancelled.originalResult?.status === "unknown",
-    );
-    assert.equal(await Deno.readTextFile(`${directory}/records/${head.actionId}.json`), record);
+    assert.ok(client.requests.every((r) => r.reply === undefined));
     assert.equal(
-      await Deno.readTextFile(`${directory}/attempts/${head.actionId}/1.result.json`),
-      attempts,
+      JSON.parse(await Deno.readTextFile(`${directory}/records/first.json`)).request.reply,
+      undefined,
+    );
+    await actions.send("same-old-sequence", {
+      ...request,
+      reply: { messageId: "source", sequence: 1 },
+    });
+    await assert.rejects(actions.send("first", { ...request, text: "changed" }), conflict);
+    await assert.rejects(
+      actions.send("invalid", {
+        ...request,
+        reply: { messageId: "", sequence: -1 },
+      }),
+      (e) => e instanceof QqActionError && e.category === "request",
     );
     await actions.close();
     actions = new QqSendActions(client, directory);
     await actions.initialize();
-    assert.deepEqual(await actions.send(head.actionId, explicit), cancelled);
-    assert.deepEqual(await actions.cancelSend(args), cancelled);
-    assert.equal(client.requests.length, 1);
-    await assert.rejects(actions.send("collision-after-cancel", explicit), conflict);
-    await actions.send("new", request);
-    assert.equal(sequence(client.requests[1]), 8);
+    await actions.send("first", { ...request, reply: undefined });
+    assert.equal(client.requests.length, 3);
   } finally {
     await actions.close();
     await Deno.remove(directory, { recursive: true });
   }
 });
 
-Deno.test("QQ回复序号：自动序号的超时持续重试保持原消息和序号", async () => {
-  const directory = await Deno.makeTempDir({ prefix: "eve-qq-sequence-retry-" });
-  const client = new Client((n) =>
-    n < 3
-      ? {
-        status: "unknown",
-        attempted: true,
-        error: { category: "transport", transportReason: "timeout" },
-      }
-      : { status: "sent", messageId: "confirmed" }
-  );
+Deno.test("QQ主动未知：尝试后超时不依赖旧回复键重试，保留队首可取消，随后才发送下一条", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-qq-active-unknown-" });
+  const client = new Client((n) => n === 1 ? timeout : { status: "sent", messageId: "next" });
   const actions = new QqSendActions(client, directory, "private", { retryDelaysMs: [0] });
   try {
     await actions.initialize();
-    const result = await actions.send("same", request);
-    assert.ok(result.status === "finished" && result.result.status === "sent");
-    assert.equal(client.requests.length, 3);
-    assert.deepEqual(client.requests[0], client.requests[1]);
-    assert.deepEqual(client.requests[1], client.requests[2]);
-    assert.equal(sequence(client.requests[0]), 1);
-  } finally {
-    await actions.close();
-    await Deno.remove(directory, { recursive: true });
-  }
-});
-
-Deno.test("QQ未知等待取消：许可中断零尝试队首保留原件，取消后按序放行且重启不重发", async () => {
-  const directory = await Deno.makeTempDir({ prefix: "eve-qq-interrupted-cancel-" });
-  const client = new Client();
-  let actions = new QqSendActions(client, directory);
-  try {
-    await actions.initialize();
-    assert.equal(
-      (await actions.send("interrupted", request, {
-        beforeAttempt: () => Promise.reject(new Error("paused")),
-      })).status,
-      "unknown",
-    );
-    assert.equal(client.requests.length, 0);
-    await actions.send("follower", { ...request, text: "follower" });
-    const original = await Deno.readTextFile(`${directory}/records/interrupted.json`);
-    await actions.close();
-    actions = new QqSendActions(client, directory);
-    await actions.initialize();
-    const head = (await actions.listSendQueue({ failedHeadsOnly: true })).items[0];
-    assert.equal(head.actionId, "interrupted");
-    assert.equal(head.canCancel, true);
+    const first = await actions.send("first", request);
+    assert.ok(first.status === "finished" && first.result.status === "unknown");
+    assert.equal(client.requests.length, 1);
+    assert.deepEqual(await actions.send("second", { ...request, text: "second" }), {
+      actionId: "second",
+      status: "blocked",
+      blockedBy: "first",
+    });
+    const head = (await actions.listSendQueue()).items[0];
     const cancelled = await actions.cancelSend({
       actionId: head.actionId,
       expectedFingerprint: head.fingerprint,
       expectedReceiptDigest: head.receiptDigest!,
-    }, { actor: "admin", failedHeadOnly: true });
+    });
     assert.ok(cancelled.status === "cancelled" && cancelled.resolution.kind === "unknown_retained");
-    assert.equal(await Deno.readTextFile(`${directory}/records/interrupted.json`), original);
-    await actions.send("follower", { ...request, text: "follower" });
-    assert.equal(client.requests.length, 1);
-    assert.equal(client.requests[0].text, "follower");
+    await actions.send("second", { ...request, text: "second", reply: undefined });
+    assert.equal(client.requests.length, 2);
+    assert.ok(client.requests.every((r) => !r.reply));
+  } finally {
+    await actions.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("QQ主动重试：仅未尝试超时与明确限流可按序重试，重启验证账本成功", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-qq-active-retry-" });
+  const client = new Client((n) =>
+    n === 1
+      ? {
+        status: "failed",
+        attempted: false,
+        error: {
+          category: "transport",
+          transportReason: "timeout",
+          failureStage: "upload",
+        },
+      }
+      : n === 2
+      ? { status: "failed", attempted: true, error: { category: "rate_limit" } }
+      : { status: "sent", messageId: "confirmed" }
+  );
+  let actions = new QqSendActions(client, directory, "private", { retryDelaysMs: [0] });
+  try {
+    await actions.initialize();
+    const result = await actions.send("same", request);
+    assert.ok(result.status === "finished" && result.result.status === "sent");
+    assert.equal(result.attemptCount, 3);
+    assert.equal(client.requests.length, 3);
+    assert.ok(client.requests.every((r) => !r.reply));
     await actions.close();
     actions = new QqSendActions(client, directory);
     await actions.initialize();
-    assert.deepEqual(await actions.send("interrupted", request), cancelled);
+    assert.deepEqual(await actions.send("same", { ...request, reply: undefined }), result);
+    assert.equal(client.requests.length, 3);
+  } finally {
+    await actions.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("QQ旧被动账本：原指纹和多次未知尝试仍能恢复，省略reply重入及取消均不重发", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-qq-legacy-reply-" });
+  const old = await legacyFixture(directory);
+  const original = await Deno.readTextFile(`${directory}/records/legacy.json`);
+  const client = new Client();
+  let actions = new QqSendActions(client, directory);
+  try {
+    await actions.initialize();
+    const result = await actions.send("legacy", { ...old, reply: undefined });
+    assert.ok(result.status === "finished" && result.result.status === "unknown");
+    assert.equal(result.attemptCount, 2);
+    assert.equal(client.requests.length, 0);
+    await assert.rejects(actions.send("legacy", { ...old, text: "changed" }), conflict);
+    const head = (await actions.listSendQueue()).items[0];
+    const cancelled = await actions.cancelSend({
+      actionId: head.actionId,
+      expectedFingerprint: head.fingerprint,
+      expectedReceiptDigest: head.receiptDigest!,
+    });
+    assert.equal(await Deno.readTextFile(`${directory}/records/legacy.json`), original);
+    await actions.close();
+    actions = new QqSendActions(client, directory);
+    await actions.initialize();
+    assert.deepEqual(await actions.send("legacy", { ...old, reply: undefined }), cancelled);
+    await actions.send("new", request);
+    assert.equal(client.requests.length, 1);
+    assert.equal(client.requests[0].reply, undefined);
+  } finally {
+    await actions.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("QQ旧被动在途：中断恢复不再凭旧msg_id重新主动发送，队首屏障仍可取消", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-qq-legacy-interrupted-" });
+  const old = await legacyFixture(directory, true);
+  const client = new Client();
+  const actions = new QqSendActions(client, directory);
+  try {
+    await actions.initialize();
+    assert.deepEqual(await actions.send("legacy", { ...old, reply: undefined }), {
+      actionId: "legacy",
+      status: "unknown",
+      reason: "interrupted",
+      attemptCount: 2,
+    });
+    assert.equal(client.requests.length, 0);
+    const interrupted = JSON.parse(
+      await Deno.readTextFile(`${directory}/attempts/legacy/2.interrupted.json`),
+    );
+    assert.ok(Number.isFinite(Date.parse(interrupted.interruptedAt)));
+    const head = (await actions.listSendQueue()).items[0];
+    assert.equal(head.canCancel, true);
+    await actions.cancelSend({
+      actionId: head.actionId,
+      expectedFingerprint: head.fingerprint,
+      expectedReceiptDigest: head.receiptDigest!,
+    });
+    await actions.send("follower", { ...request, text: "follower" });
+    assert.equal(client.requests.length, 1);
+  } finally {
+    await actions.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("QQ旧混合尝试链：早先未知或中断不被后来限流/认证拒绝覆盖，切主动不续发且可取消", async () => {
+  for (const mixed of ["unknown_rate_limit", "interrupted_auth", "aborted_auth"] as const) {
+    const directory = await Deno.makeTempDir({ prefix: "eve-qq-legacy-mixed-" });
+    const old = await legacyFixture(directory, false, mixed);
+    const original = new Map<string, string>();
+    for await (const entry of Deno.readDir(`${directory}/attempts/legacy`)) {
+      original.set(
+        entry.name,
+        await Deno.readTextFile(`${directory}/attempts/legacy/${entry.name}`),
+      );
+    }
+    const client = new Client();
+    let actions = new QqSendActions(client, directory);
+    try {
+      await actions.initialize();
+      const resumed = await actions.send("legacy", { ...old, reply: undefined });
+      if (mixed === "interrupted_auth") {
+        assert.deepEqual(resumed, {
+          actionId: "legacy",
+          status: "unknown",
+          reason: "interrupted",
+          attemptCount: 2,
+        });
+      } else {
+        assert.ok(resumed.status === "finished" && resumed.result.status === "unknown");
+      }
+      assert.equal(client.requests.length, 0);
+      assert.deepEqual(await actions.send("tail", { ...request, text: "tail" }), {
+        actionId: "tail",
+        status: "blocked",
+        blockedBy: "legacy",
+      });
+      for (const [name, bytes] of original) {
+        assert.equal(await Deno.readTextFile(`${directory}/attempts/legacy/${name}`), bytes);
+      }
+      const head = (await actions.listSendQueue()).items[0];
+      assert.equal(head.canCancel, true);
+      const cancelled = await actions.cancelSend({
+        actionId: head.actionId,
+        expectedFingerprint: head.fingerprint,
+        expectedReceiptDigest: head.receiptDigest!,
+      });
+      assert.ok(
+        cancelled.status === "cancelled" && cancelled.resolution.kind === "unknown_retained",
+      );
+      await actions.send("tail", { ...request, text: "tail", reply: undefined });
+      assert.equal(client.requests.length, 1);
+      await actions.close();
+      actions = new QqSendActions(client, directory);
+      await actions.initialize();
+      assert.deepEqual(await actions.send("legacy", { ...old, reply: undefined }), cancelled);
+      assert.equal(client.requests.length, 1);
+    } finally {
+      await actions.close();
+      await Deno.remove(directory, { recursive: true });
+    }
+  }
+});
+
+Deno.test("QQ旧混合尝试链：未知后真实sent已持久而汇总中断，恢复采用回执且零网络重放", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-qq-legacy-sent-adoption-" });
+  const old = await legacyFixture(directory, false, "unknown_sent");
+  const path = `${directory}/attempts/legacy/2.result.json`;
+  const original = await Deno.readTextFile(path);
+  const client = new Client();
+  let actions = new QqSendActions(client, directory);
+  try {
+    await actions.initialize();
+    const sent = await actions.send("legacy", { ...old, reply: undefined });
+    assert.deepEqual(sent, {
+      actionId: "legacy",
+      status: "finished",
+      attemptCount: 2,
+      result: { status: "sent", messageId: "legacy-receipt" },
+    });
+    assert.equal(client.requests.length, 0);
+    assert.equal(await Deno.readTextFile(path), original);
+    assert.equal(
+      JSON.parse(await Deno.readTextFile(`${directory}/records/legacy.json`)).status,
+      "finished",
+    );
+    await actions.send("tail", { ...request, text: "tail", reply: undefined });
+    assert.equal(client.requests.length, 1);
+    await actions.close();
+    actions = new QqSendActions(client, directory);
+    await actions.initialize();
+    assert.deepEqual(await actions.send("legacy", { ...old, reply: undefined }), sent);
     assert.equal(client.requests.length, 1);
   } finally {
     await actions.close();

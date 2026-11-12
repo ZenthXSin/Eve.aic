@@ -69,7 +69,7 @@ export interface QqSendText {
   text: string;
   /** Pinned at admission; absent in legacy records means plain text. */
   format?: "plain" | "markdown";
-  /** 调用方为一个动作固定序号；传输层不因失败或未知擅自递增。 */
+  /** 兼容旧动作账本的回复来源；新发送统一主动，不写入平台被动回复字段。 */
   reply?: { messageId: string; sequence: number } | { eventId: string };
   /** 引用展示用的 ref_idx，不是被动回复用的 msg_id。 */
   referenceIndex?: string;
@@ -239,16 +239,14 @@ function textBody(request: QqSendText): Record<string, unknown> {
         !nonempty(reply.messageId) || typeof reply.sequence !== "number" ||
         !Number.isSafeInteger(reply.sequence) || reply.sequence < 1
       ) requestError();
-      body.msg_id = reply.messageId;
-      body.msg_seq = reply.sequence;
     } else {
       if (!nonempty(reply.eventId)) requestError();
-      body.event_id = reply.eventId;
     }
   }
   if (request.referenceIndex !== undefined) {
     if (!nonempty(request.referenceIndex)) requestError();
-    // Official SDK omits message_reference for Markdown; reply msg_id is retained.
+    // Official SDK omits message_reference for Markdown. Plain/media retain display references;
+    // a reference is not a passive-reply msg_id and does not change proactive sending.
     if (request.format !== "markdown") {
       body.message_reference = { message_id: request.referenceIndex };
     }
@@ -256,7 +254,7 @@ function textBody(request: QqSendText): Record<string, unknown> {
   if (request.wakeup !== undefined) {
     if (typeof request.wakeup !== "boolean") requestError();
     if (request.wakeup) {
-      if (request.reply || request.destination.kind !== "user" || request.attachment) {
+      if (request.destination.kind !== "user" || request.attachment) {
         requestError();
       }
       body.is_wakeup = true;
@@ -523,7 +521,7 @@ export class QqClient {
     };
   }
 
-  /** 一次调用只尝试发送一次，不自动重试、递增序号、改正文或切换为主动消息。 */
+  /** 一次调用只尝试主动发送一次；不自动重试、改正文或补写被动回复字段。 */
   async sendText(request: QqSendText): Promise<QqSendResult> {
     request = structuredClone(request);
     const body = textBody(request);
@@ -548,7 +546,11 @@ export class QqClient {
           bytes = await this.#attachmentReader(request.attachment.path);
         } else requestError();
       } catch {
-        return { status: "failed", attempted: false, error: { category: "request" } };
+        return {
+          status: "failed",
+          attempted: false,
+          error: { category: "request", failureStage: "upload" },
+        };
       }
       let upload: ResponseInfo;
       try {
@@ -573,8 +575,9 @@ export class QqClient {
         );
       } catch (error) {
         return {
-          status: "unknown",
-          attempted: true,
+          // srv_send_msg:false only uploads a resource; /messages has not been attempted.
+          status: "failed",
+          attempted: false,
           error: { ...(error as QqRequestError).info, failureStage: "upload" },
         };
       }
@@ -582,25 +585,30 @@ export class QqClient {
       try {
         code = codeOf(upload.data);
       } catch (error) {
-        return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
+        return {
+          status: "failed",
+          attempted: false,
+          error: { ...(error as QqRequestError).info, failureStage: "upload" },
+        };
       }
       if (upload.httpStatus !== 200 || (code !== undefined && code !== 0)) {
         const error = { ...errorInfo(upload, code), failureStage: "upload" as const };
         if (error.category === "authentication") this.invalidateToken();
         return {
-          status: upload.httpStatus >= 500 ? "unknown" : "failed",
-          attempted: true,
+          status: "failed",
+          attempted: false,
           error,
         };
       }
       if (!nonempty(upload.data.file_info)) {
         return {
-          status: "unknown",
-          attempted: true,
+          status: "failed",
+          attempted: false,
           error: {
             category: "invalid_response",
             httpStatus: upload.httpStatus,
             traceId: upload.traceId,
+            failureStage: "upload",
           },
         };
       }

@@ -85,7 +85,11 @@ async function fixture(configured = true) {
         value: corruptResult ? { ...result, model: "wrong-model" } : result,
       });
     }
-    received.push(await request.json());
+    const body = await request.json();
+    for (const field of ["msg_id", "msg_seq", "event_id"]) {
+      assert.equal(field in body, false, `/model 回执必须主动发送，不带 ${field}`);
+    }
+    received.push(body);
     await beforeSend?.();
     if (failNextSend) {
       failNextSend = false;
@@ -246,7 +250,7 @@ Deno.test("QQ /model：并发入站顺序切换，回复使用共享账本且不
     gate.resolve();
     await old;
     await until(() => f.received.length === 3);
-    assert.deepEqual(f.received.map((r) => r.msg_id), ["older", "msg-1", "msg-2"]);
+    assert.deepEqual(f.received.map((r) => r.msg_id), [undefined, undefined, undefined]);
   } finally {
     gate.resolve();
     await f.close();
@@ -476,13 +480,13 @@ Deno.test("QQ /model：长模型列表回复有界，旧失败屏障阻止命令
       expectedFingerprint: head.fingerprint,
       expectedReceiptDigest: head.receiptDigest!,
     });
-    // 无重启、无新推送，队首取消事件唤醒原命令回复；仍是同一ID/seq且只发一次。
+    // 无重启、无新推送，队首取消事件唤醒原命令回复；仍是同一动作且只主动发送一次。
     await until(() => {
       const status = f.actions.status(`qq_model_reply_${record.identity}`);
       return status?.status === "finished" && status.result.status === "sent";
     });
     assert.equal(f.received.length, 2);
-    assert.equal(f.received[1].msg_id, "msg-1");
+    assert.equal(f.received[1].msg_id, undefined);
     assert.equal(
       f.actions.records().filter((r) => r.actionId === `qq_model_reply_${record.identity}`).length,
       1,
