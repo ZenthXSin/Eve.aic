@@ -481,3 +481,103 @@ Deno.test("脚本：取消等待中的真实动作保留未知，迟到回执存
     await f.close();
   }
 });
+
+Deno.test("脚本社交：burst编号由宿主注入并持久化，quietwait类型接口贯通且不发送", async () => {
+  const f = await fixture();
+  try {
+    const request = {
+      requestId: "social-script-original",
+      mode: "sync",
+      timeoutMs: 10_000,
+      code:
+        'const burst = await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一句","第二句"]}); const waited = await tools.phone.waitForMessages({conversationId:"qq:user:friend",purpose:"reply",quietMs:100,maxWaitMs:20}); return {burst,waited};',
+    };
+    const job = await f.kernel().call<ScriptSummary & Json>("scripts", "start", request);
+    assert.equal(job.status, "completed");
+    assert.equal(job.actions, 2);
+    assert.equal(f.count(), 2);
+    const result = JSON.parse(
+      (await f.kernel().call<{ text: string }>("scripts", "result", { jobId: job.jobId })).text,
+    );
+    assert.equal(result.burst.complete, true);
+    assert.match(result.burst.actionId, /^script_/);
+    assert.equal(result.burst.items.length, 2);
+    assert.equal(result.waited.reason, "max_wait");
+    assert.equal(result.waited.throughSeq, 2);
+    assert.equal(result.waited.lastIncomingSeq, undefined);
+    await f.restart();
+    assert.deepEqual(await f.kernel().call("scripts", "start", request), job);
+    assert.equal(f.count(), 2);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("脚本社交恢复：原脚本unknown结束后取消队首，新脚本resume只发送剩余子条", async () => {
+  let unknown = true, sentCount = 0;
+  const f = await fixture(() => {
+    sentCount++;
+    return Promise.resolve(Response.json(unknown ? {} : { id: `sent-${sentCount}` }));
+  });
+  try {
+    const initialJob = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+      requestId: "burst-original-unknown",
+      mode: "sync",
+      timeoutMs: 10_000,
+      code:
+        'return await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一条未知","第二条待发","第三条待发"]});',
+    });
+    assert.equal(initialJob.status, "completed");
+    const initial = JSON.parse(
+      (await f.kernel().call<{ text: string }>("scripts", "result", {
+        jobId: initialJob.jobId,
+        limit: 8192,
+      }))
+        .text,
+    );
+    assert.deepEqual(
+      initial.items.map((item: { receipt: { state: string } }) => item.receipt.state),
+      ["unknown", "blocked", "blocked"],
+    );
+    assert.equal(f.count(), 1);
+    const head = (await f.actions.listSendQueue({ conversationId: "qq:user:friend" })).items.find((
+      item,
+    ) => item.actionId === initial.items[0].actionId)!;
+    await f.actions.cancelSend({
+      actionId: head.actionId,
+      expectedFingerprint: head.fingerprint,
+      expectedReceiptDigest: head.receiptDigest!,
+    }, { actor: "eve" });
+    unknown = false;
+    const resumedJob = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+      requestId: "burst-new-script-resume",
+      mode: "sync",
+      timeoutMs: 10_000,
+      code:
+        'const resumed=await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一条未知","第二条待发","第三条待发"],resumeActionId:' +
+        JSON.stringify(initial.actionId) +
+        "}); return {resumed,status:await tools.phone.burstStatus({actionId:" +
+        JSON.stringify(initial.actionId) + "})};",
+    });
+    assert.equal(resumedJob.status, "completed");
+    const result = JSON.parse(
+      (await f.kernel().call<{ text: string }>("scripts", "result", {
+        jobId: resumedJob.jobId,
+        limit: 8192,
+      }))
+        .text,
+    );
+    assert.equal(result.resumed.actionId, initial.actionId);
+    assert.deepEqual(
+      result.resumed.items.slice(1).map((item: { receipt: { state: string } }) =>
+        item.receipt.state
+      ),
+      ["sent", "sent"],
+    );
+    assert.equal(result.resumed.items[0].receipt.resolution.kind, "unknown_retained");
+    assert.deepEqual(result.status, result.resumed);
+    assert.equal(f.count(), 3);
+  } finally {
+    await f.close();
+  }
+});

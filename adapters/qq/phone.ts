@@ -3,9 +3,14 @@ import type {
   HistoryCursor,
   OpenedConversation,
   PhoneActionReceipt,
+  PhoneBurstReceipt,
+  PhoneBurstStatus,
   PhoneMessage,
+  PhoneMessagesWaitResult,
   PhoneSend,
+  PhoneSendBurst,
   PhoneSendFile,
+  PhoneWaitForMessages,
 } from "../../contracts/phone.ts";
 import { historyScreen, messageScreen, messageTextPage } from "../../sdk/phone-view.ts";
 import { QqSendActions, type SendStatus } from "./actions.ts";
@@ -17,6 +22,8 @@ import { QqPhoneDownloads } from "./downloads.ts";
 import { KernelError } from "../../kernel/protocol.ts";
 import { fingerprint } from "../../kernel/calls.ts";
 import type { Json } from "../../kernel/protocol.ts";
+
+import { admitBurst, readBurst, waitForQuiet } from "./phone-social.ts";
 
 const SCREEN = { pageSize: 8, previewCharacters: 160, attachmentPageSize: 4 };
 const NOTICE = { ...SCREEN, previewCharacters: 80 };
@@ -106,6 +113,7 @@ function directGroupMention(record: InboundRecord): boolean {
 }
 
 export class QqPhone {
+  #burstTail: Promise<unknown> = Promise.resolve();
   #attachmentFailures = new Set<string>();
   #attachmentPending = new Set<string>();
   constructor(
@@ -491,6 +499,83 @@ export class QqPhone {
     // 回执先由发送账本保存；时间线失败不能重发已执行动作。恢复会从原账本补齐引用。
     await this.#snapshot();
     return phoneReceipt(result);
+  }
+
+  async sendBurst(
+    args: PhoneSendBurst,
+    options: { beforeAttempt?: () => Promise<void> } = {},
+  ): Promise<PhoneBurstReceipt> {
+    // 冻结调用者输入；同一手机内父动作准入串行，发送本身仍交给现有会话FIFO。
+    const captured = structuredClone(args);
+    const admission = this.#burstTail.then(async () => {
+      const manifest = await admitBurst(this.actions.directory, captured);
+      const match = /^qq:(user|group):(.+)$/.exec(manifest.conversationId)!;
+      // 此处没有await：在任何其它调用有机会准入前，按顺序预留所有子动作。
+      const sends = manifest.segments.map((text, index) =>
+        this.actions.send(
+          manifest.childActionIds[index],
+          { destination: { kind: match[1] as "user" | "group", openId: match[2] }, text },
+          options,
+        )
+      );
+      return { manifest, sends };
+    });
+    this.#burstTail = admission.then(() => {}, () => {});
+    const { manifest, sends } = await admission;
+    const statuses = await Promise.all(sends);
+    await this.#snapshot();
+    const items = statuses.map((status, index) => ({
+      index: index + 1,
+      actionId: manifest.childActionIds[index],
+      receipt: phoneReceipt(status),
+    }));
+    return {
+      actionId: manifest.actionId,
+      conversationId: manifest.conversationId,
+      items,
+      complete: items.every((item) => item.receipt.state === "sent"),
+    };
+  }
+
+  async burstStatus(args: { actionId: string }): Promise<PhoneBurstStatus | null> {
+    if (!args || Object.keys(args).some((key) => key !== "actionId")) {
+      throw new QqPhoneError("request");
+    }
+    const manifest = await readBurst(this.actions.directory, args.actionId);
+    if (!manifest) return null;
+    const items = manifest.childActionIds.map((actionId, index) => {
+      const status = this.actions.status(actionId);
+      return { index: index + 1, actionId, receipt: status ? phoneReceipt(status) : null };
+    });
+    return {
+      actionId: manifest.actionId,
+      conversationId: manifest.conversationId,
+      items,
+      complete: items.every((item) => item.receipt?.state === "sent"),
+    };
+  }
+
+  async waitForMessages(
+    args: PhoneWaitForMessages,
+    options: { signal?: AbortSignal; beforeCheck?: () => Promise<void> } = {},
+  ): Promise<PhoneMessagesWaitResult> {
+    const result = await waitForQuiet(args, () => {
+      const latest = this.incoming().findLast((record) =>
+        record.message.message.conversationId === args.conversationId
+      );
+      return latest ? { seq: latest.seq, receivedAt: latest.receivedAt } : undefined;
+    }, { signal: options.signal, checkpoint: options.beforeCheck });
+    const rows = await this.#snapshot();
+    const lastIncoming = result.lastSourceSeq === undefined
+      ? undefined
+      : rows.find((row) => row.key === `incoming:${result.lastSourceSeq}`);
+    return {
+      conversationId: args.conversationId,
+      reason: result.reason,
+      waitedMs: result.waitedMs,
+      throughSeq: rows.at(-1)?.message.seq ?? 0,
+      ...(lastIncoming ? { lastIncomingSeq: lastIncoming.message.seq } : {}),
+    };
   }
 
   action(args: { actionId: string }) {

@@ -1,5 +1,12 @@
 import type { Json } from "../kernel/protocol.ts";
-import type { PhoneActionReceipt, PhoneApi, PhoneSend, PhoneSendFile } from "./phone.ts";
+import type {
+  PhoneActionReceipt,
+  PhoneApi,
+  PhoneBurstReceipt,
+  PhoneSend,
+  PhoneSendBurst,
+  PhoneSendFile,
+} from "./phone.ts";
 import type { MindApi } from "./mind.ts";
 import type { NoteApi } from "./notes.ts";
 import type { CommandApi, FileApi } from "./workspace.ts";
@@ -49,10 +56,11 @@ export interface ScriptApi {
   memory: MemoryApi;
   records: RecordApi;
   mind: MindApi;
-  phone: Omit<PhoneApi, "send" | "sendFile"> & {
+  phone: Omit<PhoneApi, "send" | "sendFile" | "sendBurst"> & {
     /** actionId由宿主从持久脚本编号与调用序号产生，不让代码重试制造新动作。 */
     send(args: Omit<PhoneSend, "actionId">): Promise<PhoneActionReceipt>;
     sendFile(args: Omit<PhoneSendFile, "actionId">): Promise<PhoneActionReceipt>;
+    sendBurst(args: Omit<PhoneSendBurst, "actionId">): Promise<PhoneBurstReceipt>;
   };
   scripts: {
     status(args: { jobId: string }): Promise<ScriptSummary>;

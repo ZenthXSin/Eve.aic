@@ -78,6 +78,15 @@ export function startPhoneRpc(
           if (method === "send") {
             return await phone.send(args as never, { beforeAttempt: checkpoint });
           }
+          if (method === "sendBurst") {
+            return await phone.sendBurst(args as never, { beforeAttempt: checkpoint });
+          }
+          if (method === "waitForMessages") {
+            return await phone.waitForMessages(args as never, {
+              signal: request.signal,
+              beforeCheck: checkpoint,
+            });
+          }
           if (method === "sendFile") {
             return await phone.sendFile(args as never, { beforeAttempt: checkpoint });
           }
@@ -104,7 +113,7 @@ export function startPhoneRpc(
         if (
           !data.ownership || typeof data.ownership.actionId !== "string" ||
           !/^[a-zA-Z0-9_-]{1,128}$/.test(data.ownership.actionId) ||
-          ((method === "send" || method === "sendFile") &&
+          ((method === "send" || method === "sendFile" || method === "sendBurst") &&
             data.ownership.actionId !== args.actionId)
         ) throw new QqPhoneError("request");
         // 包括读取与游标更新；旧实例不能继续消费入站消息。号码不交给 QqPhone 业务层。
