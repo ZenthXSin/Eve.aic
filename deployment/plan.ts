@@ -119,9 +119,10 @@ export function buildDeploymentPlan(
     phone = existing.phone as Record<string, unknown>;
   if (
     !model || model.protocol !== "chat" || typeof model.apiKeyFile !== "string" || !qq ||
-    qq.replyScope !== "private" || qq.sandbox !== false || !phone ||
+    (qq.replyScope !== undefined && qq.replyScope !== "private" && qq.replyScope !== "all") ||
+    qq.sandbox !== false || !phone ||
     typeof phone.ownerPlatformUserId !== "string" || !phone.ownerPlatformUserId
-  ) throw new Error("沿用配置缺少已绑定主人或私信/模型配置");
+  ) throw new Error("沿用配置缺少已绑定主人或有效QQ/模型配置");
   for (const path of [model.apiKeyFile, qq.appIdFile, qq.appSecretFile]) absolute(path as string);
   if (
     ![model.timeoutMs, model.maxOutputTokens].every((n) => Number.isSafeInteger(n) && Number(n) > 0)
@@ -202,6 +203,7 @@ export function buildDeploymentPlan(
     phoneConnectionFile: `${r}/public/phone.json`,
     qq: {
       ...qq,
+      replyScope: qq.replyScope ?? "private",
       captureActivationBoundary: true,
       mediaRoots: [options.workspaceDirectory],
       mediaIdentity: { uid, gid },

@@ -83,7 +83,13 @@ export class QqSendActions {
   #failed = false;
   #closing = false;
 
-  constructor(readonly client: QqClient, readonly directory: string) {}
+  constructor(
+    readonly client: QqClient,
+    readonly directory: string,
+    readonly sendScope: "all" | "private" = "private",
+  ) {
+    if (!["all", "private"].includes(sendScope)) throw new QqActionError("request");
+  }
 
   get available(): boolean {
     return this.#lock !== undefined && !this.#failed && !this.#closing;
@@ -206,10 +212,11 @@ export class QqSendActions {
       };
       await this.#save(started);
       if (this.#failed) throw new QqActionError("storage");
-      // private 也在动作层落实，不能因传入了通用客户端而发群消息。
-      const received: QqSendResult = snapshot.destination.kind === "user"
-        ? await this.client.sendText(snapshot)
-        : { status: "failed", attempted: false, error: { category: "scope" } };
+      // 动作与传输分别落实范围；修改范围不能重放已有动作。
+      const received: QqSendResult =
+        this.sendScope === "all" || snapshot.destination.kind === "user"
+          ? await this.client.sendText(snapshot)
+          : { status: "failed", attempted: false, error: { category: "scope" } };
       // 回执通过 JSON 边界返回；首次与重启后保持同一份结构，不夹带 undefined 字段。
       const result: QqSendResult = JSON.parse(JSON.stringify(received));
       await this.#save({

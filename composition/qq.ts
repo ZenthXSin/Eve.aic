@@ -6,7 +6,8 @@ export async function readQqTestClient(configPath: string): Promise<QqClient> {
     const config = JSON.parse(await Deno.readTextFile(configPath));
     const qq = config.qq;
     if (
-      !qq || qq.sandbox !== false || qq.replyScope !== "private" ||
+      !qq || qq.sandbox !== false ||
+      (qq.replyScope !== undefined && !["private", "all"].includes(qq.replyScope)) ||
       typeof qq.appIdFile !== "string" || !qq.appIdFile.startsWith("/") ||
       typeof qq.appSecretFile !== "string" || !qq.appSecretFile.startsWith("/")
     ) throw new Error();
@@ -29,7 +30,10 @@ export async function readQqTestClient(configPath: string): Promise<QqClient> {
       );
       attachmentReader = (path) => files.readBytes({ path });
     }
-    return new QqClient({ appId, appSecret }, { sendScope: "private", attachmentReader });
+    return new QqClient({ appId, appSecret }, {
+      sendScope: qq.replyScope ?? "private",
+      attachmentReader,
+    });
   } catch {
     throw new QqRequestError({ category: "request" });
   }

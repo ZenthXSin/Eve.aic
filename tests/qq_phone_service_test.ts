@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { readQqTestClient } from "../composition/qq.ts";
+import { QqRequestError } from "../adapters/qq/client.ts";
+import { startQqPhoneAdapter } from "../adapters/qq/service.ts";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
 import { type QqDispatch, qqMessage } from "../adapters/qq/inbound.ts";
@@ -919,5 +922,170 @@ Deno.test("QQ 引用视图：真实出站回执索引可被引用，发送引用
     }]);
   } finally {
     await f.close();
+  }
+});
+
+Deno.test("QQ组合配置沿用缺省private，接受all并拒绝无效scope", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-qq-scope-config-" });
+  const configPath = `${directory}/config.json`;
+  try {
+    await Deno.writeTextFile(`${directory}/id`, "fixture-app\n");
+    await Deno.writeTextFile(`${directory}/secret`, "fixture-secret\n");
+    for (const replyScope of [undefined, "private", "all", null, "group", true, ["all"], {}]) {
+      await Deno.writeTextFile(
+        configPath,
+        JSON.stringify({
+          qq: {
+            sandbox: false,
+            replyScope,
+            appIdFile: `${directory}/id`,
+            appSecretFile: `${directory}/secret`,
+          },
+        }),
+      );
+      if (replyScope === undefined || replyScope === "private" || replyScope === "all") {
+        const client = await readQqTestClient(configPath);
+        assert.equal(client.sendScope, replyScope ?? "private");
+        client.close();
+      } else await assert.rejects(readQqTestClient(configPath), QqRequestError);
+    }
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持原回执不重发", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-phone-group-scope-" });
+  const paths: string[] = [];
+  const sockets = new Set<WebSocket>();
+  const platform = Deno.serve(
+    { hostname: "127.0.0.1", port: 0, onListen() {} },
+    async (r): Promise<Response> => {
+      const path = new URL(r.url).pathname;
+      if (path === "/app/getAppAccessToken") {
+        return Response.json({ access_token: "fixture-token", expires_in: 7200 });
+      }
+      if (path === "/users/@me") return Response.json({ id: "scope-bot", username: "Eve" });
+      if (path === "/gateway/bot") {
+        return Response.json({
+          url: `ws://127.0.0.1:${platform.addr.port}/websocket`,
+          session_start_limit: { remaining: 100 },
+        });
+      }
+      if (path.startsWith("/v2/")) {
+        paths.push(path);
+        const body = await r.json();
+        assert.equal(body.msg_seq, 1);
+        return Response.json({ id: `real-scope-send-${paths.length}` });
+      }
+      assert.equal(path, "/websocket");
+      const { socket, response } = Deno.upgradeWebSocket(r);
+      sockets.add(socket);
+      socket.onclose = () => sockets.delete(socket);
+      socket.onopen = () => socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 100 } }));
+      socket.onmessage = (incoming) => {
+        const data = JSON.parse(incoming.data);
+        if (data.op === 1) socket.send(JSON.stringify({ op: 11 }));
+        else if (data.op === 2) {
+          socket.send(
+            JSON.stringify({ op: 0, s: 0, t: "READY", d: { session_id: "scope-session" } }),
+          );
+          socket.send(JSON.stringify(event(1, "group-user", "群消息", "scope-group")));
+          socket.send(JSON.stringify(event(2, "user-a", "私信")));
+        } else if (data.op === 6) {
+          assert.equal(data.d.seq, 2);
+          socket.send(JSON.stringify({ op: 0, s: 2, t: "RESUMED", d: {} }));
+        }
+      };
+      return response;
+    },
+  );
+  let adapter: Awaited<ReturnType<typeof startQqPhoneAdapter>> | undefined;
+  let rpc: PhoneRpcClient | undefined;
+  async function start(scope: "private" | "all") {
+    adapter = await startQqPhoneAdapter(
+      new QqClient({ appId: "fixture", appSecret: "fixture" }, {
+        baseUrl: `http://127.0.0.1:${platform.addr.port}`,
+        sendScope: scope,
+      }),
+      `${directory}/${scope}`,
+      KEY,
+    );
+    rpc = new PhoneRpcClient(adapter.url, KEY);
+    for (let attempt = 0; attempt < 500; attempt++) {
+      const page = await rpc.call("history", { conversationId: "qq:user:user-a" }) as {
+        messages: unknown[];
+      };
+      if (page.messages.length) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("本地QQ适配器未收到测试消息");
+  }
+  async function stop() {
+    rpc?.close();
+    rpc = undefined;
+    await adapter?.close();
+    adapter = undefined;
+  }
+  try {
+    for (const scope of ["private", "all"] as const) {
+      await start(scope);
+      const health = await rpc!.call("health") as { available: boolean; replyScope: string };
+      assert.equal(health.available, true);
+      assert.equal(health.replyScope, scope);
+      const group = {
+        actionId: "scope-group-action",
+        conversationId: "qq:group:scope-group",
+        text: "自然群聊",
+        replyTo: { seq: 1, sequence: 1 },
+      };
+      const userHistory = await rpc!.call("history", { conversationId: "qq:user:user-a" }) as {
+        messages: { handle: { seq: number } }[];
+      };
+      const user = {
+        actionId: "scope-user-action",
+        conversationId: "qq:user:user-a",
+        text: "私信正常",
+        replyTo: { seq: userHistory.messages[0].handle.seq, sequence: 1 },
+      };
+      const before = paths.length;
+      const groupReceipt = await rpc!.call("send", group) as { state: string; attempted?: boolean };
+      assert.equal(groupReceipt.state, scope === "all" ? "sent" : "failed");
+      if (scope === "private") assert.equal(groupReceipt.attempted, false);
+      const userReceipt = await rpc!.call("send", user) as { state: string };
+      assert.equal(userReceipt.state, "sent");
+      assert.deepEqual(
+        paths.slice(before),
+        scope === "all"
+          ? ["/v2/groups/scope-group/messages", "/v2/users/user-a/messages"]
+          : ["/v2/users/user-a/messages"],
+      );
+      const groupBytes = await Deno.readTextFile(
+        `${directory}/${scope}/outbox/records/scope-group-action.json`,
+      );
+      const userBytes = await Deno.readTextFile(
+        `${directory}/${scope}/outbox/records/scope-user-action.json`,
+      );
+      const sentCount = paths.length;
+      await stop();
+      await start(scope);
+      assert.deepEqual(await rpc!.call("send", group), groupReceipt);
+      assert.deepEqual(await rpc!.call("send", user), userReceipt);
+      assert.equal(paths.length, sentCount);
+      assert.equal(
+        await Deno.readTextFile(`${directory}/${scope}/outbox/records/scope-group-action.json`),
+        groupBytes,
+      );
+      assert.equal(
+        await Deno.readTextFile(`${directory}/${scope}/outbox/records/scope-user-action.json`),
+        userBytes,
+      );
+      await stop();
+    }
+  } finally {
+    await stop();
+    for (const socket of sockets) socket.close();
+    await platform.shutdown();
+    await Deno.remove(directory, { recursive: true });
   }
 });

@@ -15,7 +15,7 @@ export interface QqClientOptions {
   timeoutMs?: number;
   maxResponseBytes?: number;
   now?: () => number;
-  /** 测试时显式设为 private；在任何认证或发送请求之前拒绝群聊发送。 */
+  /** 缺省仅私信；显式 all 才允许群聊，在认证或发送请求前落实。 */
   sendScope?: "all" | "private";
 }
 
@@ -258,8 +258,12 @@ export class QqClient {
     this.#timeout = timeout;
     this.#limit = limit;
     this.#now = options.now ?? Date.now;
-    this.#scope = options.sendScope ?? "all";
+    this.#scope = options.sendScope ?? "private";
     this.#attachmentReader = options.attachmentReader;
+  }
+
+  get sendScope(): "all" | "private" {
+    return this.#scope;
   }
 
   /** 独立手机存储只允许自己的完整下载回执原件，不允许任意root路径。 */

@@ -23,7 +23,7 @@ export async function startQqPhoneAdapter(
   options: { captureActivationBoundary?: boolean } = {},
 ) {
   const controller = new AbortController();
-  const actions = new QqSendActions(client, `${directory}/outbox`);
+  const actions = new QqSendActions(client, `${directory}/outbox`, client.sendScope);
   const timeline = new QqTimeline(`${directory}/timeline`);
   const reading = new QqPhoneReading(`${directory}/phone-reading`);
   const device = new QqPhoneDevice(`${directory}/phone-device`);
@@ -91,7 +91,7 @@ export async function startQqPhoneAdapter(
         available: failure === undefined && !controller.signal.aborted && actions.available &&
           timeline.available && reading.available && device.available && downloads.available,
         gateway: status,
-        replyScope: "private",
+        replyScope: client.sendScope,
       }),
       fence,
     );

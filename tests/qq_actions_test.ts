@@ -25,9 +25,10 @@ function service(handler: (request: Request) => Response | Promise<Response>) {
   });
   return {
     url: `http://127.0.0.1:${server.addr.port}`,
-    client: () =>
+    client: (sendScope: "all" | "private" = "all") =>
       new QqClient({ appId: "fixture", appSecret: "fixture" }, {
         baseUrl: `http://127.0.0.1:${server.addr.port}`,
+        sendScope,
       }),
     count: () => sends,
     close: () => server.shutdown(),
@@ -291,6 +292,85 @@ Deno.test("QQ 发送动作：损坏回执或未完成文件原样保留，不当
     assert.equal(local.count(), 1);
   } finally {
     await actions.close().catch(() => {});
+    await local.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("QQ群范围升级保留旧拒绝和unknown原件，新动作才发送，重启不重放", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-send-scope-upgrade-" });
+  const paths: string[] = [];
+  const local = service(async (r) => {
+    paths.push(new URL(r.url).pathname);
+    const body = await r.json();
+    return body.content === "未知群消息" ? Response.json({}) : Response.json({ id: "group-sent" });
+  });
+  const group: QqSendText = { ...request, destination: { kind: "group", openId: "group/id" } };
+  let actions = new QqSendActions(local.client(), directory);
+  try {
+    await actions.initialize();
+    const denied = await actions.send("old-denied", group);
+    assert.deepEqual(denied, {
+      actionId: "old-denied",
+      status: "finished",
+      result: { status: "failed", attempted: false, error: { category: "scope" } },
+    });
+    const oldBytes = await Deno.readTextFile(`${directory}/records/old-denied.json`);
+    assert.equal(local.count(), 0);
+    await actions.close();
+    actions = new QqSendActions(local.client(), directory, "all");
+    await actions.initialize();
+    assert.deepEqual(await actions.send("old-denied", group), denied);
+    assert.equal(await Deno.readTextFile(`${directory}/records/old-denied.json`), oldBytes);
+    assert.equal(local.count(), 0);
+    const sent = await actions.send("new-group", group);
+    assert.deepEqual(sent, {
+      actionId: "new-group",
+      status: "finished",
+      result: { status: "sent", messageId: "group-sent" },
+    });
+    const unknownRequest = { ...group, text: "未知群消息" };
+    const unknown = await actions.send("unknown-group", unknownRequest);
+    assert.ok(unknown.status === "finished" && unknown.result.status === "unknown");
+    const sentBytes = await Deno.readTextFile(`${directory}/records/new-group.json`);
+    const unknownBytes = await Deno.readTextFile(`${directory}/records/unknown-group.json`);
+    await actions.close();
+    actions = new QqSendActions(local.client(), directory, "all");
+    await actions.initialize();
+    assert.deepEqual(await actions.send("old-denied", group), denied);
+    assert.deepEqual(await actions.send("new-group", group), sent);
+    assert.deepEqual(await actions.send("unknown-group", unknownRequest), unknown);
+    assert.equal(await Deno.readTextFile(`${directory}/records/old-denied.json`), oldBytes);
+    assert.equal(await Deno.readTextFile(`${directory}/records/new-group.json`), sentBytes);
+    assert.equal(await Deno.readTextFile(`${directory}/records/unknown-group.json`), unknownBytes);
+    assert.deepEqual(paths, ["/v2/groups/group%2Fid/messages", "/v2/groups/group%2Fid/messages"]);
+    assert.equal(local.count(), 2);
+    assert.throws(() => new QqSendActions(local.client(), directory, "group" as "all"), /request/);
+  } finally {
+    await actions.close();
+    await local.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("动作层all不能绕过传输层private", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-send-scope-layers-" });
+  const local = service(() => Response.json({ id: "unexpected" }));
+  const actions = new QqSendActions(local.client("private"), directory, "all");
+  try {
+    await actions.initialize();
+    const result = await actions.send("transport-denied", {
+      ...request,
+      destination: { kind: "group", openId: "group" },
+    });
+    assert.deepEqual(result, {
+      actionId: "transport-denied",
+      status: "finished",
+      result: { status: "failed", attempted: false, error: { category: "scope" } },
+    });
+    assert.equal(local.count(), 0);
+  } finally {
+    await actions.close();
     await local.close();
     await Deno.remove(directory, { recursive: true });
   }

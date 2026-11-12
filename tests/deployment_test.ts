@@ -271,3 +271,24 @@ Deno.test("workspace clone keeps independent commit history without private orig
     await Deno.remove(root, { recursive: true });
   }
 });
+
+Deno.test("deployment QQ scope defaults private, accepts all, rejects malformed values", async () => {
+  const { root, options } = await fixture();
+  try {
+    for (const replyScope of [undefined, "private", "all"]) {
+      const plan = buildDeploymentPlan(
+        { ...existing, qq: { ...existing.qq, replyScope } },
+        options,
+      );
+      const adapter = JSON.parse(plan.files.find((f) => f.path.endsWith("/qq.json"))!.content);
+      assert.equal(adapter.qq.replyScope, replyScope ?? "private");
+    }
+    for (const replyScope of [null, "group", true, ["all"], {}]) {
+      assert.throws(() =>
+        buildDeploymentPlan({ ...existing, qq: { ...existing.qq, replyScope } }, options)
+      );
+    }
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});

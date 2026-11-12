@@ -64,7 +64,12 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
       await writeDurableJson(config.phoneConnectionFile, { phone: { adapterUrl: adapter.url } });
       await Deno.chmod(config.phoneConnectionFile, 0o644);
     }
-    console.log(JSON.stringify({ adapterRpc: "ready", privateSendOnly: true, eveOnline: false }));
+    console.log(JSON.stringify({
+      adapterRpc: "ready",
+      replyScope: client.sendScope,
+      privateSendOnly: client.sendScope === "private",
+      eveOnline: false,
+    }));
     await adapter.stopped;
   } finally {
     Deno.removeSignalListener("SIGTERM", stop);

@@ -178,7 +178,7 @@ Deno.test("发送保留全文、引用与固定序号，只凭真实编号返回
     }, { headers: { "X-Tps-trace-ID": "trace-1" } });
   });
   try {
-    const client = new QqClient(credentials, { baseUrl: local.url });
+    const client = new QqClient(credentials, { baseUrl: local.url, sendScope: "all" });
     const result = await client.sendText({ ...message, referenceIndex: "ref-inbound" });
     assert.deepEqual(result, {
       status: "sent",
@@ -400,6 +400,45 @@ Deno.test("请求无效在网络前拒绝，序号和回复身份不得自动补
       );
     }
     assert.equal(calls, 0);
+  } finally {
+    await local.close();
+  }
+});
+
+Deno.test("发送范围缺省私信，显式all才发群，坏值不进入网络", async () => {
+  let calls = 0;
+  const local = server((r) => {
+    calls++;
+    if (new URL(r.url).pathname === "/app/getAppAccessToken") return token();
+    assert.equal(new URL(r.url).pathname, "/v2/groups/group%2Fid/messages");
+    return Response.json({ id: "allowed-group" });
+  });
+  const group: QqSendText = {
+    destination: { kind: "group", openId: "group/id" },
+    text: "群消息",
+    reply: { eventId: "group-event" },
+  };
+  try {
+    for (const sendScope of [undefined, "private"] as const) {
+      const client = new QqClient(credentials, { baseUrl: local.url, sendScope });
+      assert.equal(client.sendScope, "private");
+      assert.deepEqual(await client.sendText(group), {
+        status: "failed",
+        attempted: false,
+        error: { category: "scope" },
+      });
+    }
+    assert.equal(calls, 0);
+    assert.throws(() =>
+      new QqClient(credentials, {
+        baseUrl: local.url,
+        sendScope: "group" as "all",
+      }), QqRequestError);
+    assert.equal(calls, 0);
+    const allowed = new QqClient(credentials, { baseUrl: local.url, sendScope: "all" });
+    assert.equal(allowed.sendScope, "all");
+    assert.deepEqual(await allowed.sendText(group), { status: "sent", messageId: "allowed-group" });
+    assert.equal(calls, 2);
   } finally {
     await local.close();
   }
