@@ -121,6 +121,24 @@ Deno.test("admin browser authentication, CSRF, bounded queries and owner control
       assert.equal(result.status, 400);
     }
     assert.equal(f.controls.length, 3);
+    result = await post(server.url, "/api/control", {
+      action: "resumeModel",
+      args: { expectedRequestId: "model_299" },
+    }, session);
+    assert.equal(result.body.ok, true);
+    assert.deepEqual(f.controls.at(-1), {
+      action: "resumeModel",
+      args: { expectedRequestId: "model_299" },
+    });
+    for (
+      const args of [{}, { expectedRequestId: "observer_1" }, {
+        expectedRequestId: "model_299",
+        scope: "all",
+      }] as Record<string, Json>[]
+    ) {
+      result = await post(server.url, "/api/control", { action: "resumeModel", args }, session);
+      assert.equal(result.status, 400);
+    }
     for (const resource of ["timeline", "notes", "memory", "receipts"]) {
       result = await post(
         server.url,

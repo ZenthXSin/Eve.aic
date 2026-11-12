@@ -75,7 +75,16 @@ export class QqPhone {
       key: `incoming:${record.seq}`,
       fingerprint: record.identity,
       observedAt: record.receivedAt,
-      message: record.message.message,
+      // 只增强可再生的手机视图；旧入站投影和原件的格式/指纹保持不变。
+      message: {
+        ...record.message.message,
+        ...(record.message.deduplication.messageIndex === undefined ? {} : {
+          referenceIndex: record.message.deduplication.messageIndex,
+        }),
+        ...(record.message.referenceIndex === undefined ? {} : {
+          reference: { index: record.message.referenceIndex },
+        }),
+      },
       notify: record.message.notify,
     }));
     for (const record of this.actions.records()) {
@@ -91,6 +100,12 @@ export class QqPhone {
           sender: { platformUserId: this.self.id, displayName: this.self.displayName },
           direction: "outgoing",
           text: record.request.text,
+          ...(record.request.referenceIndex === undefined ? {} : {
+            reference: { index: record.request.referenceIndex },
+          }),
+          ...(record.result?.status === "sent" && record.result.referenceIndex !== undefined
+            ? { referenceIndex: record.result.referenceIndex }
+            : {}),
           ...(record.request.attachment
             ? {
               attachments: [{
@@ -110,6 +125,29 @@ export class QqPhone {
       });
     }
     const rows = await this.timeline.snapshot(sources);
+    // 一次线性建表，不逐条扫描历史；索引仅在本会话唯一命中时才可解析。
+    // 平台 msg_id 可能被并行消息共用，不能拿它或正文猜测引用对象。
+    const targets = new Map<string, (typeof rows)[number] | null>();
+    const indexKey = (conversationId: string, index: string) =>
+      JSON.stringify([conversationId, index]);
+    for (const row of rows) {
+      if (row.message.referenceIndex === undefined) continue;
+      const key = indexKey(row.message.conversationId, row.message.referenceIndex);
+      targets.set(key, targets.has(key) ? null : row);
+    }
+    for (const row of rows) {
+      const reference = row.message.reference;
+      if (!reference) continue;
+      const target = targets.get(indexKey(row.message.conversationId, reference.index));
+      if (!target || target.key === row.key) continue;
+      reference.target = {
+        conversationId: target.message.conversationId,
+        seq: target.message.seq,
+      };
+      if (target.message.platformMessageId !== undefined) {
+        row.message.quote = { platformMessageId: target.message.platformMessageId };
+      }
+    }
     this.reading.validateSnapshot(rows);
     return rows;
   }

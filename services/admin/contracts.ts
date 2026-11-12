@@ -15,6 +15,7 @@ export interface AdminQuery {
 
 export type AdminControl =
   | { action: "pause" | "resume"; args: Record<string, never> }
+  | { action: "resumeModel"; args: { expectedRequestId: string } }
   | { action: "budget"; args: { dailyTokenBudget: number } };
 
 /** 仅由进程管理者注入。返回值必须是可展示数据，不含任何连接凭据、私钥或环境变量。 */

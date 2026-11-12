@@ -7,6 +7,7 @@ import {
   type ModelResponse,
   type ToolCall,
 } from "../../contracts/model.ts";
+import { permanentModelStatus } from "../../sdk/model-failure.ts";
 
 export interface ChatModelOptions {
   baseUrl: string;
@@ -21,7 +22,13 @@ export interface ChatModelOptions {
 
 export class ChatModelError extends Error {
   constructor(
-    readonly category: "configuration" | "request" | "transport" | "http" | "invalid_response",
+    readonly category:
+      | "configuration"
+      | "request"
+      | "transport"
+      | "http"
+      | "provider_rejected"
+      | "invalid_response",
     readonly httpStatus?: number,
   ) {
     // 服务端正文、URL 和 fetch 原文可能含凭据，不写入错误消息或 cause。
@@ -330,7 +337,10 @@ export class ChatModelClient {
       });
       if (response.status !== 200) {
         await response.body?.cancel();
-        throw new ChatModelError("http", response.status);
+        throw new ChatModelError(
+          permanentModelStatus(response.status) ? "provider_rejected" : "http",
+          response.status,
+        );
       }
       if (!response.body) fail("invalid_response");
       const reader = response.body.getReader();

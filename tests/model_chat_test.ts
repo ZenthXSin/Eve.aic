@@ -344,7 +344,7 @@ Deno.test("模型传输：HTTP 拒绝、响应过大与超时不泄露错误正�
     await assert.rejects(
       client.complete(request),
       (e) =>
-        e instanceof ChatModelError && e.httpStatus === 401 &&
+        e instanceof ChatModelError && e.httpStatus === 401 && e.category === "provider_rejected" &&
         !e.message.includes("fixture-secret"),
     );
     status = 200;

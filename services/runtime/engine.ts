@@ -11,6 +11,7 @@ import { NoteStore, textPage } from "./notes.ts";
 import { MemoryStore } from "./memory.ts";
 import type { LocalSemantic } from "./embedding.ts";
 import { describedImage, imageDescriptionRequest, imageProvenance } from "./vision.ts";
+import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 
 interface RequestRecord {
   id: string;
@@ -49,6 +50,7 @@ export class RuntimeEngine {
   #live = new Map<string, Promise<Json>>();
   #timelineTail: Promise<unknown> = Promise.resolve();
   #closing = false;
+  #modelBlocked: ModelBlock | null = null;
   constructor(readonly options: Options) {
     const directory = options.directory;
     const embed = options.semantic
@@ -160,10 +162,60 @@ export class RuntimeEngine {
           );
         }
       }
+      // Resume is a separate, authenticated fact. Pausing, new notifications and restarts
+      // never erase a permanent rejection of the online consciousness request.
+      const resumed = this.records.events.findLast((event) => event.kind === "model_resume");
+      const after = Number(
+        (resumed?.data as { actionsThroughSeq?: number } | undefined)?.actionsThroughSeq ?? 0,
+      );
+      if (!Number.isSafeInteger(after) || after < 0 || after > this.transactions.events.length) {
+        throw new KernelError("corrupt", "模型恢复事实水位无效，保留原件");
+      }
+      for (let index = after; index < this.transactions.events.length; index++) {
+        const event = this.transactions.events[index];
+        const data = event.data as unknown as RequestRecord;
+        const request = this.#requests.get(data.id);
+        if (
+          event.kind !== "result" || request?.namespace !== "model" ||
+          request.method !== "complete" || !/^model_[1-9][0-9]*$/.test(data.id)
+        ) continue;
+        const status = data.error
+          ? providerRejection(new KernelError(data.error.kind, data.error.message))
+          : undefined;
+        if (status !== undefined) this.#blockModel(data.id, status, event.at);
+      }
     } catch (error) {
       await this.close().catch(() => {});
       throw error;
     }
+  }
+  modelStatus() {
+    return { blocked: this.#modelBlocked ? structuredClone(this.#modelBlocked) : null };
+  }
+  #blockModel(requestId: string, httpStatus: number, at = new Date().toISOString()) {
+    if (this.#modelBlocked) return;
+    const blocked: ModelBlock = {
+      category: "provider_rejected",
+      httpStatus,
+      requestId,
+      at,
+    };
+    this.#modelBlocked = blocked;
+  }
+  async resumeModel(expectedRequestId: string) {
+    if (!this.#modelBlocked || this.#modelBlocked.requestId !== expectedRequestId) {
+      throw new KernelError("rejected", "模型阻塞状态已变化，请刷新状态后显式恢复");
+    }
+    if (!(await this.budget.status()).paused) {
+      throw new KernelError("rejected", "请先暂停运行，再明确恢复被拒绝的模型请求");
+    }
+    await this.records.append("model_resume", {
+      requestId: expectedRequestId,
+      reason: "operator_explicit_resume",
+      actionsThroughSeq: this.transactions.events.length,
+    });
+    this.#modelBlocked = null;
+    return this.modelStatus();
   }
   async #result(record: RequestRecord, result: { value?: Json; error?: WireError }) {
     await this.transactions.append("result", { id: record.id, ...result } as unknown as Json);
@@ -219,6 +271,13 @@ export class RuntimeEngine {
       } catch (error) {
         if (!(error instanceof KernelError && ["storage", "corrupt"].includes(error.kind))) {
           await this.#result(record, { error: toWireError(error) });
+          const status = providerRejection(error);
+          if (
+            namespace === "model" && method === "complete" &&
+            /^model_[1-9][0-9]*$/.test(id) && status !== undefined
+          ) {
+            this.#blockModel(id, status);
+          }
         }
         throw error;
       }
@@ -243,8 +302,8 @@ export class RuntimeEngine {
   ): Promise<Json> {
     if (namespace === "timeline") {
       if (method === "page") return this.#recordPage(args, true) as unknown as Json;
-      if (args.kind === "upgrade_rollback") {
-        throw new KernelError("rejected", "回滚范围只能由独立监督写入，实例不能伪造");
+      if (args.kind === "upgrade_rollback" || args.kind === "model_resume") {
+        throw new KernelError("rejected", "监督与模型恢复事实只能由管理出口写入，实例不能伪造");
       }
       const operation = this.#timelineTail.then(async () => {
         if (
@@ -303,13 +362,21 @@ export class RuntimeEngine {
         )) as unknown as Json;
     }
     if (namespace === "model") {
-      if (method === "budget") return await this.budget.status() as unknown as Json;
+      if (method === "budget") {
+        return { ...await this.budget.status(), model: this.modelStatus() } as unknown as Json;
+      }
       if (method === "result") {
         const result = this.#modelResult(String(args.requestId));
         if (result === undefined) throw new KernelError("not_found", "没有该模型请求回执");
         return result;
       }
       const description = method === "describeImage";
+      if (method === "complete" && /^model_[1-9][0-9]*$/.test(id) && this.#modelBlocked) {
+        throw new KernelError(
+          "rejected",
+          `模型请求未完成：provider_rejected (${this.#modelBlocked.httpStatus})`,
+        );
+      }
       const image = description ? args.image as unknown as ModelImage : undefined;
       const request = description
         ? imageDescriptionRequest(image!)

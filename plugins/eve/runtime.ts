@@ -1,9 +1,10 @@
 import type { ModelResponse, ToolSpec } from "../../contracts/model.ts";
 import type { MindEvent } from "../../contracts/mind.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
-import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
+import { type ErrorKind, type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
 import { imageTextView } from "../../sdk/image-text.ts";
+import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 import { ConsciousJournal } from "./journal.ts";
 import { RemoteJournal } from "./remote-journal.ts";
 import {
@@ -53,6 +54,7 @@ export class EveRuntime {
   #alarmFresh = false;
   #commandFresh = false;
   #contextBlocked = false;
+  #modelBlocked: ModelBlock | null = null;
   #fatal = false;
   #sharedBudget?: {
     dailyTokenBudget: number;
@@ -63,6 +65,7 @@ export class EveRuntime {
     unknownReservedTokens: number;
     safetyTotal: number;
     safeRemaining: number;
+    model?: { blocked: ModelBlock | null };
   };
   constructor(
     readonly ctx: PluginContext,
@@ -102,7 +105,18 @@ export class EveRuntime {
       if (event.kind === "model_failure") {
         this.#failures++;
         this.#retryAt = Number(data.retryAt);
+        const failure = data.error as { kind: ErrorKind; message: string };
+        const status = failure && providerRejection(new KernelError(failure.kind, failure.message));
+        if (status !== undefined) {
+          this.#modelBlocked = {
+            category: "provider_rejected",
+            httpStatus: status,
+            requestId: String(data.requestId),
+            at: event.at,
+          };
+        }
       }
+      if (event.kind === "model_resume") this.#modelBlocked = null;
       if (event.kind === "model_response") {
         this.#failures = 0;
         this.#retryAt = 0;
@@ -202,10 +216,12 @@ export class EveRuntime {
         unknownReservedTokens: number;
         safetyTotal: number;
         safeRemaining: number;
+        model?: { blocked: ModelBlock | null };
       };
       const changed = canonical((this.#sharedBudget ?? null) as unknown as Json) !==
         canonical(shared as unknown as Json);
       this.#sharedBudget = shared;
+      if (shared.model) this.#modelBlocked = shared.model.blocked;
       this.config.dailyTokenBudget = shared.dailyTokenBudget;
       this.config.timeZone = shared.timeZone;
       if (changed) {
@@ -457,6 +473,7 @@ export class EveRuntime {
       await this.journal.append("wake", { reason: "新的未观察通知" });
     }
     if (this.#closing) return;
+    if (this.#modelBlocked) return;
     if (Date.now() < this.#retryAt) return;
     if (!fresh && Date.now() < this.#wake) return;
     const tools = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
@@ -628,11 +645,23 @@ export class EveRuntime {
       }
     } catch (error) {
       this.#failures++;
-      this.#retryAt = Date.now() + Math.min(300_000, 1000 * 2 ** Math.min(this.#failures, 18));
+      const rejectedStatus = providerRejection(error);
+      if (rejectedStatus !== undefined) {
+        this.#modelBlocked = {
+          category: "provider_rejected",
+          httpStatus: rejectedStatus,
+          requestId,
+          at: new Date().toISOString(),
+        };
+      }
+      this.#retryAt = rejectedStatus === undefined
+        ? Date.now() + Math.min(300_000, 1000 * 2 ** Math.min(this.#failures, 18))
+        : 0;
       await this.journal.append("model_failure", {
         requestId,
         error: toWireError(error) as unknown as Json,
         retryAt: this.#retryAt,
+        ...(this.#modelBlocked ? { blocked: this.#modelBlocked as unknown as Json } : {}),
       });
       return;
     }
@@ -667,7 +696,24 @@ export class EveRuntime {
         budget(this.journal.events, accountingDay(this.config.timeZone)),
       lastError: this.#lastError ?? null,
       contextBlocked: this.#contextBlocked,
+      modelBlocked: this.#modelBlocked,
     };
+  }
+  async resumeModel(expectedRequestId: string) {
+    if (this.config.remoteRecords) {
+      throw new KernelError("rejected", "独立运行模式的模型阻塞只能由管理出口显式恢复");
+    }
+    await this.#busy;
+    if (!this.#modelBlocked || this.#modelBlocked.requestId !== expectedRequestId) {
+      throw new KernelError("rejected", "模型阻塞状态已变化，请刷新状态后显式恢复");
+    }
+    await this.journal.append("model_resume", {
+      requestId: expectedRequestId,
+      reason: "operator_explicit_resume",
+    });
+    this.#modelBlocked = null;
+    this.#retryAt = 0;
+    return this.status();
   }
   read(args: { afterSeq?: number }) {
     const after = args.afterSeq ?? 0;

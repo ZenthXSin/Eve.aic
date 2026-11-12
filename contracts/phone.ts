@@ -12,10 +12,20 @@ export interface PhoneMessage {
   sentAt?: string;
   text: string;
   quote?: { platformMessageId: string };
+  /** 本消息的平台引用索引；仅用于 referenceIndex，不等于 platformMessageId。 */
+  referenceIndex?: string;
+  /** 平台明确带有引用；target 缺失表示本机无法唯一定位，不能猜测对象或内容。 */
+  reference?: PhoneReference;
   /** 资源定位信息留在适配器，屏幕仅返回本消息中的附件序号。 */
   attachments?: PhoneAttachment[];
   /** 出站动作的真实状态；看见正文不等于平台已送达。 */
   delivery?: PhoneActionReceipt;
+}
+
+export interface PhoneReference {
+  index: string;
+  /** 仅在同会话已有事实唯一匹配时提供，可用 phone.message 点开。 */
+  target?: { conversationId: string; seq: number };
 }
 
 export interface PhoneAttachment {
@@ -49,6 +59,10 @@ export interface MessageScreen {
   };
   body: TextPreview;
   quote?: { platformMessageId: string };
+  /** 本消息的平台引用索引；仅用于 referenceIndex，不等于 platformMessageId。 */
+  referenceIndex?: string;
+  /** 平台明确带有引用；target 缺失表示本机无法唯一定位，不能猜测对象或内容。 */
+  reference?: PhoneReference;
   attachments: {
     index: number;
     kind: PhoneAttachment["kind"];
@@ -103,7 +117,17 @@ export interface PhoneActionReceipt {
   attempted?: boolean;
   platformMessageId?: string;
   reason?: "interrupted";
-  error?: { category: string; httpStatus?: number; code?: number; traceId?: string };
+  error?: {
+    category: string;
+    httpStatus?: number;
+    code?: number;
+    traceId?: string;
+    /** 受控传输诊断，不含资源地址、凭据或原始异常文本。 */
+    transportReason?: "timeout" | "aborted" | "network";
+    /** 包括建连/等待响应头，或读取响应正文；不证明请求是否已经送达。 */
+    phase?: "headers" | "body";
+    elapsedMs?: number;
+  };
 }
 
 export interface PhoneSend {

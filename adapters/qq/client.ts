@@ -35,6 +35,11 @@ export interface QqErrorInfo {
   httpStatus?: number;
   code?: number;
   traceId?: string;
+  /** 仅记录受控分类，不携带 fetch 原始异常、URL、凭据或请求正文。 */
+  transportReason?: "timeout" | "aborted" | "network";
+  /** headers 包括建连及等待响应头；不据此猜测请求是否已经送达。 */
+  phase?: "headers" | "body";
+  elapsedMs?: number;
 }
 
 export class QqRequestError extends Error {
@@ -263,12 +268,17 @@ export class QqClient {
   }
 
   async #request(path: string, init: RequestInit): Promise<ResponseInfo> {
+    const startedAt = performance.now();
+    const timeout = AbortSignal.timeout(this.#timeout);
+    const signal = AbortSignal.any([this.#closed.signal, timeout]);
+    let phase: "headers" | "body" = "headers";
     try {
       const response = await fetch(new URL(path, this.#base), {
         ...init,
         redirect: "manual",
-        signal: AbortSignal.any([this.#closed.signal, AbortSignal.timeout(this.#timeout)]),
+        signal,
       });
+      phase = "body";
       const data = await readObject(response, this.#limit);
       return {
         httpStatus: response.status,
@@ -277,7 +287,14 @@ export class QqClient {
       };
     } catch (error) {
       if (error instanceof QqRequestError) throw error;
-      throw new QqRequestError({ category: "transport" });
+      throw new QqRequestError({
+        category: "transport",
+        transportReason: signal.aborted
+          ? timeout.aborted && signal.reason === timeout.reason ? "timeout" : "aborted"
+          : "network",
+        phase,
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      });
     }
   }
 

@@ -58,6 +58,12 @@ export function validateQuery(body: Record<string, Json>): AdminQuery {
 
 export function validateControl(body: Record<string, Json>): AdminControl {
   if (
+    body.action === "resumeModel" && body.args && typeof body.args === "object" &&
+    !Array.isArray(body.args) && Object.keys(body.args).length === 1 &&
+    typeof body.args.expectedRequestId === "string" &&
+    /^model_[1-9][0-9]*$/.test(body.args.expectedRequestId)
+  ) return body as unknown as AdminControl;
+  if (
     (body.action === "pause" || body.action === "resume") &&
     body.args && typeof body.args === "object" && !Array.isArray(body.args) &&
     Object.keys(body.args).length === 0

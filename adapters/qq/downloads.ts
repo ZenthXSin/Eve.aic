@@ -75,9 +75,12 @@ export class QqPhoneDownloads {
     } catch {
       throw new KernelError("rejected", "附件没有可用下载地址");
     }
-    const official = ["qq.com", "qpic.cn", "gtimg.cn", "qlogo.cn"].some((host) =>
-      url.hostname === host || url.hostname.endsWith(`.${host}`)
-    );
+    // QQ 开放平台当前入站附件来自这个独立的官方多媒体主机。
+    // 只补充精确主机，不把整个 qq.com.cn 或相似后缀纳入允许范围。
+    const official = url.hostname === "multimedia.nt.qq.com.cn" ||
+      ["qq.com", "qpic.cn", "gtimg.cn", "qlogo.cn"].some((host) =>
+        url.hostname === host || url.hostname.endsWith(`.${host}`)
+      );
     if (
       url.username || url.password || url.hash ||
       !(url.protocol === "https:" && (!url.port || url.port === "443") && official) &&

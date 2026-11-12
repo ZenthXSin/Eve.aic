@@ -374,6 +374,43 @@ Deno.test("意识流：模型失败保留新消息与有限退避，恢复后不
   }
 });
 
+Deno.test("意识流：永久上游拒绝不会因新QQ或重启重试，显式恢复才允许新请求", async () => {
+  const f = await fixture((_body, index) =>
+    index === 1
+      ? new Response("provider private content", { status: 400 })
+      : Response.json(completion())
+  );
+  try {
+    await f.append(1);
+    await f.pulse();
+    const status = await f.kernel().call("eve", "status") as {
+      modelBlocked: { requestId: string; httpStatus: number };
+    };
+    assert.equal(status.modelBlocked.httpStatus, 400);
+    assert.equal(f.messages.length, 1);
+    await f.append(2);
+    await f.pulse();
+    await f.restart();
+    await f.pulse();
+    assert.equal(f.messages.length, 1);
+    assert.equal((await f.records()).filter((e) => e.kind === "model_failure").length, 1);
+    assert.equal(JSON.stringify(await f.records()).includes("provider private content"), false);
+    await assert.rejects(
+      () => f.kernel().call("eve", "resumeModel", { expectedRequestId: "model_99999" }),
+      KernelError,
+    );
+    await f.kernel().call("eve", "resumeModel", {
+      expectedRequestId: status.modelBlocked.requestId,
+    });
+    await f.pulse();
+    assert.equal(f.messages.length, 2);
+    assert.equal(JSON.stringify(f.messages[1]).includes("实际消息2"), true);
+    assert.equal(f.count(), 0);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test("意识流：明确缓存不计日预算，缺失缓存或用量保留未知，预算不足不调用模型", async () => {
   const f = await fixture(() =>
     Response.json(

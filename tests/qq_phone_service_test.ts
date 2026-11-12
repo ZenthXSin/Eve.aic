@@ -810,3 +810,114 @@ Deno.test("QQ 手机：平台已送达但浏览索引保存失败，原动作仍
     await f.close(true);
   }
 });
+
+Deno.test("QQ 引用视图：旧入站原件按同会话索引解析，未知/歧义不猜，重启不改原件", async () => {
+  const f = await fixture();
+  const indexed = (seq: number, index?: string, quoted?: string, user = "user-a") => {
+    const raw = event(seq, user);
+    (raw.d as Record<string, unknown>).message_scene = {
+      ext: [
+        ...(index === undefined ? [] : [`msg_idx=${index}`]),
+        ...(quoted === undefined ? [] : [`ref_msg_idx=${quoted}`]),
+      ],
+    };
+    return raw;
+  };
+  try {
+    await f.append(indexed(1, "own-1"));
+    await f.append(indexed(2, "own-2", "own-1"));
+    await f.append(indexed(3, "own-3", "missing"));
+    await f.append(indexed(4, "own-4", "foreign"));
+    await f.append(indexed(5, "foreign", undefined, "user-b"));
+    await f.append(indexed(6, "duplicate"));
+    await f.append(indexed(7, "duplicate"));
+    await f.append(indexed(8, "own-8", "duplicate"));
+    await f.append(indexed(9, "own-9", "own-9"));
+    const original = f.journal.records();
+    assert.equal(original[1].message.referenceIndex, "own-1");
+    assert.equal(original[1].message.message.quote, undefined);
+    assert.equal(original[1].message.message.reference, undefined);
+    const files = [];
+    for await (const file of Deno.readDir(`${f.directory}/incoming`)) {
+      files.push([file.name, await Deno.readTextFile(`${f.directory}/incoming/${file.name}`)]);
+    }
+    const restored = new QqInboundJournal(`${f.directory}/incoming`);
+    await restored.initialize();
+    assert.deepEqual(restored.records(), original);
+    const phone = new QqPhone(() => restored.records(), f.actions, f.timeline, {
+      id: "fixture-bot",
+      displayName: "Eve",
+    }, f.reading);
+    const screen = await phone.message({ handle: { conversationId: "qq:user:user-a", seq: 2 } });
+    assert.equal(screen.referenceIndex, "own-2");
+    assert.deepEqual(screen.reference, {
+      index: "own-1",
+      target: { conversationId: "qq:user:user-a", seq: 1 },
+    });
+    assert.deepEqual(screen.quote, { platformMessageId: "platform-1" });
+    assert.equal((await phone.message({ handle: screen.reference!.target! })).body.text, "消息-1");
+    for (
+      const [seq, index] of [[3, "missing"], [4, "foreign"], [8, "duplicate"], [
+        9,
+        "own-9",
+      ]] as const
+    ) {
+      const unknown = await phone.message({ handle: { conversationId: "qq:user:user-a", seq } });
+      assert.deepEqual(unknown.reference, { index });
+      assert.equal(unknown.quote, undefined);
+    }
+    const history = await phone.history({ conversationId: "qq:user:user-a" });
+    assert.deepEqual(history.messages.find((m) => m.handle.seq === 2)!.reference, screen.reference);
+    const notices = await phone.notifications();
+    assert.deepEqual(notices.items.find((m) => m.handle.seq === 2)!.reference, screen.reference);
+    assert.deepEqual(f.journal.records(), original);
+    for (const [name, content] of files) {
+      assert.equal(await Deno.readTextFile(`${f.directory}/incoming/${name}`), content);
+    }
+    assert.equal(f.count(), 0);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("QQ 引用视图：真实出站回执索引可被引用，发送引用与被动回复保持独立", async () => {
+  const f = await fixture();
+  try {
+    const raw = event(1);
+    (raw.d as Record<string, unknown>).message_scene = { ext: ["msg_idx=incoming-index"] };
+    await f.append(raw);
+    f.result({ id: "outgoing-platform-id", ext_info: { ref_idx: "outgoing-index" } });
+    const sent = await f.phone.send({
+      actionId: "reference-fixture",
+      conversationId: "qq:user:user-a",
+      text: "回复早先消息",
+      referenceIndex: "incoming-index",
+      replyTo: { seq: 1, sequence: 1 },
+    });
+    assert.equal(sent.state, "sent");
+    const outgoing = (await f.phone.history({ conversationId: "qq:user:user-a" })).messages.at(-1)!;
+    assert.equal(outgoing.referenceIndex, "outgoing-index");
+    assert.deepEqual(outgoing.reference, {
+      index: "incoming-index",
+      target: { conversationId: "qq:user:user-a", seq: 1 },
+    });
+    const reply = event(2, "user-a", "引用 Eve 上一句");
+    (reply.d as Record<string, unknown>).message_scene = {
+      ext: ["msg_idx=next-incoming-index", "ref_msg_idx=outgoing-index"],
+    };
+    await f.append(reply);
+    const incoming = (await f.phone.history({ conversationId: "qq:user:user-a" })).messages.at(-1)!;
+    assert.deepEqual(incoming.reference, { index: "outgoing-index", target: outgoing.handle });
+    assert.deepEqual(incoming.quote, { platformMessageId: "outgoing-platform-id" });
+    assert.equal(f.count(), 1);
+    assert.deepEqual(f.received, [{
+      content: "回复早先消息",
+      msg_type: 0,
+      msg_id: "platform-1",
+      msg_seq: 1,
+      message_reference: { message_id: "incoming-index" },
+    }]);
+  } finally {
+    await f.close();
+  }
+});

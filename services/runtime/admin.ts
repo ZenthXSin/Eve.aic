@@ -146,9 +146,28 @@ export function startRuntimeAdmin(
         memoryThroughSeq: engine.memory.journal.events.length,
         receiptsThroughSeq: engine.transactions.events.length,
         semanticModel: "TODO",
+        model: engine.modelStatus(),
       };
     }
     if (method === "query") return await query(args as unknown as AdminQuery);
+    if (method === "resumeModel") {
+      return await serial(async () => {
+        if (
+          Object.keys(args).length !== 1 || typeof args.expectedRequestId !== "string" ||
+          !/^model_[1-9][0-9]*$/.test(args.expectedRequestId)
+        ) {
+          throw new KernelError("rejected", "恢复模型需要当前阻塞请求编号");
+        }
+        if (
+          !(await engine.budget.status()).paused ||
+          engine.modelStatus().blocked?.requestId !== args.expectedRequestId
+        ) {
+          throw new KernelError("rejected", "请先暂停运行，并刷新当前模型阻塞状态");
+        }
+        await quiesce();
+        return await engine.resumeModel(args.expectedRequestId) as unknown as Json;
+      });
+    }
     if (method === "watermark") return engine.records.events.length;
     if (method === "quiesce") {
       await quiesce();
@@ -324,6 +343,9 @@ export class RuntimeAdminClient {
   }
   settings(patch: { dailyTokenBudget?: number; paused?: boolean }) {
     return this.call("settings", patch);
+  }
+  resumeModel(expectedRequestId: string) {
+    return this.call("resumeModel", { expectedRequestId });
   }
   quiesce() {
     return this.call("quiesce").then(() => {});

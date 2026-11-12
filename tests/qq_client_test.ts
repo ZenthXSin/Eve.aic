@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { QqClient, QqRequestError, type QqSendText } from "../adapters/qq/client.ts";
+import {
+  QqClient,
+  QqRequestError,
+  type QqSendResult,
+  type QqSendText,
+} from "../adapters/qq/client.ts";
 
 const credentials = { appId: "fixture-app", appSecret: "fixture-secret" };
 const token = () => Response.json({ access_token: "fixture-token", expires_in: "7200" });
@@ -12,6 +17,27 @@ const message: QqSendText = {
 function server(handler: (request: Request) => Response | Promise<Response>) {
   const instance = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, handler);
   return { url: `http://127.0.0.1:${instance.addr.port}`, close: () => instance.shutdown() };
+}
+
+function assertTransport(
+  result: QqSendResult,
+  reason: "timeout" | "aborted" | "network",
+  phase: "headers" | "body",
+) {
+  assert.ok(result.status === "unknown" && result.attempted);
+  assert.equal(result.error.category, "transport");
+  assert.equal(result.error.transportReason, reason);
+  assert.equal(result.error.phase, phase);
+  assert.ok(Number.isSafeInteger(result.error.elapsedMs) && result.error.elapsedMs! >= 0);
+  assert.deepEqual(Object.keys(result.error).sort(), [
+    "category",
+    "elapsedMs",
+    "phase",
+    "transportReason",
+  ]);
+  for (const sensitive of [credentials.appSecret, "fixture-token", message.text, "fixture-user"]) {
+    assert.ok(!JSON.stringify(result).includes(sensitive));
+  }
 }
 
 Deno.test("HTTP 200 的认证业务错误阻止发送，不泄露秘密", async () => {
@@ -227,11 +253,85 @@ Deno.test("回复断线和超时保留未知，不重发也不改主动消息", 
     const result = await new QqClient(credentials, { baseUrl: local.url, timeoutMs: 30 }).sendText(
       message,
     );
-    assert.ok(result.status === "unknown" && result.error.category === "transport");
+    assertTransport(result, "timeout", "headers");
     assert.equal(sends, 1);
   } finally {
     await local.close();
   }
+});
+
+Deno.test("响应头后正文超时保留安全阶段，不重发", async () => {
+  let sends = 0;
+  let finishBody: (() => void) | undefined;
+  const local = await server((r) => {
+    if (new URL(r.url).pathname === "/app/getAppAccessToken") return token();
+    sends++;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"id":"'));
+        finishBody = () => controller.close();
+      },
+      cancel() {
+        finishBody = undefined;
+      },
+    });
+    return new Response(body, { headers: { "Content-Type": "application/json" } });
+  });
+  try {
+    const client = new QqClient(credentials, { baseUrl: local.url, timeoutMs: 100 });
+    await client.authenticate();
+    const result = await client.sendText(message);
+    assertTransport(result, "timeout", "body");
+    assert.equal(sends, 1);
+  } finally {
+    finishBody?.();
+    await local.close();
+  }
+});
+
+Deno.test("发送中关闭客户端标为主动取消，不重发", async () => {
+  let sends = 0;
+  let received!: () => void;
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => received = resolve);
+  const blocked = new Promise<void>((resolve) => release = resolve);
+  const local = await server(async (r) => {
+    if (new URL(r.url).pathname === "/app/getAppAccessToken") return token();
+    sends++;
+    received();
+    await blocked;
+    return Response.json({ id: "late-result" });
+  });
+  try {
+    const client = new QqClient(credentials, { baseUrl: local.url });
+    const pending = client.sendText(message);
+    await ready;
+    client.close();
+    assertTransport(await pending, "aborted", "headers");
+    assert.equal(sends, 1);
+  } finally {
+    release();
+    await local.close();
+  }
+});
+
+Deno.test("发送连接拒绝标为网络错误，不泄露地址或重试", async () => {
+  let sends = 0;
+  const local = await server((r) => {
+    if (new URL(r.url).pathname === "/app/getAppAccessToken") return token();
+    sends++;
+    return Response.json({ id: "unexpected" });
+  });
+  const client = new QqClient(credentials, { baseUrl: local.url });
+  try {
+    await client.authenticate();
+  } finally {
+    await local.close();
+  }
+  const result = await client.sendText(message);
+  assertTransport(result, "network", "headers");
+  assert.equal(sends, 0);
+  assert.ok(!JSON.stringify(result).includes(local.url));
 });
 
 Deno.test("重定向不携带凭据跟随发送", async () => {

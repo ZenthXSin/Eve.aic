@@ -49,6 +49,13 @@ export function createEvePlugin(configPath: string) {
           return current().status() as unknown as Json;
         },
         status: () => current().status() as unknown as Json,
+        resumeModel: (args) => {
+          const requestId = (args as { expectedRequestId?: string })?.expectedRequestId;
+          if (typeof requestId !== "string") {
+            throw new KernelError("rejected", "需要模型阻塞请求编号");
+          }
+          return current().resumeModel(requestId) as unknown as Promise<Json>;
+        },
         read: (args) => current().read((args ?? {}) as { afterSeq?: number }) as unknown as Json,
       });
     },

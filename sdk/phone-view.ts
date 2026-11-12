@@ -75,6 +75,16 @@ function messageValid(message: PhoneMessage): void {
   id(message.sender.platformUserId, "platformUserId");
   if (message.platformMessageId !== undefined) id(message.platformMessageId, "platformMessageId");
   if (message.quote) id(message.quote.platformMessageId, "引用编号");
+  if (message.referenceIndex !== undefined) id(message.referenceIndex, "平台引用索引");
+  if (message.reference) {
+    id(message.reference.index, "被引用索引");
+    if (message.reference.target) {
+      if (message.reference.target.conversationId !== message.conversationId) {
+        throw new TypeError("引用对象必须属于本会话");
+      }
+      integer(message.reference.target.seq, 1, Number.MAX_SAFE_INTEGER, "引用目标 seq");
+    }
+  }
   if (message.direction !== "incoming" && message.direction !== "outgoing") {
     throw new TypeError("direction 不合法");
   }
@@ -126,6 +136,15 @@ export function messageScreen(
     time: timeView(message.sentAt, now),
     body: excerpt(message.text, 0, policy.previewCharacters),
     ...(message.quote ? { quote: { platformMessageId: message.quote.platformMessageId } } : {}),
+    ...(message.referenceIndex === undefined ? {} : { referenceIndex: message.referenceIndex }),
+    ...(message.reference
+      ? {
+        reference: {
+          index: message.reference.index,
+          ...(message.reference.target ? { target: { ...message.reference.target } } : {}),
+        },
+      }
+      : {}),
     attachments,
     attachmentCount: resources.length,
     ...(message.delivery ? { delivery: structuredClone(message.delivery) } : {}),

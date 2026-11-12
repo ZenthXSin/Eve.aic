@@ -208,6 +208,11 @@ export async function startSupervisor(configPath: string) {
           await changePause(true);
         } else if (request.action === "resume") {
           await changePause(false);
+        } else if (request.action === "resumeModel") {
+          if (!controller.state.paused) {
+            throw new KernelError("rejected", "请先暂停运行，再明确恢复被拒绝的模型请求");
+          }
+          await runtime.resumeModel(request.args.expectedRequestId);
         } else await runtime.settings({ dailyTokenBudget: request.args.dailyTokenBudget });
         return { supervisor: controller.state as unknown as Json, runtime: await runtime.status() };
       });
