@@ -39,7 +39,7 @@ const tools = Object.freeze({
     (args: Json = {}) => invoke("upgrades", method, args),
   ]))),
   ...Object.fromEntries(
-    ["notes", "files", "commands", "memory", "records"].map((
+    ["notes", "files", "commands", "memory", "records", "web"].map((
       namespace,
     ) => [
       namespace,

@@ -12,6 +12,7 @@ export const RUNTIME_METHODS = {
   timeline: ["page", "append"],
   records: ["page", "text"],
   notes: ["create", "update", "get", "list", "versions", "search"],
+  web: ["search", "fetch"],
   files: ["read", "write", "replace", "list", "search"],
   commands: ["start", "poll", "write", "cancel", "completions"],
   memory: ["remember", "recall", "used", "list", "get"],

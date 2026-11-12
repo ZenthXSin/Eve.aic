@@ -9,6 +9,7 @@ import { type Json, KernelError } from "../kernel/protocol.ts";
 import { composeRuntimePlugin } from "../composition/runtime.ts";
 import { composeScriptPlugin } from "../composition/scripts.ts";
 import { Kernel } from "../kernel/kernel.ts";
+import type { WebApi } from "../contracts/web.ts";
 import type { ScriptSummary } from "../contracts/script.ts";
 import { FileTools } from "../services/runtime/files.ts";
 import { NoteStore } from "../services/runtime/notes.ts";
@@ -18,7 +19,7 @@ import { FactJournal } from "../sdk/fact-journal.ts";
 const key = "fixture_runtime_bridge_012345678901234567890";
 const oldKey = "fixture_runtime_old_key_012345678901234567890";
 const nextKey = "fixture_runtime_next_key_01234567890123456789";
-async function fixture() {
+async function fixture(web?: WebApi) {
   const directory = await Deno.makeTempDir({ prefix: "eve-runtime-service-" });
   const settingsFile = `${directory}/settings.json`;
   await writeDurableJson(settingsFile, {
@@ -60,6 +61,7 @@ async function fixture() {
     settingsFile,
     model,
     maxOutputTokens: 100,
+    web,
   };
   let engine = new RuntimeEngine(options);
   await engine.initialize();
@@ -328,8 +330,10 @@ Deno.test("记忆：只接受原记录来源，自动浮现与强强化独立于
   }
 });
 
-Deno.test("真实内核 worker→脚本→独立工具出口：便签与文件动作各有原回执，重启不再执行", async () => {
-  const f = await fixture();
+Deno.test("真实内核 worker→脚本→独立工具出口：便签文件与web动作各有原回执，同任务不重放", async () => {
+  let webCalls = 0;
+  const web = fixtureWeb(() => webCalls++);
+  const f = await fixture(web);
   let kernel: Kernel | undefined;
   try {
     const configPath = `${f.directory}/config.json`;
@@ -367,20 +371,22 @@ Deno.test("真实内核 worker→脚本→独立工具出口：便签与文件�
       requestId: "full_tools",
       mode: "sync",
       code:
-        'const file=await tools.files.write({path:"from-script.txt",text:"脚本实际写入",expectedSha256:"absent"}); await tools.notes.create({title:"现场",alias:"现场",content:"写入了文件",sources:[{kind:"experienced",at:new Date().toISOString(),description:file.path}]}); await tools.notes.update({id:"现场",content:"短名修改已完成"}); const note=await tools.notes.get({id:"现场"}); return {file,note};',
+        'const file=await tools.files.write({path:"from-script.txt",text:"脚本实际写入",expectedSha256:"absent"}); await tools.notes.create({title:"现场",alias:"现场",content:"写入了文件",sources:[{kind:"experienced",at:new Date().toISOString(),description:file.path}]}); await tools.notes.update({id:"现场",content:"短名修改已完成"}); const note=await tools.notes.get({id:"现场"}); const search=await tools.web.search({query:"fixture docs"}); const page=await tools.web.fetch({url:search.results[0].url}); return {file,note,page};',
     };
     const job = await kernel.call("scripts", "start", request) as unknown as ScriptSummary;
     assert.equal(job.status, "completed");
-    assert.equal(job.actions, 4);
+    assert.equal(job.actions, 6);
     const receipts = await kernel.call("scripts", "receipts", { jobId: job.jobId }) as {
       items: Json[];
     };
-    assert.equal(receipts.items.length, 4);
+    assert.equal(receipts.items.length, 6);
+    assert.equal(webCalls, 2);
     assert.equal(
       await Deno.readTextFile(`${f.directory}/workspace/from-script.txt`),
       "脚本实际写入",
     );
     assert.deepEqual(await kernel.call("scripts", "start", request), job);
+    assert.equal(webCalls, 2);
     assert.equal(f.engine().notes.list().items.length, 1);
     assert.equal(f.engine().notes.get({ id: "现场" }).text, "短名修改已完成");
     assert.equal(f.engine().notes.versions({ id: "现场" }).items.length, 2);
@@ -418,6 +424,62 @@ Deno.test("执行出口：观察分页加速仍受字节上限约束，记录摘
     assert.equal(second.throughSeq, 12);
     assert.equal(second.hasMore, false);
     assert.equal(f.paid(), 0);
+  } finally {
+    await f.close();
+  }
+});
+
+function fixtureWeb(called: () => void): WebApi {
+  const source = {
+    sourceUrl: "https://example.com/docs",
+    title: "Fixture docs",
+    fetchedAt: "2026-11-12T00:00:00.000Z",
+    untrusted: true as const,
+  };
+  return {
+    search(args) {
+      called();
+      return Promise.resolve({
+        ...source,
+        query: args.query,
+        results: [{ url: source.sourceUrl, title: source.title, snippet: "documentation" }],
+      });
+    },
+    fetch() {
+      called();
+      return Promise.resolve({
+        ...source,
+        content: "external untrusted documentation",
+        startChar: 0,
+        characters: 32,
+        truncated: false,
+        sha256: "a".repeat(64),
+      });
+    },
+  };
+}
+
+Deno.test("web出口：同动作重启采用原回执，旧所有者与参数变更均拒绝", async () => {
+  let calls = 0;
+  const f = await fixture(fixtureWeb(() => calls++));
+  try {
+    const args = { query: "fixture docs" };
+    const result = await f.client.call("web", "search", args, "web_once");
+    assert.equal(calls, 1);
+    await f.restart();
+    assert.deepEqual(await f.client.call("web", "search", args, "web_once"), result);
+    assert.equal(calls, 1);
+    await assert.rejects(() => f.client.call("web", "search", { query: "changed" }, "web_once"));
+    const grant = await f.authority.grant({
+      instanceId: "next",
+      requestId: "web_handover",
+      expectedEpoch: f.authority.status().epoch,
+    });
+    assert.equal(grant.status, "granted");
+    await assert.rejects(() =>
+      f.client.call("web", "fetch", { url: "https://example.com/docs" }, "stale_web")
+    );
+    assert.equal(calls, 1);
   } finally {
     await f.close();
   }

@@ -83,6 +83,7 @@ for (const requestedBy of ["instance", "administrator"] as const) {
           "workspace",
           "memory",
           "upgrades",
+          "web",
         ].map((name) => `contracts/${name}.ts`),
       ];
       const promptManifest = [];
