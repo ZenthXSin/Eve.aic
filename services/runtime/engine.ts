@@ -2,6 +2,8 @@ import type { ModelImage, ModelRequest, ModelResponse } from "../../contracts/mo
 import { RUNTIME_METHODS } from "../../contracts/runtime.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError, toWireError, type WireError } from "../../kernel/protocol.ts";
+import { WebService } from "../web.ts";
+import type { WebApi } from "../../contracts/web.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
 import { type CommandIdentity, CommandSessions } from "./commands.ts";
 import { SharedBudget } from "./budget.ts";
@@ -37,9 +39,11 @@ interface Options {
   commandUseSystemd?: boolean;
   fileRuntime?: FileRuntime;
   semantic?: Pick<LocalSemantic, "embed" | "count">;
+  web?: WebApi;
 }
 /** 真实执行与回执不随内核/插件回退；令牌校验由独立 HTTP 出口包围整个执行。 */
 export class RuntimeEngine {
+  readonly web: WebApi;
   readonly records: FactJournal;
   readonly transactions: FactJournal;
   readonly modelResponses: FactJournal;
@@ -56,6 +60,7 @@ export class RuntimeEngine {
   #modelBlocked: (ModelBlock & { modelName?: string; modelRevision?: number }) | null = null;
   constructor(readonly options: Options) {
     const directory = options.directory;
+    this.web = options.web ?? new WebService();
     const embed = options.semantic
       ? (text: string, purpose?: "query" | "passage") => options.semantic!.embed(text, purpose)
       : undefined;
@@ -412,6 +417,9 @@ export class RuntimeEngine {
         await this.memory.observe(JSON.stringify(args));
       }
       return value as unknown as Json;
+    }
+    if (namespace === "web") {
+      return await this.web[method as "search" | "fetch"](args as never) as unknown as Json;
     }
     if (namespace === "files") {
       return await this.files[method as "read" | "write" | "replace" | "list" | "search"](

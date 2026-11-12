@@ -5,10 +5,12 @@ import type { NoteApi } from "./notes.ts";
 import type { CommandApi, FileApi } from "./workspace.ts";
 import type { MemoryApi, RecordApi } from "./memory.ts";
 import type { UpgradeApi } from "./upgrades.ts";
+import type { WebApi } from "./web.ts";
 
 export const SCRIPTS = "scripts";
 /** 固定源码能力标记；可信提示生成器只读取此声明，不执行候选代码。 */
 export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;
+export const WEB_CAPABILITY_VERSION = 1;
 /** 原生随记工具 write_thought 的参数，不属于脚本 tools 对象中的接口。 */
 export interface NativeThoughtArguments {
   thought: string;
@@ -42,6 +44,7 @@ export interface ScriptSummary {
   error?: { kind: string; message: string };
 }
 export interface ScriptApi {
+  web: WebApi;
   upgrades: UpgradeApi;
   notes: NoteApi;
   files: FileApi;
