@@ -17,7 +17,9 @@
     "src/protocol/api/api-client.ts",
     "src/protocol/api/token.ts",
     "src/protocol/api/media.ts",
-    "src/protocol/gateway/reconnect.ts"
+    "src/protocol/gateway/reconnect.ts",
+    "src/protocol/gateway/gateway-connection.ts",
+    "src/protocol/gateway/constants.ts"
   ],
   "policy": "Caller supplies durable msg_seq. getNextMsgSeq is retained as upstream source but never used for retries."
 }

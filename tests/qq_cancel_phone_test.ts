@@ -236,15 +236,20 @@ Deno.test("手机取消：已取得许可后暂停，存盘前再次复核所有
   }
 });
 
-Deno.test("手机取消：unknown 与实际发送中的项目不能被解释为失败取消", async () => {
+Deno.test("手机取消：unknown可取消等待且保留未知，实际发送中的项目不可取消", async () => {
   const f = await fixture();
   let active: Promise<Json> | undefined;
   try {
     assert.equal((await f.seed("uncertain", "unknown")).state, "unknown");
     const unknown = (await f.queue()).items[0];
-    assert.equal(unknown.canCancel, false);
-    assert.equal(unknown.cancelBlockedReason, "unknown");
-    await assert.rejects(() => f.client.call("cancelSend", cancellation(unknown)));
+    assert.equal(unknown.canCancel, true);
+    const cancelled = await f.client.call(
+      "cancelSend",
+      cancellation(unknown),
+    ) as unknown as PhoneActionReceipt;
+    assert.equal(cancelled.state, "cancelled");
+    assert.equal(cancelled.resolution?.kind, "unknown_retained");
+    assert.equal(cancelled.error?.category, "pending");
     active = f.seed("active", "hold") as unknown as Promise<Json>;
     await f.entered.promise;
     const item = (await f.queue()).items.find((item) => item.actionId === "active")!;
@@ -260,7 +265,7 @@ Deno.test("手机取消：unknown 与实际发送中的项目不能被解释为�
     );
     f.release.resolve();
     assert.equal((await active as unknown as PhoneActionReceipt).state, "sent");
-    assert.equal(f.actions.status("uncertain")?.status, "finished");
+    assert.equal(f.actions.status("uncertain")?.status, "cancelled");
     assert.equal(f.sends(), 2);
   } finally {
     f.release.resolve();

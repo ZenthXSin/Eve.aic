@@ -98,6 +98,27 @@ export function pendingTools(events: ConsciousEvent[]): PendingTool[] {
   }
   return pending;
 }
+
+/** 历史大回执只缩短本次输入，完整原件仍可通过现有 records.text 分页读取。 */
+function historicalToolResult(result: Json, seq: number, callId: string): string {
+  const content = JSON.stringify(result);
+  if (content.length <= 1024) return content;
+  let jobId: string | undefined;
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const output = result.output;
+    if (typeof output === "string") {
+      try {
+        const value = JSON.parse(output);
+        if (typeof value?.jobId === "string") jobId = value.jobId;
+      } catch { /* 非脚本回执也按意识原件定位，不猜任务编号。 */ }
+    }
+  }
+  return `历史工具回执节选，原件未改写：record=${seq} callId=${callId}` +
+    (jobId ? ` jobId=${jobId}` : "") + `，全文${content.length}字符。\n` +
+    content.slice(0, 768) + "\n[…中间内容保留于原件…]\n" + content.slice(-256) +
+    `\n读取完整原件：await tools.records.text({seq:${seq},startChar:0,limit:8192})，按nextChar翻页。`;
+}
+
 export function blocks(
   events: ConsciousEvent[],
   afterSeq = 0,
@@ -112,6 +133,27 @@ export function blocks(
     omitted: Set<string>;
   } | undefined;
   const retention = new Map<string, { mode: string; summary?: string }>();
+  const recentResponses: number[] = [];
+  const memoryItems = new Map<number, Json[]>();
+  const seenMemories = new Set<string>();
+  // 最新召回保留现有强度/来源；同一记忆的相同正文不随每次召回重复灌入。
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.seq <= afterSeq) break;
+    if (event.kind === "notice") {
+      const data = event.data as { source?: string; items?: Json[] };
+      if (data.source !== "memory" || !Array.isArray(data.items)) continue;
+      const items = data.items.filter((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+        if (typeof item.id !== "string" || typeof item.text !== "string") return true;
+        const key = JSON.stringify([item.id, item.text]);
+        if (seenMemories.has(key)) return false;
+        seenMemories.add(key);
+        return true;
+      });
+      memoryItems.set(event.seq, items);
+    }
+  }
   for (const event of events) {
     if (event.kind === "retain") {
       const data = event.data as {
@@ -122,9 +164,27 @@ export function blocks(
       };
       retention.set(`eve_${data.responseSeq}_${data.toolIndex}`, data);
     }
+    if (event.seq > afterSeq && event.kind === "model_response") {
+      const response = (event.data as unknown as { response: ModelResponse }).response;
+      if (response.toolCalls.length) recentResponses.push(event.seq);
+    }
   }
+  const recentTools = new Set(recentResponses.slice(-8));
   for (const event of events) {
     if (event.seq <= afterSeq) continue;
+    let projectedData = event.data;
+    if (event.kind === "notice") {
+      const data = event.data as { source?: string; items?: Json[] };
+      if (
+        ["phone", "scripts", "commands", "memory"].includes(data.source ?? "") &&
+        Array.isArray(data.items)
+      ) {
+        const items = memoryItems.get(event.seq) ?? data.items;
+        // 空游标推进和已同步观察的任务仍留在原件，不占用主意识输入。
+        if (!items.length) continue;
+        if (items !== data.items) projectedData = { ...data, items } as Json;
+      }
+    }
     if (
       event.kind === "notice" &&
       ["image_description", "image"].includes((event.data as { source: string }).source)
@@ -167,7 +227,7 @@ export function blocks(
           kind: event.kind,
           at: event.at,
           record: event.seq,
-          data: imageTextView(event.data),
+          data: imageTextView(projectedData),
           ...(event.kind === "upgrade_rollback"
             ? {
               explanation:
@@ -206,7 +266,9 @@ export function blocks(
       const policy = retention.get(data.callId);
       const content = policy?.mode === "summary"
         ? `${policy.summary}\n原始结果在意识记录 ${event.seq}`
-        : JSON.stringify(data.result);
+        : policy?.mode === "raw" || recentTools.has(Number(data.callId.split("_")[1]))
+        ? JSON.stringify(data.result)
+        : historicalToolResult(data.result, event.seq, data.callId);
       if (current.omitted.has(data.callId)) {
         current.deferred.push({
           role: "user",
@@ -288,6 +350,30 @@ export function estimate(messages: Message[]): number {
     total += (images?.length ?? 0) * 16_384;
   }
   return total;
+}
+/** 只报告组成与估算量，不把正文、身份或凭据放进状态。 */
+export function contextComposition(messages: Message[]) {
+  const parts: Record<string, { messages: number; estimatedTokens: number }> = {};
+  for (const message of messages) {
+    let category: string = message.role;
+    if (message.role === "system") category = "identityAndContracts";
+    else if (message.role === "user") {
+      category = "timelineAndNotices";
+      try {
+        const value = JSON.parse(message.content);
+        const source = value?.kind === "notice" ? value.data?.source : undefined;
+        if (
+          ["phone", "scripts", "commands", "memory", "image", "image_description"].includes(source)
+        ) {
+          category = `notice:${source}`;
+        }
+      } catch { /* 自写摘要不是JSON，仍归入时间线。 */ }
+    }
+    const part = parts[category] ??= { messages: 0, estimatedTokens: 0 };
+    part.messages++;
+    part.estimatedTokens += estimate([message]);
+  }
+  return { messages: messages.length, estimatedMessageTokens: estimate(messages), parts };
 }
 export interface ContextCounter {
   /** 如接入精确 tokenizer，必须标明其适配的模型，不可仅凭编码名称宣称已验证。 */

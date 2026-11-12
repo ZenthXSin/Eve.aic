@@ -29,6 +29,7 @@ export interface QqGatewayOptions {
   maxBackoffMs?: number;
   rateLimitBackoffMs?: number;
   stableConnectionMs?: number;
+  invalidSessionBackoffMs?: number;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -60,6 +61,7 @@ export class QqGateway {
       maxBackoffMs: 60_000,
       rateLimitBackoffMs: 60_000,
       stableConnectionMs: 5_000,
+      invalidSessionBackoffMs: 3_000,
       ...options,
     };
     if (!Number.isSafeInteger(options.intents) || options.intents < 0) {
@@ -72,6 +74,7 @@ export class QqGateway {
         this.#options.maxBackoffMs,
         this.#options.rateLimitBackoffMs,
         this.#options.stableConnectionMs,
+        this.#options.invalidSessionBackoffMs,
       ]
     ) {
       if (!Number.isSafeInteger(duration) || duration < 1 || duration > 2_147_483_647) {
@@ -117,7 +120,7 @@ export class QqGateway {
   async #connection(
     connection: QqGatewayConnection,
     signal: AbortSignal,
-  ): Promise<{ code: number; ready: boolean; livedMs: number }> {
+  ): Promise<{ code: number; ready: boolean; livedMs: number; reconnectDelayMs?: number }> {
     const startedAt = performance.now();
     const socket = connection.socket;
     let ready = false;
@@ -125,7 +128,9 @@ export class QqGateway {
     let receiving = true;
     let awaitingHeartbeat = false;
     let fatal: QqGatewayError | undefined;
-    let interval: ReturnType<typeof setInterval> | undefined;
+    let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+    let heartbeatIntervalMs = 0;
+    let reconnectDelayMs: number | undefined;
     let queue: Promise<void> = Promise.resolve();
     let pending = 0;
     let resolveClosed!: (code: number) => void;
@@ -151,11 +156,17 @@ export class QqGateway {
       fatal ??= error;
       close(4000, "local failure");
     };
-    const heartbeat = () => {
+    const heartbeat = (requested = false) => {
       if (socket.readyState !== WebSocket.OPEN) return;
-      if (awaitingHeartbeat) {
+      if (awaitingHeartbeat && !requested) {
         close(4000, "heartbeat deadline");
         return;
+      }
+      // A server request must be answered even while an earlier ACK is outstanding.
+      // Keep the oldest outstanding deadline, rather than extending it on requests.
+      if (!awaitingHeartbeat) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = setTimeout(() => heartbeat(), heartbeatIntervalMs);
       }
       awaitingHeartbeat = true;
       try {
@@ -207,19 +218,30 @@ export class QqGateway {
           fail(new QqGatewayError("protocol"));
           return;
         }
-        interval = setInterval(heartbeat, data.d.heartbeat_interval as number);
+        heartbeatIntervalMs = data.d.heartbeat_interval as number;
+        heartbeatTimer = setTimeout(() => heartbeat(), heartbeatIntervalMs);
       } else if (data.op === 11) {
         awaitingHeartbeat = false;
       } else if (data.op === 1) {
-        heartbeat();
+        heartbeat(true);
       } else if (data.op === 7) {
         close(4000, "server reconnect");
       } else if (data.op === 9) {
+        if (typeof data.d !== "boolean") {
+          fail(new QqGatewayError("protocol"));
+          return;
+        }
+        const resumable = data.d;
+        reconnectDelayMs = this.#options.invalidSessionBackoffMs;
         receiving = false;
-        // 服务器明确恢复态无效，必须完成本连接在途保存后再清恢复态。
+        // Finish in-flight persistence before clearing a non-resumable session.
+        // A resumable INVALID_SESSION retains the last durable sequence.
         queue = queue.then(async () => {
           if (fatal) return;
-          await this.#checkpoint(undefined);
+          if (!resumable) {
+            await this.#checkpoint(undefined);
+            this.client.invalidateToken();
+          }
           close(4000, "invalid session");
         }).catch((error) =>
           fail(error instanceof QqGatewayError ? error : new QqGatewayError("protocol"))
@@ -246,7 +268,7 @@ export class QqGateway {
             ready = true;
             clearTimeout(timeout);
             this.#options.onStatus?.({ status });
-            if (!signal.aborted) heartbeat();
+            if (!signal.aborted && !awaitingHeartbeat) heartbeat();
           }
         }).catch((error) =>
           fail(error instanceof QqGatewayError ? error : new QqGatewayError("handler"))
@@ -258,14 +280,14 @@ export class QqGateway {
     if (signal.aborted) abort();
     try {
       const code = await closed;
-      clearInterval(interval);
+      clearTimeout(heartbeatTimer);
       clearTimeout(timeout);
       // 断线不能中断已开始的落盘；等完成后才允许下一连接恢复序号。
       await queue;
       if (fatal) throw fatal;
-      return { code, ready, livedMs: performance.now() - startedAt };
+      return { code, ready, livedMs: performance.now() - startedAt, reconnectDelayMs };
     } finally {
-      clearInterval(interval);
+      clearTimeout(heartbeatTimer);
       clearTimeout(timeout);
       signal.removeEventListener("abort", abort);
       socket.onmessage = null;
@@ -290,7 +312,7 @@ export class QqGateway {
       }
       while (!signal.aborted) {
         this.#options.onStatus?.({ status: "connecting" });
-        let result: { code: number; ready: boolean; livedMs: number };
+        let result: { code: number; ready: boolean; livedMs: number; reconnectDelayMs?: number };
         let platformDelay = 0;
         try {
           result = await this.#connection(await this.client.openGateway(), signal);
@@ -298,7 +320,8 @@ export class QqGateway {
           if (signal.aborted && error instanceof QqRequestError) break;
           if (
             !(error instanceof QqRequestError) ||
-            !["transport", "rate_limit", "authentication"].includes(error.info.category)
+            (!["transport", "rate_limit", "authentication"].includes(error.info.category) &&
+              !(error.info.httpStatus !== undefined && error.info.httpStatus >= 500))
           ) throw error;
           if (error.info.category === "authentication") this.client.invalidateToken();
           if (error.info.category === "rate_limit") {
@@ -314,9 +337,12 @@ export class QqGateway {
         if ([4001, 4002, 4010, 4011, 4012, 4013, 4014, 4914, 4915].includes(result.code)) {
           throw new QqGatewayError("closed", result.code);
         }
+        platformDelay = Math.max(platformDelay, result.reconnectDelayMs ?? 0);
         if (result.code === 4004) this.client.invalidateToken();
         if (result.code === 4008) platformDelay = this.#options.rateLimitBackoffMs;
-        if ([4006, 4007].includes(result.code) || (result.code >= 4900 && result.code <= 4913)) {
+        if (
+          [4006, 4007, 4009].includes(result.code) || (result.code >= 4900 && result.code <= 4913)
+        ) {
           await this.#checkpoint(undefined);
           this.client.invalidateToken();
         }

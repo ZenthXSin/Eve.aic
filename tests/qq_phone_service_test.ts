@@ -1089,3 +1089,38 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("手机回复自动序号：省略sequence的不同新回复不碰撞，同action重入不重复发送", async () => {
+  const f = await fixture();
+  try {
+    await f.append(event(1));
+    const page = await f.phone.open({ conversationId: "qq:user:user-a" });
+    const args = {
+      actionId: "auto-first",
+      conversationId: "qq:user:user-a",
+      text: "first",
+      replyTo: { seq: page.messages[0].handle.seq },
+    };
+    assert.equal((await f.client.call("send", args) as { state: string }).state, "sent");
+    assert.equal(
+      (await f.client.call("send", { ...args, actionId: "auto-second", text: "second" }) as {
+        state: string;
+      }).state,
+      "sent",
+    );
+    assert.equal((await f.client.call("send", args) as { state: string }).state, "sent");
+    assert.equal(f.count(), 2);
+    assert.deepEqual(f.received.map((r) => (r as { msg_seq: number }).msg_seq), [1, 2]);
+    await assert.rejects(
+      f.client.call("send", {
+        ...args,
+        actionId: "bad-explicit",
+        replyTo: { ...args.replyTo, sequence: 1 },
+      }),
+      (e) => e instanceof PhoneRpcError && e.category === "conflict",
+    );
+    assert.equal(f.count(), 2);
+  } finally {
+    await f.close();
+  }
+});

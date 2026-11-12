@@ -89,11 +89,18 @@ Deno.test("QQ失败结束：精确摘要、并发幂等、原始回执与尝试�
     await actions.initialize();
     const failed = await actions.send("failed", request);
     assert.ok(failed.status === "finished" && failed.result.status === "failed");
-    assert.deepEqual(await actions.send("next", { ...request, text: "后项" }), {
-      actionId: "next",
-      status: "blocked",
-      blockedBy: "failed",
-    });
+    assert.deepEqual(
+      await actions.send("next", {
+        ...request,
+        reply: { messageId: "inbound-fixed" },
+        text: "后项",
+      }),
+      {
+        actionId: "next",
+        status: "blocked",
+        blockedBy: "failed",
+      },
+    );
     const records = await snapshot(`${directory}/records`);
     const attempts = await snapshot(`${directory}/attempts`);
     const page = await actions.listSendQueue({ failedHeadsOnly: true });
@@ -143,7 +150,11 @@ Deno.test("QQ失败结束：精确摘要、并发幂等、原始回执与尝试�
     assert.deepEqual(await actions.send("failed", request), results[0]);
     assert.equal(local.count(), 1);
     reject = false;
-    const next = await actions.send("next", { ...request, text: "后项" });
+    const next = await actions.send("next", {
+      ...request,
+      reply: { messageId: "inbound-fixed" },
+      text: "后项",
+    });
     assert.ok(next.status === "finished" && next.result.status === "sent");
     assert.deepEqual(deliveredEvents, ["finished"]);
     assert.equal(local.count(), 2);
@@ -174,8 +185,16 @@ Deno.test("QQ排队取消：只结束零尝试后项，保留队首与其余顺�
   try {
     await actions.initialize();
     await actions.send("head", request);
-    await actions.send("cancel-me", { ...request, text: "取消此项" });
-    await actions.send("remaining", { ...request, text: "仍需发送" });
+    await actions.send("cancel-me", {
+      ...request,
+      reply: { messageId: "inbound-fixed" },
+      text: "取消此项",
+    });
+    await actions.send("remaining", {
+      ...request,
+      reply: { messageId: "inbound-fixed" },
+      text: "仍需发送",
+    });
     const before = await Deno.readTextFile(`${directory}/records/cancel-me.json`);
     const page = await actions.listSendQueue();
     assert.deepEqual(page.items.map((i) => i.actionId), ["head", "cancel-me", "remaining"]);
@@ -197,12 +216,23 @@ Deno.test("QQ排队取消：只结束零尝试后项，保留队首与其余顺�
     await actions.close();
     actions = new QqSendActions(local.client(), directory);
     await actions.initialize();
-    assert.deepEqual(await actions.send("cancel-me", { ...request, text: "取消此项" }), cancelled);
+    assert.deepEqual(
+      await actions.send("cancel-me", {
+        ...request,
+        reply: { messageId: "inbound-fixed" },
+        text: "取消此项",
+      }),
+      cancelled,
+    );
     assert.equal(local.count(), 1);
     const head = (await actions.listSendQueue({ failedHeadsOnly: true })).items[0];
     await actions.cancelSend(cancellation(head));
     reject = false;
-    const remaining = await actions.send("remaining", { ...request, text: "仍需发送" });
+    const remaining = await actions.send("remaining", {
+      ...request,
+      reply: { messageId: "inbound-fixed" },
+      text: "仍需发送",
+    });
     assert.ok(remaining.status === "finished" && remaining.result.status === "sent");
     assert.deepEqual(contents, [request.text, "仍需发送"]);
   } finally {
@@ -212,7 +242,7 @@ Deno.test("QQ排队取消：只结束零尝试后项，保留队首与其余顺�
   }
 });
 
-Deno.test("QQ取消保留未知事实：unknown队首与活跃请求均不可取消", async () => {
+Deno.test("QQ取消保留未知事实：unknown队首可取消等待，活跃请求不可取消", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-resolution-unknown-" });
   const entered = deferred<void>();
   const release = deferred<void>();
@@ -232,9 +262,12 @@ Deno.test("QQ取消保留未知事实：unknown队首与活跃请求均不可取
     const result = await actions.send("unknown", request);
     assert.ok(result.status === "finished" && result.result.status === "unknown");
     const unknown = (await actions.listSendQueue()).items[0];
-    assert.equal(unknown.canCancel, false);
-    assert.equal(unknown.cancelBlockedReason, "unknown");
-    await assert.rejects(actions.cancelSend(cancellation(unknown)), conflict);
+    assert.equal(unknown.canCancel, true);
+    const cancelled = await actions.cancelSend(cancellation(unknown));
+    assert.equal(cancelled.status, "cancelled");
+    if (cancelled.status !== "cancelled") throw new Error("missing cancellation");
+    assert.equal(cancelled.resolution.kind, "unknown_retained");
+    assert.deepEqual(cancelled.originalResult, result.result);
     inflight = actions.send("inflight", {
       ...request,
       text: "inflight",
@@ -253,7 +286,7 @@ Deno.test("QQ取消保留未知事实：unknown队首与活跃请求均不可取
       }),
       conflict,
     );
-    assert.deepEqual(await snapshot(`${directory}/resolutions`), {});
+    assert.equal(Object.keys(await snapshot(`${directory}/resolutions`)).length, 1);
     release.resolve();
     await inflight;
   } finally {
@@ -437,7 +470,7 @@ class ScriptedClient extends QqClient {
     return Promise.resolve(structuredClone(this.result));
   }
 }
-Deno.test("QQ未知鉴权、限流和平台错误不自动重试，也不转成可取消失败", async () => {
+Deno.test("QQ未知鉴权、限流和平台错误不自动重试，可取消等待但保留未知事实", async () => {
   for (const category of ["authentication", "rate_limit", "platform"] as const) {
     const directory = await Deno.makeTempDir({ prefix: "eve-resolution-no-guess-" });
     const client = new ScriptedClient({
@@ -453,8 +486,9 @@ Deno.test("QQ未知鉴权、限流和平台错误不自动重试，也不转成�
       assert.equal(client.calls.length, 1);
       assert.deepEqual(await actions.send("unknown", request), result);
       const item = (await actions.listSendQueue()).items[0];
-      assert.equal(item.canCancel, false);
-      await assert.rejects(actions.cancelSend(cancellation(item)), conflict);
+      assert.equal(item.canCancel, true);
+      const cancelled = await actions.cancelSend(cancellation(item));
+      assert.ok(cancelled.status === "cancelled" && cancelled.originalResult?.status === "unknown");
       assert.equal(client.calls.length, 1);
     } finally {
       await actions.close();
@@ -542,7 +576,11 @@ Deno.test("QQ活跃队首重试期间可取消等待中的零尝试后项，并�
     await actions.initialize();
     head = actions.send("head", request);
     await waitForFile(`${directory}/attempts/head/1.result.json`);
-    follower = actions.send("pending-follower", { ...request, text: "绝不能发送的后项" });
+    follower = actions.send("pending-follower", {
+      ...request,
+      reply: { messageId: "inbound-fixed" },
+      text: "绝不能发送的后项",
+    });
     await waitForFile(`${directory}/records/pending-follower.json`);
     const original = await Deno.readTextFile(`${directory}/records/pending-follower.json`);
     const items = (await actions.listSendQueue()).items;

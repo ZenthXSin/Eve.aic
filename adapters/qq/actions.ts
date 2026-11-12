@@ -1,6 +1,11 @@
 import { QqClient, type QqSendResult, type QqSendText, validateQqSendText } from "./client.ts";
 import { writeAtomic } from "./journal.ts";
 
+/** 序号只在新动作准入时分配，持久账本和传输始终使用已经固定的数字。 */
+export type QqActionSendText = Omit<QqSendText, "reply"> & {
+  reply?: { messageId: string; sequence?: number } | { eventId: string };
+};
+
 export interface SendRecord {
   schema: 1;
   actionId: string;
@@ -18,7 +23,7 @@ export interface SendRecord {
 
 export interface SendResolution {
   schema: 1;
-  kind: "failed_retained" | "queued_cancelled";
+  kind: "failed_retained" | "unknown_retained" | "queued_cancelled";
   actionId: string;
   fingerprint: string;
   receiptDigest: string;
@@ -176,6 +181,8 @@ function conversation(request: QqSendText): string {
 /** 一个会话只允许队首先成功；许可暂停、未知和永久失败都保留屏障。 */
 export class QqSendActions {
   #records = new Map<string, SendRecord>();
+  // 首个异步哈希/落盘前同步预留，避免不同动作并发抢到同一平台去重键。
+  #admissions = new Map<string, QqSendText>();
   #inflight = new Map<string, Promise<SendStatus>>();
   #conversations = new Map<string, Promise<void>>();
   #queues = new Map<string, Map<string, number>>();
@@ -382,6 +389,11 @@ export class QqSendActions {
     ) return { kind: "failed_retained" };
     const status = this.#savedStatus(record);
     if (
+      this.#head(record.request) === record.actionId && record.policy &&
+      (status.status === "unknown" ||
+        (status.status === "finished" && status.result.status === "unknown"))
+    ) return { kind: "unknown_retained" };
+    if (
       record.status === "started" && record.policy && status.status === "blocked" &&
       !(this.#attempts.get(record.actionId)?.length)
     ) return { kind: "queued_cancelled", blockedBy: status.blockedBy };
@@ -417,8 +429,8 @@ export class QqSendActions {
           `qq:${record.request.destination.kind}:${record.request.destination.openId}`
       ) return false;
       return !args.failedHeadsOnly ||
-        (record.status === "finished" && record.result?.status === "failed" &&
-          this.#head(record.request) === record.actionId);
+        (this.#head(record.request) === record.actionId &&
+          ["failed_retained", "unknown_retained"].includes(this.#eligibility(record).kind ?? ""));
     }).sort((a, b) => a.policy!.sequence - b.policy!.sequence);
     const items: SendQueueItem[] = [];
     for (let record of eligible.slice(0, limit)) {
@@ -493,7 +505,8 @@ export class QqSendActions {
         }
         const eligibility = this.#eligibility(record, true);
         if (
-          !eligibility.kind || (options.failedHeadOnly && eligibility.kind !== "failed_retained")
+          !eligibility.kind || (options.failedHeadOnly &&
+            !["failed_retained", "unknown_retained"].includes(eligibility.kind))
         ) {
           throw new QqActionError("conflict");
         }
@@ -559,7 +572,7 @@ export class QqSendActions {
       const record = this.#records.get(resolution.actionId);
       if (
         !record?.policy || entry.name !== `${record.actionId}.json` || resolution.schema !== 1 ||
-        !["failed_retained", "queued_cancelled"].includes(resolution.kind) ||
+        !["failed_retained", "unknown_retained", "queued_cancelled"].includes(resolution.kind) ||
         !["admin", "eve"].includes(resolution.actor) ||
         !Number.isFinite(Date.parse(resolution.resolvedAt)) ||
         resolution.fingerprint !== record.fingerprint ||
@@ -582,6 +595,12 @@ export class QqSendActions {
           record.status !== "finished" || record.result?.status !== "failed" ||
           resolution.blockedBy !== undefined
         ) throw new QqActionError("corrupt");
+      } else if (resolution.kind === "unknown_retained") {
+        if (
+          resolution.blockedBy !== undefined ||
+          !(record.status === "started" ||
+            (record.status === "finished" && record.result?.status === "unknown"))
+        ) throw new QqActionError("corrupt");
       } else {
         const preceding = this.#records.get(resolution.blockedBy ?? "");
         if (
@@ -598,7 +617,9 @@ export class QqSendActions {
     );
     for (const resolution of resolutions) {
       const record = this.#records.get(resolution.actionId)!;
-      if (resolution.kind === "failed_retained" && this.#head(record.request) !== record.actionId) {
+      if (
+        resolution.kind !== "queued_cancelled" && this.#head(record.request) !== record.actionId
+      ) {
         throw new QqActionError("corrupt");
       }
       this.#resolutions.set(record.actionId, resolution);
@@ -883,9 +904,51 @@ export class QqSendActions {
     }
     return undefined;
   }
+  #admit(actionId: string, request: QqActionSendText): QqSendText {
+    const snapshot = structuredClone(request);
+    const previous = this.#records.get(actionId)?.request ?? this.#admissions.get(actionId);
+    const reply = snapshot?.reply;
+    if (reply && typeof reply === "object" && "messageId" in reply) {
+      const reserved = [
+        ...Array.from(
+          this.#records.values(),
+          (record) => [record.actionId, record.request] as const,
+        ),
+        ...this.#admissions.entries(),
+      ];
+      const sameReply = (other: QqSendText) =>
+        canonical(other.destination) === canonical(snapshot.destination) && other.reply &&
+        "messageId" in other.reply && other.reply.messageId === reply.messageId;
+      if (reply.sequence === undefined) {
+        if (previous && sameReply(previous) && previous.reply && "sequence" in previous.reply) {
+          reply.sequence = previous.reply.sequence;
+        } else {
+          let sequence = 1;
+          for (const [, other] of reserved) {
+            if (sameReply(other) && other.reply && "sequence" in other.reply) {
+              sequence = Math.max(sequence, other.reply.sequence + 1);
+            }
+          }
+          reply.sequence = sequence;
+        }
+      }
+      validateQqSendText(snapshot as QqSendText);
+      if (
+        !previous &&
+        reserved.some(([id, other]) =>
+          id !== actionId && sameReply(other) && other.reply && "sequence" in other.reply &&
+          other.reply.sequence === reply.sequence
+        )
+      ) throw new QqActionError("conflict");
+    } else validateQqSendText(snapshot as QqSendText);
+    if (previous && canonical(previous) !== canonical(snapshot)) {
+      throw new QqActionError("conflict");
+    }
+    return snapshot as QqSendText;
+  }
   async send(
     actionId: string,
-    request: QqSendText,
+    request: QqActionSendText,
     options: { beforeAttempt?: () => Promise<void> } = {},
   ): Promise<SendStatus> {
     this.#available();
@@ -894,10 +957,11 @@ export class QqSendActions {
       await this.#resolutionTail;
       return await this.send(actionId, request, options);
     }
-    const snapshot = structuredClone(request);
+    let snapshot: QqSendText;
     try {
-      validateQqSendText(snapshot);
-    } catch {
+      snapshot = this.#admit(actionId, request);
+    } catch (error) {
+      if (error instanceof QqActionError) throw error;
       throw new QqActionError("request");
     }
     if (
@@ -916,6 +980,7 @@ export class QqSendActions {
         !Number.isSafeInteger(this.#nextSequence) || this.#nextSequence >= Number.MAX_SAFE_INTEGER
       ) throw new QqActionError("storage");
       policy = { kind: "until_sent_v1", sequence: this.#nextSequence++ };
+      this.#admissions.set(actionId, snapshot);
       this.#enqueue({ actionId, request: snapshot, policy });
     }
     const preceding = this.#conversations.get(key);
@@ -979,6 +1044,7 @@ export class QqSendActions {
     try {
       return await operation;
     } finally {
+      this.#admissions.delete(actionId);
       this.#inflight.delete(actionId);
       this.#queueWake.delete(actionId);
       if (this.#conversations.get(key) === tail) this.#conversations.delete(key);

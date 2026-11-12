@@ -144,9 +144,35 @@ Deno.test("admin QQ failure resolution travels browser/CSRF/private bridges and 
       original,
     );
     assert.equal(sends, 1);
+    const unknownPage = await post("/api/query", {
+      resource: "qqFailures",
+      operation: "page",
+      args: {},
+    });
+    const unknown = unknownPage.wire.value.items[0] as SendQueueItem;
+    assert.equal(unknown.actionId, "next");
+    assert.equal(unknown.canCancel, true);
+    const unknownOriginal = await Deno.readFile(`${directory}/actions/records/next.json`);
+    const cancelledUnknown = await post("/api/control", {
+      action: "resolveQqFailure",
+      args: {
+        expectedActionId: unknown.actionId,
+        expectedFingerprint: unknown.fingerprint,
+        expectedReceiptDigest: unknown.receiptDigest!,
+      },
+    });
+    assert.equal(cancelledUnknown.wire.value.resolution.kind, "unknown_retained");
+    assert.deepEqual(
+      await Deno.readFile(`${directory}/actions/records/next.json`),
+      unknownOriginal,
+    );
+    assert.equal(sends, 1);
     assert.equal(
-      (await post("/api/query", { resource: "qqFailures", operation: "page", args: {} })).wire.value
-        .items.length,
+      (await post("/api/query", {
+        resource: "qqFailures",
+        operation: "page",
+        args: {},
+      })).wire.value.items.length,
       0,
     );
     for (

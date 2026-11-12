@@ -445,7 +445,16 @@ export class QqClient {
     ) throw new QqRequestError({ category: "invalid_response" });
     const starts = response.data.session_start_limit;
     if (object(starts) && starts.remaining === 0) {
-      throw new QqRequestError({ category: "rate_limit", httpStatus: response.httpStatus });
+      const reset = starts.reset_after;
+      const resetAfterMs = typeof reset === "number" && Number.isSafeInteger(reset) && reset >= 0
+        ? Math.min(3_600_000, reset)
+        : undefined;
+      const delay = Math.max(response.retryAfterMs ?? 0, resetAfterMs ?? 0);
+      throw new QqRequestError({
+        category: "rate_limit",
+        httpStatus: response.httpStatus,
+        ...(delay > 0 ? { retryAfterMs: delay } : {}),
+      });
     }
     const socket = new WebSocket(url.href);
     return {

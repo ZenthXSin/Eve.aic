@@ -317,32 +317,14 @@ export class QqModelCommands {
       await this.#save(saved);
     }
     if (this.#closing) return;
-    if (saved.replySequence === undefined) {
-      const replyId = `qq_model_reply_${inbound.identity}`;
-      const previous = this.actions.records().find((record) => record.actionId === replyId);
-      const previousReply = previous?.request.reply;
-      let sequence = previousReply && "sequence" in previousReply ? previousReply.sequence : 1;
-      if (!previous) {
-        for (const record of this.actions.records()) {
-          const request = record.request;
-          if (
-            request.destination.kind === inbound.message.destination.kind &&
-            request.destination.openId === inbound.message.destination.openId && request.reply &&
-            "messageId" in request.reply &&
-            request.reply.messageId === inbound.message.deduplication.messageId
-          ) {
-            sequence = Math.max(sequence, request.reply.sequence + 1);
-          }
-        }
-      }
-      saved = { ...saved, replySequence: sequence };
-      await this.#save(saved);
-    }
     // 与 Eve 共用发送账本和会话 FIFO。即使命令 HTTP 已返回，第一条未成功也不能越过。
     const job = this.actions.send(`qq_model_reply_${inbound.identity}`, {
       destination: inbound.message.destination,
       text: saved.reply!,
-      reply: { messageId: inbound.message.deduplication.messageId, sequence: saved.replySequence! },
+      reply: {
+        messageId: inbound.message.deduplication.messageId,
+        ...(saved.replySequence === undefined ? {} : { sequence: saved.replySequence }),
+      },
     });
     this.#replies.add(job);
     void job.then((status) => {

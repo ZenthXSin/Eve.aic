@@ -3,7 +3,7 @@ import { readAdminBody } from "../../services/admin/server.ts";
 import { type ResolveFailedQq, validateFailedResolution } from "../../services/admin/contracts.ts";
 import { QqActionError, type QqSendActions } from "./actions.ts";
 
-/** 专用管理能力：只列出失败队首及明确结束失败项；手机/模型不持有此密钥。 */
+/** 专用管理能力：列出失败/送达未知队首并取消等待；手机/模型不持有此密钥。 */
 export function startQqAdminServer(actions: QqSendActions, key: string) {
   if (!/^[a-zA-Z0-9_-]{32,256}$/.test(key)) throw new KernelError("rejected", "QQ 管理密钥无效");
   let origin = "";

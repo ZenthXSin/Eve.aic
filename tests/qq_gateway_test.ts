@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { QqClient } from "../adapters/qq/client.ts";
+import { QqClient, QqRequestError } from "../adapters/qq/client.ts";
 import {
   FileGatewayCheckpoint,
   type GatewayCheckpoint,
@@ -37,15 +37,20 @@ function event(sequence: number, message = "message-1") {
   };
 }
 
-function gatewayServer(onConnection: (socket: WebSocket, connection: number) => void) {
+function gatewayServer(
+  onConnection: (socket: WebSocket, connection: number) => void,
+  heartbeatIntervalMs = 30,
+) {
   let connections = 0;
   let identities = 0;
+  let tokens = 0;
   const sockets: WebSocket[] = [];
   const server = Deno.serve(
     { hostname: "127.0.0.1", port: 0, onListen() {} },
     (request): Response => {
       const path = new URL(request.url).pathname;
       if (path === "/app/getAppAccessToken") {
+        tokens++;
         return Response.json({ access_token: "fixture-gateway-secret", expires_in: 7200 });
       }
       if (path === "/gateway") {
@@ -60,7 +65,8 @@ function gatewayServer(onConnection: (socket: WebSocket, connection: number) => 
       const { socket, response } = Deno.upgradeWebSocket(request);
       sockets.push(socket);
       const number = ++connections;
-      socket.onopen = () => emit(socket, { op: 10, d: { heartbeat_interval: 30 } });
+      socket.onopen = () =>
+        emit(socket, { op: 10, d: { heartbeat_interval: heartbeatIntervalMs } });
       onConnection(socket, number);
       return response;
     },
@@ -71,7 +77,7 @@ function gatewayServer(onConnection: (socket: WebSocket, connection: number) => 
         baseUrl: `http://127.0.0.1:${server.addr.port}`,
         sendScope: "private",
       }),
-    count: () => ({ connections, identities }),
+    count: () => ({ connections, identities, tokens }),
     close: async () => {
       for (const socket of sockets) {
         try {
@@ -83,7 +89,12 @@ function gatewayServer(onConnection: (socket: WebSocket, connection: number) => 
   };
 }
 
-const durations = { initialBackoffMs: 1, maxBackoffMs: 5, connectTimeoutMs: 500 };
+const durations = {
+  initialBackoffMs: 1,
+  maxBackoffMs: 5,
+  connectTimeoutMs: 500,
+  invalidSessionBackoffMs: 5,
+};
 
 Deno.test("QQ 网关：Identify心跳继续，事件落盘前不前移恢复序号，断线后串行Resume", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-gateway-test-" });
@@ -424,12 +435,15 @@ Deno.test("QQ 网关：InvalidSession清持久态后Identify，权限拒绝停�
 
 Deno.test("QQ 网关接入点：拒绝第三方主机和明文非本机地址，不泄露凭据", async () => {
   let address = "wss://untrusted.invalid/websocket";
-  const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, (request) => {
-    if (new URL(request.url).pathname === "/app/getAppAccessToken") {
-      return Response.json({ access_token: "fixture-secret", expires_in: 7200 });
-    }
-    return Response.json({ url: address });
-  });
+  const server = Deno.serve(
+    { hostname: "127.0.0.1", port: 0, onListen() {} },
+    (request): Response => {
+      if (new URL(request.url).pathname === "/app/getAppAccessToken") {
+        return Response.json({ access_token: "fixture-secret", expires_in: 7200 });
+      }
+      return Response.json({ url: address });
+    },
+  );
   try {
     const client = new QqClient({ appId: "fixture", appSecret: "fixture" }, {
       baseUrl: `http://127.0.0.1:${server.addr.port}`,
@@ -522,5 +536,247 @@ Deno.test("QQ 独立接收器：目录锁挡住第二实例，已持久化消息
     await running?.catch(() => {});
     await local.close();
     await Deno.remove(directory, { recursive: true });
+  }
+});
+
+for (const mode of ["timeout", "resumable", "invalid"] as const) {
+  Deno.test(`QQ 网关恢复：${mode}按官方规则保留或清理水位及凭据`, async () => {
+    let session: GatewaySession | undefined = { sessionId: "old", sequence: 8 };
+    const saved: Array<GatewaySession | undefined> = [];
+    const controller = new AbortController();
+    let disconnectedAt = 0;
+    let reconnectedAt = 0;
+    const checkpoint: GatewayCheckpoint = {
+      load: () => Promise.resolve(session),
+      save: (next) => {
+        session = next;
+        saved.push(next);
+        return Promise.resolve();
+      },
+    };
+    const local = gatewayServer((socket, number) => {
+      socket.onmessage = (incoming) => {
+        const data = JSON.parse(incoming.data);
+        if (data.op === 1) {
+          emit(socket, { op: 11 });
+          return;
+        }
+        if (number === 1) {
+          assert.equal(data.op, 6);
+          assert.equal(data.d.seq, 8);
+          if (mode === "timeout") socket.close(4009, "session timed out");
+          else emit(socket, { op: 9, d: mode === "resumable" });
+        } else {
+          reconnectedAt = performance.now();
+          if (mode === "resumable") {
+            assert.equal(data.op, 6);
+            assert.equal(data.d.session_id, "old");
+            assert.equal(data.d.seq, 8);
+            emit(socket, { op: 0, t: "RESUMED", s: 8, d: "" });
+          } else {
+            assert.equal(data.op, 2);
+            ready(socket, "new", 0);
+          }
+        }
+      };
+    });
+    try {
+      const gateway = new QqGateway(local.client(), {
+        ...durations,
+        invalidSessionBackoffMs: 40,
+        intents: 1 << 25,
+        checkpoint,
+        onDispatch: () => Promise.resolve(),
+        onStatus: (status) => {
+          if (status.status === "disconnected") disconnectedAt = performance.now();
+          if (status.status === "ready" || status.status === "resumed") controller.abort();
+        },
+      });
+      await gateway.run(controller.signal);
+      assert.equal(local.count().connections, 2);
+      assert.equal(local.count().tokens, mode === "resumable" ? 1 : 2);
+      if (mode === "resumable") assert.deepEqual(saved, []);
+      else assert.deepEqual(saved, [undefined, { sessionId: "new", sequence: 0 }]);
+      if (mode !== "timeout") assert.ok(reconnectedAt - disconnectedAt >= 35);
+    } finally {
+      controller.abort();
+      await local.close();
+    }
+  });
+}
+
+Deno.test("QQ 网关心跳：READY后的确认有完整周期，服务器请求不误判未ACK为断线", async () => {
+  const controller = new AbortController();
+  let session: GatewaySession | undefined;
+  const received: number[] = [];
+  let requested = false;
+  let running: Promise<void> | undefined;
+  const timers: Array<ReturnType<typeof setTimeout>> = [];
+  const local = gatewayServer((socket) => {
+    socket.onmessage = (incoming) => {
+      const data = JSON.parse(incoming.data);
+      if (data.op === 2) {
+        // READY late in HELLO's first interval exposed the old early-ACK deadline.
+        timers.push(setTimeout(() => ready(socket), 150));
+      } else if (data.op === 1) {
+        received.push(performance.now());
+        if (!requested) {
+          requested = true;
+          timers.push(setTimeout(() => emit(socket, { op: 1 }), 10));
+          timers.push(setTimeout(() => emit(socket, { op: 11 }), 100));
+        } else if (received.length === 2) {
+          // The explicit server request is answered while the first ACK is pending.
+        } else {
+          emit(socket, { op: 11 });
+          controller.abort();
+        }
+      }
+    };
+  }, 200);
+  try {
+    const gateway = new QqGateway(local.client(), {
+      ...durations,
+      intents: 1 << 25,
+      checkpoint: {
+        load: () => Promise.resolve(session),
+        save: (next) => {
+          session = next;
+          return Promise.resolve();
+        },
+      },
+      onDispatch: () => Promise.resolve(),
+    });
+    running = gateway.run(controller.signal);
+    await running;
+    assert.equal(local.count().connections, 1);
+    assert.equal(received.length, 3);
+    assert.ok(received[1] - received[0] < 100);
+    assert.ok(received[2] - received[0] >= 180);
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+    controller.abort();
+    await running?.catch(() => {});
+    await local.close();
+  }
+});
+
+Deno.test("QQ 网关发现：认证和gateway的HTTP 5xx自动恢复，明确4xx结束", async () => {
+  let authFailures = 1;
+  let gatewayFailures = 1;
+  let gatewayStatus = 503;
+  let session: GatewaySession | undefined;
+  const controller = new AbortController();
+  const server = Deno.serve(
+    { hostname: "127.0.0.1", port: 0, onListen() {} },
+    (request): Response => {
+      const path = new URL(request.url).pathname;
+      if (path === "/app/getAppAccessToken") {
+        if (authFailures-- > 0) return Response.json({ code: 90001 }, { status: 502 });
+        return Response.json({ access_token: "fixture", expires_in: 7200 });
+      }
+      if (path === "/gateway") {
+        if (gatewayFailures-- > 0) return Response.json({ code: 90002 }, { status: gatewayStatus });
+        return Response.json({ url: `ws://127.0.0.1:${server.addr.port}/websocket` });
+      }
+      const { socket, response } = Deno.upgradeWebSocket(request);
+      socket.onopen = () => emit(socket, { op: 10, d: { heartbeat_interval: 200 } });
+      socket.onmessage = (incoming) => {
+        const data = JSON.parse(incoming.data);
+        if (data.op === 2) ready(socket);
+        else if (data.op === 1) emit(socket, { op: 11 });
+      };
+      return response;
+    },
+  );
+  const client = () =>
+    new QqClient({ appId: "fixture", appSecret: "fixture" }, {
+      baseUrl: `http://127.0.0.1:${server.addr.port}`,
+    });
+  const checkpoint: GatewayCheckpoint = {
+    load: () => Promise.resolve(session),
+    save: (next) => {
+      session = next;
+      return Promise.resolve();
+    },
+  };
+  try {
+    await new QqGateway(client(), {
+      ...durations,
+      intents: 1 << 25,
+      checkpoint,
+      onDispatch: () => Promise.resolve(),
+      onStatus: (status) => {
+        if (status.status === "ready") controller.abort();
+      },
+    }).run(controller.signal);
+    assert.ok(authFailures < 0);
+    assert.equal(gatewayFailures, -1);
+    gatewayFailures = 1;
+    gatewayStatus = 403;
+    await assert.rejects(
+      new QqGateway(client(), {
+        ...durations,
+        intents: 1 << 25,
+        checkpoint,
+        onDispatch: () => Promise.resolve(),
+      }).run(new AbortController().signal),
+      (error) => error instanceof QqRequestError && error.info.httpStatus === 403,
+    );
+    assert.equal(gatewayFailures, 0);
+  } finally {
+    controller.abort();
+    await server.shutdown();
+  }
+});
+
+Deno.test("QQ 网关心跳：持续服务器请求不能延长未确认心跳的期限", async () => {
+  const controller = new AbortController();
+  let session: GatewaySession | undefined;
+  let firstHeartbeatAt = 0;
+  let reconnectAt = 0;
+  let requestTimer: ReturnType<typeof setInterval> | undefined;
+  let beats = 0;
+  const local = gatewayServer((socket, number) => {
+    socket.onmessage = (incoming) => {
+      const data = JSON.parse(incoming.data);
+      if (data.op === 2 && number === 1) ready(socket);
+      else if (data.op === 1 && number === 1) {
+        beats++;
+        if (!firstHeartbeatAt) {
+          firstHeartbeatAt = performance.now();
+          requestTimer = setInterval(() => {
+            if (socket.readyState === WebSocket.OPEN) emit(socket, { op: 1 });
+          }, 15);
+        }
+      } else if (number === 2 && data.op === 6) {
+        reconnectAt = performance.now();
+        emit(socket, { op: 0, t: "RESUMED", s: 0, d: "" });
+      }
+    };
+  }, 100);
+  try {
+    await new QqGateway(local.client(), {
+      ...durations,
+      intents: 1 << 25,
+      checkpoint: {
+        load: () => Promise.resolve(session),
+        save: (next) => {
+          session = next;
+          return Promise.resolve();
+        },
+      },
+      onDispatch: () => Promise.resolve(),
+      onStatus: (status) => {
+        if (status.status === "resumed") controller.abort();
+      },
+    }).run(controller.signal);
+    assert.ok(beats > 2);
+    assert.equal(local.count().connections, 2);
+    assert.ok(reconnectAt - firstHeartbeatAt >= 90);
+    assert.ok(reconnectAt - firstHeartbeatAt < 400);
+  } finally {
+    clearInterval(requestTimer);
+    controller.abort();
+    await local.close();
   }
 });

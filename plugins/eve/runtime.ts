@@ -12,6 +12,7 @@ import {
   activeEvents,
   blocks,
   budget,
+  contextComposition,
   type ContextCounter,
   contextEstimate,
   mechanicalCompression,
@@ -54,6 +55,7 @@ export class EveRuntime {
   #alarmFresh = false;
   #commandFresh = false;
   #contextBlocked = false;
+  #contextComposition?: ReturnType<typeof contextComposition>;
   #modelBlocked: ModelBlock | null = null;
   #fatal = false;
   #sharedBudget?: {
@@ -541,7 +543,12 @@ export class EveRuntime {
         "字符与图像估算，未验证为当前模型精确分词",
       sourceCommit: this.config.sourceCommit,
       contextEstimatedTokens: estimated,
-      contextReminder: estimated >= 275_000 ? "已达到275k提醒线，是否整理由你决定" : null,
+      contextTargetTokens: 150_000,
+      contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
+      contextComposition: contextComposition(messages),
+      contextReminder: estimated >= 120_000
+        ? "上下文输入目标低于150k；已达到120k估算提醒线，可自主整理时间线、摘要或工具结果，原件保留"
+        : null,
       dailyBudget: this.config.dailyTokenBudget,
       knownNoncachedTokens: usage.knownNoncachedTokens,
       unknownReservedTokens: usage.unknownReservedTokens,
@@ -569,7 +576,8 @@ export class EveRuntime {
       (last.data as { day: string }).day !== day ||
       (last.data as { remainingBand: number }).remainingBand !==
         Math.floor(state.safeRemaining / 10_000_000) ||
-      (last.data as { dailyBudget?: number }).dailyBudget !== this.config.dailyTokenBudget
+      (last.data as { dailyBudget?: number }).dailyBudget !== this.config.dailyTokenBudget ||
+      (last.data as { reminder?: string | null }).reminder !== state.contextReminder
     ) {
       await this.journal.append("perception", {
         contextBand: band,
@@ -602,6 +610,7 @@ export class EveRuntime {
     }
     reservation = new TextEncoder().encode(JSON.stringify({ messages, tools })).length +
       messages.length * 32 + this.config.maxOutputTokens;
+    this.#contextComposition = contextComposition(messages);
     if (usage.safetyTotal + reservation > this.config.dailyTokenBudget) {
       await this.journal.append("budget_wait", { day, reason: "含感知的完整请求预算余量不足" });
       return;
@@ -612,6 +621,7 @@ export class EveRuntime {
       day,
       reservation,
       estimatedTokens: contextEstimate(messages, tools, this.contextCounter),
+      contextComposition: this.#contextComposition,
       sourceCommit: this.config.sourceCommit,
     });
     let response: ModelResponse;
@@ -694,6 +704,9 @@ export class EveRuntime {
         budget(this.journal.events, accountingDay(this.config.timeZone)),
       lastError: this.#lastError ?? null,
       contextBlocked: this.#contextBlocked,
+      contextTargetTokens: 150_000,
+      contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
+      contextComposition: this.#contextComposition ?? null,
       modelBlocked: this.#modelBlocked,
     };
   }

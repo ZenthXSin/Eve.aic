@@ -417,10 +417,10 @@ export class QqPhone {
   ) {
     conversation(args.conversationId);
     const match = /^qq:(user|group):(.+)$/.exec(args.conversationId)!;
-    let reply: { messageId: string; sequence: number } | undefined;
+    let reply: { messageId: string; sequence?: number } | undefined;
     if (args.replyTo !== undefined) {
       integer(args.replyTo.seq, 1);
-      integer(args.replyTo.sequence, 1);
+      if (args.replyTo.sequence !== undefined) integer(args.replyTo.sequence, 1);
       const message = await this.#message({
         conversationId: args.conversationId,
         seq: args.replyTo.seq,
@@ -428,7 +428,10 @@ export class QqPhone {
       if (message.direction !== "incoming" || !message.platformMessageId) {
         throw new QqPhoneError("request");
       }
-      reply = { messageId: message.platformMessageId, sequence: args.replyTo.sequence };
+      reply = {
+        messageId: message.platformMessageId,
+        ...(args.replyTo.sequence === undefined ? {} : { sequence: args.replyTo.sequence }),
+      };
     }
     const result = await this.actions.send(args.actionId, {
       destination: { kind: match[1] as "user" | "group", openId: match[2] },

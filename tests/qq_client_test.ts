@@ -443,3 +443,46 @@ Deno.test("发送范围缺省私信，显式all才发群，坏值不进入网络
     await local.close();
   }
 });
+
+Deno.test("网关登录额度耗尽保留平台 reset_after 毫秒及 Retry-After，额度恢复前不开 socket", async () => {
+  let reset: unknown = 125_000;
+  let retry: string | undefined;
+  let sockets = 0;
+  const local = server((r) => {
+    const path = new URL(r.url).pathname;
+    if (path === "/app/getAppAccessToken") return token();
+    if (path === "/gateway") {
+      return Response.json({
+        url: local.url.replace("http:", "ws:") + "/ws",
+        session_start_limit: { remaining: 0, reset_after: reset },
+      }, { headers: retry === undefined ? {} : { "Retry-After": retry } });
+    }
+    sockets++;
+    return new Response(null, { status: 500 });
+  });
+  const client = new QqClient(credentials, { baseUrl: local.url });
+  try {
+    for (
+      const [value, header, expected] of [
+        [125_000, undefined, 125_000],
+        [100, "180", 180_000],
+        [7_200_000, undefined, 3_600_000],
+        ["125000", undefined, undefined],
+        [-1, undefined, undefined],
+      ] as const
+    ) {
+      reset = value;
+      retry = header;
+      await assert.rejects(client.openGateway(), (error) => {
+        assert.ok(error instanceof QqRequestError);
+        assert.equal(error.info.category, "rate_limit");
+        assert.equal(error.info.retryAfterMs, expected);
+        return true;
+      });
+    }
+    assert.equal(sockets, 0);
+  } finally {
+    client.close();
+    await local.close();
+  }
+});

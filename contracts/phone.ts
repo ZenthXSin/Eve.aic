@@ -115,7 +115,11 @@ export interface PhoneActionReceipt {
   actionId: string;
   state: "running" | "blocked" | "sent" | "failed" | "unknown" | "cancelled";
   /** 逻辑结束保留原始失败/未尝试记录；绝不表示已发送。 */
-  resolution?: { kind: "failed_retained" | "queued_cancelled"; actor: "admin" | "eve"; at: string };
+  resolution?: {
+    kind: "failed_retained" | "unknown_retained" | "queued_cancelled";
+    actor: "admin" | "eve";
+    at: string;
+  };
   /** 同会话未成功的队首动作；不得用新动作越过。 */
   blockedBy?: string;
   attempted?: boolean;
@@ -142,8 +146,8 @@ export interface PhoneSend {
   actionId: string;
   conversationId: string;
   text: string;
-  /** 被动回复明确指定本会话入站编号和固定发送序号，不自动猜最近一条。 */
-  replyTo?: { seq: number; sequence: number };
+  /** 明确指定本会话入站编号；省略 sequence 时为新动作分配未占用序号，重试保持原值。 */
+  replyTo?: { seq: number; sequence?: number };
   /** 平台已提供的引用索引；不是平台消息编号。 */
   referenceIndex?: string;
   wakeup?: boolean;
@@ -174,7 +178,7 @@ export interface PhoneSendFile {
   path: string;
   kind: "image" | "file";
   text?: string;
-  replyTo?: { seq: number; sequence: number };
+  replyTo?: { seq: number; sequence?: number };
 }
 
 /** 两种看图方式由 Eve 明确选择；默认描述，任何失败都不自动切换。 */
@@ -230,7 +234,7 @@ export interface PhoneApi {
   }>;
   send(args: PhoneSend): Promise<PhoneActionReceipt>;
   action(args: { actionId: string }): Promise<PhoneActionReceipt | null>;
-  /** 队列分页不发送任何消息。running/unknown不可取消；只有canCancel且有receiptDigest可提交取消。 */
+  /** 队列分页不发送任何消息。发送中的请求不可取消；只有canCancel且有receiptDigest可提交取消。 */
   listSendQueue(
     args?: { conversationId?: string; afterSequence?: number; limit?: number },
   ): Promise<{
@@ -246,7 +250,7 @@ export interface PhoneApi {
     }[];
     next?: { conversationId?: string; afterSequence: number; limit?: number };
   }>;
-  /** 明确逻辑取消：保留原件，不重发。只允许已失败终态或零尝试的blocked等待项；陈旧回执拒绝。 */
+  /** 取消等待并保留原件：允许失败/送达未知的队首及零尝试blocked项。不会撤回已可能送达的消息；陈旧回执拒绝。 */
   cancelSend(
     args: { actionId: string; expectedFingerprint: string; expectedReceiptDigest: string },
   ): Promise<PhoneActionReceipt>;

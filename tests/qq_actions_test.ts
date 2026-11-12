@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { QqActionError, QqSendActions } from "../adapters/qq/actions.ts";
+import { QqActionError, type QqActionSendText, QqSendActions } from "../adapters/qq/actions.ts";
 import { phoneReceipt } from "../adapters/qq/phone.ts";
 import { QqClient, type QqSendText } from "../adapters/qq/client.ts";
 
@@ -74,7 +74,11 @@ Deno.test("QQ 发送动作：网络前started已落盘，同键并发只发送�
     assert.equal(local.count(), 1);
     assert.equal((await Deno.stat(`${directory}/records/action-1.json`)).mode! & 0o777, 0o600);
     await assert.rejects(
-      actions.send("action-1", { ...request, text: "更改原动作" }),
+      actions.send("action-1", {
+        ...request,
+        reply: { messageId: "inbound-1" },
+        text: "更改原动作",
+      }),
       (e) => e instanceof QqActionError && e.category === "conflict",
     );
     assert.equal(local.count(), 1);
@@ -124,7 +128,10 @@ Deno.test("QQ 发送动作：私信范围独立生效，通用客户端也不能
     });
     assert.equal(local.count(), 0);
     await assert.rejects(actions.send("../escape", request), /request/);
-    await assert.rejects(actions.send("bad-parameter", { ...request, text: "" }), /request/);
+    await assert.rejects(
+      actions.send("bad-parameter", { ...request, reply: { messageId: "inbound-1" }, text: "" }),
+      /request/,
+    );
     assert.equal(local.count(), 0);
   } finally {
     await actions.close();
@@ -267,11 +274,18 @@ Deno.test("QQ停止中止在途重试且保留屏障，释放锁后可恢复状�
       status: "unknown",
       reason: "interrupted",
     });
-    assert.deepEqual(await restart.send("blocked", { ...request, text: "blocked" }), {
-      actionId: "blocked",
-      status: "blocked",
-      blockedBy: "inflight",
-    });
+    assert.deepEqual(
+      await restart.send("blocked", {
+        ...request,
+        reply: { messageId: "inbound-1" },
+        text: "blocked",
+      }),
+      {
+        actionId: "blocked",
+        status: "blocked",
+        blockedBy: "inflight",
+      },
+    );
     assert.equal(local.count(), 1);
   } finally {
     release.resolve();
@@ -319,7 +333,11 @@ Deno.test("QQ群范围升级保留旧拒绝和unknown原件，新动作才发送
     const body = await r.json();
     return body.content === "未知群消息" ? Response.json({}) : Response.json({ id: "group-sent" });
   });
-  const group: QqSendText = { ...request, destination: { kind: "group", openId: "group/id" } };
+  const group: QqActionSendText = {
+    ...request,
+    reply: { messageId: "inbound-1" },
+    destination: { kind: "group", openId: "group/id" },
+  };
   let actions = new QqSendActions(local.client(), directory);
   try {
     await actions.initialize();
@@ -499,11 +517,18 @@ Deno.test("QQ重试后续拒绝或去重保留未知，永久屏障不放行后�
       );
       assert.deepEqual(await actions.send("bounded", request), result);
       assert.equal(calls, 2);
-      assert.deepEqual(await actions.send("following", { ...request, text: "must-wait" }), {
-        actionId: "following",
-        status: "blocked",
-        blockedBy: "bounded",
-      });
+      assert.deepEqual(
+        await actions.send("following", {
+          ...request,
+          reply: { messageId: "inbound-1" },
+          text: "must-wait",
+        }),
+        {
+          actionId: "following",
+          status: "blocked",
+          blockedBy: "bounded",
+        },
+      );
       assert.equal(calls, 2);
     } finally {
       release.resolve();
@@ -649,7 +674,11 @@ Deno.test("QQ同会话队首不限次重试直到成功再第二条，跨会话�
   try {
     await client.authenticate();
     await actions.initialize();
-    const first = actions.send("first", { ...request, text: "first" });
+    const first = actions.send("first", {
+      ...request,
+      reply: { messageId: "inbound-1" },
+      text: "first",
+    });
     const second = actions.send("second", {
       ...request,
       text: "second",
@@ -845,7 +874,11 @@ Deno.test("QQ尝试结果存储失败立即停止，不发下一次和排队动�
     await client.authenticate();
     await actions.initialize();
     const first = actions.send("broken-chain", request);
-    const queued = actions.send("queued-after-broken", { ...request, text: "queued" });
+    const queued = actions.send("queued-after-broken", {
+      ...request,
+      reply: { messageId: "inbound-1" },
+      text: "queued",
+    });
     await assert.rejects(first, /storage/);
     await assert.rejects(queued, /storage/);
     assert.equal(calls, 1);
@@ -888,7 +921,7 @@ Deno.test("新策略在途被kill后仅新许可重入：固定防重键续链�
       }
       return Response.json({ id: `actual-${body.content}` });
     });
-    const head = { ...request, text: "head" };
+    const head = { ...request, reply: { messageId: "inbound-1" }, text: "head" };
     const tail = { ...request, text: "tail", reply: { messageId: "inbound-1", sequence: 2 } };
     let child: Deno.ChildProcess | undefined;
     let restart: QqSendActions | undefined;
