@@ -401,7 +401,9 @@ export class ScriptRuntime {
       ) throw new KernelError("rejected", "工具动作编号由脚本宿主提供");
       args._actionId = actionId;
     }
-    if (message.namespace === "phone" && ["send", "sendFile"].includes(message.method)) {
+    if (
+      message.namespace === "phone" && ["send", "sendFile", "sendBurst"].includes(message.method)
+    ) {
       if (
         args === null || typeof args !== "object" || Array.isArray(args) ||
         Object.hasOwn(args, "actionId")
@@ -435,7 +437,12 @@ export class ScriptRuntime {
         ) as unknown as Json
         : await this.ctx.call<Json>(message.namespace, message.method, args, {
           idempotencyKey: actionId,
-          timeoutMs: this.config.defaultTimeoutMs,
+          timeoutMs: message.namespace === "phone" && message.method === "waitForMessages"
+            ? Math.max(
+              this.config.defaultTimeoutMs,
+              Number((args as { maxWaitMs?: number }).maxWaitMs ?? 60_000) + 5_000,
+            )
+            : this.config.defaultTimeoutMs,
         });
       canonical(value);
       await this.store.change((state) => {

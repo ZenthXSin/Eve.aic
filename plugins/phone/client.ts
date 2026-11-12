@@ -65,11 +65,16 @@ export class PhoneRpcClient {
     const proof = method === "health" ? undefined : await this.ownershipProof?.();
     const actionId = method === "cancelSend"
       ? `cancel_${await fingerprint(captured)}`
-      : (method === "send" || method === "sendFile") && captured && typeof captured === "object" &&
+      : (method === "send" || method === "sendFile" || method === "sendBurst") && captured &&
+          typeof captured === "object" &&
           !Array.isArray(captured)
       ? captured.actionId
       : `read_${crypto.randomUUID()}`;
-    const signal = AbortSignal.any([this.#controller.signal, AbortSignal.timeout(this.timeoutMs)]);
+    // 最长静默等待可达120秒，给回执留余量；仍受插件关闭/调用中断约束。
+    const timeoutMs = method === "waitForMessages"
+      ? Math.max(this.timeoutMs, 125_000)
+      : this.timeoutMs;
+    const signal = AbortSignal.any([this.#controller.signal, AbortSignal.timeout(timeoutMs)]);
     try {
       let url = this.url;
       if (this.resolveUrl) {
@@ -137,7 +142,17 @@ export class PhoneRpcClient {
     } catch (error) {
       if (error instanceof PhoneRpcError) {
         if (
-          ["send", "sendFile", "cancelSend", "open", "settings", "download", "image", "file"]
+          [
+            "send",
+            "sendFile",
+            "sendBurst",
+            "cancelSend",
+            "open",
+            "settings",
+            "download",
+            "image",
+            "file",
+          ]
             .includes(method) &&
           ["transport", "invalid_response", "internal"].includes(error.category)
         ) {
@@ -147,7 +162,17 @@ export class PhoneRpcClient {
       }
       // 请求可能已经到达适配器；发送/打开超时不能声称动作没有执行。
       throw new PhoneRpcError(
-        ["send", "sendFile", "cancelSend", "open", "settings", "download", "image", "file"]
+        [
+            "send",
+            "sendFile",
+            "sendBurst",
+            "cancelSend",
+            "open",
+            "settings",
+            "download",
+            "image",
+            "file",
+          ]
             .includes(method)
           ? "unknown"
           : "transport",

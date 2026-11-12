@@ -161,6 +161,49 @@ export interface PhoneSend {
   wakeup?: boolean;
 }
 
+/** 显式一次发一至四条文字；不自动拆分代码、附件或普通send。 */
+export interface PhoneSendBurst {
+  actionId: string;
+  conversationId: string;
+  messages: string[];
+  /** 显式选择按约30字切分；总共超过四条会拒绝，绝不截断。默认false。 */
+  splitLongText?: boolean;
+  /** 新脚本继续原父请求：仅允许已存在父编号且全部原参数一致；不会重发已结束子条。 */
+  resumeActionId?: string;
+}
+export interface PhoneBurstReceipt {
+  actionId: string;
+  conversationId: string;
+  /** 每条均为独立真实动作；unknown/blocked可用该子编号检查和取消。 */
+  items: { index: number; actionId: string; receipt: PhoneActionReceipt }[];
+  /** 只有所有子消息实际sent才为true；取消不算送达。 */
+  complete: boolean;
+}
+/** 只读父请求；子receipt为null代表尚未准入，没有虚构发送状态。 */
+export interface PhoneBurstStatus {
+  actionId: string;
+  conversationId: string;
+  complete: boolean;
+  items: { index: number; actionId: string; receipt: PhoneActionReceipt | null }[];
+}
+export interface PhoneWaitForMessages {
+  conversationId: string;
+  purpose: "reply";
+  /** 默认10秒；新真实入站延长本会话静默窗口。范围1..60000。 */
+  quietMs?: number;
+  /** 默认60秒；有界等待，范围1..120000。到期由Eve决定下一步。 */
+  maxWaitMs?: number;
+}
+export interface PhoneMessagesWaitResult {
+  conversationId: string;
+  reason: "quiet" | "max_wait" | "interrupted";
+  waitedMs: number;
+  /** 当前真实手机时间线水位；应重新打开/读取会话，不代表自动确认已读。 */
+  throughSeq: number;
+  /** 本会话最近真实入站的手机编号；没有入站时省略。 */
+  lastIncomingSeq?: number;
+}
+
 export interface PhoneConversationSettings {
   muted: boolean;
   pinned: boolean;
@@ -243,6 +286,9 @@ export interface PhoneApi {
     hasMore: boolean;
   }>;
   send(args: PhoneSend): Promise<PhoneActionReceipt>;
+  sendBurst(args: PhoneSendBurst): Promise<PhoneBurstReceipt>;
+  burstStatus(args: { actionId: string }): Promise<PhoneBurstStatus | null>;
+  waitForMessages(args: PhoneWaitForMessages): Promise<PhoneMessagesWaitResult>;
   action(args: { actionId: string }): Promise<PhoneActionReceipt | null>;
   /** 队列分页不发送任何消息。发送中的请求不可取消；只有canCancel且有receiptDigest可提交取消。 */
   listSendQueue(
