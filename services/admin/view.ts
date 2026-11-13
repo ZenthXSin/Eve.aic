@@ -56,7 +56,15 @@ function time(value){if(!value)return '';const d=new Date(value);return Number.i
 function text(value){if(typeof value==='string')return value;if(value===undefined||value===null)return '';return pretty(value);}
 function bodyText(item){const d=item?.data??item;return text(item?.content??item?.text??item?.summary??d?.text??d?.summary??d?.content??d?.response?.content??d?.reason??item?.preview??d);}
 function node(tag,className,content){const n=document.createElement(tag);if(className)n.className=className;if(content!==undefined)n.textContent=content;return n;}
-async function api(path,body){const requestSession=csrf;let response;try{response=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'content-type':'application/json','x-eve-csrf':csrf},body:body===undefined?undefined:JSON.stringify(body),credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(35000)});}catch{throw new Error(body&&path==='/api/control'?'连接中断，操作结果尚未确认。请刷新状态核对后再操作。':'暂时无法连接管理服务，请稍后刷新。');}let wire;try{wire=await response.json();}catch{throw new Error('管理服务未返回有效数据，请稍后刷新。');}if(!wire.ok){if(response.status===401&&csrf===requestSession)showLogin();throw new Error(wire.error?.message||'请求失败');}return wire.value;}
+async function api(path,body){
+const requestSession=csrf,controller=new AbortController(),timer=setTimeout(()=>controller.abort(),35000);
+const connectionError=()=>new Error(body&&path==='/api/control'?'连接中断，操作结果尚未确认。请刷新状态核对后再操作。':controller.signal.aborted?'管理服务响应超时，请稍后刷新。':'暂时无法连接管理服务，请稍后刷新。');
+try{
+let response;try{response=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'content-type':'application/json','x-eve-csrf':csrf},body:body===undefined?undefined:JSON.stringify(body),credentials:'same-origin',cache:'no-store',signal:controller.signal});}catch{throw connectionError();}
+let wire;try{wire=await response.json();}catch{if(controller.signal.aborted)throw connectionError();throw new Error('管理服务未返回有效数据，请稍后刷新。');}
+if(!wire.ok){if(response.status===401&&csrf===requestSession)showLogin();throw new Error(wire.error?.message||'请求失败');}return wire.value;
+}finally{clearTimeout(timer);}
+}
 function showLogin(){clearBrowserHistory();livePoll=null;closeLiveSocket();clearWorkspace();csrf='';lastStatus=null;queueCount=null;activityThrough=null;budgetDirty=false;liveSnapshot=null;liveRawSnapshot=null;liveRenderedSeq=-1;liveFeedKey='';liveFreshAt=0;liveError=false;el('liveFeed').replaceChildren();el('app').hidden=true;el('login').hidden=false;el('status').textContent='';el('items').replaceChildren();el('detail').textContent='';el('detailRaw').textContent='';if(el('dialog').open)el('dialog').close();}
 function syncControls(){const paused=lastStatus?.supervisor?.paused??lastStatus?.paused;el('pause').disabled=busy||paused===true;el('resume').disabled=busy||paused!==true;el('resumeModel').disabled=busy||paused!==true;}
 async function run(work){if(busy)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);el('main').setAttribute('aria-busy','true');el('loadingText').textContent='正在同步…';message('');try{await work();}catch(error){message(error.message);}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false);el('main').setAttribute('aria-busy','false');el('loadingText').textContent='';syncControls();}}
