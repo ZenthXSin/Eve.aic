@@ -363,7 +363,7 @@ Deno.test("every catalog method and unknown future tool has a readable parameter
       assert(body.includes("结果-" + name), name);
       assert(body.includes("真实异常-" + name), name);
       assert(body.includes("有界预览"), name);
-      if (method === "write_thought") assert(body.includes("正文已在右侧呈现"));
+      if (method === "write_thought") assert(body.includes("正文已在随记栏呈现"));
     }
   }
   assert(index >= 55);

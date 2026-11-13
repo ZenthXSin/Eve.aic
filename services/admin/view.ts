@@ -1,66 +1,191 @@
-import { agentsCss, agentsMarkup, agentsScript } from "./agents-view.ts";
+import { agentsMarkup, agentsScript } from "./agents-view.ts";
 import { historyScript } from "./history-view.ts";
-import { timelineCss, timelineScript } from "./timeline-view.ts";
-import {
-  workspaceCss,
-  workspaceMarkup,
-  workspaceScript,
-  workspaceSocketScript,
-} from "./workspace-view.ts";
+import { liveScript } from "./live-view.ts";
+import { panelCss } from "./styles.ts";
+import { stageScript } from "./stage-view.ts";
+import { timelineScript } from "./timeline-view.ts";
+import { usageScript } from "./usage-view.ts";
+import { workspaceMarkup, workspaceScript, workspaceSocketScript } from "./workspace-view.ts";
 
-/** 所有业务内容均以文本节点显示；不将记录作为 HTML 执行。 */
-export function panelHtml(nonce: string) {
-  return String.raw`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Eve · 管理空间</title>
-<style nonce="${nonce}">
-:root{font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;color:#263831;background:#f5f6f2;font-synthesis:none;--green:#245d49;--muted:#69796f;--line:#e2e7df;--amber:#96621d;--red:#b6473a}*{box-sizing:border-box}body{margin:0;font-size:14px;line-height:1.6}button,input,select{font:inherit}button{cursor:pointer;border:1px solid var(--line);border-radius:9px;background:#fff;color:inherit;padding:9px 15px;transition:background .15s}button:hover{background:#edf2eb;border-color:#b5c8b9}button:disabled{opacity:.45;cursor:default}button.primary{background:var(--green);border-color:var(--green);color:white}button.danger{color:var(--red)}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid #d5a747;outline-offset:3px}input,select{border:1px solid #cdd6cc;border-radius:8px;padding:10px 12px;background:white;color:inherit;max-width:100%;min-width:0}h1,h2,h3,p{margin:0}h1{font-size:28px;letter-spacing:-1px;font-weight:650}h2{font-size:17px;font-weight:650}h3{font-size:14px}small,.muted{color:var(--muted)}[hidden]{display:none!important}.brand{display:flex;align-items:center;gap:11px}.mark{height:38px;width:38px;border-radius:13px;background:var(--green);color:#fff;display:grid;place-items:center;font-family:Georgia,serif;font-size:27px}.brand strong{display:block;font-size:19px;letter-spacing:1px}.brand small{font-size:11px;letter-spacing:1px}.shell{display:grid;grid-template-columns:218px minmax(0,1fr);min-height:100vh}.sidebar{padding:32px 21px;border-right:1px solid var(--line);background:#fcfcf9;display:flex;flex-direction:column;gap:35px}.sidebar nav{display:grid;gap:7px}.nav-button{background:transparent;border:0;text-align:left;padding:11px 14px;display:flex;align-items:center;gap:11px;font-weight:500}.nav-button[aria-current=page]{background:#e7eee4;color:var(--green);font-weight:650}.nav-icon{width:20px;text-align:center;font-size:17px}.nav-label{font-size:10px;letter-spacing:2px;margin:15px 14px 5px;color:#8b968b}.side-bottom{margin-top:auto;font-size:12px;color:var(--muted)}.side-bottom button{margin-top:14px;width:100%}.main{padding:34px 42px 24px;max-width:1500px;width:100%;margin:auto}.topbar{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:28px}.eyebrow{font-size:10px;color:var(--muted);letter-spacing:2px;margin-bottom:6px}.top-actions,.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.sync{font-size:12px;color:var(--muted)}.badge{display:inline-flex;align-items:center;gap:7px;border-radius:20px;padding:5px 11px;font-size:12px;background:#e9f1e7;color:var(--green);white-space:nowrap}.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.badge.warn{background:#fbefd9;color:var(--amber)}.badge.error{background:#fbeae7;color:var(--red)}.banner{display:flex;justify-content:space-between;align-items:center;gap:24px;padding:26px 28px;background:#e9efe4;border:1px solid #dce5d6;border-radius:15px;margin-bottom:20px}.banner h2{font-size:23px;margin-bottom:5px}.banner p{color:#5e7463;max-width:640px}.banner-icon{font-size:44px;color:#7e9b75;font-family:Georgia,serif}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:22px}.card,.panel{background:#fff;border:1px solid var(--line);border-radius:13px}.card{padding:20px 22px}.card .label{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:5px}.card .number{font-size:27px;line-height:1.5;letter-spacing:-.8px;margin:9px 0 2px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.card small{font-size:11px}.panel{padding:24px}.panel-title{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:20px}.grid-two{display:grid;grid-template-columns:1.1fr 1fr;gap:20px;margin-bottom:22px}.budget-viz{display:flex;align-items:center;gap:26px}.ring{width:154px;flex-shrink:0;position:relative}.ring svg{width:100%;display:block;transform:rotate(-90deg)}.ring circle{fill:none;stroke-width:10}.ring-base{stroke:#eef1eb}.ring-known{stroke:#2f6b51}.ring-reserved{stroke:#d0b67c}.ring-label{position:absolute;inset:0;display:grid;place-content:center;text-align:center}.ring-label strong{font-size:25px;font-weight:600}.ring-label small{font-size:10px}.legend{flex:1;min-width:0}.legend-row{display:flex;justify-content:space-between;gap:12px;margin:13px 0;font-size:12px}.legend-row strong{font-weight:550;font-variant-numeric:tabular-nums}.dot{display:inline-block;width:8px;height:8px;background:#2f6b51;border-radius:3px;margin-right:7px}.dot.reserved{background:#d0b67c}.dot.remaining{background:#dfe6da}.hint{font-size:12px;color:var(--muted);margin-top:16px;line-height:1.8}.health-row{display:flex;justify-content:space-between;align-items:center;padding:13px 0;border-bottom:1px solid #eef1eb;gap:15px}.health-row:last-child{border:0}.health-row span{font-size:13px}.health-row strong{font-weight:500;font-size:12px;text-align:right;overflow-wrap:anywhere}.section-link{border:0;color:var(--green);padding:3px;background:transparent;font-size:12px}.workspace-head{margin-bottom:20px}.workspace-head p{margin-top:7px;color:var(--muted);max-width:760px}.searchbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}.searchbar input{flex:1;min-width:130px}.searchbar select{max-width:170px}.items{display:grid;gap:12px}.record{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px 22px;min-width:0}.item-head{display:flex;align-items:flex-start;justify-content:space-between;gap:15px;margin-bottom:10px}.item-title{font-size:14px;font-weight:600;overflow-wrap:anywhere}.meta{color:var(--muted);font-size:11px;display:flex;gap:12px;flex-wrap:wrap;margin-top:5px}.record-body{white-space:pre-wrap;overflow-wrap:anywhere;color:#516156;font-size:13px;line-height:1.85;max-height:220px;overflow:auto}.record-actions{display:flex;gap:8px;flex-shrink:0}.record details{margin-top:12px;font-size:12px}.record summary,summary{color:var(--muted);cursor:pointer}.empty{padding:52px 24px;text-align:center;background:#fff;border:1px dashed #ccd7c9;border-radius:13px;color:var(--muted)}.empty strong{display:block;color:#425746;font-size:17px;margin-bottom:7px}.empty-mark{font-size:30px;margin-bottom:12px;color:#9cb192}.empty.error{border-color:#dba99e}.message{border-radius:9px;padding:12px 16px;margin:0 0 20px;background:#f9eddb;color:#805622;overflow-wrap:anywhere}.page-end{display:flex;justify-content:center;margin:20px 0}.notice{background:#fcf4e5;border:1px solid #f0dfbd;border-radius:10px;padding:16px;margin-bottom:18px;color:#805a22}.notice p{margin-bottom:12px}.settings-grid{display:grid;gap:20px;max-width:850px}.settings-grid label{display:block;margin-bottom:9px}.settings-grid .row{margin-top:14px}.settings-grid p{color:var(--muted);margin-top:8px}.settings-grid h2{margin-bottom:10px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;background:#f6f7f3;padding:16px;border-radius:8px;max-height:460px;overflow:auto;margin:12px 0 0}footer{font-size:11px;color:#8a968a;display:flex;justify-content:space-between;gap:15px;margin-top:30px;padding-top:18px;border-top:1px solid var(--line)}dialog{border:1px solid var(--line);border-radius:16px;padding:26px;width:min(850px,92vw);max-height:88vh;color:inherit;background:#fff}dialog::backdrop{background:#172b225e;backdrop-filter:blur(3px)}dialog h2{margin-right:auto}.dialog-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.detail-body{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.9;margin-top:20px;max-height:52vh;overflow:auto}.login-wrap{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(440px,100%);padding:40px;background:#fff;border:1px solid var(--line);border-radius:20px;box-shadow:0 20px 70px #243b2810}.login-card .brand{margin-bottom:36px}.login-card h1{font-size:25px;margin-bottom:9px}.login-card p{color:var(--muted);margin-bottom:28px}.login-card label{display:block;margin-bottom:8px}.login-card input{width:100%;margin-bottom:18px}.login-card button{width:100%}.login-card small{display:block;text-align:center;margin-top:24px}.skip{position:absolute;left:-9999px}.skip:focus{left:20px;top:10px;z-index:10;background:white;padding:10px}#loadingText{font-size:12px;color:var(--muted)}@media(min-width:1100px){.sidebar{position:sticky;top:0;height:100vh}.main{min-height:100vh}}@media(max-width:1100px){.main{padding:26px}.shell{grid-template-columns:180px minmax(0,1fr)}.sidebar{padding:26px 14px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-two{grid-template-columns:1fr}.budget-viz{justify-content:flex-start}}@media(max-width:700px){.shell{display:block}.sidebar{padding:16px;border-right:0;border-bottom:1px solid var(--line);gap:16px}.sidebar .brand{gap:8px}.sidebar nav{display:flex;overflow-x:auto;gap:5px;padding:3px 0}.nav-button{flex-shrink:0;white-space:nowrap;padding:9px 12px;font-size:12px}.nav-icon,.nav-label,.side-bottom{display:none}.main{padding:22px 16px}.topbar{align-items:flex-start;gap:12px}.top-actions{justify-content:flex-end;gap:7px}.top-actions button{padding:7px 10px}.sync{width:100%;text-align:right;font-size:10px}h1{font-size:24px}.banner{padding:20px;gap:10px}.banner h2{font-size:20px}.banner-icon{display:none}.banner p{font-size:12px}.cards{gap:10px}.card{padding:15px}.card .number{font-size:23px}.panel{padding:19px}.budget-viz{gap:18px}.ring{width:126px}.legend-row{font-size:11px}.item-head{flex-wrap:wrap}.record-actions{width:100%}.record{padding:17px}.searchbar button{padding:9px 11px}.searchbar select{max-width:145px}.login-card{padding:28px}footer{display:block}dialog{padding:20px}.dialog-head button{padding:7px 10px}}@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
-.usage-panel{margin-bottom:22px}.chart-readout{padding:12px 15px;border-radius:8px;background:#f3f6ef;font-size:12px;color:#52694f;margin-top:10px;min-height:44px}.chart-insight{border-left:3px solid #aac09f;padding:10px 14px;margin:16px 0;color:#53664e;background:#f6f8f2;font-size:12px}.dot.unknown{background:#d0b67c}svg g:focus{outline:none}svg g:focus rect{stroke:#947b38;stroke-width:2}.usage-summary{display:flex;gap:34px;flex-wrap:wrap;margin-bottom:15px}.usage-stat strong{font-size:26px;letter-spacing:-.7px;font-weight:600;display:block}.usage-stat span{font-size:11px;color:var(--muted)}.usage-chart{width:100%;height:auto;display:block;min-height:150px}.chart-legend{display:flex;gap:18px;font-size:11px;color:var(--muted);flex-wrap:wrap}.chart-data{width:100%;border-collapse:collapse;font-size:12px}.chart-data th,.chart-data td{text-align:left;border-bottom:1px solid var(--line);padding:9px 6px;font-variant-numeric:tabular-nums}.chart-table{overflow:auto}.usage-panel details{margin-top:15px;font-size:12px}.chart-empty{text-align:center;padding:40px;color:var(--muted)}#modelValue{font-size:22px;line-height:1.85}.record[data-resource="timeline"]{border-left:3px solid #a6bca0}.record[data-resource="qqFailures"]{border-left:3px solid #d0b67c}
-.live-hero{background:#233e30;color:#edf3e8;border-radius:15px;padding:26px 28px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:flex-start;gap:20px}.live-hero .eyebrow{color:#afc6a6}.live-hero h2{font-size:25px;margin:7px 0}.live-hero p{color:#c1d0b9;font-size:13px;max-width:760px}.live-hero .badge{background:#37533f;color:#e0eddb}.live-duration{font-variant-numeric:tabular-nums;white-space:nowrap;font-size:12px;color:#bbd0b2}.live-flow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}.flow-step{padding:15px 17px;border:1px solid var(--line);border-radius:10px;background:#fff;color:#82907e;font-size:12px}.flow-step strong{font-size:15px;display:block;font-weight:550}.flow-step.active{border-color:#97b48c;background:#e9f0e3;color:#2e603e}.live-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:20px;align-items:start}.thought-panel{position:sticky;top:22px}.thought-text{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:2;padding:18px 0;max-height:540px;overflow:auto}.live-filters{display:flex;gap:7px;flex-wrap:wrap;margin:18px 0}.live-filter{padding:5px 11px;font-size:12px}.live-filter[aria-pressed=true]{background:#e7eee1;border-color:#a9bfa0;color:#245d49}.live-feed{display:grid;gap:10px;max-height:740px;overflow:auto;overscroll-behavior:contain}.live-event{padding:15px 17px;background:#fff;border:1px solid var(--line);border-left:3px solid #c3cfb9;border-radius:9px;min-width:0}.live-event[data-category=thought]{border-left-color:#477650}.live-event[data-category=action]{border-left-color:#9ba9c6}.live-event[data-category=error]{border-left-color:#c57e69}.live-event h3{font-size:13px;line-height:1.7}.live-event p{font-size:12px;color:#65745e;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px}.live-event .meta{justify-content:space-between}.live-event button{font-size:11px;padding:2px 0;background:transparent;border:0;color:#537347}.live-follow{font-size:12px;white-space:nowrap}.live-toolbar{display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap;margin-bottom:18px}.live-source{font-size:11px;color:#84917b;margin-top:14px}.live-error{border-color:#dba99e;background:#fff3ef}.live-help{font-size:12px;color:var(--muted);margin-bottom:20px;max-width:900px}@media(max-width:1100px){.live-layout{grid-template-columns:1fr}.thought-panel{position:static}}@media(max-width:700px){.live-hero{padding:21px;flex-direction:column;gap:10px}.live-hero h2{font-size:21px}.live-flow{gap:6px}.flow-step{padding:10px 7px;font-size:10px}.flow-step strong{font-size:12px}.thought-text{max-height:330px;font-size:13px}.live-feed{max-height:600px}}
+/** 导航图标均为本站静态常量。 */
+const paths: Record<string, string> = {
+  live: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  overview:
+    '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  records: '<path d="M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3Z"/><path d="M9 9h6M9 13h4"/>',
+  agents:
+    '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/>',
+  queue: '<path d="M4 13 6.5 5h11L20 13v6H4Z"/><path d="M4 13h4.5l1.2 2.5h4.6l1.2-2.5H20"/>',
+  settings:
+    '<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
+  more:
+    '<circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/>',
+  refresh: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/>',
+  theme: '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/>',
+  logout: '<path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l-4-4 4-4M6 12h9"/>',
+};
+const icon = (id: string) =>
+  `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${paths[id]}</svg>`;
 
-/* 连续工作流：文字为主，操作按相邻步骤折叠。 */
-.workstream{--paper:#181a19;--ink:#e7eae6;--sub:#a0aaa2;--edge:#333a35;--accent:#a6cfb2;--hover:#272e29;background:var(--paper);color:var(--ink);border:1px solid var(--edge);border-radius:18px;max-width:1000px;margin:0 auto;position:relative;overflow:hidden;box-shadow:0 18px 55px #152b2010}
-.workstream[data-theme=light]{--paper:#fff;--ink:#263831;--sub:#69796f;--edge:#e2e7df;--accent:#245d49;--hover:#f0f4ed}
-.workstream .live-hero{border-radius:0;background:transparent;color:var(--ink);border-bottom:1px solid var(--edge);padding:27px 34px;margin:0;align-items:center}
-.workstream .live-hero h2{font-size:19px;letter-spacing:-.3px;margin:5px 0}.workstream .live-hero p{color:var(--sub);font-size:12px}.workstream .live-hero .eyebrow{color:var(--accent);font-size:10px;letter-spacing:2px}.workstream .live-duration{color:var(--accent)}
-.workstream .stream-heading{display:flex;justify-content:space-between;gap:12px;color:var(--sub);font-size:11px;padding:20px 34px 0}.workstream .live-filters{margin:16px 34px 8px;gap:6px}.workstream .live-filter{background:transparent;border:1px solid transparent;color:var(--sub);padding:5px 12px;border-radius:20px}.workstream .live-filter:hover,.workstream .live-filter[aria-pressed=true]{background:var(--hover);border-color:var(--edge);color:var(--ink)}
-.stream-caption{color:var(--sub);font-size:11px;padding:0 34px 15px}.workstream .live-feed{display:block;max-height:72vh;min-height:240px;overflow:auto;padding:10px 34px 30px;scrollbar-color:var(--edge) transparent;overflow-anchor:none}.stream-entry{margin:10px 0 36px;min-width:0}.stream-meta{display:flex;align-items:center;gap:10px;color:var(--sub);font-size:10px;letter-spacing:.4px;margin-bottom:12px}.stream-meta strong{color:var(--accent);font-size:11px;font-weight:600;letter-spacing:1.5px}.stream-meta button{margin-left:auto}.stream-prose{font-size:17px;line-height:1.95;white-space:pre-wrap;overflow-wrap:anywhere;letter-spacing:.15px}.workstream button.stream-original{background:transparent;border:0;color:var(--sub);font-size:10px;padding:3px 5px}.workstream button.stream-original:hover{color:var(--accent);background:var(--hover)}.stream-operations{margin:8px 0 30px;color:var(--sub);border-left:1px solid var(--edge);padding-left:16px}.stream-operations>summary{font-size:13px;line-height:1.9;list-style:none;color:var(--sub);padding:6px 0;display:flex;gap:10px;align-items:center}.stream-operations>summary::-webkit-details-marker{display:none}.stream-operations>summary::after{content:'›';font-size:22px;line-height:1;transition:transform .15s}.stream-operations[open]>summary::after{transform:rotate(90deg)}.stream-operations>summary:hover{color:var(--accent)}.stream-operation{padding:13px 0;border-bottom:1px solid var(--edge);font-size:12px;overflow-wrap:anywhere}.stream-operation:last-child{border-bottom:0}.stream-operation p{white-space:pre-wrap;line-height:1.9;margin:5px 0;color:var(--sub)}.stream-operation .stream-meta{margin:0 0 4px}.stream-operation strong{font-weight:500;color:var(--ink)}.stream-error{color:#e2a792!important}.stream-foot{border-top:1px solid var(--edge);padding:17px 34px;color:var(--sub);font-size:10px;line-height:1.9}.workstream .empty{background:transparent;border-color:var(--edge);color:var(--sub);font-size:13px}.workstream .stream-latest{display:block;margin:0 auto 18px;border:1px solid var(--edge);background:var(--hover);color:var(--accent);border-radius:24px;font-size:12px;padding:9px 20px}.workstream .live-error{background:#442e25}.stream-decision .stream-prose{font-size:12px;color:var(--sub);line-height:1.9}.stream-decision{margin-bottom:14px}.stream-truncated{font-size:11px;color:var(--sub);margin-top:12px}.live-help{margin:0}
-@media(max-width:700px){.workstream{border-radius:12px}.workstream .live-hero{padding:21px 20px;align-items:flex-start}.workstream .live-hero h2{font-size:18px}.workstream .live-feed{padding:4px 20px 22px;max-height:68vh}.workstream .stream-heading{padding:17px 20px 0;font-size:10px}.workstream .live-filters{margin:14px 14px 8px}.stream-caption{padding:0 20px 12px}.stream-prose{font-size:16px;line-height:1.95}.stream-entry{margin-bottom:28px}.stream-foot{padding:15px 20px}.stream-operations{padding-left:12px}.live-toolbar{gap:10px}.live-toolbar .row{width:100%;justify-content:flex-end}.stream-meta{gap:7px}}
-${workspaceCss}
-${agentsCss}
-${timelineCss}
-</style></head><body>
-<a class="skip" href="#main">跳到主要内容</a>
-<div id="login" class="login-wrap"><section class="login-card"><div class="brand"><span class="mark" aria-hidden="true">e</span><div><strong>Eve</strong><small>与你一起，持续生长</small></div></div><h1>欢迎回来</h1><p>看看 Eve 的近况，也照顾好她的运行空间。</p><form id="loginForm"><label for="token">管理员密码</label><input id="token" type="password" autocomplete="current-password" required maxlength="1024" placeholder="输入管理员密码"><button class="primary">进入管理空间 →</button></form><p id="loginMessage" role="status" aria-live="polite"></p><small>私密空间 · 安全会话登录</small></section></div>
-<div id="app" class="shell" hidden><aside class="sidebar"><div class="brand"><span class="mark" aria-hidden="true">e</span><div><strong>Eve</strong><small>管理空间</small></div></div><nav aria-label="主导航"><button class="nav-button" data-view="overview" aria-current="page"><span class="nav-icon" aria-hidden="true">◫</span>总览</button><button class="nav-button" data-view="live"><span class="nav-icon" aria-hidden="true">◉</span>此刻</button><p class="nav-label">她的世界</p><button class="nav-button" data-view="agents"><span class="nav-icon" aria-hidden="true">☏</span>子代理</button><button class="nav-button" data-view="timeline"><span class="nav-icon" aria-hidden="true">≋</span>意识流</button><button class="nav-button" data-view="notes"><span class="nav-icon" aria-hidden="true">▤</span>便签</button><button class="nav-button" data-view="memory"><span class="nav-icon" aria-hidden="true">◇</span>记忆</button><button class="nav-button" data-view="receipts"><span class="nav-icon" aria-hidden="true">↗</span>动作回执</button><p class="nav-label">管理</p><button class="nav-button" data-view="qqFailures"><span class="nav-icon" aria-hidden="true">☷</span>消息待处理</button><button class="nav-button" data-view="settings"><span class="nav-icon" aria-hidden="true">⚙</span>运行设置</button></nav><div class="side-bottom">用清晰的记录，理解每一步。<button id="logout">退出登录</button></div></aside>
-<main id="main" class="main"><header class="topbar"><div><p class="eyebrow">EVE / WORKSPACE</p><h1 id="pageTitle">总览</h1></div><div class="top-actions"><span id="liveBadge" class="badge warn">读取中</span><button id="refresh">↻ 刷新</button><button id="logoutMobile" aria-label="退出登录">退出</button><span id="sync" class="sync">等待同步</span></div></header>
-<p id="message" class="message" role="status" aria-live="polite" hidden></p><span id="loadingText" role="status" aria-live="polite"></span>
-<section id="overview"><div class="banner"><div><p class="eyebrow">此刻的 EVE</p><h2 id="greeting">正在了解她的近况</h2><p id="healthSummary">正在读取独立运行管理者的状态。</p></div><span class="banner-icon" aria-hidden="true">❋</span></div>
-<div class="cards"><article class="card"><div class="label">运行状态 <span aria-hidden="true">◉</span></div><div class="number" id="runningValue">—</div><small id="runningHint">等待读取</small></article><article class="card"><div class="label">当前模型 <span aria-hidden="true">◇</span></div><div class="number" id="modelValue">—</div><small id="modelHint">等待读取</small></article><article class="card"><div class="label">意识记录水位 <span aria-hidden="true">≋</span></div><div class="number" id="recordValue">—</div><small>累计序号，包含系统事件</small></article><article class="card"><div class="label">待处理会话队首 <span aria-hidden="true">↗</span></div><div class="number" id="queueValue">—</div><button class="section-link" data-view="qqFailures">查看会话队首 →</button></article></div>
-<section class="panel usage-panel"><div class="panel-title"><div><h2>上下文与缓存</h2><p class="hint" id="usageRange">读取最近真实请求用量…</p></div><span class="badge">真实用量</span></div><div class="usage-summary"><div class="usage-stat"><strong id="inputAverage">—</strong><span>平均输入 token</span></div><div class="usage-stat"><strong id="cacheHit">—</strong><span>按输入 token 加权命中</span></div><div class="usage-stat"><strong>150k</strong><span>平均输入目标 · 非硬上限</span></div></div><p id="usageInsight" class="chart-insight">正在分析已报告的请求用量。</p><div class="chart-legend"><span><i class="dot"></i>已缓存输入</span><span><i class="dot remaining"></i>非缓存输入</span><span><i class="dot unknown"></i>缓存未报告</span><span>┄ 150k 参考线</span></div><svg id="usageChart" class="usage-chart" viewBox="0 0 900 230" role="img" aria-labelledby="usageChartTitle"><title id="usageChartTitle">最近真实请求输入与缓存分布</title></svg><p id="chartReadout" class="chart-readout" aria-live="polite">点击柱形或用 Tab 聚焦，查看单次请求。</p><p id="usageEmpty" class="chart-empty" hidden></p><details><summary>查看每次请求的数值</summary><div class="chart-table"><table class="chart-data"><thead><tr><th>完成时间</th><th>请求</th><th>输入 token</th><th>缓存 token</th></tr></thead><tbody id="usageTable"></tbody></table></div></details><p class="hint">来自最近 80 条意识日志中的已报告用量。缺失或无效的缓存用量不按零命中计算；柱形按请求顺序等距排列，间距不代表时间间隔；此窗口不代表全天平均。</p></section><div class="grid-two"><section class="panel"><div class="panel-title"><h2>今日预算</h2><button class="section-link" data-view="settings">调整预算 →</button></div><div class="budget-viz"><div class="ring"><svg viewBox="0 0 140 140" role="img" aria-labelledby="budgetChartTitle"><title id="budgetChartTitle">今日 token 预算分配</title><circle class="ring-base" cx="70" cy="70" r="58"/><circle id="knownArc" class="ring-known" cx="70" cy="70" r="58" stroke-dasharray="0 365"/><circle id="reservedArc" class="ring-reserved" cx="70" cy="70" r="58" stroke-dasharray="0 365"/></svg><div class="ring-label"><strong id="budgetPercent">—</strong><small>安全预算已占用</small></div></div><div class="legend"><div class="legend-row"><span><i class="dot"></i>已知非缓存消耗</span><strong id="knownValue">—</strong></div><div class="legend-row"><span><i class="dot reserved"></i>未知用量预留</span><strong id="reservedValue">—</strong></div><div class="legend-row"><span><i class="dot remaining"></i>安全剩余</span><strong id="remainingValue">—</strong></div><div class="legend-row"><span>每日上限</span><strong id="budgetValue">—</strong></div></div></div><p class="hint" id="budgetHint">预算采用安全记账口径，未知预留不等于实际消耗。</p></section>
-<section class="panel"><div class="panel-title"><h2>运行脉络</h2><span class="muted">实时状态</span></div><div class="health-row"><span>执行服务</span><strong id="runtimeHealth">—</strong></div><div class="health-row"><span>实例所有权</span><strong id="ownerHealth">—</strong></div><div class="health-row"><span>版本更新</span><strong id="upgradeHealth">—</strong></div><div class="health-row"><span>便签 / 记忆记录水位</span><strong id="knowledgeHealth">—</strong></div><div class="health-row"><span>动作回执水位</span><strong id="receiptsHealth">—</strong></div><p class="hint">水位是日志累计序号，便签的多个版本会分别计入。</p></section></div><section class="panel"><div class="panel-title"><h2>需要留意</h2><span class="muted">从当前状态发现</span></div><p id="attention" class="muted">正在检查运行与模型状态。</p><div class="row"><button class="section-link" data-view="qqFailures">检查消息等待 →</button><button class="section-link" data-view="timeline">阅读最近意识记录 →</button></div></section></section>
-${workspaceMarkup}
-${agentsMarkup}<section id="records" hidden><div class="workspace-head"><h2 id="recordsTitle">意识流</h2><p id="recordsHint"></p></div><form id="searchForm" class="searchbar"><select id="scope" aria-label="记录范围"><option value="recent">最近 80 条范围</option><option value="all">全部记录范围</option></select><input id="query" type="search" placeholder="搜索记录中的文字…" aria-label="搜索文字" maxlength="512"><button class="primary">搜索</button><button type="button" id="clear">清除筛选</button></form><p id="listSummary" class="hint" role="status"></p><div id="items" class="items"></div><div class="page-end"><button id="more" hidden>加载更多记录 ↓</button></div></section>
-<section id="settings" class="settings-grid" hidden><section class="panel"><h2>运行控制</h2><p>暂停会交由独立管理者收拢当前执行。恢复后，Eve 可继续处理工作。</p><div class="row"><button id="pause">暂停运行</button><button id="resume" class="primary">恢复运行</button></div></section><div id="modelBlocked" class="notice" hidden><p id="blockedText"></p><button id="resumeModel">明确恢复被拒绝的模型</button></div><section class="panel"><h2>每日 token 预算</h2><p>采用安全记账口径。设置为 0 会阻止新增模型工作。</p><form id="budgetForm"><div class="row"><label for="budget">每日上限</label><input id="budget" type="number" min="0" step="1" required inputmode="numeric"><button class="primary">保存预算</button></div></form></section><section class="panel"><h2>技术详情</h2><p>需要排查问题时，可在这里核对管理者返回的原始状态。</p><details><summary>展开原始状态</summary><pre id="status"></pre></details><p class="hint">语义检索模型接入待办。当前检索能力以运行服务实际配置为准。</p></section></section>
-<footer><span>Eve · 每一步都有迹可循</span><span>状态每 30 秒同步 · 记录按需加载</span></footer></main></div>
-<dialog id="dialog" aria-labelledby="detailTitle"><div class="dialog-head"><h2 id="detailTitle">记录详情</h2><button id="versions" hidden>查看版本</button><button id="closeDetail" aria-label="关闭详情">关闭 ×</button></div><div id="detail" class="detail-body"></div><button id="detailMore" hidden>继续读取</button><details><summary>原始数据</summary><pre id="detailRaw"></pre></details></dialog>
-<script nonce="${nonce}">
+/** [目标视图, 导航分组, 图标, 名称]。记录分组包含意识流、便签、记忆与动作回执。 */
+const destinations = [
+  ["live", "live", "live", "实时"],
+  ["overview", "overview", "overview", "总览"],
+  ["timeline", "records", "records", "记录"],
+  ["agents", "agents", "agents", "子代理"],
+  ["qqFailures", "qqFailures", "queue", "待处理"],
+  ["settings", "settings", "settings", "设置"],
+] as const;
+const navButton = ([view, group, image, label]: readonly string[]) =>
+  `<button class="nav-button" data-view="${view}" data-nav="${group}">${
+    icon(image)
+  }<span>${label}</span>${
+    group === "qqFailures" ? '<span class="count queue-count" hidden></span>' : ""
+  }</button>`;
+const brand = (caption: string) =>
+  `<div class="brand"><span class="mark" aria-hidden="true">e</span><div><strong>Eve</strong><small>${caption}</small></div></div>`;
+const controls =
+  `<button data-control="pause">暂停运行</button><button data-control="resume" class="primary" hidden>恢复运行</button>`;
+
+const loginMarkup = `<div id="login" class="login-wrap"><section class="login-card">${
+  brand("管理面板")
+}
+<h1>登录</h1><p>查看 Eve 的运行情况，管理预算与待处理消息。</p>
+<form id="loginForm"><label for="token">管理员密码</label><input id="token" type="password" autocomplete="current-password" required maxlength="1024"><button class="primary">登录</button></form>
+<p id="loginMessage" role="status" aria-live="polite"></p></section></div>`;
+
+const shellMarkup = `<aside class="sidebar">${brand("管理面板")}
+<nav aria-label="主导航">${destinations.map(navButton).join("")}</nav>
+<div class="side-bottom"><button class="nav-button" data-theme-toggle>${
+  icon("theme")
+}<span>切换明暗</span></button><button class="nav-button" id="logout">${
+  icon("logout")
+}<span>退出登录</span></button></div></aside>`;
+
+const topbarMarkup =
+  `<header class="topbar"><div class="topbar-title"><span class="mark" aria-hidden="true">e</span><div><h1 id="pageTitle">实时</h1><p id="pageHint"></p></div></div>
+<div class="top-actions"><span id="sync" class="sync">等待同步</span><span id="liveBadge" class="badge warn">读取中</span><button id="refresh" class="icon-button" aria-label="刷新" title="刷新">${
+    icon("refresh")
+  }</button></div></header>
+<span id="loadingText" class="skip" role="status" aria-live="polite"></span>`;
+
+const overviewMarkup = `<section id="overview" class="view" hidden>
+<div class="hero" id="hero"><div><h2 id="greeting">正在读取状态</h2><p id="healthSummary">正在向运行管理者查询。</p></div><div class="row">${controls}<button data-view="live">看看她在做什么</button></div></div>
+<div id="attention" class="attention" aria-label="需要留意"></div>
+<div class="tiles">
+<article class="tile"><div class="label">今日预算已用</div><div class="number" id="tileBudget">—</div><svg class="meter" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect class="meter-known" id="meterKnown" height="6" width="0"/><rect class="meter-reserved" id="meterReserved" height="6" width="0"/></svg><small id="tileBudgetHint">等待读取</small></article>
+<article class="tile"><div class="label">当前模型</div><div class="number text" id="modelValue">—</div><small id="modelHint">等待读取</small></article>
+<article class="tile"><div class="label">意识流记录</div><div class="number" id="recordValue">—</div><button class="link" data-view="timeline">阅读最近记录</button></article>
+<article class="tile"><div class="label">待处理消息</div><div class="number" id="queueValue">—</div><button class="link" data-view="qqFailures">查看并处理</button></article>
+</div>
+<div class="grid-two">
+<section class="panel usage-panel"><div class="panel-title"><div><h2>每次请求的输入量</h2><p class="hint" id="usageRange">读取最近的真实请求用量…</p></div></div>
+<div class="usage-summary"><div class="usage-stat"><strong id="inputAverage">—</strong><span>平均输入 token</span></div><div class="usage-stat"><strong id="cacheHit">—</strong><span>缓存命中率（按 token 加权）</span></div><div class="usage-stat"><strong>150k</strong><span>平均输入目标，非硬上限</span></div></div>
+<p id="usageInsight" class="chart-insight">正在分析已报告的请求用量。</p>
+<div class="chart-legend"><span><i class="dot"></i>已缓存</span><span><i class="dot remaining"></i>未缓存</span><span><i class="dot unknown"></i>缓存未报告</span><span>┄ 150k 目标</span></div>
+<div class="chart-scroll"><svg id="usageChart" class="usage-chart" viewBox="0 0 900 230" role="img" aria-labelledby="usageChartTitle"><title id="usageChartTitle">最近真实请求输入与缓存分布</title></svg></div>
+<p id="chartReadout" class="chart-readout" aria-live="polite">点按柱形查看单次请求。</p><p id="usageEmpty" class="chart-empty" hidden></p>
+<details><summary>以表格查看</summary><div class="chart-table"><table class="chart-data"><thead><tr><th>完成时间</th><th>请求</th><th>输入 token</th><th>缓存 token</th></tr></thead><tbody id="usageTable"></tbody></table></div></details>
+<p class="hint">取自最近 80 条意识流记录。未报告缓存的请求不计入命中率；柱形按请求顺序排列，间距不代表时间；这个窗口不代表全天平均。</p></section>
+<div class="stack">
+<section class="panel"><div class="panel-title"><h2>今日预算</h2><button class="link" data-view="settings">调整</button></div>
+<div class="budget-viz"><div class="ring"><svg viewBox="0 0 140 140" role="img" aria-labelledby="budgetChartTitle"><title id="budgetChartTitle">今日 token 预算分配</title><circle class="ring-base" cx="70" cy="70" r="58"/><circle id="knownArc" class="ring-known" cx="70" cy="70" r="58" stroke-dasharray="0 365"/><circle id="reservedArc" class="ring-reserved" cx="70" cy="70" r="58" stroke-dasharray="0 365"/></svg><div class="ring-label"><strong id="budgetPercent">—</strong><small>已占用</small></div></div>
+<div class="legend"><div class="legend-row"><span><i class="dot"></i>已确认消耗</span><strong id="knownValue">—</strong></div><div class="legend-row"><span><i class="dot reserved"></i>为未知用量预留</span><strong id="reservedValue">—</strong></div><div class="legend-row"><span><i class="dot remaining"></i>还可使用</span><strong id="remainingValue">—</strong></div><div class="legend-row"><span>每日上限</span><strong id="budgetValue">—</strong></div></div></div>
+<p class="hint" id="budgetHint">按安全口径记账：预留不等于实际消耗。</p></section>
+<section class="panel"><div class="panel-title"><h2>运行详情</h2></div><div class="facts">
+<div><span>执行服务</span><strong id="runtimeHealth">—</strong></div>
+<div><span>当前实例</span><strong id="runningHint">—</strong></div>
+<div><span>实例所有权</span><strong id="ownerHealth">—</strong></div>
+<div><span>版本更新</span><strong id="upgradeHealth">—</strong></div>
+<div><span>便签 / 记忆记录数</span><strong id="knowledgeHealth">—</strong></div>
+<div><span>动作回执记录数</span><strong id="receiptsHealth">—</strong></div>
+</div><p class="hint">记录数是日志累计序号；便签的每个版本分别计入。</p></section>
+</div></div></section>`;
+
+const recordsMarkup = `<section id="records" class="view" hidden>
+<div class="segmented" id="recordTabs" role="group" aria-label="记录类型"><button data-view="timeline" data-tab="timeline">意识流</button><button data-view="notes" data-tab="notes">便签</button><button data-view="memory" data-tab="memory">记忆</button><button data-view="receipts" data-tab="receipts">动作回执</button></div>
+<form id="searchForm" class="searchbar"><input id="query" type="search" placeholder="搜索记录中的文字" aria-label="搜索文字" maxlength="512"><select id="scope" aria-label="记录范围"><option value="recent">最近 80 条</option><option value="all">全部记录</option></select><button class="primary">搜索</button><button type="button" id="clear" class="quiet">清除</button></form>
+<div id="recordChips" class="chips" role="group" aria-label="按类型筛选"><button data-record-filter="all" aria-pressed="true">全部</button><button data-record-filter="thought" aria-pressed="false">想法</button><button data-record-filter="message" aria-pressed="false">通知</button><button data-record-filter="tool" aria-pressed="false">工具</button><button data-record-filter="error" aria-pressed="false">异常</button><button data-record-filter="other" aria-pressed="false">其他</button></div>
+<p id="recordsHint" class="hint"></p><p id="listSummary" class="hint" role="status"></p>
+<div id="items" class="items"></div>
+<div class="page-end"><button id="more" hidden>加载更多</button></div></section>`;
+
+const settingsMarkup = `<section id="settings" class="view settings-grid" hidden>
+<div id="modelBlocked" class="notice wide" hidden><p id="blockedText"></p><button id="resumeModel">解除模型阻塞</button></div>
+<section class="panel"><h2>运行控制</h2><p>暂停后，运行管理者会等当前这一步收尾再停下；恢复后 Eve 继续工作。</p><div class="row">${controls}</div></section>
+<section class="panel"><h2>每日 token 预算</h2><p>按安全口径记账。设为 0 会阻止新的模型请求。</p><form id="budgetForm"><div class="row"><label for="budget">每日上限</label><input id="budget" type="number" min="0" step="1" required inputmode="numeric"><button class="primary">保存</button></div><p id="budgetPreview" class="hint"></p></form></section>
+<section class="panel"><h2>外观</h2><p>只保存在这台设备的浏览器中。</p><div class="segmented" role="group" aria-label="外观"><button data-theme-choice="auto" aria-pressed="true">跟随系统</button><button data-theme-choice="light" aria-pressed="false">浅色</button><button data-theme-choice="dark" aria-pressed="false">深色</button></div></section>
+<section class="panel"><h2>技术详情</h2><p>排查问题时，可核对运行管理者返回的原始状态。</p><details><summary>展开原始状态</summary><pre id="status"></pre></details><p class="hint">语义检索模型接入待办。当前检索能力以运行服务实际配置为准。</p></section>
+</section>`;
+
+const overlayMarkup = `<nav class="tabbar" aria-label="快捷导航">${
+  destinations.filter(([, group]) => !["agents", "settings"].includes(group)).map(navButton).join(
+    "",
+  )
+}<button class="nav-button" id="navMore" data-nav="more" aria-haspopup="dialog">${
+  icon("more")
+}<span>更多</span></button></nav>
+<dialog id="moreSheet" class="sheet" aria-label="更多">${
+  destinations.filter(([, group]) => ["agents", "settings"].includes(group)).map(navButton).join("")
+}<button class="nav-button" data-theme-toggle>${
+  icon("theme")
+}<span>切换明暗</span></button><button class="nav-button" id="logoutSheet">${
+  icon("logout")
+}<span>退出登录</span></button></dialog>
+<dialog id="dialog" class="drawer" aria-labelledby="detailTitle"><div class="dialog-head"><h2 id="detailTitle">记录详情</h2><button id="versions" class="small" hidden>历史版本</button><button id="closeDetail" class="small" aria-label="关闭详情">关闭</button></div><div class="drawer-body"><div id="detail" class="detail-body"></div><button id="detailMore" hidden>继续读取</button><details><summary>原始数据</summary><pre id="detailRaw"></pre></details></div></dialog>
+<dialog id="confirm" class="confirm" aria-labelledby="confirmTitle"><h2 id="confirmTitle"></h2><p id="confirmText"></p><div class="row"><button id="confirmCancel">取消</button><button id="confirmOk" class="primary">确定</button></div></dialog>
+<p id="message" class="toast" role="status" aria-live="polite" hidden></p>`;
+
+const coreScript = String.raw`
 'use strict';
 const el=id=>document.getElementById(id);
-let csrf='',busy=false,activeView='overview',currentResource='timeline',currentOperation='page',next=null,detailArgs=null,detailOperation='get',detailResource=null,blockedRequestId=null,lastStatus=null,loaded=0,queueCount=null,queueHasMore=false,budgetDirty=false,activityThrough=null,liveFollow=true,liveSnapshot=null,liveRawSnapshot=null,liveFilter='thought',liveFreshAt=0,liveRenderedSeq=-1,liveError=false,liveFeedKey='';
+const inBrowser=typeof window!=='undefined';
+let csrf='',busy=false,activeView='live',currentResource='timeline',currentOperation='page',next=null,detailArgs=null,detailOperation='get',detailResource=null,blockedRequestId=null,lastStatus=null,loaded=0,queueCount=null,queueHasMore=false,budgetDirty=false,activityThrough=null,liveFollow=true,liveSnapshot=null,liveRawSnapshot=null,liveFilter='thought',liveFreshAt=0,liveRenderedSeq=-1,liveError=false,liveFeedKey='',recordFilter='all',listSummaryText='',messageTimer=null,askResolve=null;
 const pretty=value=>JSON.stringify(value,null,2),num=value=>Number.isFinite(value)?new Intl.NumberFormat('zh-CN').format(value):'—';
-const labels={agents:'子代理',overview:'总览',live:'此刻',timeline:'意识流',notes:'便签',memory:'记忆',receipts:'动作回执',qqFailures:'消息待处理',settings:'运行设置'};
-const hints={timeline:'从最近的记录了解 Eve 的思考、请求与经历。需要追溯时，可切换到全部记录范围。',notes:'她整理的便签与版本。优先展示短名字、标题与摘要，完整编号保留在详情中。',memory:'她留下的记忆。阅读内容、来源与强度，了解哪些经历被记住。',receipts:'查看动作的执行结果与关联记录。失败和送达未知保留原始回执。',qqFailures:'这里只列出阻塞会话的失败或送达未知队首。取消等待不会撤回可能已经送达的消息；取消后，同一会话的后续消息才可继续。'};
+const labels={live:'实时',overview:'总览',timeline:'意识流',notes:'便签',memory:'记忆',receipts:'动作回执',agents:'子代理',qqFailures:'待处理',settings:'设置'};
+const recordViews=['timeline','notes','memory','receipts'];
+const pageHints={live:'Eve 此刻在做什么，以及她写下的文字',overview:'运行状态、预算与模型用量',records:'阅读 Eve 的意识流、便签、记忆与动作回执',agents:'Eve 委派出去的独立会话',qqFailures:'发送失败或结果未知、正挡住会话的消息',settings:'运行控制、预算与外观'};
+const hints={timeline:'按时间记录 Eve 的想法、收到的通知和工具调用。',notes:'Eve 自己整理的便签，打开可阅读全文和历史版本。',memory:'Eve 形成的记忆，附来源与强度。',receipts:'每个动作的执行结果。失败与送达未知会保留原始回执。',qqFailures:'这些消息发送失败或结果未知，正挡住同一会话后面的消息。取消等待不会撤回可能已送达的消息，只是让后续消息继续发送。'};
 const kindNames={thought:'思考',model_start:'发起模型请求',model_complete:'模型请求完成',model_error:'模型请求异常',context_projection:'更新上下文投影',context_summary:'整理上下文',compression:'压缩上下文',upgrade_rollback:'版本回滚',self_reflection:'自己的待办浮现',notice:'收到通知',formation:'形成记忆',note:'便签更新',script_start:'开始脚本',script_complete:'脚本完成',wake:'唤醒',rest:'休息'};
-
-function svgNode(tag,attributes,content){const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [key,value]of Object.entries(attributes))n.setAttribute(key,String(value));if(content!==undefined)n.textContent=content;return n;}
-async function activity(force=false){const through=lastStatus?.runtime?.throughSeq;if(!Number.isSafeInteger(through))return;if(!force&&activityThrough===through)return;const chart=el('usageChart');el('usageRange').textContent='正在读取最近 80 条意识日志…';try{let args={afterSeq:Math.max(0,through-80),throughSeq:through},events=[];for(let i=0;i<10;i++){const value=await api('/api/query',{resource:'timeline',operation:'page',args});events.push(...(value.items??[]));if(!value.next)break;args=value.next;}const responses=events.filter(e=>e.kind==='model_response');const rows=responses.map(e=>({at:e.at,id:e.data?.requestId,usage:e.data?.response?.usage})).filter(e=>e.usage?.status!=='invalid'&&Number.isSafeInteger(e.usage?.inputTokens)&&e.usage.inputTokens>=0);paintUsage(rows,responses.length,through);activityThrough=through;}catch(error){el('usageRange').textContent='用量读取失败 · 点击刷新重试';el('inputAverage').textContent='—';el('cacheHit').textContent='—';chart.replaceChildren(svgNode('title',{id:'usageChartTitle'},'用量读取失败'));el('usageTable').replaceChildren();el('usageInsight').textContent='用量尚未确认，无法判断是否达到平均输入目标。';el('chartReadout').textContent='暂无可读取的单次请求。';el('usageEmpty').hidden=false;el('usageEmpty').textContent='暂时无法读取用量；未将连接失败视为零消耗。';if(!csrf)throw error;}}
-function paintUsage(rows,responseCount,through){const chart=el('usageChart');chart.replaceChildren(svgNode('title',{id:'usageChartTitle'},'最近真实请求输入与缓存分布'));el('usageTable').replaceChildren();el('usageEmpty').hidden=rows.length>0;el('usageEmpty').textContent='最近 80 条日志中没有可用的已报告用量。';chart.hidden=!rows.length;const cacheRows=rows.filter(r=>Number.isSafeInteger(r.usage.cachedInputTokens)&&r.usage.cachedInputTokens>=0&&r.usage.cachedInputTokens<=r.usage.inputTokens);const total=rows.reduce((s,r)=>s+r.usage.inputTokens,0),cacheInput=cacheRows.reduce((s,r)=>s+r.usage.inputTokens,0),cached=cacheRows.reduce((s,r)=>s+r.usage.cachedInputTokens,0);el('inputAverage').textContent=rows.length?num(Math.round(total/rows.length)):'—';el('cacheHit').textContent=cacheInput>0?(cached/cacheInput*100).toFixed(1)+'%':'未报告';el('usageRange').textContent=rows.length+' 次输入样本 · '+cacheRows.length+' 次缓存样本 · 日志水位 '+num(through)+(responseCount>rows.length?' · '+(responseCount-rows.length)+' 次响应未提供可用用量':'')+(rows.length?' · '+time(rows[0].at)+' 至 '+time(rows.at(-1).at):'');el('chartReadout').hidden=!rows.length;el('usageInsight').textContent=rows.length?'这 '+rows.length+' 次请求的平均输入为目标的 '+(total/rows.length/150000*100).toFixed(1)+'%，'+(total/rows.length<=150000?'低于':'高于')+' 150k 目标 '+num(Math.round(Math.abs(150000-total/rows.length)))+' token。缓存统计覆盖 '+cacheRows.length+'/'+rows.length+' 次请求'+(cacheRows.length<rows.length?'，其余请求未计入命中率。':'。'):'当前没有可用用量，不能判断是否达到目标。';if(!rows.length)return;const max=Math.max(150000,...rows.map(r=>r.usage.inputTokens))*1.13,left=58,right=880,top=18,bottom=185,height=bottom-top,width=right-left,step=width/rows.length,bar=Math.min(44,step*.56),y=v=>bottom-v/max*height;for(const value of [0,Math.round(max/2),Math.round(max)]){chart.append(svgNode('line',{x1:left,x2:right,y1:y(value),y2:y(value),stroke:'#e8ede4'}),svgNode('text',{x:left-9,y:y(value)+4,'text-anchor':'end',fill:'#83917f','font-size':11},value===0?'0':Math.round(value/1000)+'k'));}chart.append(svgNode('line',{x1:left,x2:right,y1:y(150000),y2:y(150000),stroke:'#bb9a5a','stroke-dasharray':'5 5'}),svgNode('text',{x:right,y:y(150000)-7,'text-anchor':'end',fill:'#9a7d42','font-size':10},'150k 目标'));rows.forEach((r,i)=>{const x=left+step*(i+.5),u=r.usage,valid=cacheRows.includes(r),c=valid?u.cachedInputTokens:0,group=svgNode('g',{tabindex:0,'aria-label':time(r.at)+'，输入 '+num(u.inputTokens)+'，缓存 '+(valid?num(c):'未报告')});group.append(svgNode('title',{},time(r.at)+' / '+r.id+'\n输入 '+num(u.inputTokens)+' · 缓存 '+(valid?num(c):'未报告')),svgNode('rect',{x:x-bar/2,y:y(u.inputTokens),width:bar,height:Math.max(0,bottom-y(u.inputTokens)),fill:valid?'#dfe6da':'#d0b67c',rx:4}),svgNode('rect',{x:x-bar/2,y:y(c),width:bar,height:Math.max(0,bottom-y(c)),fill:'#32684e',rx:3}));const readout=()=>{el('chartReadout').textContent=time(r.at)+' · '+(r.id??'请求')+' · 输入 '+num(u.inputTokens)+' token · '+(valid?'已缓存 '+num(c)+' · 非缓存 '+num(u.inputTokens-c)+' · 命中 '+(u.inputTokens>0?(c/u.inputTokens*100).toFixed(1)+'%':'无输入'):'缓存未报告，未计入命中率');};group.addEventListener('focus',readout);group.addEventListener('click',readout);if(i===rows.length-1)readout();chart.append(group);if(rows.length<=12||i===0||i===rows.length-1)chart.append(svgNode('text',{x,y:bottom+22,'text-anchor':'middle',fill:'#83917f','font-size':10},new Date(r.at).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'})));const tr=node('tr');for(const cell of [time(r.at),r.id??'—',num(u.inputTokens),valid?num(c):'未报告'])tr.append(node('td','',cell));el('usageTable').append(tr);});}
-
-function message(text){el('message').textContent=text||'';el('message').hidden=!text;el('loginMessage').textContent=text||'';}
+function navGroup(view){return recordViews.includes(view)?'records':view;}
 function time(value){if(!value)return '';const d=new Date(value);return Number.isFinite(d.getTime())?d.toLocaleString('zh-CN',{hour12:false}):String(value);}
 function text(value){if(typeof value==='string')return value;if(value===undefined||value===null)return '';return pretty(value);}
 function bodyText(item){const d=item?.data??item;return text(item?.content??item?.text??item?.summary??d?.text??d?.summary??d?.content??d?.response?.content??d?.reason??item?.preview??d);}
 function node(tag,className,content){const n=document.createElement(tag);if(className)n.className=className;if(content!==undefined)n.textContent=content;return n;}
+
+/* 提示条：登录前显示在登录卡片内，登录后以浮动提示出现并自动消失。 */
+function message(content,tone){
+  const shown=content||'';
+  if(messageTimer!==null){clearTimeout(messageTimer);messageTimer=null;}
+  el('loginMessage').textContent=csrf?'':shown;
+  el('message').textContent=shown;el('message').hidden=!shown||!csrf;
+  el('message').className='toast'+(tone==='error'?' error':'');
+  if(shown&&csrf)messageTimer=setTimeout(()=>{messageTimer=null;el('message').hidden=true;},tone==='error'?9000:5000);
+}
+/* 确认框：须在 run() 之外等待，否则全局禁用会连确认按钮一起禁用。 */
+function ask(title,body,okLabel,danger){
+  return new Promise(resolve=>{
+    askResolve=resolve;
+    el('confirmTitle').textContent=title;el('confirmText').textContent=body;
+    el('confirmOk').textContent=okLabel||'确定';el('confirmOk').className=danger?'danger':'primary';
+    el('confirm').returnValue='';el('confirm').showModal();
+  });
+}
+el('confirm').addEventListener('close',()=>{const resolve=askResolve;askResolve=null;if(resolve)resolve(el('confirm').returnValue==='ok');});
+el('confirmOk').addEventListener('click',()=>el('confirm').close('ok'));
+el('confirmCancel').addEventListener('click',()=>el('confirm').close(''));
+
+/* 外观：未选择时跟随系统；选择只保存在本机浏览器。 */
+const themeKey='eve.admin-theme';
+function themeChoice(){try{const saved=localStorage.getItem(themeKey);return saved==='light'||saved==='dark'?saved:'auto';}catch{return 'auto';}}
+function themeResolved(){const choice=themeChoice();if(choice!=='auto')return choice;return typeof matchMedia==='function'&&matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}
+function applyTheme(){const root=document.documentElement;if(root)root.setAttribute('data-theme',themeResolved());const choice=themeChoice();document.querySelectorAll('[data-theme-choice]').forEach(n=>n.setAttribute('aria-pressed',String(n.dataset.themeChoice===choice)));}
+function setTheme(choice){try{if(choice==='auto')localStorage.removeItem(themeKey);else localStorage.setItem(themeKey,choice);}catch{}applyTheme();}
+document.querySelectorAll('[data-theme-choice]').forEach(n=>n.addEventListener('click',()=>setTheme(n.dataset.themeChoice)));
+document.querySelectorAll('[data-theme-toggle]').forEach(n=>n.addEventListener('click',()=>setTheme(themeResolved()==='dark'?'light':'dark')));
+if(typeof matchMedia==='function')matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyTheme);
+applyTheme();
+
 async function api(path,body){
 const requestSession=csrf,controller=new AbortController(),timer=setTimeout(()=>controller.abort(),35000);
 const connectionError=()=>new Error(body&&path==='/api/control'?'连接中断，操作结果尚未确认。请刷新状态核对后再操作。':controller.signal.aborted?'管理服务响应超时，请稍后刷新。':'暂时无法连接管理服务，请稍后刷新。');
@@ -70,59 +195,234 @@ let wire;try{wire=await response.json();}catch{if(controller.signal.aborted)thro
 if(!wire.ok){if(response.status===401&&csrf===requestSession)showLogin();throw new Error(wire.error?.message||'请求失败');}return wire.value;
 }finally{clearTimeout(timer);}
 }
-function showLogin(){clearAgentPanel();clearBrowserHistory();livePoll=null;closeLiveSocket();clearWorkspace();csrf='';lastStatus=null;queueCount=null;activityThrough=null;budgetDirty=false;liveSnapshot=null;liveRawSnapshot=null;liveRenderedSeq=-1;liveFeedKey='';liveFreshAt=0;liveError=false;el('liveFeed').replaceChildren();el('app').hidden=true;el('login').hidden=false;el('status').textContent='';el('items').replaceChildren();el('detail').textContent='';el('detailRaw').textContent='';if(el('dialog').open)el('dialog').close();}
-function syncControls(){const paused=lastStatus?.supervisor?.paused??lastStatus?.paused;el('pause').disabled=busy||paused===true;el('resume').disabled=busy||paused!==true;el('resumeModel').disabled=busy||paused!==true;}
-async function run(work){if(busy)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);el('main').setAttribute('aria-busy','true');el('loadingText').textContent='正在同步…';message('');try{await work();}catch(error){message(error.message);}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false);el('main').setAttribute('aria-busy','false');el('loadingText').textContent='';syncControls();}}
-function paintStatus(value){lastStatus=value;el('status').textContent=pretty(value);const r=value?.runtime??{},s=value?.supervisor??value,o=value?.ownership??{},b=r.budget??value.budget??{},blocked=r.model?.blocked??null;blockedRequestId=blocked?.requestId??null;const paused=s.paused===true||b.paused===true,available=r.available;const state=blocked?'模型已阻塞':paused?'已暂停':available===false?'服务不可用':available===true?'运行中':'状态待确认';el('liveBadge').textContent=state;el('liveBadge').className='badge'+(blocked||available===false?' error':paused||available!==true?' warn':'');el('runningValue').textContent=state;el('runningHint').textContent=s.current?'实例 '+s.current:'管理者未提供当前实例';el('modelValue').textContent=r.model?.current?.model??'—';el('modelHint').textContent=r.model?.current?.revision!==undefined?'模型配置版本 '+r.model.current.revision:'等待模型配置';el('recordValue').textContent=num(r.throughSeq);el('runtimeHealth').textContent=available===true?'可用':available===false?'不可用':'未知';el('ownerHealth').textContent=o.owner?.instanceId??(o.mode==='paused'?'已暂停':'未提供');el('upgradeHealth').textContent=s.upgrade?'更新中 · '+(s.upgrade.phase??'准备中'):s.lastOutcome?.outcome==='confirmed'?'当前版本已确认':s.lastOutcome?.outcome??'暂无更新记录';el('knowledgeHealth').textContent=num(r.notesThroughSeq)+' / '+num(r.memoryThroughSeq);el('receiptsHealth').textContent=num(r.receiptsThroughSeq);el('greeting').textContent=blocked?'有一件事需要你留意':paused?'Eve 正在暂停中':available===true?'Eve 的工作空间已就绪':'暂时无法确认运行状态';el('healthSummary').textContent=blocked?'上游拒绝了模型请求，自动重试已停止。请到运行设置中检查原因。':paused?'当前执行已交由管理者暂停。准备好后，可在运行设置中恢复。':available===true?'执行服务可用。你可以阅读她的记录，或检查消息等待与今日预算。':'请刷新状态，核对管理服务和执行服务的连接。';
-const amount=b.dailyTokenBudget??value.dailyTokenBudget;if(Number.isSafeInteger(amount)&&!budgetDirty&&document.activeElement!==el('budget'))el('budget').value=String(amount);el('budgetValue').textContent=num(amount);el('knownValue').textContent=num(b.knownNoncachedTokens);el('reservedValue').textContent=num(b.unknownReservedTokens);el('remainingValue').textContent=num(b.safeRemaining);const valid=Number.isFinite(amount)&&amount>0&&Number.isFinite(b.knownNoncachedTokens)&&Number.isFinite(b.unknownReservedTokens);const known=valid?Math.min(1,Math.max(0,b.knownNoncachedTokens/amount)):0,reserved=valid?Math.min(1-known,Math.max(0,b.unknownReservedTokens/amount)):0;el('knownArc').setAttribute('stroke-dasharray',(known*365)+' 365');el('reservedArc').setAttribute('stroke-dasharray',(reserved*365)+' 365');el('reservedArc').setAttribute('stroke-dashoffset',String(-known*365));el('budgetPercent').textContent=valid?Math.round((b.knownNoncachedTokens+b.unknownReservedTokens)/amount*100)+'%':amount===0?'停用':'—';el('budgetChartTitle').textContent='今日预算：已知非缓存消耗 '+num(b.knownNoncachedTokens)+'，未知预留 '+num(b.unknownReservedTokens)+'，安全剩余 '+num(b.safeRemaining);el('budgetHint').textContent=(b.day?'记账日 '+b.day+' · '+(b.timeZone??'')+'。':'')+'未知预留不等于实际消耗；此图不表示缓存命中率。';
-el('modelBlocked').hidden=!blocked;el('resumeModel').hidden=!blocked;el('blockedText').textContent=blocked?'模型请求已停止自动重试：'+blocked.category+'，HTTP '+blocked.httpStatus+'。请先暂停运行，核实上游原因，再明确恢复。':'';const notices=[];if(blocked)notices.push('模型请求阻塞，请到运行设置处理。');if(paused)notices.push('Eve 当前处于暂停状态。');if(available===false)notices.push('执行服务当前不可用。');if(b.safeRemaining===0)notices.push('今日安全预算已用尽。');if(s.upgrade)notices.push('版本正在更新，等待监督确认。');if(queueCount===null)notices.push('消息等待情况尚未确认，可刷新或打开消息待处理查看。');if(queueCount>0)notices.push('有 '+queueCount+' 个'+(queueHasMore?'或更多':'')+'会话队首等待处理。');el('attention').textContent=notices.join(' ')||'当前返回的运行与预算状态没有需要特别处理的提示。';el('sync').textContent='同步于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});syncControls();}
+function showLogin(){clearAgentPanel();clearBrowserHistory();livePoll=null;closeLiveSocket();clearWorkspace();clearStage();csrf='';lastStatus=null;queueCount=null;activityThrough=null;budgetDirty=false;liveSnapshot=null;liveRawSnapshot=null;liveRenderedSeq=-1;liveFeedKey='';liveFreshAt=0;liveError=false;el('liveFeed').replaceChildren();el('app').hidden=true;el('login').hidden=false;el('status').textContent='';el('items').replaceChildren();el('detail').textContent='';el('detailRaw').textContent='';message('');for(const id of ['dialog','moreSheet','confirm'])if(el(id).open)el(id).close();}
+function syncControls(){
+  const paused=lastStatus?.supervisor?.paused??lastStatus?.paused;
+  document.querySelectorAll('[data-control]').forEach(n=>{n.hidden=n.dataset.control==='pause'?paused===true:paused!==true;});
+  el('resumeModel').disabled=busy||paused!==true;
+}
+/* 同一时间只执行一个操作；期间按钮禁用，结束后恢复。 */
+async function run(work){
+  if(busy)return;busy=true;
+  document.querySelectorAll('button').forEach(b=>b.disabled=true);
+  el('main').setAttribute('aria-busy','true');el('loadingText').textContent='正在同步…';
+  try{await work();}catch(error){message(error.message,'error');}
+  finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false);el('main').setAttribute('aria-busy','false');el('loadingText').textContent='';syncControls();}
+}
+
+/* ── 状态与总览 ── */
+function budgetWords(amount){if(!Number.isFinite(amount))return '';if(amount>=1e8)return '约 '+(amount/1e8).toFixed(amount%1e8?2:0)+' 亿 token';if(amount>=1e4)return '约 '+(amount/1e4).toFixed(amount%1e4?1:0)+' 万 token';return num(amount)+' token';}
+function paintAttention(notices){
+  const rows=notices.map(([tone,content,view,action])=>{
+    const row=node('div','attention-item');row.setAttribute('data-tone',tone);row.append(node('span','',content));
+    if(view){const go=node('button','small',action);go.addEventListener('click',()=>run(()=>navigate(view)));row.append(go);}
+    return row;
+  });
+  el('attention').replaceChildren(...rows);
+}
+function paintStatus(value){
+  lastStatus=value;el('status').textContent=pretty(value);
+  const r=value?.runtime??{},s=value?.supervisor??value,o=value?.ownership??{},b=r.budget??value.budget??{},blocked=r.model?.blocked??null;
+  blockedRequestId=blocked?.requestId??null;
+  const paused=s.paused===true||b.paused===true,available=r.available;
+  const state=blocked?'模型已阻塞':paused?'已暂停':available===false?'服务不可用':available===true?'运行中':'状态待确认';
+  const tone=blocked||available===false?'error':paused||available!==true?'warn':'ok';
+  el('liveBadge').textContent=state;el('liveBadge').className='badge'+(tone==='ok'?'':' '+tone);
+  el('hero').setAttribute('data-tone',tone);
+  el('greeting').textContent=blocked?'模型请求被拒绝，已停止重试':paused?'Eve 已暂停':available===true?'Eve 正在运行':'暂时无法确认运行状态';
+  el('healthSummary').textContent=blocked?'上游拒绝了模型请求。请到设置中核对原因，再决定是否解除。':paused?'运行管理者已暂停当前执行。准备好后可以恢复运行。':available===true?'执行服务可用。':'请刷新，并核对管理服务与执行服务的连接。';
+  el('runningHint').textContent=s.current??'未提供';
+  el('modelValue').textContent=r.model?.current?.model??'—';
+  el('modelHint').textContent=r.model?.current?.revision!==undefined?'配置版本 '+r.model.current.revision:'等待模型配置';
+  el('recordValue').textContent=num(r.throughSeq);
+  el('runtimeHealth').textContent=available===true?'可用':available===false?'不可用':'未知';
+  el('ownerHealth').textContent=o.owner?.instanceId??(o.mode==='paused'?'已暂停':'未提供');
+  el('upgradeHealth').textContent=s.upgrade?'更新中 · '+(s.upgrade.phase??'准备中'):s.lastOutcome?.outcome==='confirmed'?'当前版本已确认':s.lastOutcome?.outcome??'暂无更新记录';
+  el('knowledgeHealth').textContent=num(r.notesThroughSeq)+' / '+num(r.memoryThroughSeq);
+  el('receiptsHealth').textContent=num(r.receiptsThroughSeq);
+
+  const amount=b.dailyTokenBudget??value.dailyTokenBudget;
+  if(Number.isSafeInteger(amount)&&!budgetDirty&&document.activeElement!==el('budget')){el('budget').value=String(amount);el('budgetPreview').textContent=budgetWords(amount);}
+  el('budgetValue').textContent=num(amount);el('knownValue').textContent=num(b.knownNoncachedTokens);el('reservedValue').textContent=num(b.unknownReservedTokens);el('remainingValue').textContent=num(b.safeRemaining);
+  const valid=Number.isFinite(amount)&&amount>0&&Number.isFinite(b.knownNoncachedTokens)&&Number.isFinite(b.unknownReservedTokens);
+  const known=valid?Math.min(1,Math.max(0,b.knownNoncachedTokens/amount)):0,reserved=valid?Math.min(1-known,Math.max(0,b.unknownReservedTokens/amount)):0;
+  el('knownArc').setAttribute('stroke-dasharray',(known*365)+' 365');
+  el('reservedArc').setAttribute('stroke-dasharray',(reserved*365)+' 365');el('reservedArc').setAttribute('stroke-dashoffset',String(-known*365));
+  el('meterKnown').setAttribute('width',String(known*100));el('meterReserved').setAttribute('x',String(known*100));el('meterReserved').setAttribute('width',String(reserved*100));
+  const percent=valid?Math.round((b.knownNoncachedTokens+b.unknownReservedTokens)/amount*100)+'%':amount===0?'停用':'—';
+  el('budgetPercent').textContent=percent;el('tileBudget').textContent=percent;
+  el('tileBudgetHint').textContent=Number.isFinite(b.safeRemaining)?'还可使用 '+num(b.safeRemaining):'等待预算数据';
+  el('budgetChartTitle').textContent='今日预算：已知非缓存消耗 '+num(b.knownNoncachedTokens)+'，未知预留 '+num(b.unknownReservedTokens)+'，安全剩余 '+num(b.safeRemaining);
+  el('budgetHint').textContent=(b.day?'记账日 '+b.day+(b.timeZone?'（'+b.timeZone+'）':'')+'。':'')+'已确认消耗只计非缓存 token；预留不等于实际消耗。';
+
+  el('modelBlocked').hidden=!blocked;el('resumeModel').hidden=!blocked;
+  el('blockedText').textContent=blocked?'模型请求已停止自动重试：'+blocked.category+'，HTTP '+blocked.httpStatus+'。请先暂停运行，核实上游原因，再明确解除。解除后仍保持暂停。':'';
+  const notices=[];
+  if(blocked)notices.push(['error','模型请求被上游拒绝，自动重试已停止。','settings','去处理']);
+  if(available===false)notices.push(['error','执行服务当前不可用。']);
+  if(paused)notices.push(['warn','Eve 当前处于暂停状态。']);
+  if(b.safeRemaining===0)notices.push(['warn','今日预算已用尽，新的模型请求会等待。','settings','调整预算']);
+  if(s.upgrade)notices.push(['warn','版本正在更新，等待监督确认。']);
+  if(queueCount>0)notices.push(['warn','有 '+queueCount+(queueHasMore?' 条以上':' 条')+'消息挡住了会话，等待处理。','qqFailures','去处理']);
+  paintAttention(notices);
+  el('sync').textContent='同步于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  syncControls();
+}
 async function status(){try{paintStatus(await api('/api/status'));}catch(error){el('liveBadge').textContent='状态未同步';el('liveBadge').className='badge warn';throw error;}}
-async function queueStatus(){try{const v=await api('/api/query',{resource:'qqFailures',operation:'page',args:{limit:32}});queueCount=v.items.length;queueHasMore=Boolean(v.next);el('queueValue').textContent=num(queueCount)+(v.next?'+':'');if(lastStatus)paintStatus(lastStatus);}catch(error){if(!csrf)throw error;queueCount=null;el('queueValue').textContent='未读取';if(lastStatus)paintStatus(lastStatus);}}
-async function entered(){const session=csrf;const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(session));if(csrf!==session)return;initBrowserHistory(Array.from(new Uint8Array(hash),byte=>byte.toString(16).padStart(2,'0')).join(''));el('token').value='';el('login').hidden=true;el('app').hidden=false;await status();await navigate('live');}
+async function queueStatus(){
+  try{const v=await api('/api/query',{resource:'qqFailures',operation:'page',args:{limit:32}});queueCount=v.items.length;queueHasMore=Boolean(v.next);el('queueValue').textContent=num(queueCount)+(v.next?'+':'');}
+  catch(error){if(!csrf)throw error;queueCount=null;el('queueValue').textContent='未读取';}
+  document.querySelectorAll('.queue-count').forEach(n=>{n.hidden=!(queueCount>0);n.textContent=String(queueCount)+(queueHasMore?'+':'');});
+  if(lastStatus)paintStatus(lastStatus);
+}
+
+/* ── 导航与路由 ── */
+function routeView(){if(!inBrowser)return null;const view=window.location.hash.replace(/^#\/?/,'');return Object.hasOwn(labels,view)?view:null;}
+async function entered(){
+  const session=csrf;const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(session));if(csrf!==session)return;
+  initBrowserHistory(Array.from(new Uint8Array(hash),byte=>byte.toString(16).padStart(2,'0')).join(''));
+  el('token').value='';el('login').hidden=true;el('app').hidden=false;message('');
+  await status();await queueStatus();await navigate(routeView()??'live');
+}
 function initialArgs(){if(currentResource==='qqFailures'||currentResource==='notes')return {};const r=lastStatus?.runtime??{},key={timeline:'throughSeq',memory:'memoryThroughSeq',receipts:'receiptsThroughSeq'}[currentResource],through=r[key];return el('scope').value==='recent'&&Number.isSafeInteger(through)?{afterSeq:Math.max(0,through-80),throughSeq:through}:{};}
-async function navigate(view){if(view!=='live')closeLiveSocket();activeView=view;el('pageTitle').textContent=labels[view];document.querySelectorAll('[data-view]').forEach(n=>{if(n.classList.contains('nav-button')){if(n.dataset.view===view)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');}});el('overview').hidden=view!=='overview';el('settings').hidden=view!=='settings';el('records').hidden=view==='overview'||view==='settings'||view==='live';el('live').hidden=view!=='live';el('agentsPanel').hidden=view!=='agents';if(view==='agents'){el('records').hidden=true;await refreshAgents();return;}if(view==='live'){openLiveSocket();await pollLive(true);return;}if(view==='overview'){await queueStatus();await activity();return;}if(view==='settings')return;currentResource=view;currentOperation='page';el('query').value='';el('searchForm').hidden=view==='qqFailures';el('scope').hidden=view==='notes';el('recordsTitle').textContent=labels[view];el('recordsHint').textContent=hints[view];await page(initialArgs());}
+async function navigate(view){
+  if(!Object.hasOwn(labels,view))view='live';
+  if(view!=='live')closeLiveSocket();
+  activeView=view;
+  const group=navGroup(view),title=group==='records'?'记录':labels[view];
+  el('pageTitle').textContent=title;el('pageHint').textContent=pageHints[group];
+  document.querySelectorAll('.nav-button[data-nav]').forEach(n=>{const current=n.dataset.nav===group||n.dataset.nav==='more'&&['agents','settings'].includes(group);if(current)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');});
+  document.querySelectorAll('[data-tab]').forEach(n=>{if(n.dataset.tab===view)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');});
+  if(el('moreSheet').open)el('moreSheet').close();
+  if(inBrowser){document.title=title+' · Eve';if(routeView()!==view)window.location.hash='/'+view;window.scrollTo(0,0);}
+  const listed=group==='records'||view==='qqFailures';
+  el('overview').hidden=view!=='overview';el('settings').hidden=view!=='settings';el('records').hidden=!listed;el('live').hidden=view!=='live';el('agentsPanel').hidden=view!=='agents';
+  if(view==='agents'){await refreshAgents();return;}
+  if(view==='live'){openLiveSocket();await pollLive(true);return;}
+  if(view==='overview'){await queueStatus();await activity();return;}
+  if(view==='settings')return;
+  currentResource=view;currentOperation='page';el('query').value='';
+  el('recordTabs').hidden=view==='qqFailures';el('searchForm').hidden=view==='qqFailures';el('scope').hidden=view==='notes';el('recordChips').hidden=view!=='timeline';
+  el('recordsHint').textContent=hints[view];
+  await page(initialArgs());
+}
+
+/* ── 记录列表 ── */
+function recordVisible(category){return recordFilter==='all'||(recordFilter==='other'?!['thought','message','tool','error'].includes(category):category===recordFilter);}
+function paintListSummary(){
+  let shown=0,total=0;
+  if(currentResource==='timeline')for(const card of el('items').querySelectorAll('.record')){total++;card.hidden=!recordVisible(card.dataset.category);if(!card.hidden)shown++;}
+  el('listSummary').textContent=listSummaryText+(currentResource==='timeline'&&recordFilter!=='all'&&total?' · 筛选后显示 '+shown+' 条':'');
+}
 function empty(title,description,isError=false){const box=node('div','empty'+(isError?' error':''));box.append(node('div','empty-mark',isError?'!':'◇'),node('strong','',title),node('p','',description));el('items').append(box);}
-async function page(args,append=false){if(append)el('items').querySelectorAll('.empty').forEach(n=>n.remove());if(!append){el('items').replaceChildren();loaded=0;next=null;el('more').hidden=true;el('listSummary').textContent='正在读取记录…';}let value;try{value=await api('/api/query',{resource:currentResource,operation:currentOperation,args});}catch(error){if(!append){empty('暂时没有读取成功','点击右上角刷新重试，已有记录仍保留在服务端。',true);el('listSummary').textContent='读取失败';}throw error;}const items=Array.isArray(value?.items)?value.items:[];for(const item of items)renderItem(item);loaded+=items.length;next=value?.next??null;el('more').hidden=!next;el('listSummary').textContent='已加载 '+num(loaded)+' 条'+(next?' · 还有更多记录':' · 当前范围已读完')+(currentOperation==='search'?' · 文字搜索':'');if(!loaded)empty(currentResource==='qqFailures'?'暂时没有待处理的会话队首':'这个范围里还没有记录',next?'可以继续加载后面的扫描范围。':currentResource==='qqFailures'?'当前没有失败或送达未知的消息阻塞会话。':'试试搜索其他文字，或切换到全部记录范围。');}
-function renderItem(item){if(currentResource==='timeline'){renderTimelineRecord(item);return;}const article=node('article','record'),head=node('div','item-head'),heading=node('div'),actions=node('div','record-actions');const isQueue=currentResource==='qqFailures';let title=item?.title??(isQueue?(item.status?.status==='unknown'?'送达未知':'发送失败'):(kindNames[item?.kind]??item?.kind??(currentResource==='memory'?'记忆':'记录')));if(item?.alias)title='@'+item.alias+' · '+title;heading.append(node('div','item-title',String(title)));const meta=node('div','meta');for(const part of [time(item.at??item.formedAt),item.seq!==undefined?'#'+item.seq:null,item.revision!==undefined?'版本 '+item.revision:null,item.group,item.quarantined?'未确认候选记录':null,currentResource==='memory'&&item.strength!==undefined?'强度 '+item.strength:null])if(part)meta.append(node('span','',String(part)));head.append(heading,actions);heading.append(meta);const resource=currentResource;if(!isQueue&&item&&typeof item==='object'&&(item.id!==undefined||item.seq!==undefined)){const button=node('button','','阅读全文');button.addEventListener('click',()=>run(()=>detail(item.id!==undefined?{id:item.id}:{seq:item.seq},false,'get',resource)));actions.append(button);}if(isQueue&&item?.canCancel===true&&typeof item.receiptDigest==='string'){const button=node('button','danger','取消此项等待');const expected={expectedActionId:item.actionId,expectedFingerprint:item.fingerprint,expectedReceiptDigest:item.receiptDigest};button.addEventListener('click',()=>run(async()=>{if(!confirm('取消此会话队首的等待？\n\n原始回执会保留；可能已经送达的消息不会撤回。同一会话后续消息将可继续。\n\n动作编号：'+expected.expectedActionId))return;await api('/api/control',{action:'resolveQqFailure',args:expected});await page({});await queueStatus();message('已保留原始回执并取消此项等待。');}));actions.append(button);}article.setAttribute('data-resource',resource);article.append(head);const content=isQueue?'会话：'+item.conversationId+'\n原因：'+(item.status?.reason??'未提供')+'\n动作：'+item.actionId:bodyText(item);article.append(node('div','record-body',content.length>1400?content.slice(0,1400)+'\n… 点击阅读全文查看完整记录':content));const raw=node('details'),summary=node('summary','','原始字段与关联编号');raw.append(summary,node('pre','',pretty(item)));article.append(raw);el('items').append(article);}
+async function page(args,append=false){
+  if(append)el('items').querySelectorAll('.empty').forEach(n=>n.remove());
+  if(!append){el('items').replaceChildren();loaded=0;next=null;el('more').hidden=true;el('listSummary').textContent='正在读取…';}
+  let value;
+  try{value=await api('/api/query',{resource:currentResource,operation:currentOperation,args});}
+  catch(error){if(!append){empty('没有读取成功','点右上角的刷新重试。记录仍保留在服务端。',true);el('listSummary').textContent='读取失败';}throw error;}
+  const items=Array.isArray(value?.items)?value.items:[];
+  for(const item of items)renderItem(item);
+  loaded+=items.length;next=value?.next??null;el('more').hidden=!next;
+  listSummaryText='已加载 '+num(loaded)+' 条'+(next?'，还有更多':'，已到末尾')+(currentOperation==='search'?' · 搜索结果':'');
+  paintListSummary();
+  if(!loaded)empty(currentResource==='qqFailures'?'没有待处理的消息':'这个范围里没有记录',next?'可以继续加载后面的范围。':currentResource==='qqFailures'?'当前没有发送失败或结果未知的消息挡住会话。':'换个搜索词，或把范围切换到全部记录。');
+}
+function renderItem(item){
+  if(currentResource==='timeline'){renderTimelineRecord(item);return;}
+  const article=node('article','record'),head=node('div','item-head'),heading=node('div'),actions=node('div','record-actions');
+  const isQueue=currentResource==='qqFailures',resource=currentResource;
+  let title=item?.title??(isQueue?(item.status?.status==='unknown'?'结果未知':'发送失败'):(kindNames[item?.kind]??item?.kind??(resource==='memory'?'记忆':'记录')));
+  if(item?.alias)title='@'+item.alias+' · '+title;
+  heading.append(node('div','item-title',String(title)));
+  const meta=node('div','meta');
+  for(const part of [time(item.at??item.formedAt),item.seq!==undefined?'#'+item.seq:null,item.revision!==undefined?'版本 '+item.revision:null,item.group,item.quarantined?'未确认候选记录':null,resource==='memory'&&item.strength!==undefined?'强度 '+item.strength:null])if(part)meta.append(node('span','',String(part)));
+  heading.append(meta);head.append(heading,actions);
+  if(!isQueue&&item&&typeof item==='object'&&(item.id!==undefined||item.seq!==undefined)){
+    const button=node('button','','打开');
+    button.addEventListener('click',()=>run(()=>detail(item.id!==undefined?{id:item.id}:{seq:item.seq},false,'get',resource)));
+    actions.append(button);
+  }
+  if(isQueue&&item?.canCancel===true&&typeof item.receiptDigest==='string'){
+    const button=node('button','danger','取消等待');
+    const expected={expectedActionId:item.actionId,expectedFingerprint:item.fingerprint,expectedReceiptDigest:item.receiptDigest};
+    button.addEventListener('click',async()=>{
+      if(!await ask('取消这条消息的等待？','原始回执会保留；可能已经送达的消息不会撤回。取消后，同一会话后面的消息才会继续发送。\n\n动作编号：'+expected.expectedActionId,'取消等待',true))return;
+      run(async()=>{await api('/api/control',{action:'resolveQqFailure',args:expected});await page({});await queueStatus();message('已保留原始回执，并取消这条消息的等待。');});
+    });
+    actions.append(button);
+  }
+  article.setAttribute('data-resource',resource);article.append(head);
+  const content=isQueue?'会话：'+item.conversationId+'\n原因：'+(item.status?.reason??'未提供')+'\n动作：'+item.actionId+(item.canCancel===true?'':'\n这一条正在发送、重试或结果未知，暂时不能从这里取消。'):bodyText(item);
+  article.append(node('div','record-body',content.length>1400?content.slice(0,1400)+'\n… 打开后阅读完整记录':content));
+  const raw=node('details');raw.append(node('summary','','原始字段'),node('pre','',pretty(item)));article.append(raw);
+  el('items').append(article);
+}
 async function detail(args,append=false,operation='get',resource=detailResource??currentResource){const value=await api('/api/query',{resource,operation,args});detailResource=resource;detailOperation=operation;let content=typeof value.text==='string'?value.text:bodyText(value);if(operation==='versions'&&Array.isArray(value.items))content=value.items.map(v=>'版本 '+(v.revision??'—')+' · '+(v.title??'便签')+'\n'+time(v.at)+'\n'+bodyText(v)).join('\n\n');if(resource!=='notes'&&typeof value.text==='string'&&value.nextChar===undefined&&!append){try{const recorded=JSON.parse(value.text);if(recorded&&recorded.seq!==undefined&&recorded.kind)content=timelineInfo(recorded)[2]+' · '+time(recorded.at)+'\n\n'+timelineDescription(recorded);}catch{}}el('detailTitle').textContent=operation==='versions'?'便签版本记录':labels[resource]+' · 详情';if(!append){el('detail').textContent='';el('detailRaw').textContent='';}el('detail').textContent+=(append?'\n':'')+content;el('detailRaw').textContent+=(append?'\n':'')+pretty(value);detailArgs=value?.next??(value?.nextChar!==undefined?{...args,startChar:value.nextChar}:null);el('detailMore').hidden=!detailArgs;el('versions').hidden=resource!=='notes'||!args.id;el('versions').dataset.id=args.id??'';if(!el('dialog').open)el('dialog').showModal();}
+async function search(){const query=el('query').value.trim();currentOperation=query?'search':'page';await page({...initialArgs(),...(query?{query}:{})});}
+`;
 
-function applyLiveSnapshot(snapshot){if(!csrf||liveSnapshot&&Date.parse(snapshot.asOf)<Date.parse(liveSnapshot.asOf))return;liveFreshAt=Date.now();liveError=false;el('liveWarning').hidden=true;liveRawSnapshot=snapshot;liveSnapshot=mergeBrowserHistory(snapshot);paintLive(liveSnapshot);el('sync').textContent='动态同步于 '+new Date(snapshot.asOf).toLocaleTimeString('zh-CN',{hour12:false});}
-function markLiveFailure(error){liveError=true;el('liveWarning').hidden=false;el('liveWarning').textContent='动态同步中断，画面保留上次记录，不能代表当前状态。'+error.message;el('liveTitle').textContent='实时状态暂未确认';el('liveHero').className='live-hero live-error';el('liveDuration').textContent='';el('liveBadge').textContent='动态未同步';el('liveBadge').className='badge warn';liveAge();}
-let livePoll=null;
-async function pollLive(force=false){if(!csrf||!liveFollow&&!force)return;if(livePoll)return livePoll;const session=csrf;const request=(async()=>{try{const snapshot=await api('/api/live');if(csrf!==session)return;applyLiveSnapshot(snapshot);openLiveSocket();await refreshWorkspaceSelected();}catch(error){if(csrf===session){markLiveFailure(error);throw error;}}})();livePoll=request;try{await request;}finally{if(livePoll===request)livePoll=null;}}
-function paintLive(snapshot){if(snapshot.status)paintStatus(snapshot.status);const state=snapshot.state;el('liveHero').className='live-hero';el('liveTitle').textContent=state.title;el('liveDescription').textContent=state.description;el('liveWatermark').textContent='日志 #'+num(snapshot.throughSeq);const feedKey=JSON.stringify(snapshot.events);if(feedKey!==liveFeedKey){paintLiveFeed();liveFeedKey=feedKey;}else paintLiveSummary(snapshot.events??[]);liveRenderedSeq=snapshot.throughSeq;paintWorkspace(snapshot);liveAge();}
-function paintLiveSummary(rawEvents){const history=liveSnapshot?.browserHistory;el('historyMore').hidden=!history?.hasMore;el('historyMore').textContent='加载更早本地记录 · '+(history?.hiddenEvents??0)+' 条活动 / '+(history?.hiddenOperations??0)+' 次操作待展开';el('liveFeedSummary').textContent=num(rawEvents.length)+' 条记录'+(liveSnapshot?.browserHistory?' · '+(liveSnapshot.browserHistory.available?'本地保留，刷新可回看':'本地保存不可用，本页暂存')+' · 保存于 '+workspaceShortTime(liveSnapshot.browserHistory.savedAt):'')+' · '+(liveFollow?'正在跟随':'画面已暂停，Eve 继续运行');}
-function paintLiveFeed(){const feed=el('liveFeed'),seen=new Set([...feed.querySelectorAll('.stream-entry')].map(n=>n.dataset.seq)),nearEnd=feed.scrollHeight-feed.scrollTop-feed.clientHeight<90,top=feed.scrollTop,opened=new Set([...feed.querySelectorAll('details[open]')].map(n=>n.dataset.key));feed.replaceChildren();const rawEvents=liveSnapshot?.events??[],events=rawEvents.filter(e=>(!e.thoughtWrite||e.category==='error')&&(liveFilter==='all'||(liveFilter==='thought'?e.category==='thought'&&e.hasText:e.category===liveFilter)||(liveFilter==='action'&&e.category==='result')));paintLiveSummary(rawEvents);if(!events.length){feed.append(node('div','empty','这个窗口里还没有她留下的这类记录。'));el('liveLatest').hidden=true;return;}
-const original=e=>{const b=node('button','stream-original',(e.retained?'历史 · ':'')+'原件 #'+e.seq);b.addEventListener('click',()=>run(()=>detail({seq:e.seq},false,'get','timeline')));return b;};
-let group=[];const flush=()=>{if(!group.length)return;const section=node('details','stream-operations');section.dataset.key=String(group[0].seq);section.open=opened.has(section.dataset.key);const starts=group.filter(e=>e.kind==='tool_start'),results=group.filter(e=>e.kind==='tool_result'),notices=group.filter(e=>e.kind==='notice'),errors=group.filter(e=>e.category==='error');const labels=[];if(starts.length){const names=new Map();for(const e of starts){const name=e.tool==='execute_script'?'脚本工具':e.tool||'工具';names.set(name,(names.get(name)||0)+1);}for(const [name,count]of names)labels.push('调用 '+count+' 次'+name);labels.push(results.length+' 条回执');}else if(results.length)labels.push(results.length+' 条工具回执');if(notices.length)labels.push(notices.length+' 条通知');if(errors.length)labels.push(errors.length+' 条异常');if(!labels.length)labels.push(group.some(e=>e.kind==='model_start')?'模型请求与状态记录':'过程记录');section.append(node('summary','',labels.join(' · ')));for(const e of group){const row=node('div','stream-operation timeline-card'),meta=node('div','stream-meta');meta.append(node('span','',time(e.at)),original(e));if(e.sourceCommit)meta.append(node('span','timeline-version','版本 '+e.sourceCommit.slice(0,12)));if(e.relatedSeq){const related=node('button','stream-original','↖ 原决定 #'+e.relatedSeq);related.addEventListener('click',()=>run(()=>detail({seq:e.relatedSeq},false,'get','timeline')));meta.append(related);}row.dataset.category=timelineInfo(e)[0];row.dataset.kind=e.kind;row.append(meta,node('strong',e.category==='error'?'stream-error':'',e.title),node('p','',e.text));section.append(row);}feed.append(section);group=[];};
-for(const e of events){if(e.kind==='model_response'){flush();const article=node('article',e.hasText?'stream-entry':'stream-entry stream-decision');article.dataset.seq=String(e.seq);article.dataset.new=String(!seen.has(String(e.seq)));const meta=node('div','stream-meta');meta.append(node('strong','',e.hasText?'EVE':'EVE / 工具与状态'),node('span','',time(e.at)),original(e));article.append(meta,node('div','stream-prose',e.text));if(e.truncated)article.append(node('p','stream-truncated','此处为节选，打开原件继续阅读。'));feed.append(article);}else group.push(e);}flush();if(nearEnd&&liveFollow){feed.scrollTop=feed.scrollHeight;el('liveLatest').hidden=true;}else{feed.scrollTop=top;el('liveLatest').hidden=feed.scrollHeight-feed.scrollTop-feed.clientHeight<90;}}
-el('historyMore').addEventListener('click',()=>{if(!csrf||!liveRawSnapshot)return;loadBrowserHistoryPage();liveSnapshot=mergeBrowserHistory(liveRawSnapshot);paintLive(liveSnapshot);});
-el('historyAll').addEventListener('click',()=>run(async()=>{el('scope').value='all';await navigate('timeline');}));
-el('liveLatest').addEventListener('click',()=>{const f=el('liveFeed');f.scrollTop=f.scrollHeight;el('liveLatest').hidden=true;});
-el('liveFeed').addEventListener('scroll',()=>{const f=el('liveFeed');el('liveLatest').hidden=f.scrollHeight-f.scrollTop-f.clientHeight<90;});
-el('liveTheme').addEventListener('click',()=>{const dark=el('workstream').dataset.theme!=='dark';el('workstream').dataset.theme=dark?'dark':'light';el('liveTheme').textContent=dark?'浅色外观':'深色外观';el('liveTheme').setAttribute('aria-pressed',String(dark));});
-function liveAge(){if(activeView!=='live'||!liveSnapshot)return;if(liveError){el('liveDuration').textContent='当前状态未确认 · 上次同步 '+new Date(liveSnapshot.asOf).toLocaleTimeString('zh-CN',{hour12:false});return;}if(!liveFollow){el('liveDuration').textContent='画面停留在 '+new Date(liveSnapshot.asOf).toLocaleTimeString('zh-CN',{hour12:false});return;}if(Date.now()-liveFreshAt>12000){el('liveDuration').textContent='同步超过 12 秒未更新';return;}const s=liveSnapshot.state;if(['model','tool'].includes(s.phase)&&s.since){const seconds=Math.max(0,Math.floor((Date.now()-Date.parse(s.since))/1000));el('liveDuration').textContent='已等待 '+(seconds>=60?Math.floor(seconds/60)+' 分 '+seconds%60+' 秒':seconds+' 秒');}else el('liveDuration').textContent='实时同步 · '+new Date(liveSnapshot.asOf).toLocaleTimeString('zh-CN',{hour12:false});}
-el('liveFollow').addEventListener('click',()=>{liveFollow=!liveFollow;el('liveFollow').textContent=liveFollow?'暂停画面跟随':'继续跟随最新';el('liveFollow').setAttribute('aria-pressed',String(liveFollow));liveAge();paintLiveFeed();if(liveFollow){openLiveSocket();run(()=>pollLive(true));}else closeLiveSocket();});
-
-document.querySelectorAll('[data-live-filter]').forEach(button=>button.addEventListener('click',()=>{liveFilter=button.dataset.liveFilter;document.querySelectorAll('[data-live-filter]').forEach(n=>n.setAttribute('aria-pressed',String(n===button)));paintLiveFeed();}));
-if(typeof window!=='undefined'){window.setInterval(()=>{if(liveSocketWanted()&&!busy&&!el('dialog').open){if(typeof WebSocket==='undefined')run(()=>pollLive());else if(liveSocketStalled()){closeLiveSocket();openLiveSocket();run(()=>pollLive());}else{openLiveSocket();if(!liveFreshAt||Date.now()-liveFreshAt>12000)run(()=>pollLive());else void refreshWorkspaceSelected();}}},3000);window.setInterval(liveAge,1000);document.addEventListener('visibilitychange',()=>{if(document.hidden)closeLiveSocket();else if(liveSocketWanted()&&!busy){openLiveSocket();run(()=>pollLive(true));}});}
-
+const wiringScript = String.raw`
+/* ── 事件绑定 ── */
 el('loginForm').addEventListener('submit',event=>{event.preventDefault();run(async()=>{const value=await api('/api/login',{token:el('token').value});csrf=value.csrf;await entered();});});
 document.querySelectorAll('[data-view]').forEach(n=>n.addEventListener('click',()=>run(()=>navigate(n.dataset.view))));
-el('refresh').addEventListener('click',()=>run(async()=>{await status();if(activeView==='agents'){await refreshAgents();}else if(activeView==='live'){await pollLive(true);}else if(activeView==='overview'){await queueStatus();await activity(true);}else if(activeView!=='settings'){currentOperation=el('query').value.trim()?'search':'page';await page({...initialArgs(),...(currentOperation==='search'?{query:el('query').value.trim()}:{})});}}));
-for(const action of ['pause','resume'])el(action).addEventListener('click',()=>run(async()=>{if(action==='pause'&&!confirm('暂停 Eve 的运行？管理者会等待当前执行收拢；之后可随时恢复。'))return;await api('/api/control',{action,args:{}});await status();message(action==='pause'?'运行已暂停。':'运行已恢复。');}));
-el('resumeModel').addEventListener('click',()=>run(async()=>{if(!blockedRequestId)throw new Error('请先刷新模型状态');if(!confirm('已检查上游拒绝原因，并明确恢复这个模型请求？解除后仍保持暂停。'))return;await api('/api/control',{action:'resumeModel',args:{expectedRequestId:blockedRequestId}});await status();message('模型阻塞已解除；运行仍保持暂停，可按需恢复。');}));
-el('budget').addEventListener('input',()=>{budgetDirty=true;});
-el('budgetForm').addEventListener('submit',event=>{event.preventDefault();run(async()=>{const amount=Number(el('budget').value);if(!Number.isSafeInteger(amount)||amount<0)throw new Error('预算必须是非负整数');if(amount===0&&!confirm('将每日预算设为 0 会阻止新增模型工作，确定保存？'))return;await api('/api/control',{action:'budget',args:{dailyTokenBudget:amount}});budgetDirty=false;await status();message('每日预算已保存。');});});
-for(const id of ['logout','logoutMobile'])el(id).addEventListener('click',()=>run(async()=>{await api('/api/logout',{});showLogin();}));
-async function search(){const query=el('query').value.trim();currentOperation=query?'search':'page';await page({...initialArgs(),...(query?{query}:{})});}
-el('searchForm').addEventListener('submit',event=>{event.preventDefault();run(search);});el('scope').addEventListener('change',()=>run(search));el('clear').addEventListener('click',()=>run(async()=>{el('query').value='';await search();}));el('more').addEventListener('click',()=>run(()=>page(next,true)));el('closeDetail').addEventListener('click',()=>el('dialog').close());el('detailMore').addEventListener('click',()=>run(()=>detail(detailArgs,true,detailOperation)));el('versions').addEventListener('click',()=>run(()=>detail({id:el('versions').dataset.id},false,'versions')));
-if(typeof window!=='undefined')window.setInterval(()=>{if(csrf&&!busy&&!document.hidden&&!el('dialog').open&&activeView!=='live')run(async()=>{await status();if(activeView==='agents'){await refreshAgents();}else if(activeView==='overview'){await queueStatus();await activity();}});},30000);
-${agentsScript}
-${timelineScript}
-${historyScript}
-${workspaceScript}
-${workspaceSocketScript}
-run(async()=>{let session;try{session=await api('/api/session');}catch(error){showLogin();if(error.message!=='请先登录')message(error.message);return;}csrf=session.csrf;await entered();});
+el('navMore').addEventListener('click',()=>el('moreSheet').showModal());
+for(const id of ['moreSheet','dialog'])el(id).addEventListener('click',event=>{if(event.target===el(id))el(id).close();});
+if(inBrowser)window.addEventListener('hashchange',()=>{const view=routeView();if(csrf&&view&&view!==activeView)run(()=>navigate(view));});
+el('refresh').addEventListener('click',()=>run(async()=>{
+  await status();
+  if(activeView==='agents')await refreshAgents();
+  else if(activeView==='live')await pollLive(true);
+  else if(activeView==='overview'){await queueStatus();await activity(true);}
+  else if(activeView!=='settings'){currentOperation=el('query').value.trim()?'search':'page';await page({...initialArgs(),...(currentOperation==='search'?{query:el('query').value.trim()}:{})});}
+}));
+document.querySelectorAll('[data-control]').forEach(n=>n.addEventListener('click',async()=>{
+  const action=n.dataset.control;
+  if(action==='pause'&&!await ask('暂停 Eve 的运行？','运行管理者会等当前这一步收尾后停下，之后可以随时恢复。','暂停运行'))return;
+  run(async()=>{await api('/api/control',{action,args:{}});await status();message(action==='pause'?'运行已暂停。':'运行已恢复。');});
+}));
+el('resumeModel').addEventListener('click',async()=>{
+  if(!blockedRequestId){message('请先刷新模型状态。','error');return;}
+  if(!await ask('解除模型阻塞？','请确认已经核实上游拒绝的原因。解除后运行仍保持暂停，需要再手动恢复。','解除阻塞'))return;
+  run(async()=>{await api('/api/control',{action:'resumeModel',args:{expectedRequestId:blockedRequestId}});await status();message('模型阻塞已解除；运行仍保持暂停，可按需恢复。');});
+});
+el('budget').addEventListener('input',()=>{budgetDirty=true;const amount=Number(el('budget').value);el('budgetPreview').textContent=el('budget').value===''?'':Number.isSafeInteger(amount)&&amount>=0?budgetWords(amount):'须为非负整数';});
+el('budgetForm').addEventListener('submit',async event=>{
+  event.preventDefault();
+  const amount=Number(el('budget').value);
+  if(!Number.isSafeInteger(amount)||amount<0){message('预算必须是非负整数。','error');return;}
+  if(amount===0&&!await ask('把每日预算设为 0？','这会阻止新的模型请求，直到你重新调高预算。','设为 0',true))return;
+  run(async()=>{await api('/api/control',{action:'budget',args:{dailyTokenBudget:amount}});budgetDirty=false;await status();message('每日预算已保存。');});
+});
+for(const id of ['logout','logoutSheet'])el(id).addEventListener('click',()=>run(async()=>{await api('/api/logout',{});showLogin();}));
+el('searchForm').addEventListener('submit',event=>{event.preventDefault();run(search);});
+el('scope').addEventListener('change',()=>run(search));
+el('clear').addEventListener('click',()=>run(async()=>{el('query').value='';await search();}));
+el('more').addEventListener('click',()=>run(()=>page(next,true)));
+document.querySelectorAll('[data-record-filter]').forEach(n=>n.addEventListener('click',()=>{recordFilter=n.dataset.recordFilter;document.querySelectorAll('[data-record-filter]').forEach(other=>other.setAttribute('aria-pressed',String(other===n)));paintListSummary();}));
+el('closeDetail').addEventListener('click',()=>el('dialog').close());
+el('detailMore').addEventListener('click',()=>run(()=>detail(detailArgs,true,detailOperation)));
+el('versions').addEventListener('click',()=>run(()=>detail({id:el('versions').dataset.id},false,'versions')));
+if(inBrowser)window.setInterval(()=>{if(csrf&&!busy&&!document.hidden&&!el('dialog').open&&!el('confirm').open&&activeView!=='live')run(async()=>{await status();if(activeView==='agents'){await refreshAgents();}else if(activeView==='overview'){await queueStatus();await activity();}});},30000);
+`;
+
+/** 所有业务内容均以文本节点显示；不将记录作为 HTML 执行。 */
+export function panelHtml(nonce: string) {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><title>Eve</title>
+<style nonce="${nonce}">${panelCss}</style></head><body>
+<a class="skip" href="#main">跳到主要内容</a>
+${loginMarkup}
+<div id="app" class="shell" hidden>${shellMarkup}
+<main id="main" class="main">${topbarMarkup}
+${workspaceMarkup}
+${overviewMarkup}
+${agentsMarkup}
+${recordsMarkup}
+${settingsMarkup}
+</main>
+${overlayMarkup}</div>
+<script nonce="${nonce}">${coreScript}${usageScript}${liveScript}${wiringScript}${agentsScript}${timelineScript}${historyScript}${workspaceScript}${stageScript}${workspaceSocketScript}
+run(async()=>{let session;try{session=await api('/api/session');}catch(error){showLogin();if(error.message!=='请先登录')message(error.message,'error');return;}csrf=session.csrf;await entered();});
 </script></body></html>`;
 }
