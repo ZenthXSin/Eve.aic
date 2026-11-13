@@ -80,6 +80,7 @@ for (const mode of ["replace", "observed"] as const) {
           "prompts/qq-mechanics.md",
           ...[
             "phone",
+            "agents",
             "model",
             "script",
             "mind",

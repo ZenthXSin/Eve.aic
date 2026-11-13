@@ -35,7 +35,7 @@ export async function startRuntimeRpc(engine: RuntimeEngine, key: string, fence:
           const next = await reader.read();
           if (next.done) break;
           size += next.value.length;
-          if (size > 16_777_216) {
+          if (size > 16_777_216 && request.headers.get("x-eve-namespace") !== "agents") {
             await reader.cancel();
             throw new KernelError("rejected", "请求超过当前格式上限");
           }
@@ -51,6 +51,9 @@ export async function startRuntimeRpc(engine: RuntimeEngine, key: string, fence:
         offset += chunk.length;
       }
       const data = JSON.parse(new TextDecoder().decode(bytes)) as RuntimeRequest;
+      if (request.headers.get("x-eve-namespace") === "agents" && data.namespace !== "agents") {
+        throw new KernelError("rejected", "消息传输命名空间不符");
+      }
       if (data.namespace === "health") {
         return Response.json({
           ok: true,
@@ -69,13 +72,39 @@ export async function startRuntimeRpc(engine: RuntimeEngine, key: string, fence:
           throw new KernelError("rejected", "命令等待参数无效");
         }
       }
+      let admitted!: () => void;
+      const admission = new Promise<void>((resolve) => admitted = resolve);
       const work = fence.run(data.ownership.proof, data.ownership.actionId, {
         namespace: data.namespace,
         method: data.method,
         args,
-      }, () => engine.dispatch(data.namespace, data.method, args, data.ownership.actionId));
+      }, async () => {
+        if (data.namespace === "agents" && data.method === "send") {
+          await engine.validateRepeat(data.namespace, data.method, args, data.ownership.actionId);
+          admitted();
+        }
+        return await engine.dispatch(data.namespace, data.method, args, data.ownership.actionId);
+      });
       live.add(work);
       void work.finally(() => live.delete(work)).catch(() => {});
+      if (data.namespace === "agents" && data.method === "send") {
+        const controller = new AbortController();
+        try {
+          const outcome = await Promise.race([
+            work.then((value) => ({ value })),
+            admission.then(() => engine.agents.accepted(data.ownership.actionId, controller.signal))
+              .then(() => null),
+          ]);
+          return Response.json({
+            ok: true,
+            value: outcome
+              ? outcome.value
+              : engine.agents.status({ jobId: data.ownership.actionId }),
+          });
+        } finally {
+          controller.abort();
+        }
+      }
       if (data.namespace === "commands" && data.method === "start") {
         const ms = args.waitMs ?? 1000;
         const sessionId = await fingerprint(["command-v1", data.ownership.actionId]);
@@ -107,6 +136,7 @@ export async function startRuntimeRpc(engine: RuntimeEngine, key: string, fence:
     async quiesce() {
       // The caller first stops the owning instance. Drain actual work, including a command
       // whose exit-permit request was still in flight when the first cancellation ran.
+      await engine.agents.cancelAll();
       while (live.size) {
         await engine.commands.cancelAll();
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -122,6 +152,7 @@ export async function startRuntimeRpc(engine: RuntimeEngine, key: string, fence:
     },
     async close() {
       // 先终结命令，避免 HTTP shutdown 等待长命令形成互等。
+      await engine.agents.cancelAll();
       await engine.commands.close();
       await server.shutdown();
       await Promise.allSettled([...live]);

@@ -31,7 +31,7 @@ export async function readEveConfig(path: string): Promise<EveConfig> {
   } catch {
     throw new KernelError("rejected", "预算时区无效");
   }
-  return value;
+  return { ...value, agentsEnabled: value.remoteRecords === true && value.agentsEnabled !== false };
 }
 export function createEvePlugin(configPath: string) {
   let runtime: EveRuntime | undefined;

@@ -9,6 +9,20 @@ export interface RuntimeRequest {
   ownership: { proof: OwnershipProof; actionId: string };
 }
 export const RUNTIME_METHODS = {
+  agents: [
+    "create",
+    "configure",
+    "list",
+    "send",
+    "status",
+    "open",
+    "history",
+    "message",
+    "search",
+    "notifications",
+    "cancel",
+    "close",
+  ],
   timeline: ["page", "append"],
   records: ["page", "text"],
   notes: ["create", "update", "get", "list", "versions", "search"],

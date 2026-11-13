@@ -389,7 +389,9 @@ export class ScriptRuntime {
     if (
       !(message.namespace === "phone" && PHONE_METHODS.includes(message.method as never)) &&
       !(message.namespace === "upgrades" && UPGRADE_METHODS.includes(message.method as never)) &&
-      !(["notes", "files", "commands", "memory", "records", "web"].includes(message.namespace) &&
+      !(["notes", "files", "commands", "memory", "records", "web", "agents"].includes(
+        message.namespace,
+      ) &&
         (RUNTIME_METHODS[message.namespace as "notes"] as readonly string[]).includes(
           message.method,
         )) &&
@@ -404,7 +406,7 @@ export class ScriptRuntime {
     const actionId = `script_${jobId}_${message.seq}`;
     const args = structuredClone(message.args);
     if (
-      ["notes", "files", "commands", "memory", "records", "web", "upgrades"].includes(
+      ["notes", "files", "commands", "memory", "records", "web", "upgrades", "agents"].includes(
         message.namespace,
       )
     ) {

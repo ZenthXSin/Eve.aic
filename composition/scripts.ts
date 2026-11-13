@@ -21,6 +21,7 @@ export async function composeScriptPlugin(directory: string, configPath: string)
         provides: { scripts: "1.0.0", tools: "1.0.0" },
         requires: { phone: "^1.0.0" },
         optional: {
+          agents: "^1.0.0",
           web: "^1.0.0",
           upgrades: "^1.0.0",
           mind: "^1.0.0",

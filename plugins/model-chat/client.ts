@@ -2,6 +2,7 @@
 import {
   MODEL_IMAGE_MAX_BYTES,
   MODEL_IMAGE_MAX_COUNT,
+  type ModelCallOptions,
   type ModelImage,
   type ModelRequest,
   type ModelResponse,
@@ -309,12 +310,20 @@ export class ChatModelClient {
     this.#closed.abort();
   }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
+  async complete(request: ModelRequest, overrides: ModelCallOptions = {}): Promise<ModelResponse> {
+    const config = { ...this.#config, ...overrides };
+    if (
+      !positive(config.maxOutputTokens) || typeof config.model !== "string" ||
+      !config.model.trim() ||
+      typeof config.sessionId !== "string" || !/^[a-zA-Z0-9_.:-]{1,256}$/.test(config.sessionId) ||
+      overrides.reasoningEffort !== undefined &&
+        !["none", "minimal", "low", "medium", "high", "xhigh"].includes(overrides.reasoningEffort)
+    ) fail("request");
     let snapshot: ModelRequest;
     let body: string;
     try {
       snapshot = structuredClone(request);
-      body = JSON.stringify(await requestBody(snapshot, this.#config));
+      body = JSON.stringify(await requestBody(snapshot, config));
     } catch (error) {
       if (error instanceof ChatModelError) throw error;
       fail("request");
@@ -330,8 +339,8 @@ export class ChatModelClient {
         headers: {
           Authorization: `Bearer ${this.#config.apiKey}`,
           "Content-Type": "application/json",
-          session_id: this.#config.sessionId,
-          "X-Session-ID": this.#config.sessionId,
+          session_id: config.sessionId,
+          "X-Session-ID": config.sessionId,
         },
         body,
       });

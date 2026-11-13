@@ -49,6 +49,14 @@ export interface ToolSpec {
   parameters?: { [key: string]: Json };
 }
 
+/** 每次调用独立选择，复用连接池；不修改其他会话默认配置。 */
+export interface ModelCallOptions {
+  model?: string;
+  reasoningEffort?: string;
+  maxOutputTokens?: number;
+  sessionId?: string;
+}
+
 export interface ModelRequest {
   messages: Message[];
   tools: ToolSpec[];

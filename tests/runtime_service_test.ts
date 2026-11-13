@@ -484,3 +484,63 @@ Deno.test("web出口：同动作重启采用原回执，旧所有者与参数变
     await f.close();
   }
 });
+
+Deno.test("actual kernel worker → script → agents supports typed create/configure/send/history and persisted admission", async () => {
+  const f = await fixture();
+  const root = `${f.directory}/plugins-agents`, configFile = `${f.directory}/agent-config.json`;
+  await writeDurableJson(configFile, {
+    runtime: {
+      connectionFile: f.connectionFile,
+      keyFile: `${f.directory}/key`,
+      proofFile: f.proofFile,
+    },
+    scripts: {
+      directory: `${f.directory}/scripts-agents`,
+      cacheDirectory: `${f.directory}/script-cache-agents`,
+      denoBinary: Deno.execPath(),
+      defaultTimeoutMs: 120000,
+    },
+  });
+  const kernel = new Kernel({ dataDir: `${f.directory}/kernel-agents` });
+  try {
+    await composeRuntimePlugin(`${root}/runtime`, configFile);
+    await composeScriptPlugin(`${root}/scripts`, configFile);
+    await Deno.mkdir(`${root}/phone`, { recursive: true });
+    await Deno.writeTextFile(
+      `${root}/phone/manifest.json`,
+      JSON.stringify({ name: "phone", version: "1.0.0", provides: { phone: "1.0.0" } }),
+    );
+    await Deno.writeTextFile(
+      `${root}/phone/mod.ts`,
+      'export default {load(ctx){ctx.provide("phone",{notifications(){return {items:[],throughSeq:0}}})}};',
+    );
+    await kernel.register(`${root}/phone`);
+    await kernel.register(`${root}/runtime`);
+    await kernel.register(`${root}/scripts`);
+    await kernel.start();
+    const result = await kernel.call("tools", "execute", {
+      name: "execute_script",
+      id: "agent_script_integration",
+      args: {
+        mode: "sync",
+        code:
+          'const agent=await tools.agents.create({role:"coding",reasoningEffort:"medium"});const configured=await tools.agents.configure({agentId:agent.agentId,name:"typed integration"});const job=await tools.agents.send({agentId:agent.agentId,text:"一条完整任务"});return {configured,job};',
+      },
+    }) as { status?: string; output?: string; result?: { text?: string } };
+    assert.equal(result.status, "completed");
+    const job = JSON.parse(result.output!);
+    assert.equal(job.status, "completed", JSON.stringify(job));
+    const actual = JSON.parse(job.result.text);
+    assert.equal(actual.configured.config.reasoningEffort, "medium");
+    assert.equal(actual.job.agentId, actual.configured.agentId);
+    await f.engine().dispatch("agents", "send", {
+      agentId: actual.job.agentId,
+      text: "一条完整任务",
+    }, actual.job.jobId);
+    assert.equal(f.engine().agents.history({ agentId: actual.job.agentId }).messages.length, 2);
+    assert.equal(f.paid(), 1);
+  } finally {
+    await kernel.stop();
+    await f.close();
+  }
+});

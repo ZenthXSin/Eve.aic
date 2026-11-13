@@ -1,3 +1,4 @@
+import type { AgentApi } from "./agents.ts";
 import type { Json } from "../kernel/protocol.ts";
 import type {
   PhoneActionReceipt,
@@ -20,6 +21,7 @@ export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;
 export const WEB_CAPABILITY_VERSION = 1;
 /** 默认工具等待上限与后台续行能力，用于准确复原旧版本生成提示。 */
 export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 1;
+export const AGENT_CAPABILITY_VERSION = 1;
 /** 原生随记工具 write_thought 的参数，不属于脚本 tools 对象中的接口。 */
 export interface NativeThoughtArguments {
   thought: string;
@@ -54,6 +56,7 @@ export interface ScriptSummary {
   error?: { kind: string; message: string };
 }
 export interface ScriptApi {
+  agents: AgentApi;
   web: WebApi;
   upgrades: UpgradeApi;
   notes: NoteApi;

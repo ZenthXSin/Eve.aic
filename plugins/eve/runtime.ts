@@ -35,6 +35,7 @@ export interface EveConfig {
   dailyTokenBudget: number;
   timeZone?: string;
   remoteRecords?: boolean;
+  agentsEnabled?: boolean;
 }
 export class EveRuntime {
   readonly journal: ConsciousJournal | RemoteJournal;
@@ -69,6 +70,8 @@ export class EveRuntime {
     this.#rememberJob(callId, result);
   }
   #wake = 0;
+  #agentThrough = 0;
+  #agentFresh = false;
   #phoneThrough = 0;
   #scriptThrough = 0;
   #commandThrough = 0;
@@ -119,6 +122,7 @@ export class EveRuntime {
           ["image", "image_description"].includes(String(data.source)) &&
           typeof data.actionId === "string"
         ) this.#imageActions.add(data.actionId);
+        if (data.source === "agents") this.#agentThrough = Number(data.throughSeq);
         if (data.source === "phone") this.#phoneThrough = Number(data.throughSeq);
         if (data.source === "scripts") this.#scriptThrough = Number(data.throughSeq);
         if (data.source === "commands") this.#commandThrough = Number(data.throughSeq);
@@ -266,11 +270,12 @@ export class EveRuntime {
   async #notices(): Promise<boolean> {
     this.#restApplied = false;
     this.#phoneFresh = false;
+    this.#agentFresh = false;
     this.#alarmFresh = false;
     this.#commandFresh = false;
     let fresh = false;
     // Reads are independent; apply their receipts in the established deterministic order.
-    const [, phone, tasks, completed, controls] = await Promise.all([
+    const [, phone, tasks, completed, controls, agents] = await Promise.all([
       this.#refreshBudget(),
       this.ctx.call<Json>("phone", "notifications", { afterSeq: this.#phoneThrough }),
       this.ctx.call<Json>("scripts", "completions", { afterSeq: this.#scriptThrough }),
@@ -278,6 +283,9 @@ export class EveRuntime {
         ? this.ctx.call("commands", "completions", { afterSeq: this.#commandThrough })
         : Promise.resolve(undefined),
       this.ctx.call<Json>("mind", "poll", { afterSeq: this.#mindThrough }),
+      this.config.agentsEnabled
+        ? this.ctx.call<Json>("agents", "notifications", { afterSeq: this.#agentThrough })
+        : Promise.resolve(undefined),
     ]);
     const page = phone as unknown as { items: Json[]; throughSeq: number; hasMore: boolean };
     if (page.throughSeq > this.#phoneThrough) {
@@ -292,6 +300,22 @@ export class EveRuntime {
         fresh = true;
         this.#phoneFresh = true;
         this.#wake = 0;
+      }
+    }
+    if (agents) {
+      const page = agents as unknown as { items: Json[]; throughSeq: number };
+      if (page.throughSeq > this.#agentThrough) {
+        await this.journal.append("notice", {
+          source: "agents",
+          throughSeq: page.throughSeq,
+          items: page.items,
+        });
+        this.#agentThrough = page.throughSeq;
+        if (page.items.length) {
+          fresh = true;
+          this.#agentFresh = true;
+          this.#wake = 0;
+        }
       }
     }
     const completion = tasks as unknown as { items: Json[]; throughSeq: number };
@@ -619,7 +643,10 @@ export class EveRuntime {
     const noticesStarted = performance.now();
     const fresh = await this.#notices();
     const noticesMs = performance.now() - noticesStarted;
-    if (this.#restApplied && !this.#phoneFresh && !this.#alarmFresh && !this.#commandFresh) return;
+    if (
+      this.#restApplied && !this.#phoneFresh && !this.#alarmFresh && !this.#commandFresh &&
+      !this.#agentFresh
+    ) return;
     if (fresh) {
       this.#wake = 0;
       await this.journal.append("wake", { reason: "新的未观察通知" });
@@ -861,6 +888,7 @@ export class EveRuntime {
       healthy: this.journal.available && !this.#closing && !this.#fatal,
       sourceCommit: this.config.sourceCommit,
       records: this.journal.events.length,
+      agentThroughSeq: this.#agentThrough,
       phoneThroughSeq: this.#phoneThrough,
       scriptThroughSeq: this.#scriptThrough,
       commandThroughSeq: this.#commandThrough,

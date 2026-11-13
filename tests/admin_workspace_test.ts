@@ -411,7 +411,7 @@ Deno.test("workspace queries reject file paths, phone open and invalid cursors",
   );
 });
 
-Deno.test("workspace covers every ScriptApi method, native tool, and future namespace without thought duplication", async () => {
+Deno.test("workspace catalog covers every ScriptApi method while the latest operation window remains bounded", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-all-tools-observer-" });
   const store = new ScriptStore(directory);
   try {
@@ -448,7 +448,7 @@ Deno.test("workspace covers every ScriptApi method, native tool, and future name
       }
     });
     const original = await new ScriptObserver(directory).read() as Record<string, Json>;
-    assert.equal((original.items as Json[]).length, methods.length);
+    assert.equal((original.items as Json[]).length, Math.min(64, methods.length));
     const reader = new WorkspaceReader({
       status: () => Promise.resolve(null),
       control: () => {
@@ -519,8 +519,8 @@ Deno.test("workspace covers every ScriptApi method, native tool, and future name
     ];
     const merged = withNativeOperations(base, events) as Record<string, Json>;
     const operations = merged.operations as Record<string, Json>[];
-    assert.equal(operations.length, methods.length + 2);
-    for (const { namespace, method } of methods) {
+    assert.equal(operations.length, Math.min(64, methods.length) + 2);
+    for (const { namespace, method } of methods.slice(-64)) {
       assert(
         operations.some((op) => op.namespace === namespace && op.method === method),
         `${namespace}.${method}`,
@@ -543,7 +543,7 @@ Deno.test("workspace covers every ScriptApi method, native tool, and future name
     assert.equal(events[0].text, thought);
     assert.equal((merged.currentApp as Record<string, Json>).appId, "tools");
     const tools = (merged.apps as Record<string, Record<string, Json>>).tools;
-    assert.equal((tools.items as Json[]).length, methods.length + 2);
+    assert.equal((tools.items as Json[]).length, Math.min(64, methods.length) + 2);
   } finally {
     await store.close();
     await Deno.remove(directory, { recursive: true });

@@ -1,4 +1,10 @@
-import type { ModelImage, ModelRequest, ModelResponse } from "../../contracts/model.ts";
+import { AgentService } from "./agents.ts";
+import type {
+  ModelCallOptions,
+  ModelImage,
+  ModelRequest,
+  ModelResponse,
+} from "../../contracts/model.ts";
 import { RUNTIME_METHODS } from "../../contracts/runtime.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError, toWireError, type WireError } from "../../kernel/protocol.ts";
@@ -31,7 +37,10 @@ interface Options {
   workspace: string;
   allowedRoots?: string[];
   settingsFile: string;
-  model: { complete(args: ModelRequest): Promise<ModelResponse>; close(): void };
+  model: {
+    complete(args: ModelRequest, options?: ModelCallOptions): Promise<ModelResponse>;
+    close(): void;
+  };
   maxOutputTokens: number;
   modelName?: string;
   modelSelection?: Pick<ModelSelection, "snapshot" | "current">;
@@ -43,6 +52,7 @@ interface Options {
 }
 /** 真实执行与回执不随内核/插件回退；令牌校验由独立 HTTP 出口包围整个执行。 */
 export class RuntimeEngine {
+  readonly agents: AgentService;
   readonly web: WebApi;
   readonly records: FactJournal;
   readonly transactions: FactJournal;
@@ -53,6 +63,7 @@ export class RuntimeEngine {
   readonly commands: CommandSessions;
   readonly budget: SharedBudget;
   #requests = new Map<string, RequestRecord>();
+  #responseIndex = new Map<string, number>();
   #live = new Map<string, Promise<Json>>();
   #timelineTail: Promise<unknown> = Promise.resolve();
   #modelSelectionTail: Promise<unknown> = Promise.resolve();
@@ -84,11 +95,25 @@ export class RuntimeEngine {
       options.commandUseSystemd,
     );
     this.budget = new SharedBudget(`${directory}/budget`, options.settingsFile);
+    this.agents = new AgentService(`${directory}/agents`, {
+      result: (id) => this.#modelResult(id) as unknown as ModelResponse | undefined,
+      complete: async (request, config, id) =>
+        await this.dispatch(
+          "model",
+          "complete",
+          { ...request, _purpose: "isolated", _agentConfig: config } as unknown as Record<
+            string,
+            Json
+          >,
+          id,
+        ) as unknown as ModelResponse,
+      invoke: (namespace, method, args, id) => this.dispatch(namespace, method, args, id),
+    });
   }
   get available() {
     return !this.#closing && this.transactions.available && this.records.available &&
       this.notes.journal.available && this.memory.journal.available &&
-      this.budget.journal.available;
+      this.budget.journal.available && this.agents.available;
   }
   async initialize() {
     await Deno.mkdir(this.options.workspace, { recursive: true, mode: 0o700 });
@@ -115,6 +140,7 @@ export class RuntimeEngine {
           throw new KernelError("corrupt", "模型响应原件索引无效，保留现场");
         }
         responseIds.add(data.id);
+        this.#responseIndex.set(data.id, event.seq);
         // 原响应已落盘而预算结算前中断时，用原用量补记；不再调用模型或重复强化记忆。
         await this.budget.response(data.id, data.response);
       }
@@ -135,9 +161,18 @@ export class RuntimeEngine {
           Object.assign(previous, data, { terminal: true });
         } else throw new KernelError("corrupt", "未知执行记录");
       }
+      // Reconcile agent originals first, so a completed reply also restores its outer receipt.
+      await this.agents.initialize();
       for (const r of this.#requests.values()) {
         if (!r.terminal) {
           let value: Json | undefined;
+          if (r.namespace === "agents" && r.method === "send") {
+            try {
+              value = this.agents.status({ jobId: r.id }) as unknown as Json;
+            } catch (error) {
+              if (!(error instanceof KernelError && error.kind === "not_found")) throw error;
+            }
+          }
           if (r.namespace === "notes") {
             value = this.notes.receipt(r.id) as unknown as Json | undefined;
           }
@@ -290,6 +325,12 @@ export class RuntimeEngine {
     const record = this.#requests.get(id);
     return record?.terminal ? structuredClone(record) : undefined;
   }
+  async validateRepeat(namespace: string, method: string, args: Record<string, Json>, id: string) {
+    const old = this.#requests.get(id);
+    if (old && old.hash !== await fingerprint({ namespace, method, args })) {
+      throw new KernelError("rejected", "同一动作编号不能改变参数");
+    }
+  }
   async dispatch(
     namespace: string,
     method: string,
@@ -309,6 +350,14 @@ export class RuntimeEngine {
         method,
       )
     ) throw new KernelError("rejected", "该能力不在契约内");
+    // Read-only agent views use the metadata index and do not append an execution ledger
+    // on every idle notification poll or duplicate a complete long body into a capped fact.
+    if (
+      namespace === "agents" &&
+      ["list", "status", "history", "message", "search", "notifications"].includes(method)
+    ) {
+      return await this.agents.invoke(method, args, id);
+    }
     // Capture before the first await: an admitted request keeps its original client and provenance.
     const selected = namespace === "model" && ["complete", "describeImage"].includes(method)
       ? this.options.modelSelection?.snapshot() ?? {
@@ -369,7 +418,8 @@ export class RuntimeEngine {
     }
   }
   #modelResult(id: string): Json | undefined {
-    return (this.modelResponses.events.find((e) => (e.data as { id: string }).id === id)?.data as {
+    const seq = this.#responseIndex.get(id);
+    return ((seq === undefined ? undefined : this.modelResponses.events[seq - 1])?.data as {
       response?: Json;
     } | undefined)?.response;
   }
@@ -380,6 +430,7 @@ export class RuntimeEngine {
     id: string,
     selected?: ModelSnapshot,
   ): Promise<Json> {
+    if (namespace === "agents") return await this.agents.invoke(method, args, id);
     if (namespace === "timeline") {
       if (method === "page") return this.#recordPage(args, true) as unknown as Json;
       if (args.kind === "upgrade_rollback" || args.kind === "model_resume") {
@@ -464,21 +515,34 @@ export class RuntimeEngine {
         );
       }
       const image = description ? args.image as unknown as ModelImage : undefined;
-      const { _purpose: purpose, ...modelArgs } = args;
+      const { _purpose: purpose, _agentConfig: agentConfig, ...modelArgs } = args;
+      const overrides = agentConfig as unknown as ModelCallOptions | undefined;
+      if (overrides && (!id.startsWith("script_") && !id.startsWith("agent_"))) {
+        throw new KernelError("rejected", "子代理模型配置需要独立任务编号");
+      }
+      const outputTokens = overrides?.maxOutputTokens ?? selected?.maxOutputTokens ??
+        this.options.maxOutputTokens;
       const request = description
         ? imageDescriptionRequest(image!)
         : modelArgs as unknown as ModelRequest;
       const amount = new TextEncoder().encode(JSON.stringify(request)).length +
-        request.messages.length * 64 + (selected?.maxOutputTokens ?? this.options.maxOutputTokens);
+        request.messages.length * 64 + outputTokens;
       await this.budget.reserve(id, amount);
-      const response = await (selected?.client ?? this.options.model).complete(request);
-      await this.modelResponses.append("response", {
+      const response = await (selected?.client ?? this.options.model).complete(request, overrides);
+      const savedResponse = await this.modelResponses.append("response", {
         id,
         response,
-        ...(selected?.modelName
-          ? { modelName: selected.modelName, modelRevision: selected.revision }
+        ...(selected?.modelName || overrides?.model
+          ? {
+            modelName: overrides?.model ?? selected?.modelName,
+            modelRevision: selected?.revision ?? 0,
+          }
+          : {}),
+        ...(overrides
+          ? { agentSession: overrides.sessionId, reasoningEffort: overrides.reasoningEffort }
           : {}),
       } as unknown as Json);
+      this.#responseIndex.set(id, savedResponse.seq);
       await this.budget.response(id, response);
       if (description) {
         return describedImage(
@@ -529,6 +593,7 @@ export class RuntimeEngine {
     } catch (e) {
       errors.push(e);
     }
+    await this.agents.close();
     await Promise.allSettled([...this.#live.values(), this.#modelSelectionTail]);
     for (
       const service of [

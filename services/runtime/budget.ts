@@ -6,6 +6,26 @@ import { accountingDay } from "../../plugins/eve/view.ts";
 export class SharedBudget {
   readonly journal: FactJournal;
   #tail: Promise<unknown> = Promise.resolve();
+  #reservations = new Map<string, { day: string; amount: number }>();
+  #usages = new Set<string>();
+  #days = new Map<string, { known: number; unknown: number }>();
+  #index(
+    kind: string,
+    data: { id: string; day?: string; amount?: number; known?: number; unknown?: number },
+  ) {
+    if (kind === "reserve") {
+      this.#reservations.set(data.id, { day: data.day!, amount: data.amount! });
+      const total = this.#days.get(data.day!) ?? { known: 0, unknown: 0 };
+      total.unknown += data.amount!;
+      this.#days.set(data.day!, total);
+    } else {
+      const reservation = this.#reservations.get(data.id)!;
+      const total = this.#days.get(reservation.day)!;
+      total.known += data.known!;
+      total.unknown += data.unknown! - reservation.amount;
+      this.#usages.add(data.id);
+    }
+  }
   constructor(directory: string, readonly settingsFile: string) {
     this.journal = new FactJournal(directory);
   }
@@ -38,6 +58,10 @@ export class SharedBudget {
           ) throw new KernelError("corrupt", "预算用量缺少唯一有效预留");
           usages.add(data.id);
         } else throw new KernelError("corrupt", "未知预算记录");
+        this.#index(
+          event.kind,
+          data as { id: string; day?: string; amount?: number; known?: number; unknown?: number },
+        );
       }
       await this.settings();
     } catch (error) {
@@ -65,23 +89,7 @@ export class SharedBudget {
   }
   async status() {
     const settings = await this.settings(), day = accountingDay(settings.timeZone);
-    const reservations = new Map<string, number>();
-    let known = 0;
-    for (const event of this.journal.events) {
-      const data = event.data as {
-        id: string;
-        day: string;
-        amount: number;
-        known: number;
-        unknown: number;
-      };
-      if (event.kind === "reserve" && data.day === day) reservations.set(data.id, data.amount);
-      if (event.kind === "usage" && reservations.has(data.id)) {
-        known += data.known;
-        reservations.set(data.id, data.unknown);
-      }
-    }
-    const unknown = [...reservations.values()].reduce((sum, x) => sum + x, 0);
+    const { known, unknown } = this.#days.get(day) ?? { known: 0, unknown: 0 };
     if (!Number.isSafeInteger(known + unknown)) {
       throw new KernelError("corrupt", "预算总量超出安全整数，停止新请求");
     }
@@ -99,11 +107,9 @@ export class SharedBudget {
       throw new KernelError("rejected", "预算预留参数无效");
     }
     const work = this.#tail.then(async () => {
-      const existing = this.journal.events.find((e) =>
-        e.kind === "reserve" && (e.data as { id: string }).id === id
-      );
+      const existing = this.#reservations.get(id);
       if (existing) {
-        if ((existing.data as { amount: number }).amount !== amount) {
+        if (existing.amount !== amount) {
           throw new KernelError("rejected", "同一请求不能更改预算预留");
         }
         return;
@@ -116,6 +122,7 @@ export class SharedBudget {
         );
       }
       await this.journal.append("reserve", { id, day: status.day, amount });
+      this.#index("reserve", { id, day: status.day, amount });
     });
     this.#tail = work.catch(() => {});
     await work;
@@ -126,14 +133,10 @@ export class SharedBudget {
     await work;
   }
   async #response(id: string, response: ModelResponse) {
-    if (
-      !this.journal.events.some((e) => e.kind === "reserve" && (e.data as { id: string }).id === id)
-    ) {
+    if (!this.#reservations.has(id)) {
       throw new KernelError("rejected", "模型用量没有对应的预算预留");
     }
-    if (
-      this.journal.events.some((e) => e.kind === "usage" && (e.data as { id: string }).id === id)
-    ) return;
+    if (this.#usages.has(id)) return;
     const usage = response.usage;
     if (
       usage?.status === "invalid" || usage?.inputTokens === undefined ||
@@ -144,15 +147,14 @@ export class SharedBudget {
         Number.isSafeInteger(n) && n >= 0
       ) && (usage.cachedInputTokens ?? 0) <= usage.inputTokens;
     if (!valid || !Number.isSafeInteger(usage.inputTokens + usage.outputTokens)) return;
-    await this.journal.append(
-      "usage",
-      {
-        id,
-        known: usage.outputTokens +
-          (usage.cachedInputTokens === undefined ? 0 : usage.inputTokens - usage.cachedInputTokens),
-        unknown: usage.cachedInputTokens === undefined ? usage.inputTokens : 0,
-      } as Json,
-    );
+    const data = {
+      id,
+      known: usage.outputTokens +
+        (usage.cachedInputTokens === undefined ? 0 : usage.inputTokens - usage.cachedInputTokens),
+      unknown: usage.cachedInputTokens === undefined ? usage.inputTokens : 0,
+    };
+    await this.journal.append("usage", data as Json);
+    this.#index("usage", data);
   }
   async close() {
     await this.#tail;

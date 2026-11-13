@@ -1,6 +1,7 @@
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 
 export const ADMIN_READS = {
+  agents: ["page", "get", "search"],
   timeline: ["page", "get", "search"],
   notes: ["page", "get", "versions", "search"],
   memory: ["page", "get", "search"],

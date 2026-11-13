@@ -29,6 +29,7 @@ export class RuntimeClient {
         headers: {
           authorization: `Bearer ${(await Deno.readTextFile(this.config.keyFile)).trim()}`,
           "content-type": "application/json",
+          ...(namespace === "agents" ? { "x-eve-namespace": "agents" } : {}),
         },
         body: JSON.stringify(body),
         signal: AbortSignal.any([this.#controller.signal, AbortSignal.timeout(300000)]),
@@ -45,7 +46,7 @@ export class RuntimeClient {
           const part = await reader.read();
           if (part.done) break;
           size += part.value.length;
-          if (size > 16_777_216) {
+          if (size > 16_777_216 && namespace !== "agents") {
             await reader.cancel();
             throw new KernelError("unknown", "执行回执超过当前格式");
           }

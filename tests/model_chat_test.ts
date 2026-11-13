@@ -446,3 +446,42 @@ Deno.test("模型插件：真实 worker 经内核工具回传，不把凭据放�
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("model per-call options isolate subagent model, effort and cache session while retaining online defaults", async () => {
+  const seen: Record<string, unknown>[] = [];
+  const local = server(async (request) => {
+    const body = await request.json();
+    seen.push(body);
+    assert.equal(request.headers.get("session_id"), body.prompt_cache_key);
+    return Response.json(completion("one whole reply"));
+  });
+  const client = new ChatModelClient({ ...options, baseUrl: local.url });
+  try {
+    await Promise.all([
+      client.complete(request, {
+        model: "agent-one",
+        reasoningEffort: "low",
+        sessionId: "agent_one",
+        maxOutputTokens: 12345,
+      }),
+      client.complete(request, {
+        model: "agent-two",
+        reasoningEffort: "xhigh",
+        sessionId: "agent_two",
+      }),
+    ]);
+    await client.complete(request);
+    const first = seen.find((x) => x.model === "agent-one")!;
+    assert.equal(first.reasoning_effort, "low");
+    assert.equal(first.max_completion_tokens, 12345);
+    assert.equal(first.prompt_cache_key, "agent_one");
+    const second = seen.find((x) => x.model === "agent-two")!;
+    assert.equal(second.reasoning_effort, "xhigh");
+    assert.equal(seen[2].model, options.model);
+    assert.equal(seen[2].reasoning_effort, options.reasoningEffort);
+    assert.equal(seen[2].prompt_cache_key, options.sessionId);
+  } finally {
+    client.close();
+    await local.close();
+  }
+});

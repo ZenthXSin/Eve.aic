@@ -38,6 +38,12 @@ export function startRuntimeAdmin(
       !request.args || typeof request.args !== "object" || Array.isArray(request.args)
     ) throw new KernelError("rejected", "管理查询不在契约内");
     const { resource, operation, args } = request;
+    if (resource === "agents") {
+      if (operation === "get") return await engine.agents.message(args) as unknown as Json;
+      if (operation === "search") return await engine.agents.search(args) as unknown as Json;
+      if (typeof args.agentId === "string") return engine.agents.history(args) as unknown as Json;
+      return engine.agents.list(args) as unknown as Json;
+    }
     if (resource === "notes") {
       if (operation === "page") {
         const result = engine.notes.list({ ...args, includeUnconfirmed: true } as never);

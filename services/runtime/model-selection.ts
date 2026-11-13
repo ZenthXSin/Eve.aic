@@ -1,4 +1,4 @@
-import type { ModelRequest, ModelResponse } from "../../contracts/model.ts";
+import type { ModelCallOptions, ModelRequest, ModelResponse } from "../../contracts/model.ts";
 import { type Json, KernelError, type WireError } from "../../kernel/protocol.ts";
 import { ChatModelClient, type ChatModelOptions } from "../../plugins/model-chat/client.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
@@ -7,7 +7,10 @@ export interface ModelSnapshot {
   modelName: string;
   revision: number;
   maxOutputTokens: number;
-  client: { complete(args: ModelRequest): Promise<ModelResponse>; close(): void };
+  client: {
+    complete(args: ModelRequest, options?: ModelCallOptions): Promise<ModelResponse>;
+    close(): void;
+  };
 }
 export interface ModelSelectionResult {
   actionId: string;
