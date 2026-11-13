@@ -44,6 +44,83 @@ function context(read?: (namespace: string, method: string, args: Json) => Promi
   };
 }
 
+Deno.test("未读消息：半小时提醒、并发去重、重启保留、读完停止、查询失败不阻塞其他提醒", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-unread-reminder-" });
+  const interval = 30 * 60_000;
+  let now = Date.parse("2026-11-14T00:00:00Z"), calls = 0, unavailable = false;
+  let items: Json[] = [{ handle: { conversationId: "qq:user:a", seq: 1 } }];
+  const read = (namespace: string, method: string, args: Json) => {
+    assert.equal(namespace, "phone");
+    assert.equal(method, "notifications");
+    assert.deepEqual(args, { afterSeq: 0 });
+    calls++;
+    if (unavailable) throw new Error("phone unavailable");
+    return Promise.resolve({ items, hasMore: false });
+  };
+  let host = context(read), plugin = createMindControls(directory, undefined, () => now, interval);
+  const poll = () =>
+    host.handlers.poll({ afterSeq: 0 }) as Promise<{
+      items: { kind: string; args: { source?: string; items?: Json[] } }[];
+    }>;
+  try {
+    await plugin.load!(host.ctx);
+    await plugin.enable!(host.ctx);
+    await poll();
+    now += interval - 1;
+    await poll();
+    assert.equal(calls, 0);
+    now++;
+    const pages = await Promise.all([poll(), poll()]);
+    assert.equal(calls, 1);
+    assert.equal(pages[0].items.length, 1);
+    assert.equal(pages[1].items.length, 1);
+    assert.equal(pages[0].items[0].kind, "alarm");
+    assert.equal(pages[0].items[0].args.source, "unread_messages");
+    assert.deepEqual(pages[0].items[0].args.items, items);
+    await host.close();
+    host = context(read);
+    plugin = createMindControls(directory, undefined, () => now, interval);
+    await plugin.load!(host.ctx);
+    await plugin.enable!(host.ctx);
+    await poll();
+    assert.equal(calls, 1);
+    now += interval;
+    assert.equal((await poll()).items.length, 2);
+    items = [];
+    now += interval;
+    assert.equal((await poll()).items.length, 2);
+    unavailable = true;
+    now += interval;
+    await host.handlers.remind({
+      requestId: "independent",
+      at: "2020-01-01T00:00:00Z",
+      text: "其他提醒",
+    });
+    assert.equal((await poll()).items.length, 4);
+    const status = await host.handlers.status(null) as {
+      unreadReminder: { nextCheck: number; lastError: string };
+    };
+    assert.match(status.unreadReminder.lastError, /phone unavailable/);
+    assert.equal(status.unreadReminder.nextCheck, now + 60_000);
+    const previousCalls = calls;
+    now += 59_999;
+    await poll();
+    assert.equal(calls, previousCalls);
+    unavailable = false;
+    now++;
+    await poll();
+    assert.equal(calls, previousCalls + 1);
+    assert.equal(
+      (await host.handlers.status(null) as { unreadReminder: { lastError?: string } })
+        .unreadReminder.lastError,
+      undefined,
+    );
+  } finally {
+    await host.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
 Deno.test("每晚自检：当地时间、重启恢复、停机补一次、并发不重复且不代替Eve删文件", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-nightly-" });
   const attachmentDirectory = `${directory}/attachments`;

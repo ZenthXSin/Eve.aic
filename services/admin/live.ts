@@ -43,6 +43,7 @@ export interface LiveEvent {
   toolReceiptPartial?: boolean;
   wakeAt?: number;
   retryAt?: number;
+  noticeSource?: string;
   sourceCommit?: string;
   relatedSeq?: number;
 }
@@ -156,6 +157,7 @@ export function liveEvent(value: unknown): LiveEvent {
     case "notice": {
       event.category = "notice";
       const source = string(d.source);
+      event.noticeSource = source;
       const sources: Record<string, string> = {
         phone: "消息",
         scripts: "脚本",

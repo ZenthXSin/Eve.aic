@@ -147,7 +147,7 @@ function paintConstellation(snapshot){
   // 新的文字记录让光球闪一下；首帧只记水位，不补放旧动画。
   const events=snapshot.events||[];
   let thoughtSeq=-1,noticeSeq=-1,notice=null;
-  for(const e of events){if(e.retained)continue;if(e.kind==='model_response'&&e.hasText)thoughtSeq=Math.max(thoughtSeq,e.seq);if(e.kind==='notice'&&e.seq>noticeSeq){noticeSeq=e.seq;notice=e;}}
+  for(const e of events){if(e.retained)continue;if(e.kind==='model_response'&&e.hasText)thoughtSeq=Math.max(thoughtSeq,e.seq);if(e.kind==='notice'&&e.noticeSource!=='memory'&&e.seq>noticeSeq){noticeSeq=e.seq;notice=e;}}
   if(stageThoughtSeq!==null&&thoughtSeq>stageThoughtSeq){stageSpark=stageSpark==='a'?'b':'a';el('constellation').setAttribute('data-spark',stageSpark);}
   stageThoughtSeq=Math.max(stageThoughtSeq??-1,thoughtSeq);
   if(stageNoticeSeq!==null&&notice&&noticeSeq>stageNoticeSeq)showStageBanner(notice);
