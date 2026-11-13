@@ -1,0 +1,299 @@
+[
+  {
+    "number": 559,
+    "title": "接通持久所有权交接及 QQ 出口令牌检查",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/559",
+    "head": "codex/rebuild-ownership-20261112",
+    "headCommit": "6adcebb0ade15c52bff855bf1f643cb8a626c941",
+    "base": "codex/rebuild-consciousness-20261112",
+    "baseCommit": "7a75fb3fde1f3d7521e6254540b1499d12bb1914"
+  },
+  {
+    "number": 558,
+    "title": "接通持续意识流与自主休息提醒，恢复复用真实动作回执",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/558",
+    "head": "codex/rebuild-consciousness-20261112",
+    "headCommit": "7a75fb3fde1f3d7521e6254540b1499d12bb1914",
+    "base": "codex/rebuild-script-runtime-20261112",
+    "baseCommit": "588c628bf0e1a691a46173c662c8f53958b53871"
+  },
+  {
+    "number": 557,
+    "title": "接通原生异步脚本与独立动作账本，恢复回滚不重放",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/557",
+    "head": "codex/rebuild-script-runtime-20261112",
+    "headCommit": "588c628bf0e1a691a46173c662c8f53958b53871",
+    "base": "codex/rebuild-qq-phone-service-20261112",
+    "baseCommit": "79fe22c3b4d476e0e64e43f33f37d30d91ff7a4a"
+  },
+  {
+    "number": 556,
+    "title": "接通独立QQ适配器与手机，跨重启保留消息和真实回执",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/556",
+    "head": "codex/rebuild-qq-phone-service-20261112",
+    "headCommit": "79fe22c3b4d476e0e64e43f33f37d30d91ff7a4a",
+    "base": "codex/rebuild-qq-send-receipts-20261112",
+    "baseCommit": "621558cd491268cf222042d786a04f85739d4b1b"
+  },
+  {
+    "number": 555,
+    "title": "QQ 每个发送动作持久回执，恢复未知不盲目重发",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/555",
+    "head": "codex/rebuild-qq-send-receipts-20261112",
+    "headCommit": "621558cd491268cf222042d786a04f85739d4b1b",
+    "base": "codex/rebuild-qq-gateway-20261112",
+    "baseCommit": "8b5f4e72085a3dbbe731a43e54508c1773c42f05"
+  },
+  {
+    "number": 554,
+    "title": "接通独立 QQ 网关，持久消费水位并验证断线恢复",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/554",
+    "head": "codex/rebuild-qq-gateway-20261112",
+    "headCommit": "8b5f4e72085a3dbbe731a43e54508c1773c42f05",
+    "base": "codex/rebuild-qq-inbound-20261112",
+    "baseCommit": "c22a09dd48ee9ab4a2bd6dda849a4613ed3bd19c"
+  },
+  {
+    "number": 553,
+    "title": "持久化官方 QQ 入站去重，限制测试版只发私信",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/553",
+    "head": "codex/rebuild-qq-inbound-20261112",
+    "headCommit": "c22a09dd48ee9ab4a2bd6dda849a4613ed3bd19c",
+    "base": "codex/rebuild-model-chat-20261111",
+    "baseCommit": "908bdba3fe8444747af8f554be8c4ba75d97d449"
+  },
+  {
+    "number": 552,
+    "title": "组合 QQ 候选并接入原模型，验证真实工具往返",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/552",
+    "head": "codex/rebuild-model-chat-20261111",
+    "headCommit": "908bdba3fe8444747af8f554be8c4ba75d97d449",
+    "base": "codex/rebuild-qq-phone-view-20261111",
+    "baseCommit": "f7d74a8b11215792f4ded789acc8665ae56d8100"
+  },
+  {
+    "number": 551,
+    "title": "实现 QQ 消息屏幕与快照翻页，整理交流提示词候选",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/551",
+    "head": "codex/rebuild-qq-phone-view-20261111",
+    "headCommit": "f7d74a8b11215792f4ded789acc8665ae56d8100",
+    "base": "codex/rebuild-qq-transport-20261111",
+    "baseCommit": "7b19ac5ff23c294ff9bcb0e5c97a565a57df41f6"
+  },
+  {
+    "number": 550,
+    "title": "修复调用重放、状态丢失与回滚门控，落实已确认规则",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/550",
+    "head": "codex/rebuild-runtime-reliability-20261111",
+    "headCommit": "e9acb6e90ec04e0afccbd52afaa8efc9edd47043",
+    "base": "ccr-cc5187ac-83u4uj",
+    "baseCommit": "b925780c8b33f61f2574ff4e9419c31c545fd6db"
+  },
+  {
+    "number": 549,
+    "title": "接入独立 QQ HTTP 传输，区分真实发送与未知结果",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/549",
+    "head": "codex/rebuild-qq-transport-20261111",
+    "headCommit": "7b19ac5ff23c294ff9bcb0e5c97a565a57df41f6",
+    "base": "ccr-cc5187ac-83u4uj",
+    "baseCommit": "b925780c8b33f61f2574ff4e9419c31c545fd6db"
+  },
+  {
+    "number": 547,
+    "title": "写入 Eve TS 重做设计文档（第二版）",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/547",
+    "head": "ccr-cc5187ac-83u4uj",
+    "headCommit": "b925780c8b33f61f2574ff4e9419c31c545fd6db",
+    "base": "codex/rebuild-20261111",
+    "baseCommit": "edd883d491a01db4160929b07558330173ba46dc"
+  },
+  {
+    "number": 544,
+    "title": "让工作区 Node 测试证据跨进度与重启复用，并拒绝过期输入",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/544",
+    "head": "codex/workspace-test-evidence-20261111",
+    "headCommit": "3527c2f53d58c8fca1617ce1e8ad70f050534204",
+    "base": "codex/frozen-node-test-20261110",
+    "baseCommit": "a7d111a2f76ebdff3756f0a6e3680cd00a0a306c"
+  },
+  {
+    "number": 543,
+    "title": "对齐身份文件中的自主执行策略，移除重复的固定分工流程",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/543",
+    "head": "codex/agent-policy-alignment-20261111",
+    "headCommit": "f3c1e6ae6a0dbdf0b12231c08928629fa5a2d18d",
+    "base": "codex/identity-prompt-prefix-20261111",
+    "baseCommit": "268d57c1f6ec8349da9dc5751572253aa57e1ac1"
+  },
+  {
+    "number": 542,
+    "title": "等待重启请求归档后再核对热升级验收唯一性",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/542",
+    "head": "codex/ci-restart-archive-20261111",
+    "headCommit": "d4f0469b43efd494994fb16cdf8b15034b695879",
+    "base": "codex/identity-prompt-prefix-20261111",
+    "baseCommit": "268d57c1f6ec8349da9dc5751572253aa57e1ac1"
+  },
+  {
+    "number": 541,
+    "title": "将固定身份资料说明移入缓存前缀，保留逐轮授权与资料更新",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/541",
+    "head": "codex/identity-prompt-prefix-20261111",
+    "headCommit": "268d57c1f6ec8349da9dc5751572253aa57e1ac1",
+    "base": "codex/speech-first-response-20261111",
+    "baseCommit": "5f46e06f3e64dfdfc716f19ec49842ebfad9a950"
+  },
+  {
+    "number": 540,
+    "title": "澄清后台交流触发条件，允许自然承接尚未回应的内容",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/540",
+    "head": "codex/speech-first-response-20261111",
+    "headCommit": "5f46e06f3e64dfdfc716f19ec49842ebfad9a950",
+    "base": "codex/delegated-progress-notes-20261110",
+    "baseCommit": "9556d68f06a963e07b26dc5e4df78514e0490e74"
+  },
+  {
+    "number": 539,
+    "title": "将子代理自愿登记的阶段说明交给原会话发言判断",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/539",
+    "head": "codex/delegated-progress-notes-20261110",
+    "headCommit": "9556d68f06a963e07b26dc5e4df78514e0490e74",
+    "base": "codex/autonomous-task-guidance-20261110",
+    "baseCommit": "8bc32244f28d23d964f6f6ee944a3c6ae459a319"
+  },
+  {
+    "number": 538,
+    "title": "重访旧经验时附上最新基线，避免分页遗漏已有条件",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/538",
+    "head": "codex/learner-history-latest-20261110",
+    "headCommit": "abc83a450d8300fc1c752d353f3836b7a3e5a0c5",
+    "base": "codex/autonomous-task-guidance-20261110",
+    "baseCommit": "8bc32244f28d23d964f6f6ee944a3c6ae459a319"
+  },
+  {
+    "number": 537,
+    "title": "固定 Node 测试对象并复用可信回执，避免进度登记后重复验收",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/537",
+    "head": "codex/frozen-node-test-20261110",
+    "headCommit": "a7d111a2f76ebdff3756f0a6e3680cd00a0a306c",
+    "base": "codex/autonomous-task-guidance-20261110",
+    "baseCommit": "8bc32244f28d23d964f6f6ee944a3c6ae459a319"
+  },
+  {
+    "number": 536,
+    "title": "澄清交流学习纠正与反例分类，明确证据引用唯一性",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/536",
+    "head": "codex/learner-assessment-contract-20261110",
+    "headCommit": "3c1dfb7d048d1e849ed671c16415630dfbacbc3f",
+    "base": "codex/autonomous-task-guidance-20261110",
+    "baseCommit": "8bc32244f28d23d964f6f6ee944a3c6ae459a319"
+  },
+  {
+    "number": 535,
+    "title": "按需选择分工与进度登记，取消固定执行流程",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/535",
+    "head": "codex/autonomous-task-guidance-20261110",
+    "headCommit": "8bc32244f28d23d964f6f6ee944a3c6ae459a319",
+    "base": "codex/receipt-evidence-query-20261110",
+    "baseCommit": "0cf725f2ddd41ee4e20febe2a0bde9335b535fb7"
+  },
+  {
+    "number": 534,
+    "title": "直接交回子代理历史验收证据，减少重新翻阅执行日志",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/534",
+    "head": "codex/receipt-evidence-query-20261110",
+    "headCommit": "0cf725f2ddd41ee4e20febe2a0bde9335b535fb7",
+    "base": "codex/speech-recall-topic-budget-20261110",
+    "baseCommit": "52939a1f9be6fc226822f1a5540c6aaa588fdd95"
+  },
+  {
+    "number": 533,
+    "title": "保留自主发言的当前事件主题，修复长原话挤出记忆检索",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/533",
+    "head": "codex/speech-recall-topic-budget-20261110",
+    "headCommit": "52939a1f9be6fc226822f1a5540c6aaa588fdd95",
+    "base": "codex/conversation-batch-continuity-20261110",
+    "baseCommit": "f8709f1229e74916eb4ac4e6ae0daef8ced56f1f"
+  },
+  {
+    "number": 532,
+    "title": "让跨蒸馏批次的纠正保留真实前文并核对成功背景",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/532",
+    "head": "codex/conversation-batch-continuity-20261110",
+    "headCommit": "f8709f1229e74916eb4ac4e6ae0daef8ced56f1f",
+    "base": "codex/learned-expression-continuity-20261110",
+    "baseCommit": "77c87b33890a1dc90c5408da44057a4564dd6e05"
+  },
+  {
+    "number": 499,
+    "title": "按实际健康观测退役旧告警，保留未知状态与新故障机会",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/499",
+    "head": "codex/eve-health-incident-lifecycle-20261107",
+    "headCommit": "887ddc656c998e5d64a1d8413be03c874c4a87a5",
+    "base": "codex/eve-continuity-integration-20261107",
+    "baseCommit": "f707188bdbeac59816a3cf09bc7f627d2496b4b1"
+  },
+  {
+    "number": 498,
+    "title": "原子完成唤醒静默，避免结束后再次触发表达",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/498",
+    "head": "codex/wake-silence-completion-20261107",
+    "headCommit": "d8fdd72343ac969cceb195400cb3f0c139a17d03",
+    "base": "codex/eve-continuity-integration-20261107",
+    "baseCommit": "f707188bdbeac59816a3cf09bc7f627d2496b4b1"
+  },
+  {
+    "number": 497,
+    "title": "在QQ与Web入站前验证持久恢复并阻止失败启动绕过",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/497",
+    "head": "codex/eve-startup-preservation-20261107",
+    "headCommit": "94072a5201f172c898a9b2dea80e8f2470a08eca",
+    "base": "codex/eve-continuity-integration-20261107",
+    "baseCommit": "f707188bdbeac59816a3cf09bc7f627d2496b4b1"
+  },
+  {
+    "number": 496,
+    "title": "原子交接同一输入的即时交流，避免前台与主轮重复响应",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/496",
+    "head": "codex/live-speech-receipt-context-20261107",
+    "headCommit": "bb963f789469c6b05426a8d4055c4d7c26227e32",
+    "base": "codex/eve-continuity-integration-20261107",
+    "baseCommit": "f707188bdbeac59816a3cf09bc7f627d2496b4b1"
+  },
+  {
+    "number": 481,
+    "title": "主辅模型接入原 Codex Responses 适配器并提供原子切换入口",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/481",
+    "head": "codex/eve-codex-adapter-20261106",
+    "headCommit": "09439bffd1f60bf5bcc76feb70abf82df4d9f205",
+    "base": "codex/eve-model-sessions-20261106",
+    "baseCommit": "c0ede7efed0a3b2ee2676b37c578fc8eb6c6da85"
+  },
+  {
+    "number": 480,
+    "title": "支持无需目标的自由探索并保存连续经历",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/480",
+    "head": "codex/eve-free-exploration-20261105",
+    "headCommit": "5e05386399d0c05f32d61eb26e9857c8845022a8",
+    "base": "codex/eve-direct-safety-20261106",
+    "baseCommit": "6fec1bbce3178c9018225d969c0cd99a2b436ed8"
+  },
+  {
+    "number": 478,
+    "title": "将行动审查收窄为可信身份与直接系统危害",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/478",
+    "head": "codex/eve-direct-safety-20261106",
+    "headCommit": "6fec1bbce3178c9018225d969c0cd99a2b436ed8",
+    "base": "codex/eve-model-sessions-20261106",
+    "baseCommit": "8b6fd3d5955d44b0f015dd33f1f06d8366b12002"
+  },
+  {
+    "number": 477,
+    "title": "关联模型传输失败、重试与超时的用途和请求",
+    "url": "https://github.com/ZenthXSin/Eve.aic/pull/477",
+    "head": "codex/eve-transport-diagnostics-20261106",
+    "headCommit": "ba33a454237ba421759d5b881a750a4eeff6e2b3",
+    "base": "codex/eve-model-sessions-20261106",
+    "baseCommit": "8b6fd3d5955d44b0f015dd33f1f06d8366b12002"
+  }
+]
