@@ -38,7 +38,7 @@ async function until(check: () => boolean) {
 }
 async function fixture(configured = true) {
   const directory = await Deno.makeTempDir({ prefix: "eve-qq-model-" });
-  const received: { content: string; msg_id?: string }[] = [];
+  const received: { markdown: { content: string }; msg_id?: string }[] = [];
   const selected: { actionId: string; model: string }[] = [];
   const results = new Map<string, unknown>();
   let available = ["model-b", "model-a"];
@@ -220,7 +220,9 @@ Deno.test("QQ /model：未绑定、非主人、群内同字符串身份均拒绝
       assert.equal(f.statusCount(), 0);
       assert.equal(f.selected.length, 0);
       assert(
-        f.received.every((r) => /未获授权/.test(r.content) && !r.content.includes("model-a")),
+        f.received.every((r) =>
+          /未获授权/.test(r.markdown.content) && !r.markdown.content.includes("model-a")
+        ),
       );
       assert(
         records.every((record) => f.commands().receipt(record.identity)?.outcome === "denied"),
@@ -264,7 +266,7 @@ Deno.test("QQ /model：HTTP未知或不匹配成功体不冒称切换，重启�
       await f.commands().idle();
       await until(() => f.received.length === 1);
       assert.equal(f.commands().receipt(record.identity)?.outcome, "unknown");
-      assert.match(f.received[0].content, /尚未确认/);
+      assert.match(f.received[0].markdown.content, /尚未确认/);
       await f.restart();
       await f.commands().idle();
       assert.equal(f.selected.length, 1);
@@ -438,7 +440,7 @@ Deno.test("QQ /model：启用边界跳过历史命令，未提交select的中断
     await fresh.idle();
     await until(() => f.received.length === 1);
     assert.equal(fresh.receipt(record.identity)?.outcome, "unknown");
-    assert.match(f.received[0].content, /尚未确认/);
+    assert.match(f.received[0].markdown.content, /尚未确认/);
     assert.equal(f.selected.length, 0);
   } finally {
     await fresh?.close();

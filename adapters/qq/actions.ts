@@ -925,10 +925,10 @@ export class QqSendActions {
   #admit(actionId: string, request: QqActionSendText): QqSendText {
     const snapshot = structuredClone(request);
     const previous = this.#records.get(actionId)?.request ?? this.#admissions.get(actionId);
-    // Pin the caller format hint for replay identity; the transport always renders plain text.
+    // Freeze the wire format before the first attempt. Existing plain/legacy retries stay plain.
     if (snapshot && typeof snapshot === "object" && snapshot.format === undefined) {
       if (previous?.format !== undefined) snapshot.format = previous.format;
-      else if (!previous) snapshot.format = "plain";
+      else if (!previous && snapshot.attachment === undefined) snapshot.format = "markdown";
     }
     // Validate legacy-shaped caller input before ignoring its passive reply metadata.
     const validation = structuredClone(snapshot);
