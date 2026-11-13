@@ -1,11 +1,13 @@
 import type { Message, ModelResponse, ToolCall, ToolSpec } from "../../contracts/model.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
+import { withFactReadCache } from "../../sdk/fact-journal.ts";
 import { imageTextView } from "../../sdk/image-text.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import { projectThoughts, withoutThought } from "./thoughts.ts";
 
 interface ActiveIndex {
   scanned: number;
+  revision: number;
   ranges: { afterSeq: number; throughSeq: number }[];
   indices: number[];
   view: ConsciousEvent[];
@@ -18,7 +20,7 @@ export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
   events = activeSources.get(events) ?? events;
   let index = activeIndexes.get(events);
   if (!index) {
-    const current = { scanned: 0, ranges: [], indices: [], view: [] } as ActiveIndex;
+    const current = { scanned: 0, revision: 0, ranges: [], indices: [], view: [] } as ActiveIndex;
     current.view = new Proxy([] as ConsciousEvent[], {
       get(target, key, receiver) {
         if (key === "length") return current.indices.length;
@@ -53,6 +55,7 @@ export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
         !Number.isSafeInteger(range.afterSeq) || !Number.isSafeInteger(range.throughSeq) ||
         range.afterSeq < 0 || range.throughSeq < range.afterSeq || range.throughSeq >= event.seq
       ) throw new KernelError("corrupt", "换版回滚事实区间无效");
+      index.revision++;
       index.ranges.push(range);
       index.indices = index.indices.filter((source) =>
         source + 1 <= range.afterSeq || source + 1 > range.throughSeq
@@ -77,27 +80,49 @@ export function callFor(event: ConsciousEvent, index: number): ToolCall {
   return { ...raw, id: `eve_${event.seq}_${index}` };
 }
 export function pendingTools(events: ConsciousEvent[]): PendingTool[] {
-  events = activeEvents(events);
-  const started = new Set<string>(), finished = new Set<string>();
-  for (const event of events) {
-    if (event.kind === "tool_start" || event.kind === "tool_result") {
-      const data = event.data as { callId: string };
-      (event.kind === "tool_start" ? started : finished).add(data.callId);
-    }
+  const source = activeSources.get(events) ?? events;
+  return withFactReadCache(source, () => pendingToolsUncached(events));
+}
+interface PendingIndex {
+  scanned: number;
+  revision: number;
+  started: Set<string>;
+  finished: Set<string>;
+  pending: Map<string, { responseSeq: number; index: number }>;
+}
+const toolIndexes = new WeakMap<ConsciousEvent[], PendingIndex>();
+function pendingToolsUncached(events: ConsciousEvent[]): PendingTool[] {
+  const source = activeSources.get(events) ?? events;
+  events = activeEvents(source);
+  const revision = activeIndexes.get(source)!.revision;
+  let state = toolIndexes.get(source);
+  if (!state || state.revision !== revision) {
+    state = { scanned: 0, revision, started: new Set(), finished: new Set(), pending: new Map() };
+    toolIndexes.set(source, state);
   }
-  const pending: PendingTool[] = [];
-  for (const event of events) {
+  for (let i = state.scanned; i < events.length; i++) {
+    const event = events[i];
+    if (event.kind === "tool_start") state.started.add((event.data as { callId: string }).callId);
+    if (event.kind === "tool_result") {
+      const id = (event.data as { callId: string }).callId;
+      state.finished.add(id);
+      state.pending.delete(id);
+    }
     if (event.kind === "model_response") {
       const response = (event.data as unknown as { response: ModelResponse }).response;
-      for (let i = 0; i < response.toolCalls.length; i++) {
-        const call = callFor(event, i);
-        if (!finished.has(call.id)) {
-          pending.push({ responseSeq: event.seq, index: i, call, started: started.has(call.id) });
-        }
+      for (let index = 0; index < response.toolCalls.length; index++) {
+        const id = `eve_${event.seq}_${index}`;
+        if (!state.finished.has(id)) state.pending.set(id, { responseSeq: event.seq, index });
       }
     }
+    state.scanned = i + 1;
   }
-  return pending;
+  return [...state.pending].map(([id, pending]) => ({
+    ...pending,
+    // Keep only positions between activations; revalidate the actual decision before execution.
+    call: callFor(source[pending.responseSeq - 1], pending.index),
+    started: state.started.has(id),
+  }));
 }
 
 /** 历史大回执只缩短本次输入，完整原件仍可通过现有 records.text 分页读取。 */
@@ -121,6 +146,13 @@ function historicalToolResult(result: Json, seq: number, callId: string): string
 }
 
 export function blocks(
+  events: ConsciousEvent[],
+  afterSeq = 0,
+): { throughSeq: number; messages: Message[] }[] {
+  const source = activeSources.get(events) ?? events;
+  return withFactReadCache(source, () => blocksUncached(events, afterSeq));
+}
+function blocksUncached(
   events: ConsciousEvent[],
   afterSeq = 0,
 ): { throughSeq: number; messages: Message[] }[] {
@@ -310,6 +342,10 @@ export function blocks(
   return result;
 }
 export function render(events: ConsciousEvent[], prompt: string): Message[] {
+  const source = activeSources.get(events) ?? events;
+  return withFactReadCache(source, () => renderUncached(events, prompt));
+}
+function renderUncached(events: ConsciousEvent[], prompt: string): Message[] {
   events = activeEvents(events);
   let through = 0;
   let memory = "";

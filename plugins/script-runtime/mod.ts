@@ -7,7 +7,7 @@ import { type ScriptConfig, ScriptRuntime } from "./runtime.ts";
 export const SCRIPT_TOOL: ToolSpec = {
   name: "execute_script",
   description:
-    "执行一份 TypeScript 脚本；使用 tools 的类型接口调用能力。默认异步返回任务编号，可选择同步等待；每个具体动作独立保存真实回执。脚本正文可 await 或 return。已完成任务的回执含 result 返回值 JSON 文本页（最多8192字符）；若 truncated，使用原 jobId 执行 return await tools.scripts.result({jobId,startChar:nextChar,limit:2048}) 读取后续原件页，异步任务完成后也这样读取。",
+    "执行一份 TypeScript 脚本；使用 tools 的类型接口调用能力。默认最多等待5秒，未完成就返回原任务编号并在后台并行继续；mode:async可立即返回，mode:sync也最多等待5秒；每个具体动作独立保存真实回执。脚本正文可 await 或 return。已完成任务的回执含 result 返回值 JSON 文本页（最多8192字符）；若 truncated，使用原 jobId 执行 return await tools.scripts.result({jobId,startChar:nextChar,limit:2048}) 读取后续原件页，异步任务完成后也这样读取。",
   parameters: {
     type: "object",
     properties: {

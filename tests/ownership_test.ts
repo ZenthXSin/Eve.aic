@@ -347,7 +347,10 @@ Deno.test("守护 RPC 实际区分控制、出口与实例凭据，正文不入�
 Deno.test("守护损坏/号码上限和出口回退号码不被静默接受，原件保留", async () => {
   const f = await fixture();
   try {
+    const legacy = JSON.stringify(f.authority.store.state);
     await f.authority.close();
+    await Deno.remove(`${f.directory}/guard/changes`, { recursive: true });
+    await Deno.writeTextFile(`${f.directory}/guard/index.json`, legacy);
     const index = `${f.directory}/guard/index.json`,
       valid = await Deno.readTextFile(index),
       state = JSON.parse(valid);
@@ -427,5 +430,53 @@ Deno.test("长重试链复核原许可：不新增许可，暂停或交接后禁
       await fence.close();
       await f.close();
     }
+  }
+});
+
+Deno.test("守护增量：检查点固定，恢复完整许可与取消历史，变更检查点或丢失增量拒绝启动", async () => {
+  const f = await fixture();
+  let reopened: OwnershipAuthority | undefined;
+  try {
+    const path = `${f.directory}/guard/index.json`;
+    const checkpoint = await Deno.readTextFile(path);
+    const request = await permitRequest(f.proof, "ledger-retained");
+    const permit = await f.authority.begin(request);
+    await f.authority.finish(permit.id, "completed", "d".repeat(64));
+    const cancelled = await permitRequest(f.proof, "cancel-retained");
+    await f.authority.cancel({
+      id: cancelled.permitId,
+      instanceId: f.proof.instanceId,
+      epoch: f.proof.epoch,
+      resource: cancelled.resource,
+      actionId: cancelled.actionId,
+    }, cancelled.requestHash);
+    const before = structuredClone(f.authority.store.state);
+    assert.equal(await Deno.readTextFile(path), checkpoint);
+    await f.authority.close();
+    reopened = new OwnershipAuthority(`${f.directory}/guard`, 100, () => 2000);
+    await reopened.initialize();
+    assert.deepEqual(reopened.store.state.permits, before.permits);
+    assert.deepEqual(reopened.store.state.cancellations, before.cancellations);
+    assert.deepEqual(reopened.store.state.requests, before.requests);
+    await rejects(() => reopened!.begin(request), "rejected");
+    await rejects(() => reopened!.begin(cancelled), "rejected");
+    await rejects(() => reopened!.finish(permit.id, "unknown"), "rejected");
+    await reopened.close();
+    const altered = JSON.parse(checkpoint);
+    altered.epoch++;
+    await Deno.writeTextFile(path, JSON.stringify(altered));
+    await rejects(
+      () => new OwnershipAuthority(`${f.directory}/guard`, 100).initialize(),
+      "corrupt",
+    );
+    await Deno.writeTextFile(path, checkpoint);
+    await Deno.remove(`${f.directory}/guard/changes/events/0000000000000002.json`);
+    await rejects(
+      () => new OwnershipAuthority(`${f.directory}/guard`, 100).initialize(),
+      "corrupt",
+    );
+  } finally {
+    await reopened?.close();
+    await f.close();
   }
 });

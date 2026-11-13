@@ -271,7 +271,7 @@ export class OwnershipAuthority {
       };
       state.permits.push({ ...permit, requestHash: request.requestHash, startedAt: this.now() });
       return permit;
-    });
+    }, id);
   }
   async cancel(permit: OwnershipPermit, requestHash: string) {
     if (
@@ -307,7 +307,7 @@ export class OwnershipAuthority {
         old.outcome = "not_executed";
         old.finishedAt = Math.max(old.startedAt, now);
       } else state.cancellations.push({ ...permit, requestHash });
-    });
+    }, permit.id);
   }
   async finish(id: string, outcome: PermitOutcome, resultHash?: string) {
     if (
@@ -327,7 +327,7 @@ export class OwnershipAuthority {
       permit.outcome = outcome;
       permit.finishedAt = Math.max(permit.startedAt, this.now());
       if (resultHash !== undefined) permit.resultHash = resultHash;
-    });
+    }, id);
   }
   outstanding() {
     return structuredClone(this.store.state.permits.filter((p) => p.outcome === undefined));

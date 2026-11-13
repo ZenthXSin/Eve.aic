@@ -1,4 +1,7 @@
 import type { OwnershipOwner, OwnershipPermit, PermitOutcome } from "../contracts/ownership.ts";
+import { fingerprint } from "../kernel/calls.ts";
+import type { Json } from "../kernel/protocol.ts";
+import { FactJournal } from "../sdk/fact-journal.ts";
 import { KernelError } from "../kernel/protocol.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
 
@@ -151,7 +154,46 @@ export class OwnershipStore {
   #initialized = false;
   #closing = false;
   #tail: Promise<unknown> = Promise.resolve();
-  constructor(readonly directory: string) {}
+  #changes: FactJournal;
+  #permitPositions = new Map<string, number>();
+  #cancelPositions = new Map<string, number>();
+  constructor(readonly directory: string) {
+    this.#changes = new FactJournal(`${directory}/changes`);
+  }
+  #control(state: OwnershipState) {
+    const { permits: _permits, cancellations: _cancellations, ...control } = state;
+    return control;
+  }
+  #apply(data: Record<string, Json>) {
+    if (data.control) {
+      const control = data.control as unknown as Omit<OwnershipState, "permits" | "cancellations">;
+      this.state = {
+        ...control,
+        permits: this.state.permits,
+        cancellations: this.state.cancellations,
+      };
+    } else {
+      if (typeof data.id !== "string" || (!data.permit && !data.cancellation)) {
+        throw new KernelError("corrupt", "守护增量记录无效");
+      }
+      for (
+        const [key, positions] of [
+          ["permits", this.#permitPositions],
+          ["cancellations", this.#cancelPositions],
+        ] as const
+      ) {
+        const value = data[key === "permits" ? "permit" : "cancellation"];
+        if (!value) continue;
+        if (typeof value !== "object" || Array.isArray(value) || value.id !== data.id) {
+          throw new KernelError("corrupt", "守护增量许可编号不符");
+        }
+        const index = positions.get(data.id) ?? this.state[key].length;
+        // Both arrays hold permits; their full invariants are checked before admission/recovery.
+        (this.state[key] as unknown[])[index] = value;
+        positions.set(data.id, index);
+      }
+    }
+  }
   get available() {
     return this.#lock !== undefined && !this.#failed;
   }
@@ -181,6 +223,7 @@ export class OwnershipStore {
     this.#lock = lock;
     try {
       for await (const file of Deno.readDir(this.directory)) {
+        if (file.name === "changes" && file.isDirectory) continue;
         if (!file.isFile || !["writer.lock", "index.json", "connection.json"].includes(file.name)) {
           throw new KernelError("corrupt", "守护有未完成文件，原件保留");
         }
@@ -197,30 +240,100 @@ export class OwnershipStore {
         this.state = value;
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
+        // A ledger can never be attached to a fabricated or missing checkpoint.
+        try {
+          await Deno.lstat(`${this.directory}/changes`);
+          throw new KernelError("corrupt", "守护检查点缺失，增量原件保留");
+        } catch (missing) {
+          if (!(missing instanceof Deno.errors.NotFound)) throw missing;
+        }
+        await writeDurableJson(`${this.directory}/index.json`, this.state);
+      }
+      this.state.permits.forEach((p, i) => this.#permitPositions.set(p.id, i));
+      this.state.cancellations.forEach((p, i) => this.#cancelPositions.set(p.id, i));
+      await this.#changes.initialize();
+      const digest = await fingerprint(this.state as unknown as Json);
+      if (!this.#changes.count) await this.#changes.append("checkpoint", { digest });
+      else {
+        const first = this.#changes.events[0];
+        if (first.kind !== "checkpoint" || (first.data as { digest?: string }).digest !== digest) {
+          throw new KernelError("corrupt", "守护检查点与增量链不符，原件保留");
+        }
+        let after = 1;
+        while (after < this.#changes.count) {
+          const page = this.#changes.readPage(after, 128);
+          for (const event of page.events) {
+            if (event.kind !== "change" || !record(event.data)) {
+              throw new KernelError("corrupt", "未知守护增量记录");
+            }
+            this.#apply(event.data as Record<string, Json>);
+          }
+          after = page.nextSeq;
+        }
+        if (!validateOwnershipState(this.state)) {
+          throw new KernelError("corrupt", "守护增量恢复状态无效，原件保留");
+        }
       }
     } catch (error) {
+      await this.#changes.close().catch(() => {});
       lock.close();
       this.#lock = undefined;
       throw error;
     }
   }
-  change<T>(edit: (state: OwnershipState) => T): Promise<T> {
+  /** Control changes clone only metadata; an exit changes exactly one indexed permit.
+   * The legacy checkpoint remains intact. Every accepted delta is fsynced in a chained
+   * append-only ledger before becoming visible, including lease renewal and terminal receipts.
+   */
+  change<T>(edit: (state: OwnershipState) => T, permitId?: string): Promise<T> {
     if (this.#closing) return Promise.reject(new KernelError("unavailable", "守护正在关闭"));
     const operation = this.#tail.then(async () => {
       if (!this.available) throw new KernelError("storage", "守护不可提交");
-      const next = structuredClone(this.state);
-      const result = edit(next);
-      if (!validateOwnershipState(next)) throw new KernelError("corrupt", "拒绝无效的所有权状态");
-      if (new TextEncoder().encode(JSON.stringify(next)).length > 33_554_432) {
-        throw new KernelError("storage", "守护记录超出当前格式，原件保留");
+      let next: OwnershipState;
+      if (permitId === undefined) {
+        next = {
+          ...structuredClone(this.#control(this.state)),
+          permits: this.state.permits,
+          cancellations: this.state.cancellations,
+        };
+      } else {
+        next = {
+          ...this.state,
+          permits: this.state.permits.slice(),
+          cancellations: this.state.cancellations.slice(),
+        };
+        const pi = this.#permitPositions.get(permitId), ci = this.#cancelPositions.get(permitId);
+        if (pi !== undefined) next.permits[pi] = structuredClone(next.permits[pi]);
+        if (ci !== undefined) next.cancellations[ci] = structuredClone(next.cancellations[ci]);
       }
+      const result = edit(next);
+      const permit = permitId === undefined
+        ? undefined
+        : next.permits[this.#permitPositions.get(permitId) ?? this.state.permits.length];
+      const cancellation = permitId === undefined ? undefined : next
+        .cancellations[this.#cancelPositions.get(permitId) ?? this.state.cancellations.length];
+      const checked = {
+        ...next,
+        permits: permit ? [permit] : [],
+        cancellations: cancellation ? [cancellation] : [],
+      };
+      if (!validateOwnershipState(checked)) {
+        throw new KernelError("corrupt", "拒绝无效的所有权状态");
+      }
+      const data = permitId === undefined
+        ? { control: this.#control(next) }
+        : { id: permitId, permit: permit ?? null, cancellation: cancellation ?? null };
       try {
-        await writeDurableJson(`${this.directory}/index.json`, next);
+        await this.#changes.append("change", data as unknown as Json);
       } catch {
         this.#failed = true;
         throw new KernelError("storage", "守护提交失败，原件保留");
       }
       this.state = next;
+      if (permit) this.#permitPositions.set(permit.id, next.permits.indexOf(permit));
+      if (cancellation) {
+        this.#cancelPositions.set(cancellation.id, next.cancellations.indexOf(cancellation));
+      }
       return result;
     });
     this.#tail = operation.catch(() => {});
@@ -229,6 +342,7 @@ export class OwnershipStore {
   async close() {
     this.#closing = true;
     await this.#tail;
+    await this.#changes.close();
     this.#lock?.close();
     this.#lock = undefined;
     if (this.#failed) throw new KernelError("storage", "守护关闭时有未完成写入");

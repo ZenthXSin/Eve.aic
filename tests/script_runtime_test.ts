@@ -377,11 +377,12 @@ Deno.test("脚本：类型或参数错误在执行前拒绝，不发生发送；
   }
 });
 
-Deno.test("脚本：默认异步，忙worker可终止，完成通知持久且只记录一次", async () => {
+Deno.test("脚本：显式异步，忙worker可终止，完成通知持久且只记录一次", async () => {
   const f = await fixture();
   try {
     const live = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
       requestId: "busy",
+      mode: "async",
       // 本例验证主动取消；独立脚本的类型检查不应先耗尽默认的五秒期限。
       timeoutMs: 30_000,
       code: "while(true) {}",

@@ -227,3 +227,27 @@ Deno.test("事实日志：导入原件保留历史序号时间摘要，重复幂
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("事实日志：同步投影缓存不共享可变正文，退出后重验原件，空返回只执行一次", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-fact-scope-" });
+  const journal = new FactJournal(directory);
+  try {
+    await journal.initialize();
+    await journal.append("notice", { text: "原件" });
+    let called = 0;
+    const { withFactReadCache } = await import("../sdk/fact-journal.ts");
+    withFactReadCache(journal.events, () => {
+      called++;
+      journal.events[0].data = "临时修改";
+      assert.deepEqual(journal.events[0].data, { text: "原件" });
+      Deno.writeTextFileSync(`${directory}/events/0000000000000001.json`, "{}");
+      assert.deepEqual(journal.events[0].data, { text: "原件" });
+    });
+    assert.equal(called, 1);
+    assert.throws(() => journal.events[0], KernelError);
+    assert.equal(journal.available, false);
+  } finally {
+    await journal.close().catch(() => {});
+    await Deno.remove(directory, { recursive: true });
+  }
+});

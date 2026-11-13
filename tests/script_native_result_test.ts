@@ -86,11 +86,11 @@ async function fixture() {
     release,
     phoneCalls: () => phoneCalls,
     kernel: () => kernel,
-    async execute(id: string, code: string, mode = "sync") {
+    async execute(id: string, code: string, mode?: string) {
       const result = await kernel.call<ToolResult & Json>("tools", "execute", {
         id,
         name: "execute_script",
-        args: { code, mode },
+        args: { code, ...(mode === undefined ? {} : { mode }) },
       });
       assert.equal(result.status, "completed");
       return JSON.parse(result.output) as NativeResult;
@@ -210,5 +210,49 @@ Deno.test("原生脚本返回值：异步手机大原件完成后可通过原生
     assert.equal(f.phoneCalls(), 1);
   } finally {
     await f.close();
+  }
+});
+
+Deno.test("原生脚本：默认和sync最多等待5秒，原任务后台并行，迟到结果只执行一次", async () => {
+  for (const mode of [undefined, "sync"]) {
+    const f = await fixture();
+    try {
+      const started = performance.now();
+      const job = await f.execute(
+        "five-second-background",
+        'return await tools.phone.file({handle:{conversationId:"qq:user:fixture",seq:3},index:1});',
+        mode,
+      );
+      assert.ok(performance.now() - started >= 4900, "先等待完整5秒");
+      assert.ok(["queued", "checking", "running"].includes(job.status));
+      assert.equal(job.result, undefined);
+      assert.equal(f.phoneCalls(), 1);
+      const independent = await f.execute(
+        "parallel-short",
+        "return await tools.phone.conversations();",
+      );
+      assert.equal(independent.status, "completed");
+      assert.equal(f.phoneCalls(), 2);
+      f.release.resolve();
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const status = await f.kernel().call<ScriptSummary & Json>("scripts", "status", {
+          jobId: job.jobId,
+        });
+        if (status.status === "completed") break;
+        assert.ok(attempt < 499, "后台任务应接收真实结果");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const result = await f.execute(
+        "five-second-background",
+        'return await tools.phone.file({handle:{conversationId:"qq:user:fixture",seq:3},index:1});',
+        mode,
+      );
+      assert.equal(result.jobId, job.jobId);
+      assert.equal(result.status, "completed");
+      assert.ok(result.result);
+      assert.equal(f.phoneCalls(), 2);
+    } finally {
+      await f.close();
+    }
   }
 });

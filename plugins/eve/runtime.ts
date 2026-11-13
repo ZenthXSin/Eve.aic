@@ -43,6 +43,31 @@ export class EveRuntime {
   #closing = false;
   #busy?: Promise<void>;
   #timer?: ReturnType<typeof setTimeout>;
+  #toolStartedAt = new Map<string, number>();
+  #continueImmediately = false;
+  #observedJobs = new Map<string, { callId: string; status: string }>();
+  #rememberJob(callId: string, result: Json) {
+    try {
+      const output = (result as { output?: string })?.output;
+      if (typeof output !== "string") return;
+      const summary = JSON.parse(output);
+      if (typeof summary.jobId === "string" && typeof summary.status === "string") {
+        this.#observedJobs.set(summary.jobId, { callId, status: summary.status });
+      }
+    } catch { /* 非脚本回执不建立任务索引。 */ }
+  }
+  async #saveToolResult(callId: string, result: Json) {
+    const started = this.#toolStartedAt.get(callId);
+    await this.journal.append("tool_result", {
+      callId,
+      result,
+      ...(started === undefined
+        ? {}
+        : { executionMs: Math.round((performance.now() - started) * 100) / 100 }),
+    });
+    this.#toolStartedAt.delete(callId);
+    this.#rememberJob(callId, result);
+  }
   #wake = 0;
   #phoneThrough = 0;
   #scriptThrough = 0;
@@ -86,6 +111,9 @@ export class EveRuntime {
     await this.journal.initialize();
     for (const event of activeEvents(this.journal.events)) {
       const data = event.data as Record<string, Json>;
+      if (event.kind === "tool_result") {
+        this.#rememberJob(String(data.callId), data.result);
+      }
       if (event.kind === "notice") {
         if (
           ["image", "image_description"].includes(String(data.source)) &&
@@ -183,6 +211,7 @@ export class EveRuntime {
     return work;
   }
   async #pulse() {
+    this.#continueImmediately = false;
     try {
       await this.#step();
       if (this.#lastError) {
@@ -204,9 +233,10 @@ export class EveRuntime {
         });
       }
       this.#lastError = kind;
+      this.#continueImmediately = false;
     } finally {
       this.#busy = undefined;
-      this.#schedule(this.config.pollMs);
+      this.#schedule(this.#continueImmediately ? 0 : this.config.pollMs);
     }
   }
   async #refreshBudget() {
@@ -234,15 +264,21 @@ export class EveRuntime {
     }
   }
   async #notices(): Promise<boolean> {
-    await this.#refreshBudget();
     this.#restApplied = false;
     this.#phoneFresh = false;
     this.#alarmFresh = false;
     this.#commandFresh = false;
     let fresh = false;
-    const phone = await this.ctx.call<Json>("phone", "notifications", {
-      afterSeq: this.#phoneThrough,
-    });
+    // Reads are independent; apply their receipts in the established deterministic order.
+    const [, phone, tasks, completed, controls] = await Promise.all([
+      this.#refreshBudget(),
+      this.ctx.call<Json>("phone", "notifications", { afterSeq: this.#phoneThrough }),
+      this.ctx.call<Json>("scripts", "completions", { afterSeq: this.#scriptThrough }),
+      this.config.remoteRecords
+        ? this.ctx.call("commands", "completions", { afterSeq: this.#commandThrough })
+        : Promise.resolve(undefined),
+      this.ctx.call<Json>("mind", "poll", { afterSeq: this.#mindThrough }),
+    ]);
     const page = phone as unknown as { items: Json[]; throughSeq: number; hasMore: boolean };
     if (page.throughSeq > this.#phoneThrough) {
       // 同一事实提交同时包含游标；不先标领取再写经历。
@@ -258,32 +294,15 @@ export class EveRuntime {
         this.#wake = 0;
       }
     }
-    const tasks = await this.ctx.call<Json>("scripts", "completions", {
-      afterSeq: this.#scriptThrough,
-    });
     const completion = tasks as unknown as { items: Json[]; throughSeq: number };
     if (completion.throughSeq > this.#scriptThrough) {
-      const observed = new Map<string, string>();
-      for (const event of activeEvents(this.journal.events)) {
-        if (event.kind === "tool_result") {
-          const output = (event.data as { result?: { output?: string } }).result?.output;
-          if (typeof output !== "string") continue;
-          try {
-            const summary = JSON.parse(output);
-            if (
-              typeof summary.jobId === "string" &&
-              ["completed", "failed", "cancelled", "unknown"].includes(summary.status)
-            ) observed.set(summary.jobId, summary.status);
-          } catch { /* 非脚本结果原样保留 */ }
-        }
-      }
       for (const item of completion.items) {
         const job = (item as { job?: { jobId?: string } }).job;
         if (job?.jobId) await this.#observations(job.jobId);
       }
       const newItems = completion.items.filter((item) => {
         const job = (item as { job?: { jobId?: string; status?: string } }).job;
-        return !job?.jobId || observed.get(job.jobId) !== job.status;
+        return !job?.jobId || this.#observedJobs.get(job.jobId)?.status !== job.status;
       });
       await this.journal.append("notice", {
         source: "scripts",
@@ -298,24 +317,21 @@ export class EveRuntime {
       }
     }
     if (this.config.remoteRecords) {
-      const completed = await this.ctx.call("commands", "completions", {
-        afterSeq: this.#commandThrough,
-      }) as unknown as { items: Json[]; throughSeq: number };
-      if (completed.throughSeq > this.#commandThrough) {
+      const page = completed as unknown as { items: Json[]; throughSeq: number };
+      if (page.throughSeq > this.#commandThrough) {
         await this.journal.append("notice", {
           source: "commands",
-          throughSeq: completed.throughSeq,
-          items: completed.items,
+          throughSeq: page.throughSeq,
+          items: page.items,
         });
-        this.#commandThrough = completed.throughSeq;
-        if (completed.items.length) {
+        this.#commandThrough = page.throughSeq;
+        if (page.items.length) {
           fresh = true;
           this.#commandFresh = true;
           this.#wake = 0;
         }
       }
     }
-    const controls = await this.ctx.call<Json>("mind", "poll", { afterSeq: this.#mindThrough });
     const events = controls as unknown as { items: MindEvent[]; throughSeq: number };
     for (const event of events.items) {
       let wakeAt: number | undefined;
@@ -380,15 +396,7 @@ export class EveRuntime {
   }
   async #observations(jobId: string) {
     const known = this.#imageActions;
-    const callId = this.journal.events.find((event) => {
-      if (event.kind !== "tool_result") return false;
-      try {
-        return JSON.parse((event.data as { result: { output: string } }).result.output).jobId ===
-          jobId;
-      } catch {
-        return false;
-      }
-    })?.data as { callId?: string } | undefined;
+    const callId = this.#observedJobs.get(jobId);
     for (const method of ["observations", "images"]) {
       let afterSeq = 0;
       do {
@@ -418,6 +426,7 @@ export class EveRuntime {
 
   async #tool(pending: PendingTool) {
     const call = pending.call;
+    this.#toolStartedAt.set(call.id, performance.now());
     if (!pending.started) {
       await this.journal.append("tool_start", {
         responseSeq: pending.responseSeq,
@@ -478,7 +487,7 @@ export class EveRuntime {
         if (!(error instanceof KernelError && error.kind === "rejected")) throw error;
         result = { status: "failed", error: toWireError(error) as unknown as Json };
       }
-      await this.journal.append("tool_result", { callId: call.id, result });
+      await this.#saveToolResult(call.id, result);
       return;
     }
     if (call.name === WRITE_THOUGHT_TOOL.name) {
@@ -495,7 +504,7 @@ export class EveRuntime {
         }
         : { status: "failed", output: "需要非空的简短thought字符串，且不接受其他参数" };
       // 正文已经在对应 model_response 原件中。重启只补齐这条工具回执。
-      await this.journal.append("tool_result", { callId: call.id, result });
+      await this.#saveToolResult(call.id, result);
       return;
     }
     if (pending.started && call.name === "execute_script") {
@@ -503,7 +512,7 @@ export class EveRuntime {
       try {
         const summary = await this.ctx.call<Json>("scripts", "status", { jobId });
         result = { status: "completed", output: JSON.stringify(summary), adopted: true };
-        await this.journal.append("tool_result", { callId: call.id, result });
+        await this.#saveToolResult(call.id, result);
         await this.#observations(jobId);
         return;
       } catch (error) {
@@ -545,7 +554,7 @@ export class EveRuntime {
       };
       if (wire.kind === "storage") throw error;
     }
-    await this.journal.append("tool_result", { callId: call.id, result });
+    await this.#saveToolResult(call.id, result);
     if (call.name === "execute_script") {
       await this.#observations(await fingerprint(["script-job-v1", call.id]));
     }
@@ -596,15 +605,20 @@ export class EveRuntime {
   async #step() {
     if (this.#closing || !this.journal.available) return;
     // 每次工具批次先完成/恢复原决定，再处理通知；新的通知不打断当前动作。
+    const preparationStarted = performance.now();
     const pending = pendingTools(this.journal.events);
+    const pendingScanMs = performance.now() - preparationStarted;
     if (pending.length) {
       for (const tool of pending) {
         if (this.#closing) return;
         await this.#tool(tool);
       }
+      if (!this.#closing) this.#continueImmediately = true;
       return;
     }
+    const noticesStarted = performance.now();
     const fresh = await this.#notices();
+    const noticesMs = performance.now() - noticesStarted;
     if (this.#restApplied && !this.#phoneFresh && !this.#alarmFresh && !this.#commandFresh) return;
     if (fresh) {
       this.#wake = 0;
@@ -614,7 +628,10 @@ export class EveRuntime {
     if (this.#modelBlocked) return;
     if (Date.now() < this.#retryAt) return;
     if (!fresh && Date.now() < this.#wake) return;
+    const toolsStarted = performance.now();
     const tools = await this.#tools();
+    const toolsListMs = performance.now() - toolsStarted;
+    const recallStarted = performance.now();
     if (this.config.remoteRecords) {
       if (this.#sharedBudget?.paused) return;
       const query = recallQuery(activeEvents(this.journal.events));
@@ -646,14 +663,13 @@ export class EveRuntime {
         await this.journal.append("notice", { source: "memory", anchor, items: recalled.items });
       }
     }
+    const recallMs = performance.now() - recallStarted;
+    const contextStarted = performance.now();
     // 必须先固定初次投影，再判断 500k 机械保护，避免旧 raw 历史误触压缩。
     let messages = await this.#projectContext(tools);
-    const compression = mechanicalCompression(
-      this.journal.events,
-      this.#prompt,
-      tools,
-      this.contextCounter,
-    );
+    const compression = contextEstimate(messages, tools, this.contextCounter) >= 500_000
+      ? mechanicalCompression(this.journal.events, this.#prompt, tools, this.contextCounter)
+      : undefined;
     if (compression) {
       await this.journal.append("compression", { ...compression, source: "system" });
       messages = await this.#projectContext(tools);
@@ -706,8 +722,7 @@ export class EveRuntime {
     }
     // 感知追加一次，避免时间/用量改动稳定身份。没有固定QQ开场或自动消息。
     const band = Math.floor(estimated / 25_000);
-    const last = activeEvents(this.journal.events).filter((event) => event.kind === "perception")
-      .at(-1);
+    const last = activeEvents(this.journal.events).findLast((event) => event.kind === "perception");
     if (
       !last || (last.data as { contextBand: number }).contextBand !== band ||
       (last.data as { day: string }).day !== day ||
@@ -761,6 +776,14 @@ export class EveRuntime {
       estimatedTokens: contextEstimate(messages, tools, this.contextCounter),
       contextComposition: this.#contextComposition,
       sourceCommit: this.config.sourceCommit,
+      runtimeTiming: {
+        pendingScanMs,
+        noticesMs,
+        toolsListMs,
+        recallMs,
+        contextAndStateMs: performance.now() - contextStarted,
+        preparationMs: performance.now() - preparationStarted,
+      },
     });
     let response: ModelResponse;
     try {
@@ -818,7 +841,6 @@ export class EveRuntime {
     });
     // Shared accounting is already durable; refresh it on the next activation.
     // Preserve the model receipt before any optional read during shutdown.
-    if (!this.#closing) await this.#refreshBudget();
     this.#failures = 0;
     this.#retryAt = 0;
     if (response.toolCalls.length === 0) {
@@ -827,7 +849,10 @@ export class EveRuntime {
         wakeAt: this.#wake,
         reason: "本步没有继续动作；默认长唤醒，Eve可改",
       });
-    } else this.#wake = 0;
+    } else {
+      this.#wake = 0;
+      this.#continueImmediately = true;
+    }
   }
   status() {
     return {

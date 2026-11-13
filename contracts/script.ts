@@ -18,6 +18,8 @@ export const SCRIPTS = "scripts";
 /** 固定源码能力标记；可信提示生成器只读取此声明，不执行候选代码。 */
 export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;
 export const WEB_CAPABILITY_VERSION = 1;
+/** 默认工具等待上限与后台续行能力，用于准确复原旧版本生成提示。 */
+export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 1;
 /** 原生随记工具 write_thought 的参数，不属于脚本 tools 对象中的接口。 */
 export interface NativeThoughtArguments {
   thought: string;
@@ -30,6 +32,7 @@ export interface ScriptRequest {
   /** 原生工具调用的真实编号；意识流须先保存，不由重试生成新编号。 */
   requestId: string;
   code: string;
+  /** 默认/同步最多等待5秒，随后后台继续；async立即返回；等待结束不会取消任务。 */
   mode?: "async" | "sync";
   timeoutMs?: number;
 }

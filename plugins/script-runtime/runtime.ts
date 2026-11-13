@@ -194,7 +194,6 @@ export class ScriptRuntime {
         if (previous.fingerprint !== hash) {
           throw new KernelError("rejected", "同一脚本调用编号不能换代码或执行参数");
         }
-        if (request.mode === "sync") await this.#live.get(jobId)?.done;
         return summary(this.store.job(jobId));
       }
       await this.store.change((state) =>
@@ -235,15 +234,29 @@ export class ScriptRuntime {
         this.#finish(jobId, "failed", toWireError(error))
       )
         .catch(() => {});
-      if (request.mode === "sync") await done;
       return summary(this.store.job(jobId));
     })();
     this.#starting.set(jobId, operation);
     try {
-      return await operation;
+      await operation;
     } finally {
       this.#starting.delete(jobId);
     }
+    // Waiting is a caller policy, not a task identity or cancellation deadline.
+    // A slow task retains its worker, action IDs and real eventual receipt.
+    const live = this.#live.get(jobId);
+    if (request.mode !== "async" && live) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          live.done,
+          new Promise<void>((resolve) => timer = setTimeout(resolve, 5000)),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return summary(this.store.job(jobId));
   }
 
   async #run(jobId: string) {

@@ -26,6 +26,13 @@ function indexOf(property: PropertyKey): number | undefined {
   const index = Number(property);
   return Number.isSafeInteger(index) ? index : undefined;
 }
+const journals = new WeakMap<FactEvent[], FactJournal>();
+/** Reuse verified bytes only within a synchronous projection. No historical bodies
+ * survive the call; the next operation rechecks disk originals and digest anchors. */
+export function withFactReadCache<T>(events: FactEvent[], operation: () => T): T {
+  const journal = journals.get(events);
+  return journal ? journal.withReadCache(operation) : operation();
+}
 /**
  * 原件只追加。常驻索引每条仅 32 字节摘要，不保留所有历史正文。
  * events 是兼容旧调用的只读、按需读取数组视图；filter/map 等结果仍由调用者持有。
@@ -34,6 +41,16 @@ function indexOf(property: PropertyKey): number | undefined {
 export class FactJournal {
   readonly events: FactEvent[];
   #view: FactEvent[] = [];
+  #readCache?: { records: Map<number, string>; bytes: number };
+  withReadCache<T>(operation: () => T): T {
+    if (this.#readCache) return operation();
+    this.#readCache = { records: new Map(), bytes: 0 };
+    try {
+      return operation();
+    } finally {
+      this.#readCache = undefined;
+    }
+  }
   #digests: Uint8Array[] = [];
   #count = 0;
   #lock?: Deno.FsFile;
@@ -87,6 +104,7 @@ export class FactJournal {
         throw new KernelError("rejected", "事实日志视图不能修改原型");
       },
     });
+    journals.set(this.events, this);
   }
   get count() {
     return this.#count;
@@ -126,14 +144,23 @@ export class FactJournal {
   #read(seq: number): FactEvent | undefined {
     if (seq < 1 || seq > this.#count) return;
     if (this.#failed) throw new KernelError("corrupt", "事实日志已失效，原件保留");
+    const cached = this.#readCache?.records.get(seq);
+    if (cached !== undefined) return JSON.parse(cached);
     try {
       const path = `${this.directory}/events/${filename(seq)}`;
       const stat = Deno.lstatSync(path);
       if (!stat.isFile || stat.isSymlink || stat.size > MAX_RECORD_BYTES) {
         throw new Error("invalid file");
       }
-      const event = this.#validate(Deno.readTextFileSync(path), seq, this.#digest(seq - 1));
+      const raw = Deno.readTextFileSync(path);
+      const event = this.#validate(raw, seq, this.#digest(seq - 1));
       if (event.digest !== this.#digest(seq)) throw new Error("changed original");
+      const cache = this.#readCache;
+      // Account UTF-16 storage conservatively, without retaining unbounded history.
+      if (cache && cache.bytes + raw.length * 2 <= 64 * 1024 * 1024) {
+        cache.records.set(seq, raw);
+        cache.bytes += raw.length * 2;
+      }
       return event;
     } catch {
       this.#failed = true;
