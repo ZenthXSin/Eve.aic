@@ -128,7 +128,7 @@ Deno.test("独立模型拒绝：在线scope跨重启持久、图片与观察隔�
         kind: "model_resume",
         data: {},
       }, "forged_resume"), KernelError);
-    await writeDurableJson(settingsFile, settings);
+    await engine.budget.updateSettings(settings);
     await engine.dispatch("model", "complete", request, "model_3");
     assert.equal(attempts, paid + 2);
   } finally {

@@ -2,13 +2,37 @@ import type { ModelResponse } from "../../contracts/model.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
 import { accountingDay } from "../../plugins/eve/view.ts";
+import { writeDurableJson } from "../../sdk/durable-json.ts";
+
+export interface BudgetSettings {
+  dailyTokenBudget: number;
+  paused: boolean;
+  timeZone: string;
+}
+
+function validateSettings(value: unknown): asserts value is BudgetSettings {
+  const v = value as BudgetSettings | null;
+  if (
+    !v || typeof v !== "object" || Array.isArray(v) ||
+    !Number.isSafeInteger(v.dailyTokenBudget) || v.dailyTokenBudget < 0 ||
+    typeof v.paused !== "boolean" || typeof v.timeZone !== "string"
+  ) throw new KernelError("corrupt", "运行设置无效，保留原件");
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: v.timeZone }).format();
+  } catch {
+    throw new KernelError("corrupt", "预算时区无效");
+  }
+}
 
 export class SharedBudget {
   readonly journal: FactJournal;
+  readonly settingsJournal: FactJournal;
   #tail: Promise<unknown> = Promise.resolve();
   #reservations = new Map<string, { day: string; amount: number }>();
   #usages = new Set<string>();
   #days = new Map<string, { known: number; unknown: number }>();
+  #settings?: BudgetSettings;
+  #settingsRevision = 0;
   #index(
     kind: string,
     data: { id: string; day?: string; amount?: number; known?: number; unknown?: number },
@@ -28,6 +52,7 @@ export class SharedBudget {
   }
   constructor(directory: string, readonly settingsFile: string) {
     this.journal = new FactJournal(directory);
+    this.settingsJournal = new FactJournal(`${directory}/settings`);
   }
   async initialize() {
     await this.journal.initialize();
@@ -63,29 +88,85 @@ export class SharedBudget {
           data as { id: string; day?: string; amount?: number; known?: number; unknown?: number },
         );
       }
-      await this.settings();
+      await this.settingsJournal.initialize();
+      for (const event of this.settingsJournal.events) {
+        const data = event.data as unknown as { revision: number; settings: BudgetSettings };
+        if (event.kind !== "settings" || !data || data.revision !== this.#settingsRevision + 1) {
+          throw new KernelError("corrupt", "运行设置修订链无效");
+        }
+        validateSettings(data.settings);
+        this.#settings = structuredClone(data.settings);
+        this.#settingsRevision = data.revision;
+      }
+      if (!this.#settings) {
+        const initial = await this.#bootstrapSettings();
+        await this.settingsJournal.append("settings", { revision: 1, settings: { ...initial } });
+        this.#settings = initial;
+        this.#settingsRevision = 1;
+      }
+      // This file is a compatibility snapshot. Deployments cannot replace committed settings.
+      await this.#snapshotSettings();
     } catch (error) {
+      await this.settingsJournal.close();
       await this.journal.close();
       throw error;
     }
   }
-  async settings() {
+  async #bootstrapSettings(): Promise<BudgetSettings> {
     const stat = await Deno.lstat(this.settingsFile);
     if (!stat.isFile || stat.isSymlink || stat.size > 65536) {
       throw new KernelError("corrupt", "运行设置原件无效");
     }
     const value = JSON.parse(await Deno.readTextFile(this.settingsFile));
-    if (
-      !value || typeof value !== "object" || Array.isArray(value) ||
-      !Number.isSafeInteger(value.dailyTokenBudget) || value.dailyTokenBudget < 0 ||
-      typeof value.paused !== "boolean" || typeof value.timeZone !== "string"
-    ) throw new KernelError("corrupt", "运行设置无效，保留原件");
+    validateSettings(value);
+    return {
+      dailyTokenBudget: value.dailyTokenBudget,
+      paused: value.paused,
+      timeZone: value.timeZone,
+    };
+  }
+  async #snapshotSettings() {
     try {
-      new Intl.DateTimeFormat("en", { timeZone: value.timeZone }).format();
-    } catch {
-      throw new KernelError("corrupt", "预算时区无效");
+      const stat = await Deno.lstat(this.settingsFile);
+      if (!stat.isFile || stat.isSymlink) {
+        throw new KernelError("corrupt", "运行设置快照不是普通文件");
+      }
+      if (
+        stat.size <= 65536 &&
+        await Deno.readTextFile(this.settingsFile) === JSON.stringify(this.#settings) + "\n"
+      ) return;
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    return value as { dailyTokenBudget: number; paused: boolean; timeZone: string };
+    await writeDurableJson(this.settingsFile, this.#settings);
+  }
+  settings(): Promise<BudgetSettings> {
+    if (!this.#settings || !this.journal.available || !this.settingsJournal.available) {
+      return Promise.reject(new KernelError("unavailable", "持久运行设置尚未就绪"));
+    }
+    return Promise.resolve(structuredClone(this.#settings));
+  }
+  async updateSettings(patch: Partial<BudgetSettings>) {
+    const work = this.#tail.then(async () => {
+      if (
+        !patch || typeof patch !== "object" || Array.isArray(patch) ||
+        Object.keys(patch).some((key) => !["dailyTokenBudget", "paused", "timeZone"].includes(key))
+      ) throw new KernelError("rejected", "运行设置字段无效");
+      const previous = await this.settings(), next = { ...previous, ...patch };
+      validateSettings(next);
+      if (JSON.stringify(previous) === JSON.stringify(next)) {
+        await this.#snapshotSettings();
+        return this.status();
+      }
+      const revision = this.#settingsRevision + 1;
+      await this.settingsJournal.append("settings", { revision, settings: { ...next } });
+      this.#settings = next;
+      this.#settingsRevision = revision;
+      await this.#snapshotSettings();
+      return this.status();
+    });
+    this.#tail = work.catch(() => {});
+    return await work;
   }
   async status() {
     const settings = await this.settings(), day = accountingDay(settings.timeZone);
@@ -158,6 +239,7 @@ export class SharedBudget {
   }
   async close() {
     await this.#tail;
+    await this.settingsJournal.close();
     await this.journal.close();
   }
 }

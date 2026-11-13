@@ -176,7 +176,7 @@ Deno.test("独立执行出口：意识流/文件/模型共用令牌与原回执�
       event,
     );
     assert.equal(f.engine().records.events.length, 1);
-    await writeDurableJson(f.settingsFile, {
+    await f.engine().budget.updateSettings({
       dailyTokenBudget: 0,
       paused: false,
       timeZone: "Asia/Shanghai",

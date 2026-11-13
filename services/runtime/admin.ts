@@ -1,5 +1,4 @@
 import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
-import { writeDurableJson } from "../../sdk/durable-json.ts";
 import type { AdminQuery } from "../admin/contracts.ts";
 import { ADMIN_READS } from "../admin/contracts.ts";
 import { textPage } from "./notes.ts";
@@ -191,9 +190,7 @@ export function startRuntimeAdmin(
         ) {
           throw new KernelError("rejected", "设置只能更改日预算与暂停状态");
         }
-        const settings = await engine.budget.settings();
-        await writeDurableJson(engine.options.settingsFile, { ...settings, ...args });
-        return await engine.budget.status();
+        return await engine.budget.updateSettings(args);
       });
     }
     if (method === "rollback") {
