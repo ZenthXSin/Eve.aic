@@ -475,6 +475,15 @@ Deno.test("admin status fills budget from the actual supervisor envelope", async
       }
       return elements.get(id)!;
     },
+    createElement() {
+      return {
+        textContent: "",
+        className: "",
+        append() {},
+        setAttribute() {},
+        addEventListener() {},
+      };
+    },
     querySelectorAll() {
       return [];
     },
