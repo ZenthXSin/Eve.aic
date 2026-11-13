@@ -12,7 +12,7 @@ Deno.test("自我便签：2000 token按分词计数，超额不改原文；默�
   let notes = new NoteStore(directory, undefined, undefined, count);
   try {
     await notes.initialize();
-    assert.deepEqual(notes.self(), { aboutMe: null, ideas: [] });
+    assert.deepEqual(await notes.self(), { aboutMe: null, ideas: [] });
     const original =
       "我喜欢观察\n## 最近想做的事\n- [ ] 了解星星 🌟\n- [ ] 做小工具\n- [x] 已经完成\n## 其他\n这不是待办";
     await notes.change(
@@ -26,7 +26,7 @@ Deno.test("自我便签：2000 token按分词计数，超额不改原文；默�
       content: "- [ ] 研究分词\n- [ ] 做小工具\n- [ ] 读书\n- [X] 完成的疑问",
       sources,
     }, "curiosity-create");
-    const state = notes.self({ idle: true });
+    const state = await notes.self({ idle: true });
     assert.equal(state.aboutMe?.content, original);
     assert.equal(state.ideas.length, 3);
     assert.equal(new Set(state.ideas.map((i) => i.text)).size, 3);
@@ -36,8 +36,8 @@ Deno.test("自我便签：2000 token按分词计数，超额不改原文；默�
       );
       assert.equal(idea.revision, 1);
     }
-    assert.equal(notes.self().ideas.length, 0);
-    notes.self({ idle: true });
+    assert.equal((await notes.self()).ideas.length, 0);
+    await notes.self({ idle: true });
     assert.equal(counts, 1);
     await assert.rejects(
       notes.change("update", { id: "关于我", content: "星".repeat(2001) }, "too-big"),
@@ -46,13 +46,13 @@ Deno.test("自我便签：2000 token按分词计数，超额不改原文；默�
     assert.equal(notes.get({ id: "关于我" }).text, original);
     assert.equal(notes.journal.events.length, 2);
     await notes.change("update", { id: "关于我", content: "🌟".repeat(2000) }, "exact-limit");
-    assert.equal(notes.self().aboutMe?.tokens, 2000);
+    assert.equal((await notes.self()).aboutMe?.tokens, 2000);
     await notes.close();
     notes = new NoteStore(directory, undefined, undefined, count);
     await notes.initialize();
-    assert.equal(notes.self().aboutMe?.content, "🌟".repeat(2000));
-    assert.equal(notes.self({ idle: true, limit: 10 }).ideas.length, 3);
-    assert.throws(() => notes.self({ limit: 11 }), /1至10/);
+    assert.equal((await notes.self()).aboutMe?.content, "🌟".repeat(2000));
+    assert.equal((await notes.self({ idle: true, limit: 10 })).ideas.length, 3);
+    await assert.rejects(() => notes.self({ limit: 11 }), /1至10/);
   } finally {
     await notes.close();
     await Deno.remove(directory, { recursive: true });
@@ -83,14 +83,58 @@ Deno.test("自我便签：回滚排除候选修改与候选兴趣，保留可读
       { id: "关于我", content: "## 最近想做的事\n候选版本的打算" },
       "candidate",
     );
-    assert.equal(notes.self({ idle: true }).ideas.length, 1);
+    assert.equal((await notes.self({ idle: true })).ideas.length, 1);
     await records.append("upgrade_rollback", { afterSeq: 1, throughSeq: 2 });
-    assert.equal(notes.self().aboutMe?.content, "最初的偏好");
-    assert.equal(notes.self({ idle: true }).ideas.length, 0);
+    assert.equal((await notes.self()).aboutMe?.content, "最初的偏好");
+    assert.equal((await notes.self({ idle: true })).ideas.length, 0);
     assert.equal(notes.get({ id: "关于我", revision: 2 }).note.quarantined, true);
   } finally {
     await notes.close();
     await records.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("自我便签：未配置语义服务仍按本地token计数，旧原件补算缓存且不改历史", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-self-local-tokens-" });
+  const original = new FactJournal(directory);
+  const text = "你好".repeat(1000);
+  try {
+    await original.initialize();
+    await original.append("note", {
+      id: "a".repeat(64),
+      revision: 1,
+      recordSeq: 1,
+      alias: "关于我",
+      title: "旧关于我",
+      group: "",
+      summary: "",
+      content: text,
+      sources,
+      requestId: "legacy-self",
+    });
+  } finally {
+    await original.close();
+  }
+  const notes = new NoteStore(directory);
+  try {
+    await notes.initialize();
+    assert.ok(new TextEncoder().encode(text).length > 2000);
+    const self = await notes.self();
+    assert.equal(self.aboutMe?.encoding, "o200k_base");
+    assert.equal(self.aboutMe?.tokens, 1000);
+    assert.equal(self.aboutMe?.content, text);
+    assert.deepEqual(await notes.self(), self);
+    assert.equal(notes.journal.events.length, 1);
+    const revision = await notes.change("update", { id: "关于我", content: text }, "local-edit");
+    assert.equal(revision.selfTokenCount?.tokens, 1000);
+    await assert.rejects(
+      notes.change("update", { id: "关于我", content: "你 ".repeat(3000) }, "local-too-large"),
+      /上限2000/,
+    );
+    assert.equal(notes.get({ id: "关于我" }).text, text);
+  } finally {
+    await notes.close();
     await Deno.remove(directory, { recursive: true });
   }
 });

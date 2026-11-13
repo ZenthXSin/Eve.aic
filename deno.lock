@@ -1,0 +1,16 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:tiktoken@1.0.22": "1.0.22"
+  },
+  "npm": {
+    "tiktoken@1.0.22": {
+      "integrity": "sha512-PKvy1rVF1RibfF3JlXBSP0Jrcw2uq3yXdgcEXtKTYn3QJ/cBRBHDnrJ5jHky+MENZ6DIPwNUGWpkVx+7joCpNA=="
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "npm:tiktoken@1.0.22"
+    ]
+  }
+}

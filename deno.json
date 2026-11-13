@@ -35,5 +35,8 @@
   },
   "exclude": [
     "data/"
-  ]
+  ],
+  "imports": {
+    "tiktoken": "npm:tiktoken@1.0.22"
+  }
 }

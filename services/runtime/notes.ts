@@ -1,4 +1,5 @@
 import type { NoteApi, NoteRevision, NoteSource } from "../../contracts/notes.ts";
+import { countSelfTokens } from "../../sdk/token-count.ts";
 import { fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
@@ -55,6 +56,7 @@ export class NoteStore {
     seq: number;
     generation: number;
     about: NoteRevision | null;
+    measured?: { tokens: number; encoding: string };
     ideas: { noteId: string; revision: number; text: string }[];
   };
   readonly journal: FactJournal;
@@ -177,10 +179,7 @@ export class NoteStore {
       } as NoteRevision;
       if (!valid(note)) throw new KernelError("rejected", "便签需要标题、内容和有效来源");
       if (note.alias === "关于我") {
-        const measured = this.count ? await this.count(note.content) : {
-          tokens: new TextEncoder().encode(note.content).length,
-          encoding: "utf8_byte_upper_bound",
-        };
+        const measured = await (this.count ?? countSelfTokens)(note.content);
         if (!Number.isSafeInteger(measured.tokens) || measured.tokens < 0) {
           throw new KernelError("rejected", "关于我的分词结果无效，原文未修改");
         }
@@ -198,7 +197,7 @@ export class NoteStore {
     this.#tail = work.catch(() => {});
     return await work;
   }
-  self(args: { idle?: boolean; limit?: number } = {}): Awaited<ReturnType<NoteApi["self"]>> {
+  async self(args: { idle?: boolean; limit?: number } = {}): ReturnType<NoteApi["self"]> {
     if (args.idle !== undefined && typeof args.idle !== "boolean") {
       throw new KernelError("rejected", "idle必须为布尔值");
     }
@@ -238,14 +237,14 @@ export class NoteStore {
       }
       this.#selfCache = { seq: this.journal.events.length, generation, about, ideas };
     }
-    const { about, ideas } = this.#selfCache;
-    const tokens = about?.selfTokenCount ??
-      (about
-        ? {
-          tokens: new TextEncoder().encode(about.content).length,
-          encoding: "utf8_byte_upper_bound",
-        }
-        : undefined);
+    const cache = this.#selfCache;
+    const { about, ideas } = cache;
+    const tokens = about
+      ? cache.measured ??=
+        about.selfTokenCount && about.selfTokenCount.encoding !== "utf8_byte_upper_bound"
+          ? about.selfTokenCount
+          : await (this.count ?? countSelfTokens)(about.content)
+      : undefined;
     // Legacy oversized notes remain intact and readable; never silently truncate them into a persona.
     if (tokens && tokens.tokens > 2000) {
       throw new KernelError(

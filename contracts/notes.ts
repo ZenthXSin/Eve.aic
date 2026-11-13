@@ -4,7 +4,7 @@ export interface NoteSource {
   description: string;
 }
 export interface NoteRevision {
-  /** “关于我”使用 o200k_base 分词；无分词服务时为显式 UTF-8 字节安全上界。 */
+  /** “关于我”使用本地 o200k_base 分词；与当前聊天模型的编码映射未宣称一致。 */
   selfTokenCount?: { tokens: number; encoding: string };
   /** 意识水位及明确的版本前件，候选回滚不会合并其编辑。 */
   contextRecordSeq?: number;

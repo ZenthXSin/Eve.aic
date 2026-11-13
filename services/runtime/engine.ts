@@ -364,7 +364,7 @@ export class RuntimeEngine {
       return await this.agents.invoke(method, args, id);
     }
     if (namespace === "notes" && method === "self") {
-      return this.notes.self(args as never) as unknown as Json;
+      return await this.notes.self(args as never) as unknown as Json;
     }
     // Capture before the first await: an admitted request keeps its original client and provenance.
     const selected = namespace === "model" && ["complete", "describeImage"].includes(method)
