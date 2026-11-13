@@ -21,7 +21,10 @@ export class FileTools {
       real = resolve(await Deno.realPath(dirname(full)), full.slice(full.lastIndexOf("/") + 1));
     }
     const roots = await Promise.all(this.allowedRoots.map((r) => Deno.realPath(r)));
-    if (!isAbsolute(real) || !roots.some((r) => real === r || real.startsWith(r + "/"))) {
+    if (
+      !isAbsolute(real) ||
+      !roots.some((r) => real === r || real.startsWith(r === "/" ? r : r + "/"))
+    ) {
       throw new KernelError("rejected", "路径不在当前配置的工作目录");
     }
     return real;

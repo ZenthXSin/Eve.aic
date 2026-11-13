@@ -46,6 +46,7 @@ interface Options {
   modelSelection?: Pick<ModelSelection, "snapshot" | "current">;
   commandIdentity?: CommandIdentity;
   commandUseSystemd?: boolean;
+  accessMode?: "restricted" | "unrestricted";
   fileRuntime?: FileRuntime;
   semantic?: Pick<LocalSemantic, "embed" | "count">;
   web?: WebApi;
@@ -70,6 +71,18 @@ export class RuntimeEngine {
   #closing = false;
   #modelBlocked: (ModelBlock & { modelName?: string; modelRevision?: number }) | null = null;
   constructor(readonly options: Options) {
+    if (
+      options.accessMode !== undefined &&
+      !["restricted", "unrestricted"].includes(options.accessMode)
+    ) {
+      throw new KernelError("rejected", "未知执行权限模式");
+    }
+    const unrestricted = options.accessMode === "unrestricted";
+    if (
+      unrestricted && (options.commandIdentity?.uid !== 0 || options.commandIdentity?.gid !== 0)
+    ) {
+      throw new KernelError("rejected", "整机管理员模式必须明确配置 root 用户与组");
+    }
     const directory = options.directory;
     this.web = options.web ?? new WebService();
     const embed = options.semantic
@@ -85,7 +98,9 @@ export class RuntimeEngine {
       options.semantic ? (text) => options.semantic!.count(text) : undefined,
     );
     this.memory = new MemoryStore(`${directory}/memory`, this.records, embed);
-    this.files = options.commandIdentity
+    this.files = unrestricted
+      ? new FileTools(options.workspace, ["/"])
+      : options.commandIdentity
       ? new RestrictedFileTools(
         options.workspace,
         options.allowedRoots,
@@ -98,6 +113,7 @@ export class RuntimeEngine {
       this.files,
       options.commandIdentity,
       options.commandUseSystemd,
+      unrestricted,
     );
     this.budget = new SharedBudget(`${directory}/budget`, options.settingsFile);
     this.agents = new AgentService(`${directory}/agents`, {

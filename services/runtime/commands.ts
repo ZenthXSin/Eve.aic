@@ -38,16 +38,20 @@ export class CommandSessions {
     readonly files: FileTools,
     readonly identity?: CommandIdentity,
     readonly useSystemd = false,
+    readonly unrestricted = false,
   ) {
     this.completionJournal = new FactJournal(`${directory}/completions`);
     if (useSystemd && !identity) {
       throw new KernelError("rejected", "systemd 命令必须明确非 root 身份");
     }
     if (
-      identity && (!Number.isSafeInteger(identity.uid) || identity.uid <= 0 ||
-        !Number.isSafeInteger(identity.gid) || identity.gid <= 0)
+      identity && (!Number.isSafeInteger(identity.uid) || identity.uid < (unrestricted ? 0 : 1) ||
+        !Number.isSafeInteger(identity.gid) || identity.gid < (unrestricted ? 0 : 1))
     ) {
       throw new KernelError("rejected", "命令身份必须是明确的非 root 用户与组");
+    }
+    if (unrestricted && (identity?.uid !== 0 || identity?.gid !== 0)) {
+      throw new KernelError("rejected", "整机管理员模式必须明确配置 root 命令身份");
     }
   }
   async initialize() {
@@ -255,10 +259,12 @@ export class CommandSessions {
           "--regid",
           String(this.identity.gid),
           "--clear-groups",
-          "--no-new-privs",
-          "--bounding-set=-all",
-          "--inh-caps=-all",
-          "--ambient-caps=-all",
+          ...(this.unrestricted ? [] : [
+            "--no-new-privs",
+            "--bounding-set=-all",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+          ]),
           "/usr/bin/setsid",
         ]
         : [];
@@ -274,15 +280,19 @@ export class CommandSessions {
           `--property=User=${this.identity!.uid}`,
           `--property=Group=${this.identity!.gid}`,
           "--property=KillMode=control-group",
-          "--property=NoNewPrivileges=yes",
-          "--property=CapabilityBoundingSet=",
-          "--property=AmbientCapabilities=",
+          ...(this.unrestricted ? ["--property=NoNewPrivileges=no"] : [
+            "--property=NoNewPrivileges=yes",
+            "--property=CapabilityBoundingSet=",
+            "--property=AmbientCapabilities=",
+          ]),
           "--property=TimeoutStopSec=1s",
           "--property=SendSIGKILL=yes",
           "/usr/bin/env",
           "-i",
-          "PATH=/usr/local/bin:/usr/bin:/bin",
-          `HOME=${cwd}`,
+          `PATH=${
+            this.unrestricted ? "/usr/local/sbin:/usr/sbin:/sbin:" : ""
+          }/usr/local/bin:/usr/bin:/bin`,
+          `HOME=${this.unrestricted ? "/root" : cwd}`,
           "LANG=C.UTF-8",
           "/bin/bash",
           "-lc",
@@ -299,7 +309,13 @@ export class CommandSessions {
           args: systemdArgs ?? [...identityArgs, "/bin/bash", "-lc", args.cmd],
           cwd,
           clearEnv: true,
-          env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: cwd, LANG: "C.UTF-8" },
+          env: {
+            PATH: `${
+              this.unrestricted ? "/usr/local/sbin:/usr/sbin:/sbin:" : ""
+            }/usr/local/bin:/usr/bin:/bin`,
+            HOME: this.unrestricted ? "/root" : cwd,
+            LANG: "C.UTF-8",
+          },
           stdin: "piped",
           stdout: "piped",
           stderr: "piped",

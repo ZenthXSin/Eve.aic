@@ -27,12 +27,25 @@ export async function runRuntimeService(configPath: string) {
     ]
       .some((p) => typeof p !== "string" || !p.startsWith("/"))
   ) throw new Error("独立执行服务需要完整私有路径");
+  const unrestricted = c.accessMode === "unrestricted";
+  if (c.accessMode !== undefined && !["restricted", "unrestricted"].includes(c.accessMode)) {
+    throw new Error("未知执行权限模式");
+  }
   if (
     !c.commandIdentity || !Number.isSafeInteger(c.commandIdentity.uid) ||
-    c.commandIdentity.uid < 1 ||
-    !Number.isSafeInteger(c.commandIdentity.gid) || c.commandIdentity.gid < 1
+    c.commandIdentity.uid < (unrestricted ? 0 : 1) ||
+    !Number.isSafeInteger(c.commandIdentity.gid) || c.commandIdentity.gid < (unrestricted ? 0 : 1)
   ) {
     throw new Error("生产命令出口必须配置独立非 root 用户");
+  }
+  if (unrestricted) {
+    const id = await new Deno.Command("/usr/bin/id", { args: ["-u"] }).output();
+    if (
+      !id.success || new TextDecoder().decode(id.stdout).trim() !== "0" ||
+      c.commandIdentity.uid !== 0 || c.commandIdentity.gid !== 0
+    ) {
+      throw new Error("整机管理员模式需要 root 宿主与明确的 root 命令身份");
+    }
   }
   if (c.commandUseSystemd !== true) throw new Error("生产命令出口必须启用逐命令进程组监督");
   const model = await readPrivateModelConfig(configPath);
@@ -60,6 +73,7 @@ export async function runRuntimeService(configPath: string) {
     semantic,
     commandIdentity: c.commandIdentity,
     commandUseSystemd: true,
+    accessMode: c.accessMode,
   });
   const fence = new OwnershipFence(
     `${c.directory}/ownership`,
