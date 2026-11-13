@@ -134,7 +134,8 @@ export class RuntimeEngine {
   get available() {
     return !this.#closing && this.transactions.available && this.records.available &&
       this.notes.journal.available && this.memory.journal.available &&
-      this.budget.journal.available && this.agents.available;
+      this.budget.journal.available && this.budget.settingsJournal.available &&
+      this.agents.available;
   }
   async initialize() {
     await Deno.mkdir(this.options.workspace, { recursive: true, mode: 0o700 });

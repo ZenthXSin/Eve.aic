@@ -148,7 +148,7 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     // 无新消息，仍休息；共享配置和其它模型用量不会被本地意识流估算覆盖。
     settings.paused = true;
     settings.dailyTokenBudget = 123456;
-    await writeDurableJson(settingsFile, settings);
+    await engine.budget.updateSettings(settings);
     await eve.pulse();
     assert.equal(paid, 2);
     assert.equal((eve.status().budget as unknown as { paused: boolean }).paused, true);
@@ -160,13 +160,13 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     assert.equal(paid, 2);
     settings.paused = false;
     settings.dailyTokenBudget = 0;
-    await writeDurableJson(settingsFile, settings);
+    await engine.budget.updateSettings(settings);
     phoneSeq = 1;
     await eve.pulse();
     assert.equal(paid, 2);
     assert.equal(eve.journal.events.some((e) => e.kind === "budget_wait"), true);
     settings.dailyTokenBudget = 200_000_000;
-    await writeDurableJson(settingsFile, settings);
+    await engine.budget.updateSettings(settings);
     await eve.pulse();
     assert.equal(paid, 3);
     assert.equal(eve.status().lastError, null);
@@ -194,7 +194,7 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     assert.ok(requests.at(-1)!.at(-1)?.content.includes("我喜欢星星"));
     const reflected = reflections().length;
     settings.dailyTokenBudget = 0;
-    await writeDurableJson(settingsFile, settings);
+    await engine.budget.updateSettings(settings);
     await eve.close();
     eve = new EveRuntime(ctx, config);
     await eve.initialize();
@@ -204,7 +204,7 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     assert.equal(reflections().length, reflected);
     assert.equal(eve.status().commandThroughSeq, 1);
     settings.dailyTokenBudget = 200_000_000;
-    await writeDurableJson(settingsFile, settings);
+    await engine.budget.updateSettings(settings);
     await eve.pulse();
     assert.equal(paid, 5);
     assert.equal(reflections().length, reflected + 1);

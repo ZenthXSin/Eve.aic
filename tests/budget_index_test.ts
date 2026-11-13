@@ -36,9 +36,9 @@ Deno.test("shared budget indexes committed facts once, concurrent admission cann
     assert.equal(expected.unknownReservedTokens, 5000);
     assert.equal(expected.safeRemaining, 4850);
     assert.equal(reads, 0, "status, reservation lookup and settlement never rescan old bodies");
-    await writeDurableJson(settings, { ...config, paused: true });
+    await budget.updateSettings({ paused: true });
     await assert.rejects(budget.reserve("paused", 1), /暂停/);
-    await writeDurableJson(settings, config);
+    await budget.updateSettings(config);
     await budget.close();
     budget = new SharedBudget(`${directory}/facts`, settings);
     await budget.initialize();
