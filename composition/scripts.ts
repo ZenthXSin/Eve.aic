@@ -35,6 +35,7 @@ export async function composeScriptPlugin(directory: string, configPath: string)
           read: [
             configPath,
             config.directory,
+            new URL("../contracts/", import.meta.url).pathname,
             new URL("../plugins/script-runtime/", import.meta.url).pathname,
             new URL("../kernel/calls.ts", import.meta.url).pathname,
           ],

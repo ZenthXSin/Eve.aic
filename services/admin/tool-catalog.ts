@@ -15,7 +15,7 @@ export const SCRIPT_TOOL_METHODS = {
   records: RUNTIME_METHODS.records,
   mind: ["rest", "remind", "watch", "cancelReminder", "compress", "retain", "status"],
   phone: PHONE_METHODS,
-  scripts: ["status", "cancel", "result", "receipt"],
+  scripts: ["status", "cancel", "result", "receipt", "contracts"],
 } as const satisfies { [N in keyof ScriptApi]: readonly (keyof ScriptApi[N])[] };
 type MissingMethods = {
   [N in keyof ScriptApi]: Exclude<keyof ScriptApi[N], (typeof SCRIPT_TOOL_METHODS)[N][number]>;

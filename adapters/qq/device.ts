@@ -25,7 +25,11 @@ export class QqPhoneDevice {
           event.kind !== "settings" || !value ||
           !/^qq:(user|group):.{1,512}$/.test(value.conversationId) ||
           typeof value.settings?.muted !== "boolean" ||
-          typeof value.settings.pinned !== "boolean" || typeof value.settings.draft !== "string"
+          typeof value.settings.pinned !== "boolean" || typeof value.settings.draft !== "string" ||
+          value.settings.remark !== undefined &&
+            (typeof value.settings.remark !== "string" ||
+              Array.from(value.settings.remark).length > 128) ||
+          value.settings.alias !== undefined && !conversationAlias(value.settings.alias)
         ) {
           throw new KernelError("corrupt", "手机设置异常，原件保留");
         }
@@ -36,16 +40,39 @@ export class QqPhoneDevice {
       throw error;
     }
   }
+  resolve(reference: string): string {
+    if (!this.available) throw new KernelError("unavailable", "手机设置不可用");
+    if (/^qq:(user|group):.{1,512}$/.test(reference)) return reference;
+    if (!conversationAlias(reference)) throw new KernelError("rejected", "会话短名无效");
+    const matches = [...this.#settings].filter(([, settings]) => settings.alias === reference);
+    if (matches.length !== 1) {
+      throw new KernelError("rejected", "会话短名不存在或不唯一，请使用原始会话编号");
+    }
+    return matches[0][0];
+  }
   get(conversationId: string): PhoneConversationSettings {
     if (!this.available) throw new KernelError("unavailable", "手机设置不可用");
     return structuredClone(
       this.#settings.get(conversationId) ?? { muted: false, pinned: false, draft: "" },
     );
   }
-  async update(conversationId: string, patch: Partial<PhoneConversationSettings>) {
+  async update(
+    conversationId: string,
+    patch: Omit<Partial<PhoneConversationSettings>, "alias"> & { alias?: string | null },
+  ) {
     const captured = structuredClone(patch);
     const operation = this.#tail.then(async () => {
-      const settings = { ...this.get(conversationId), ...captured };
+      if (
+        captured.alias !== undefined && captured.alias !== null &&
+        (!conversationAlias(captured.alias) ||
+          [...this.#settings].some(([id, s]) =>
+            id !== conversationId && s.alias === captured.alias
+          ))
+      ) {
+        throw new KernelError("rejected", "会话短名无效或已被占用");
+      }
+      const settings = { ...this.get(conversationId), ...captured } as PhoneConversationSettings;
+      if (captured.alias === null) delete settings.alias;
       await this.journal.append("settings", { conversationId, settings } as unknown as Json);
       this.#settings.set(conversationId, settings);
       return structuredClone(settings);
@@ -57,4 +84,9 @@ export class QqPhoneDevice {
     await this.#tail;
     await this.journal.close();
   }
+}
+
+export function conversationAlias(value: unknown): value is string {
+  return typeof value === "string" && Array.from(value).length >= 1 &&
+    Array.from(value).length <= 64 && !/[\s\p{Cc}\p{Cf}\\/:]/u.test(value);
 }

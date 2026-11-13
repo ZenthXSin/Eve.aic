@@ -59,6 +59,7 @@ export function createScriptPlugin(configPath: string) {
       ctx.provide(SCRIPTS, {
         start: (args) =>
           current().start(args as unknown as ScriptRequest) as unknown as Promise<Json>,
+        contracts: (args) => current().contracts(args as never) as unknown as Promise<Json>,
         status: (args) => current().status(args as { jobId: string }) as unknown as Json,
         observations: (args) =>
           current().observations(args as { jobId: string; afterSeq?: number }) as unknown as Json,

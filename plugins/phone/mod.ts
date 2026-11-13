@@ -52,6 +52,19 @@ function relationships(value: Json, ownerId?: string): Json {
   if (value !== null && typeof value === "object") {
     const mapped: Record<string, Json> = {};
     for (const [key, child] of Object.entries(value)) mapped[key] = relationships(child, ownerId);
+    if (Array.isArray(value.mentions)) {
+      mapped.mentions = value.mentions.map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+        return {
+          ...item,
+          relationship: item.platformUserId === ownerId
+            ? "owner"
+            : item.relationship === "self"
+            ? "self"
+            : "other",
+        };
+      });
+    }
     if (
       value.handle && value.sender && typeof value.sender === "object" &&
       !Array.isArray(value.sender) &&

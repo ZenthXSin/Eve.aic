@@ -125,6 +125,25 @@ export function messageScreen(
   });
   // 显式构造输出，不把任意原始字段、资源 URL 或伪造的 isOwner 传给模型。
   return {
+    ...(message.conversation ? { conversation: structuredClone(message.conversation) } : {}),
+    ...(message.mentions?.length
+      ? {
+        mentions: message.mentions.map(({ isSelf, ...mention }) => ({
+          ...structuredClone(mention),
+          ...(isSelf ? { relationship: "self" as const } : {}),
+        })),
+        displayBody: excerpt(
+          message.text.replace(/<@!?(\w[\w-]{0,511})>/g, (_raw, id) => {
+            const mention = message.mentions!.find((m) => m.platformUserId === id);
+            return mention?.displayName
+              ? `@${mention.displayName}（id=${id}）`
+              : `@${id}（未能解析）`;
+          }),
+          0,
+          policy.previewCharacters,
+        ),
+      }
+      : {}),
     handle: { conversationId: message.conversationId, seq: message.seq },
     ...(message.platformMessageId === undefined ? {} : {
       platformMessageId: message.platformMessageId,

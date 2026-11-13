@@ -43,6 +43,8 @@ export interface LiveEvent {
   toolReceiptPartial?: boolean;
   wakeAt?: number;
   retryAt?: number;
+  sourceCommit?: string;
+  relatedSeq?: number;
 }
 
 /** 只展示实际留下的文字和动作元数据，不推断未返回的模型内容或脚本副作用。 */
@@ -63,6 +65,11 @@ export function liveEvent(value: unknown): LiveEvent {
   }
   if (typeof d.requestId === "string") event.requestId = d.requestId;
   if (typeof d.callId === "string") event.callId = d.callId;
+  if (typeof d.sourceCommit === "string" && /^[a-f0-9]{40}$/.test(d.sourceCommit)) {
+    event.sourceCommit = d.sourceCommit;
+  }
+  const related = /^eve_(\d+)_\d+$/.exec(String(d.callId ?? ""));
+  if (related) event.relatedSeq = Number(related[1]);
   switch (event.kind) {
     case "model_start":
       event.category = "action";
@@ -198,6 +205,16 @@ export function liveEvent(value: unknown): LiveEvent {
       break;
     case "channel_recovered":
       event.title = "通道连接恢复";
+      break;
+    case "upgrade_rollback":
+      event.title = "版本回滚";
+      event.text = "原始经历与动作保留，未确认版本的决定已隔离。";
+      break;
+    case "self_reflection":
+      event.title = "翻到自己写的待办";
+      event.text = Array.isArray(d.ideas)
+        ? d.ideas.map((v) => string(object(v).text)).join("\n")
+        : "原话与来源见原件。";
       break;
     case "model_resume":
       event.title = "模型阻塞已明确解除";

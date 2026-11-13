@@ -24,6 +24,7 @@ import { fingerprint } from "../../kernel/calls.ts";
 import type { Json } from "../../kernel/protocol.ts";
 
 import { admitBurst, readBurst, waitForQuiet } from "./phone-social.ts";
+import { contactIndex, messageMentions } from "./contacts.ts";
 
 const SCREEN = { pageSize: 8, previewCharacters: 160, attachmentPageSize: 4 };
 const NOTICE = { ...SCREEN, previewCharacters: 80 };
@@ -114,6 +115,9 @@ function directGroupMention(record: InboundRecord): boolean {
 
 export class QqPhone {
   #burstTail: Promise<unknown> = Promise.resolve();
+  #contacts = contactIndex([]);
+  #contactsThrough = 0;
+  #contactsAnchor = "";
   #attachmentFailures = new Set<string>();
   #attachmentPending = new Set<string>();
   constructor(
@@ -129,22 +133,39 @@ export class QqPhone {
   ) {}
 
   async #snapshot(options: { storedNotifications?: boolean } = {}) {
-    const sources: TimelineSource[] = this.incoming().map((record) => ({
-      key: `incoming:${record.seq}`,
-      fingerprint: record.identity,
-      observedAt: record.receivedAt,
-      // 只增强可再生的手机视图；旧入站投影和原件的格式/指纹保持不变。
-      message: {
-        ...record.message.message,
-        ...(record.message.deduplication.messageIndex === undefined ? {} : {
-          referenceIndex: record.message.deduplication.messageIndex,
-        }),
-        ...(record.message.referenceIndex === undefined ? {} : {
-          reference: { index: record.message.referenceIndex },
-        }),
-      },
-      notify: record.message.notify || (!options.storedNotifications && directGroupMention(record)),
-    }));
+    const incoming = this.incoming();
+    if (
+      incoming.length < this.#contactsThrough ||
+      this.#contactsThrough > 0 &&
+        incoming[this.#contactsThrough - 1]?.identity !== this.#contactsAnchor
+    ) {
+      this.#contacts = contactIndex([]);
+      this.#contactsThrough = 0;
+    }
+    const contacts = contactIndex(incoming.slice(this.#contactsThrough), this.#contacts);
+    this.#contactsThrough = incoming.length;
+    this.#contactsAnchor = incoming.at(-1)?.identity ?? "";
+    const sources: TimelineSource[] = incoming.map((record) => {
+      const mentions = messageMentions(record, contacts.names, this.self);
+      return ({
+        key: `incoming:${record.seq}`,
+        fingerprint: record.identity,
+        observedAt: record.receivedAt,
+        // 只增强可再生的手机视图；旧入站投影和原件的格式/指纹保持不变。
+        message: {
+          ...record.message.message,
+          ...(mentions.length ? { mentions } : {}),
+          ...(record.message.deduplication.messageIndex === undefined ? {} : {
+            referenceIndex: record.message.deduplication.messageIndex,
+          }),
+          ...(record.message.referenceIndex === undefined ? {} : {
+            reference: { index: record.message.referenceIndex },
+          }),
+        },
+        notify: record.message.notify ||
+          (!options.storedNotifications && directGroupMention(record)),
+      });
+    });
     for (const record of this.actions.records()) {
       const delivery = phoneReceipt(this.actions.status(record.actionId)!);
       sources.push({
@@ -183,6 +204,17 @@ export class QqPhone {
       });
     }
     const rows = await this.timeline.snapshot(sources);
+    for (const row of rows) {
+      const settings = this.device?.get(row.message.conversationId);
+      const platformName = contacts.conversations.get(row.message.conversationId);
+      if (platformName || settings?.remark || settings?.alias) {
+        row.message.conversation = {
+          ...(platformName ? { platformName } : {}),
+          ...(settings?.remark ? { remark: settings.remark } : {}),
+          ...(settings?.alias ? { alias: settings.alias } : {}),
+        };
+      }
+    }
     // 一次线性建表，不逐条扫描历史；索引仅在本会话唯一命中时才可解析。
     // 平台 msg_id 可能被并行消息共用，不能拿它或正文猜测引用对象。
     const targets = new Map<string, (typeof rows)[number] | null>();
@@ -303,6 +335,7 @@ export class QqPhone {
       items: page.map((message) => ({
         conversationId: message.conversationId,
         kind: message.conversationId.startsWith("qq:user:") ? "user" : "group",
+        ...message.conversation,
         latest: messageScreen(message, SCREEN, this.now()),
         pendingNotifications: this.device?.get(message.conversationId).muted
           ? 0
@@ -352,6 +385,10 @@ export class QqPhone {
   }
 
   async open(args: { conversationId: string }): Promise<OpenedConversation> {
+    args = {
+      ...args,
+      conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+    };
     conversation(args.conversationId);
     // open 不接受历史游标，防止将向前翻页误作打开最新一屏。
     if (Object.hasOwn(args, "cursor")) throw new QqPhoneError("request");
@@ -381,6 +418,10 @@ export class QqPhone {
   }
 
   async history(args: { conversationId: string; cursor?: HistoryCursor }) {
+    args = {
+      ...args,
+      conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+    };
     conversation(args.conversationId);
     cursor(args.cursor);
     const rows = await this.#snapshot();
@@ -397,6 +438,10 @@ export class QqPhone {
   }
 
   async #message(handle: { conversationId: string; seq: number }) {
+    handle = {
+      ...handle,
+      conversationId: this.device?.resolve(handle?.conversationId) ?? handle?.conversationId,
+    };
     conversation(handle?.conversationId);
     integer(handle.seq, 1);
     const found = (await this.#snapshot()).find(({ message }) =>
@@ -428,7 +473,13 @@ export class QqPhone {
     if (typeof args.query !== "string" || args.query.length === 0 || args.query.length > 256) {
       throw new QqPhoneError("request");
     }
-    if (args.conversationId !== undefined) conversation(args.conversationId);
+    if (args.conversationId !== undefined) {
+      args = {
+        ...args,
+        conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+      };
+      conversation(args.conversationId);
+    }
     cursor(args.cursor);
     const rows = await this.#snapshot();
     const through = args.cursor?.snapshotThroughSeq ?? rows.at(-1)?.message.seq ?? 0;
@@ -436,7 +487,9 @@ export class QqPhone {
     const eligible = rows.map((row) => row.message).filter((message) =>
       message.seq <= through && (!args.cursor || message.seq < args.cursor.beforeSeq) &&
       (args.conversationId === undefined || message.conversationId === args.conversationId) &&
-      message.text.includes(args.query)
+      (message.text.includes(args.query) || message.conversation?.remark?.includes(args.query) ||
+        message.conversation?.alias?.includes(args.query) ||
+        message.conversation?.platformName?.includes(args.query))
     );
     const page = eligible.slice(-SCREEN.pageSize);
     return {
@@ -479,6 +532,10 @@ export class QqPhone {
     },
     options: { beforeAttempt?: () => Promise<void> } = {},
   ) {
+    args = {
+      ...args,
+      conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+    };
     conversation(args.conversationId);
     const match = /^qq:(user|group):(.+)$/.exec(args.conversationId)!;
     if (args.replyTo !== undefined) {
@@ -510,7 +567,10 @@ export class QqPhone {
     options: { beforeAttempt?: () => Promise<void> } = {},
   ): Promise<PhoneBurstReceipt> {
     // 冻结调用者输入；同一手机内父动作准入串行，发送本身仍交给现有会话FIFO。
-    const captured = structuredClone(args);
+    const captured = structuredClone({
+      ...args,
+      conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+    });
     const admission = this.#burstTail.then(async () => {
       const manifest = await admitBurst(this.actions.directory, captured);
       const match = /^qq:(user|group):(.+)$/.exec(manifest.conversationId)!;
@@ -563,6 +623,10 @@ export class QqPhone {
     args: PhoneWaitForMessages,
     options: { signal?: AbortSignal; beforeCheck?: () => Promise<void> } = {},
   ): Promise<PhoneMessagesWaitResult> {
+    args = {
+      ...args,
+      conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+    };
     const result = await waitForQuiet(args, () => {
       const latest = this.incoming().findLast((record) =>
         record.message.message.conversationId === args.conversationId
@@ -589,6 +653,12 @@ export class QqPhone {
   async listSendQueue(
     args: { conversationId?: string; afterSequence?: number; limit?: number } = {},
   ) {
+    if (args.conversationId !== undefined) {
+      args = {
+        ...args,
+        conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+      };
+    }
     if (
       Object.keys(args).some((key) => !["conversationId", "afterSequence", "limit"].includes(key))
     ) throw new QqPhoneError("request");
@@ -611,20 +681,36 @@ export class QqPhone {
   }
 
   async settings(
-    args: { conversationId: string; muted?: boolean; pinned?: boolean; draft?: string },
+    args: {
+      conversationId: string;
+      muted?: boolean;
+      pinned?: boolean;
+      draft?: string;
+      remark?: string;
+      alias?: string | null;
+    },
   ) {
+    args = {
+      ...args,
+      conversationId: this.device?.resolve(args.conversationId) ?? args.conversationId,
+    };
     conversation(args.conversationId);
     if (!this.device) throw new KernelError("unavailable", "手机设置存储未接入");
     if (
       Object.keys(args).some((key) =>
-        !["conversationId", "muted", "pinned", "draft"].includes(key)
+        !["conversationId", "muted", "pinned", "draft", "remark", "alias"].includes(key)
       ) ||
+      (args.remark !== undefined &&
+        (typeof args.remark !== "string" || Array.from(args.remark).length > 128 ||
+          /[\p{Cc}\p{Cf}]/u.test(args.remark))) ||
       (args.muted !== undefined && typeof args.muted !== "boolean") ||
       (args.pinned !== undefined && typeof args.pinned !== "boolean") ||
       (args.draft !== undefined &&
         (typeof args.draft !== "string" || new TextEncoder().encode(args.draft).length > 65_536))
     ) throw new QqPhoneError("request");
     const patch = {
+      ...(args.remark === undefined ? {} : { remark: args.remark }),
+      ...(args.alias === undefined ? {} : { alias: args.alias }),
       ...(args.muted === undefined ? {} : { muted: args.muted }),
       ...(args.pinned === undefined ? {} : { pinned: args.pinned }),
       ...(args.draft === undefined ? {} : { draft: args.draft }),

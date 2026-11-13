@@ -190,3 +190,41 @@ Deno.test("初次组成提示按人格、社交、机制、实际契约排序，
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("升级人格：仅精确旧原件可迁移，新人格摘要验真；自定义前缀逐字保留", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-identity-migration-" });
+  try {
+    const old = await fixture(`${directory}/old`, "old"),
+      next = await fixture(`${directory}/next`, "next");
+    const add = async (source: SourceArtifact, identity: string) => {
+      const path = "prompts/identity.md", bytes = new TextEncoder().encode(identity);
+      await Deno.writeTextFile(`${source.directory}/${path}`, identity);
+      source.files.push({
+        path,
+        sha256: [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((b) =>
+          b.toString(16).padStart(2, "0")
+        ).join(""),
+        executable: false,
+      });
+    };
+    await add(old, "旧人格\n");
+    await add(next, "新版人格，学感兴趣的事\n");
+    const suffix = `\n\nQQ old\n\n\n${await renderScriptContracts((p) =>
+      Deno.readTextFile(`${old.directory}/${p}`)
+    )}`;
+    assert.ok(
+      (await refreshUpgradePrompt("旧人格\n" + suffix, old, next)).startsWith(
+        "新版人格，学感兴趣的事\n",
+      ),
+    );
+    assert.ok(
+      (await refreshUpgradePrompt("主人的定制\r\n  原字不改\n" + suffix, old, next)).startsWith(
+        "主人的定制\r\n  原字不改\n",
+      ),
+    );
+    await Deno.writeTextFile(`${next.directory}/prompts/identity.md`, "被改的原件");
+    await assert.rejects(() => refreshUpgradePrompt("旧人格\n" + suffix, old, next), /摘要变化/);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});

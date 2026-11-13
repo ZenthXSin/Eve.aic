@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { Message } from "../contracts/model.ts";
 import { EveRuntime } from "../plugins/eve/runtime.ts";
 import { RuntimeEngine } from "../services/runtime/engine.ts";
 import { RuntimeClient } from "../services/runtime/client.ts";
@@ -25,13 +26,15 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
   });
   if (granted.status !== "granted") throw new Error("not granted");
   let paid = 0;
+  const requests: Message[][] = [];
   const engine = new RuntimeEngine({
     directory: `${directory}/data`,
     workspace: `${directory}/workspace`,
     settingsFile,
     maxOutputTokens: 100,
     model: {
-      complete() {
+      complete(args) {
+        requests.push(args.messages);
         paid++;
         return Promise.resolve({
           content: "这一步先休息",
@@ -111,6 +114,18 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
       messages: [{ role: "user", content: "已在出口完成" }],
       tools: [],
     }, "interrupted_request");
+    await engine.notes.change("create", {
+      title: "关于我",
+      alias: "关于我",
+      content: "我喜欢星星",
+      sources: [{ kind: "experienced", at: "2026-11-13T00:00:00Z", description: "自己的观察" }],
+    }, "self-profile");
+    await engine.notes.change("create", {
+      title: "想弄明白的事",
+      alias: "想弄明白的事",
+      content: "了解星星\n制作工具\n读书\n观察天空",
+      sources: [{ kind: "experienced", at: "2026-11-13T00:00:00Z", description: "自己的打算" }],
+    }, "self-ideas");
     await eve.initialize();
     assert.equal(paid, 1);
     const adopted = eve.journal.events.find((e) => e.kind === "model_response");
@@ -118,6 +133,11 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     assert.equal(eve.journal.events.some((e) => e.kind === "recovery"), false);
     await eve.pulse();
     assert.equal(paid, 2);
+    assert.equal(requests[1][0].content, "稳定身份");
+    assert.equal(requests[1].at(-1)?.role, "user");
+    assert.ok(requests[1].at(-2)?.content.includes("我喜欢星星"));
+    const reflections = () => eve.journal.events.filter((e) => e.kind === "self_reflection");
+    assert.equal((reflections()[0].data as { ideas: unknown[] }).ideas.length, 3);
     assert.equal(eve.status().lastError, null);
     await eve.pulse();
     assert.equal(eve.status().budget.knownNoncachedTokens, 60);
@@ -148,6 +168,7 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     assert.equal(paid, 3);
     assert.equal(eve.status().lastError, null);
     assert.equal(eve.journal.events.filter((e) => e.kind === "model_response").length, 3);
+    config.defaultSleepMs = 0;
     await client.call(
       "commands",
       "start",
@@ -166,12 +187,25 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     );
     assert.equal(commandNotice.length, 1);
     assert.equal((commandNotice[0].data as { items: { exitCode: number }[] }).items[0].exitCode, 0);
+    // A fresh command notification must not surface idle ideas.
+    assert.ok(requests.at(-1)!.at(-1)?.content.includes("我喜欢星星"));
+    const reflected = reflections().length;
+    settings.dailyTokenBudget = 0;
+    await writeDurableJson(settingsFile, settings);
     await eve.close();
     eve = new EveRuntime(ctx, config);
     await eve.initialize();
     await eve.pulse();
+    await eve.pulse();
     assert.equal(paid, 4);
+    assert.equal(reflections().length, reflected);
     assert.equal(eve.status().commandThroughSeq, 1);
+    settings.dailyTokenBudget = 200_000_000;
+    await writeDurableJson(settingsFile, settings);
+    await eve.pulse();
+    assert.equal(paid, 5);
+    assert.equal(reflections().length, reflected + 1);
+    assert.equal((reflections().at(-1)!.data as { ideas: unknown[] }).ideas.length, 3);
   } finally {
     await eve.close();
     client.close();

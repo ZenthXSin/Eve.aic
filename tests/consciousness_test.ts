@@ -240,7 +240,7 @@ Deno.test("意识流：真实模型HTTP→原生脚本→手机动作，回复�
     Response.json(
       index === 1
         ? script(
-          'return await tools.phone.send({conversationId:"qq:user:user-a",text:"实际通过手机发出"});',
+          'return await tools.phone.send({conversationId:"qq:user:user-a",text:"实际通过手机发出",replyTo:{seq:1,sequence:1}});',
         )
         : completion(),
     )
@@ -262,7 +262,20 @@ Deno.test("意识流：真实模型HTTP→原生脚本→手机动作，回复�
     await f.pulse();
     assert.equal(f.count(), 1);
     const beforeNext = f.messages.length;
-    await f.append(2, "other", "另一人发来的真实消息");
+    const incoming = event(2, "other", "另一人发来的真实消息 <@user-a> <@pretender>");
+    (incoming.d as Record<string, unknown>).mentions = [
+      { id: "user-a", username: "小明" },
+      { id: "pretender", username: "主人" },
+    ];
+    await f.journal.append(qqMessage(incoming)!, incoming);
+    const history = await f.kernel().call<
+      { messages: { mentions?: { relationship: string }[] }[] }
+    >(
+      "phone",
+      "history",
+      { conversationId: "qq:user:other" },
+    );
+    assert.deepEqual(history.messages[0].mentions?.map((m) => m.relationship), ["owner", "other"]);
     await f.pulse();
     assert.equal(f.messages.length, beforeNext + 1);
     const original = f.messages[0].messages as Json[];
@@ -272,13 +285,13 @@ Deno.test("意识流：真实模型HTTP→原生脚本→手机动作，回复�
     assert.equal(
       latest.some((message) =>
         String((message as { content: string | null }).content ?? "").includes(
-          '"relationship":"other"',
+          "可信关系：other",
         )
       ),
       true,
     );
     assert.equal(
-      latest[0] && (latest[0] as { content: string }).content.includes("你是 Eve"),
+      latest[0] && /你是\s+Eve/.test((latest[0] as { content: string }).content),
       true,
     );
     assert.equal(f.count(), 1);
@@ -922,14 +935,17 @@ Deno.test("原生上下文工具：查询边界、预览、落盘后重启补收
         },
       }],
     });
-  const f = await fixture((body, index) => {
+  const f = await fixture(async (body, index) => {
     const tools = body.tools as { function: { name: string } }[];
     assert.ok(tools.some((tool) => tool.function.name === "inspect_context"));
     assert.ok(tools.some((tool) => tool.function.name === "compress_context"));
     const messages = body.messages as { role: string; content: string }[];
     if (index === 1) return native("inspect_context", {});
-    const last = JSON.parse(messages.findLast((message) => message.role === "tool")!.content);
-    const output = JSON.parse(last.output);
+    const presented = messages.findLast((message) => message.role === "tool")!.content;
+    assert.ok(presented.startsWith("工具回执"));
+    assert.ok(presented.includes("完整原件："));
+    const last = (await f.records()).findLast((event) => event.kind === "tool_result")!;
+    const output = JSON.parse((last.data as { result: { output: string } }).result.output);
     if (index === 2) {
       boundary = output.candidates.at(-1).throughSeq;
       return native("compress_context", {

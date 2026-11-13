@@ -230,3 +230,42 @@ Deno.test("QQ 群提醒：/model 接管视图保持抑制通知，原始群提�
     await f.close();
   }
 });
+
+Deno.test("QQ艾特名称：保留原文与id，解析平台昵称不冒充身份，替换后按Unicode预算预览", async () => {
+  const f = await fixture();
+  try {
+    const raw = group(1, [{ scope: "single", id: "owner-real", username: "小明" }, {
+      scope: "single",
+      id: "unknown",
+    }]);
+    (raw.d as Record<string, unknown>).content = "<@owner-real> " + "🌟".repeat(180) +
+      " <@unknown>";
+    raw.t = "GROUP_AT_MESSAGE_CREATE";
+    (raw.d as Record<string, unknown>).group_name = "平台研究群";
+    await f.append(raw);
+    await f.phone.settings({
+      conversationId: "qq:group:group-a",
+      remark: "我的研究群",
+      alias: "研究群",
+    });
+    const message = (await f.phone.history({ conversationId: "研究群" })).messages[0];
+    assert.ok(message.body.text.startsWith("<@owner-real>"));
+    assert.ok(message.displayBody?.text.startsWith("@小明（id=owner-real）"));
+    assert.equal(Array.from(message.displayBody!.text).length, 160);
+    assert.equal(message.displayBody?.truncated, true);
+    assert.equal(message.mentions?.[0].platformUserId, "owner-real");
+    assert.equal(message.mentions?.[0].relationship, undefined);
+    assert.equal(message.mentions?.[1].resolved, false);
+    assert.equal(message.conversation?.platformName, "平台研究群");
+    assert.equal(message.conversation?.remark, "我的研究群");
+    const notice = (await f.phone.notifications()).items[0];
+    assert.equal(Array.from(notice.displayBody!.text).length, 80);
+    assert.ok(!notice.displayBody!.text.endsWith("\ud83c"));
+    assert.equal(
+      f.journal.records()[0].message.message.text,
+      (raw.d as Record<string, unknown>).content,
+    );
+  } finally {
+    await f.close();
+  }
+});

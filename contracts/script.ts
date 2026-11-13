@@ -1,4 +1,5 @@
 import type { AgentApi } from "./agents.ts";
+import type { LegacyReply } from "./phone-compat.ts";
 import type { Json } from "../kernel/protocol.ts";
 import type {
   PhoneActionReceipt,
@@ -22,6 +23,7 @@ export const WEB_CAPABILITY_VERSION = 1;
 /** 默认工具等待上限与后台续行能力，用于准确复原旧版本生成提示。 */
 export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 1;
 export const AGENT_CAPABILITY_VERSION = 1;
+export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 1;
 /** 原生随记工具 write_thought 的参数，不属于脚本 tools 对象中的接口。 */
 export interface NativeThoughtArguments {
   thought: string;
@@ -67,11 +69,15 @@ export interface ScriptApi {
   mind: MindApi;
   phone: Omit<PhoneApi, "send" | "sendFile" | "sendBurst"> & {
     /** actionId由宿主从持久脚本编号与调用序号产生，不让代码重试制造新动作。 */
-    send(args: Omit<PhoneSend, "actionId">): Promise<PhoneActionReceipt>;
-    sendFile(args: Omit<PhoneSendFile, "actionId">): Promise<PhoneActionReceipt>;
+    send(args: Omit<PhoneSend, "actionId"> & LegacyReply): Promise<PhoneActionReceipt>;
+    sendFile(args: Omit<PhoneSendFile, "actionId"> & LegacyReply): Promise<PhoneActionReceipt>;
     sendBurst(args: Omit<PhoneSendBurst, "actionId">): Promise<PhoneBurstReceipt>;
   };
   scripts: {
+    /** 按需读取完整类型原件；按Unicode码点分页，不改变执行能力。 */
+    contracts(
+      args: { name: "phone-details" | "agents"; startChar?: number; limit?: number },
+    ): Promise<{ text: string; characters: number; nextChar?: number }>;
     status(args: { jobId: string }): Promise<ScriptSummary>;
     cancel(args: { jobId: string }): Promise<ScriptSummary>;
     result(args: { jobId: string; startChar?: number; limit?: number }): Promise<{

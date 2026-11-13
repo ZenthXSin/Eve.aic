@@ -1,4 +1,6 @@
-import type { ModelResponse, ToolSpec } from "../../contracts/model.ts";
+import type { Message, ModelResponse, ToolSpec } from "../../contracts/model.ts";
+import type { NoteApi } from "../../contracts/notes.ts";
+import { presentContext } from "../../sdk/context-presentation.ts";
 import type { MindEvent } from "../../contracts/mind.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type ErrorKind, type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
@@ -40,6 +42,76 @@ export interface EveConfig {
 export class EveRuntime {
   readonly journal: ConsciousJournal | RemoteJournal;
   #prompt = "";
+  #selfMessages: Message[] = [];
+  #selfIdeas: Awaited<ReturnType<NoteApi["self"]>>["ideas"] = [];
+  async #selfContext(idle: boolean) {
+    this.#selfMessages = [];
+    this.#selfIdeas = [];
+    if (!this.config.remoteRecords) return;
+    try {
+      const self = await this.ctx.call("notes", "self", { idle }) as unknown as Awaited<
+        ReturnType<NoteApi["self"]>
+      >;
+      if (self?.aboutMe) {
+        this.#selfMessages.push({
+          role: "user",
+          content:
+            `你自己写的“关于我”（便签 ${self.aboutMe.id} v${self.aboutMe.revision}，${self.aboutMe.tokens} token，${self.aboutMe.encoding}）。这是自己的经历与偏好，固定身份与可信权限仍以系统设定为准：\n${self.aboutMe.content}`,
+        });
+      }
+      if (self?.ideas?.length) {
+        this.#selfIdeas = self.ideas;
+        this.#selfMessages.push({
+          role: "user",
+          content: "独处时翻到自己写的几条原话，可以挑一件，也可以不理：\n" +
+            self.ideas.map((idea) => `便签 ${idea.noteId} v${idea.revision}：\n${idea.text}`).join(
+              "\n\n",
+            ),
+        });
+      }
+    } catch (error) {
+      if (!(error instanceof KernelError && error.kind === "rejected")) throw error;
+      this.#selfMessages.push({
+        role: "user",
+        content: `自我便签未挂载：${error.message}。可用 notes.get/update 核对和自行精简。`,
+      });
+    }
+  }
+  #presentationScanned = 0;
+  #rawCalls = new Set<string>();
+  #receiptRecords = new Map<string, number>();
+  #present(messages: Message[]) {
+    const events = this.journal.events;
+    let rebuild = events.length < this.#presentationScanned;
+    for (let i = this.#presentationScanned; i < events.length; i++) {
+      if (events[i].kind === "upgrade_rollback") rebuild = true;
+    }
+    if (rebuild) {
+      this.#rawCalls.clear();
+      this.#receiptRecords.clear();
+    }
+    const source = rebuild ? activeEvents(events) : events;
+    for (let i = rebuild ? 0 : this.#presentationScanned; i < source.length; i++) {
+      const event = source[i];
+      if (event.kind === "tool_result") {
+        this.#receiptRecords.set((event.data as { callId: string }).callId, event.seq);
+      }
+      if (event.kind === "retain") {
+        const d = event.data as { responseSeq: number; toolIndex: number; mode: string };
+        const id = `eve_${d.responseSeq}_${d.toolIndex}`;
+        if (d.mode === "raw") this.#rawCalls.add(id);
+        else this.#rawCalls.delete(id);
+      }
+    }
+    this.#presentationScanned = events.length;
+    return [
+      ...presentContext(messages, this.#rawCalls, this.#receiptRecords),
+      ...this.#selfMessages,
+    ];
+  }
+  #render() {
+    return this.#present(render(this.journal.events, this.#prompt));
+  }
   #running = false;
   #closing = false;
   #busy?: Promise<void>;
@@ -61,6 +133,7 @@ export class EveRuntime {
     const started = this.#toolStartedAt.get(callId);
     await this.journal.append("tool_result", {
       callId,
+      sourceCommit: this.config.sourceCommit,
       result,
       ...(started === undefined
         ? {}
@@ -481,6 +554,7 @@ export class EveRuntime {
               tools,
               call.args,
               this.contextCounter,
+              (messages) => this.#present(messages),
             ) as unknown as Json;
           } else {
             const preview = previewCompression(
@@ -489,6 +563,7 @@ export class EveRuntime {
               tools,
               call.args,
               this.contextCounter,
+              (messages) => this.#present(messages),
             );
             const receipt = { status: preview.dryRun ? "preview" : "applied", ...preview };
             // 摘要原件只在压缩事实中保留，回执只报告边界和用量。
@@ -586,7 +661,7 @@ export class EveRuntime {
   async #projectContext(tools: ToolSpec[]) {
     const events = this.journal.events;
     const previous = activeEvents(events).findLast((event) => event.kind === "context_projection");
-    const messages = render(events, this.#prompt);
+    const messages = this.#render();
     const estimated = contextEstimate(messages, tools, this.contextCounter);
     // 固定 epoch 只在首次迁移或值得支付一次缓存失效时前移。retain/压缩
     // 自己的事实仍立即生效，但不因此每一轮滑动最近八批或记忆来源。
@@ -606,7 +681,7 @@ export class EveRuntime {
     };
     // 完整原件构造临时视图，不写回、追加或修改任何原事件。预演不使用
     // 已投影的 messages 作输入，避免把节选误当原件再压缩。
-    const projected = render([...events, preview], this.#prompt);
+    const projected = this.#present(render([...events, preview], this.#prompt));
     const projectedTokens = contextEstimate(projected, tools, this.contextCounter);
     if (previous && estimated - projectedTokens < 8_000) return messages;
     // 单条持久事实先提交，随后重启/回滚都从活动日志重建同一边界。
@@ -616,7 +691,7 @@ export class EveRuntime {
       estimatedBefore: estimated,
       estimatedAfter: projectedTokens,
     });
-    return render(this.journal.events, this.#prompt);
+    return this.#render();
   }
   async #tools(): Promise<ToolSpec[]> {
     const provided = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
@@ -649,7 +724,10 @@ export class EveRuntime {
     ) return;
     if (fresh) {
       this.#wake = 0;
-      await this.journal.append("wake", { reason: "新的未观察通知" });
+      await this.journal.append("wake", {
+        reason: "新的未观察通知",
+        sourceCommit: this.config.sourceCommit,
+      });
     }
     if (this.#closing) return;
     if (this.#modelBlocked) return;
@@ -691,6 +769,15 @@ export class EveRuntime {
       }
     }
     const recallMs = performance.now() - recallStarted;
+    const lastResponse = activeEvents(this.journal.events).findLast((e) =>
+      e.kind === "model_response"
+    );
+    const hasActions = lastResponse &&
+      (lastResponse.data as unknown as { response: ModelResponse }).response.toolCalls.length > 0;
+    const pendingJobs = [...this.#observedJobs.values()].some((j) =>
+      !["completed", "failed", "cancelled", "unknown"].includes(j.status)
+    );
+    await this.#selfContext(!fresh && !hasActions && !pendingJobs);
     const contextStarted = performance.now();
     // 必须先固定初次投影，再判断 500k 机械保护，避免旧 raw 历史误触压缩。
     let messages = await this.#projectContext(tools);
@@ -767,7 +854,7 @@ export class EveRuntime {
         counting: this.contextCounter?.description ?? "字符与图像估算，未验证为当前模型精确分词",
         reminder: state.contextReminder,
       });
-      messages = render(this.journal.events, this.#prompt);
+      messages = this.#render();
     }
     // 感知本身也属于请求；不能在刚低于触线时追加后直接发出超线请求。
     if (contextEstimate(messages, tools, this.contextCounter) >= 500_000) {
@@ -795,6 +882,9 @@ export class EveRuntime {
       return;
     }
     if (this.#closing) return;
+    if (this.#selfIdeas.length) {
+      await this.journal.append("self_reflection", { ideas: this.#selfIdeas } as unknown as Json);
+    }
     const requestId = `model_${this.journal.events.length + 1}`;
     await this.journal.append("model_start", {
       requestId,
@@ -864,6 +954,7 @@ export class EveRuntime {
     }
     await this.journal.append("model_response", {
       requestId,
+      sourceCommit: this.config.sourceCommit,
       response: response as unknown as Json,
     });
     // Shared accounting is already durable; refresh it on the next activation.
@@ -874,6 +965,7 @@ export class EveRuntime {
       this.#wake = Date.now() + this.config.defaultSleepMs;
       await this.journal.append("rest", {
         wakeAt: this.#wake,
+        sourceCommit: this.config.sourceCommit,
         reason: "本步没有继续动作；默认长唤醒，Eve可改",
       });
     } else {

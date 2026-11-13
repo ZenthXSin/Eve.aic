@@ -4,6 +4,8 @@ export interface NoteSource {
   description: string;
 }
 export interface NoteRevision {
+  /** “关于我”使用 o200k_base 分词；无分词服务时为显式 UTF-8 字节安全上界。 */
+  selfTokenCount?: { tokens: number; encoding: string };
   /** 意识水位及明确的版本前件，候选回滚不会合并其编辑。 */
   contextRecordSeq?: number;
   basedOnRevision?: number;
@@ -22,6 +24,15 @@ export interface NoteRevision {
   sources: NoteSource[];
 }
 export interface NoteApi {
+  /** 读取自己写的便签短名“关于我”（最多2000 token）与空闲时随机浮现的原话（默认3条，limit为1..10）。
+   * 用现有 create/update 编辑；“关于我”中“最近想做的事”标题下每行一条，
+   * 另可写短名“想弄明白的事”的便签。没有内容时不编造、不自动创建。 */
+  self(args?: { idle?: boolean; limit?: number }): Promise<{
+    aboutMe:
+      | { id: string; revision: number; content: string; tokens: number; encoding: string }
+      | null;
+    ideas: { noteId: string; revision: number; text: string }[];
+  }>;
   create(
     args: {
       title: string;

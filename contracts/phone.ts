@@ -1,7 +1,18 @@
+import type { PhoneActionReceipt, PhoneBurstReceipt, PhoneBurstStatus } from "./phone-details.ts";
+export type { PhoneActionReceipt, PhoneBurstReceipt, PhoneBurstStatus } from "./phone-details.ts";
+
 // 平台事实与手机屏幕契约。阅读状态另存于独立适配器，不随手机 worker 换版回滚。
 // 此处不认证调用方，也不从昵称、正文、引用或附件推断主人身份。
 
 export interface PhoneMessage {
+  conversation?: { platformName?: string; remark?: string; alias?: string };
+  /** 手机视图解析的艾特；原始正文与平台id仍保留，身份由中间件补充。 */
+  mentions?: {
+    platformUserId: string;
+    displayName?: string;
+    resolved: boolean;
+    isSelf?: boolean;
+  }[];
   /** 适配器日志内单调递增的编号；不等于平台消息编号。 */
   seq: number;
   conversationId: string;
@@ -49,6 +60,15 @@ export interface TextPreview {
 }
 
 export interface MessageScreen {
+  conversation?: { platformName?: string; remark?: string; alias?: string };
+  mentions?: {
+    platformUserId: string;
+    displayName?: string;
+    resolved: boolean;
+    relationship?: "owner" | "other" | "self";
+  }[];
+  /** 艾特可读投影，不改变body原文及text分页偏移。 */
+  displayBody?: TextPreview;
   handle: { conversationId: string; seq: number };
   platformMessageId?: string;
   sender: {
@@ -118,37 +138,6 @@ export interface OpenedConversation extends HistoryScreen {
 
 export const PHONE = "phone";
 
-export interface PhoneActionReceipt {
-  actionId: string;
-  state: "running" | "blocked" | "sent" | "failed" | "unknown" | "cancelled";
-  /** 逻辑结束保留原始失败/未尝试记录；绝不表示已发送。 */
-  resolution?: {
-    kind: "failed_retained" | "unknown_retained" | "queued_cancelled";
-    actor: "admin" | "eve";
-    at: string;
-  };
-  /** 同会话未成功的队首动作；不得用新动作越过。 */
-  blockedBy?: string;
-  attempted?: boolean;
-  /** 仅多次真实尝试时提供；仅在确认尚未提交或明确拒绝时自动重试原主动消息。 */
-  attemptCount?: number;
-  platformMessageId?: string;
-  reason?: "interrupted";
-  error?: {
-    category: string;
-    httpStatus?: number;
-    code?: number;
-    traceId?: string;
-    /** 受控传输诊断，不含资源地址、凭据或原始异常文本。 */
-    transportReason?: "timeout" | "aborted" | "network";
-    /** 包括建连/等待响应头，或读取响应正文；不证明请求是否已经送达。 */
-    phase?: "headers" | "body";
-    elapsedMs?: number;
-    retryAfterMs?: number;
-    failureStage?: "auth" | "upload" | "message";
-  };
-}
-
 /** QQ 文字统一主动发送；引用展示不改变发送模式。 */
 export interface PhoneSend {
   actionId: string;
@@ -169,21 +158,7 @@ export interface PhoneSendBurst {
   /** 新脚本继续原父请求：仅允许已存在父编号且全部原参数一致；不会重发已结束子条。 */
   resumeActionId?: string;
 }
-export interface PhoneBurstReceipt {
-  actionId: string;
-  conversationId: string;
-  /** 每条均为独立真实动作；unknown/blocked可用该子编号检查和取消。 */
-  items: { index: number; actionId: string; receipt: PhoneActionReceipt }[];
-  /** 只有所有子消息实际sent才为true；取消不算送达。 */
-  complete: boolean;
-}
-/** 只读父请求；子receipt为null代表尚未准入，没有虚构发送状态。 */
-export interface PhoneBurstStatus {
-  actionId: string;
-  conversationId: string;
-  complete: boolean;
-  items: { index: number; actionId: string; receipt: PhoneActionReceipt | null }[];
-}
+
 export interface PhoneWaitForMessages {
   conversationId: string;
   purpose: "reply";
@@ -203,6 +178,8 @@ export interface PhoneMessagesWaitResult {
 }
 
 export interface PhoneConversationSettings {
+  remark?: string;
+  alias?: string;
   muted: boolean;
   pinned: boolean;
   /** 仅存在本机，不自动发送。空串表示没有草稿。 */
@@ -251,6 +228,9 @@ export interface PhoneApi {
     items: {
       conversationId: string;
       kind: "user" | "group";
+      platformName?: string;
+      remark?: string;
+      alias?: string;
       latest: MessageScreen;
       pendingNotifications: number;
       reading: PhoneReadingState | null;
@@ -309,6 +289,10 @@ export interface PhoneApi {
   /** 只改变明确提供的字段；省略所有字段时只读取。本机设置随重启保留。 */
   settings(args: {
     conversationId: string;
+    /** 群聊或私信的本机备注，不更改平台名称与身份。 */
+    remark?: string;
+    /** 唯一短名；null移除。手机动作的conversationId也可填写当前短名。 */
+    alias?: string | null;
     muted?: boolean;
     pinned?: boolean;
     draft?: string;

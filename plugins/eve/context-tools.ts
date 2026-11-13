@@ -1,4 +1,4 @@
-import type { ToolSpec } from "../../contracts/model.ts";
+import type { Message, ToolSpec } from "../../contracts/model.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import {
@@ -64,13 +64,14 @@ export function contextUsage(
   prompt: string,
   tools: ToolSpec[],
   counter?: ContextCounter,
+  project: (messages: Message[]) => Message[] = (messages) => messages,
 ) {
   const latest = activeEvents(events).findLast((event) =>
     event.kind === "model_response" &&
     !!(event.data as { response?: { usage?: Json } }).response?.usage
   );
   return {
-    estimatedTokens: contextEstimate(render(events, prompt), tools, counter),
+    estimatedTokens: contextEstimate(project(render(events, prompt)), tools, counter),
     measurement: counter?.description ?? "本地估算，包含身份、消息及工具定义；非上游精确token",
     compressedThroughSeq: compressionThrough(events),
     targetTokens: 150000,
@@ -89,6 +90,7 @@ export function inspectContext(
   tools: ToolSpec[],
   args: Json,
   counter?: ContextCounter,
+  project?: (messages: Message[]) => Message[],
 ) {
   const value = contextArgs(args, ["afterSeq", "limit"]);
   const after = value.afterSeq ?? 0, limit = value.limit ?? 50;
@@ -98,7 +100,7 @@ export function inspectContext(
   ) {
     throw new KernelError("rejected", "afterSeq须为非负整数，limit须为1至100");
   }
-  const usage = contextUsage(events, prompt, tools, counter);
+  const usage = contextUsage(events, prompt, tools, counter, project);
   const complete = blocks(events, usage.compressedThroughSeq);
   let removed = 0;
   const all = complete.map((block) => {
@@ -122,6 +124,7 @@ export function previewCompression(
   tools: ToolSpec[],
   args: Json,
   counter?: ContextCounter,
+  project?: (messages: Message[]) => Message[],
 ) {
   const value = contextArgs(args, ["throughSeq", "summary", "dryRun"]);
   if (
@@ -144,7 +147,7 @@ export function previewCompression(
       "指定位置不是尚未压缩的完整消息/工具回执边界；请用inspect_context查询",
     );
   }
-  const before = contextUsage(events, prompt, tools, counter);
+  const before = contextUsage(events, prompt, tools, counter, project);
   const last = events.at(-1);
   const preview: ConsciousEvent = {
     schema: 1,
@@ -155,7 +158,7 @@ export function previewCompression(
     digest: "preview",
     data: { throughSeq, summary: value.summary, source: "eve" },
   };
-  const after = contextUsage([...events, preview], prompt, tools, counter);
+  const after = contextUsage([...events, preview], prompt, tools, counter, project);
   return {
     throughSeq,
     summary: value.summary,

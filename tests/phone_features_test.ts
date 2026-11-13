@@ -625,3 +625,62 @@ Deno.test("启动边界损坏保留原件并拒绝覆盖，空快照仍有可验
     await f.close();
   }
 });
+
+Deno.test("手机备注短名：群与私信共用唯一索引，动作按原编号主动发送，历史搜索与重启保留", async () => {
+  const f = await fixture();
+  try {
+    await f.incoming(1, "user-a");
+    await f.incoming(2, "user-b");
+    await f.client.call("settings", {
+      conversationId: "qq:user:user-a",
+      remark: "观察朋友",
+      alias: "朋友",
+    });
+    await f.client.call("settings", {
+      conversationId: "qq:group:group-a",
+      remark: "研究群",
+      alias: "研究",
+    });
+    await assert.rejects(() =>
+      f.client.call("settings", { conversationId: "qq:user:user-b", alias: "朋友" })
+    );
+    await assert.rejects(() =>
+      f.client.call("settings", { conversationId: "qq:user:user-b", alias: "a/b" })
+    );
+    const page = await f.client.call("history", { conversationId: "朋友" }) as {
+      messages: {
+        handle: { conversationId: string };
+        conversation: { remark: string; alias: string };
+      }[];
+    };
+    assert.equal(page.messages[0].handle.conversationId, "qq:user:user-a");
+    assert.equal(page.messages[0].conversation.remark, "观察朋友");
+    const search = await f.phone.search({ query: "观察朋友" });
+    assert.equal(search.messages[0].handle.conversationId, "qq:user:user-a");
+    const sent = await f.client.call("send", {
+      actionId: "alias-send",
+      conversationId: "朋友",
+      text: "通过短名主动发送",
+    }) as { state: string };
+    assert.equal(sent.state, "sent");
+    assert.ok(f.requests[0].path.includes("user-a"));
+    assert.equal(f.requests[0].body.msg_id, undefined);
+    await f.client.call("settings", { conversationId: "朋友", alias: "朋友新名" });
+    await assert.rejects(() => f.client.call("history", { conversationId: "朋友" }));
+    assert.equal(
+      (await f.phone.history({ conversationId: "朋友新名" })).messages[0].conversation?.alias,
+      "朋友新名",
+    );
+    await f.device.close();
+    const reopened = new QqPhoneDevice(`${f.directory}/device`);
+    await reopened.initialize();
+    try {
+      assert.equal(reopened.resolve("研究"), "qq:group:group-a");
+      assert.equal(reopened.resolve("朋友新名"), "qq:user:user-a");
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});

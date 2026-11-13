@@ -45,5 +45,20 @@ export async function refreshUpgradePrompt(
   ) {
     throw new KernelError("rejected", "旧提示生成区无法唯一确认，保留原件并先修复提示格式");
   }
-  return `${prompt.slice(0, boundary)}\n\n${await generatedPrompt(candidate)}`;
+  let identity = prompt.slice(0, boundary);
+  // Only migrate an unmodified, pinned stock identity. Custom identities remain byte-exact.
+  const readIdentity = async (source: SourceArtifact) => {
+    const member = source.files.find((file) => file.path === "prompts/identity.md");
+    if (!member) return undefined;
+    const bytes = await Deno.readFile(`${source.directory}/${member.path}`);
+    const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    if (digest !== member.sha256) throw new KernelError("corrupt", "身份原件摘要变化");
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  };
+  const oldIdentity = await readIdentity(active);
+  if (oldIdentity !== undefined && identity === oldIdentity) {
+    identity = await readIdentity(candidate) ?? identity;
+  }
+  return `${identity}\n\n${await generatedPrompt(candidate)}`;
 }

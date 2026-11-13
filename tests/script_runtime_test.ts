@@ -437,6 +437,8 @@ Deno.test("脚本：取消等待中的真实动作保留未知，迟到回执存
   try {
     const request = {
       requestId: "cancelled-send",
+      // Cancellation is exercised explicitly after dispatch, not by a cold-start deadline.
+      timeoutMs: 30_000,
       code: 'return await tools.phone.send({conversationId:"qq:user:friend",text:"发送中取消"});',
     };
     const job = await f.kernel().call<ScriptSummary & Json>("scripts", "start", request);
@@ -578,6 +580,39 @@ Deno.test("脚本社交恢复：原脚本unknown结束后取消队首，新脚�
     assert.equal(result.resumed.items[0].receipt.resolution.kind, "unknown_retained");
     assert.deepEqual(result.status, result.resumed);
     assert.equal(f.count(), 3);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("脚本：详细契约可按需读取并分页，未知名称拒绝，固定提示不常驻子代理长契约", async () => {
+  const f = await fixture();
+  try {
+    const job = await f.kernel().call("scripts", "start", {
+      requestId: "contracts-lookup",
+      code: 'return await tools.scripts.contracts({name:"agents",limit:40});',
+      mode: "sync",
+    }) as unknown as ScriptSummary;
+    const completed = await waitFor(async () => {
+      const s = await f.kernel().call("scripts", "status", {
+        jobId: job.jobId,
+      }) as unknown as ScriptSummary;
+      return s.status === "completed" ? s : undefined;
+    });
+    assert.equal(completed.status, "completed");
+    const page = await f.kernel().call("scripts", "contracts", { name: "agents", limit: 40 }) as {
+      text: string;
+      nextChar: number;
+    };
+    assert.equal(Array.from(page.text).length, 40);
+    assert.equal(page.nextChar, 40);
+    await assert.rejects(() =>
+      f.kernel().call("scripts", "contracts", { name: "../../etc/passwd" })
+    );
+    const prompt = await renderScriptContracts();
+    assert.ok(prompt.includes('name:"agents"'));
+    assert.equal(prompt.includes("export interface AgentView"), false);
+    assert.equal(prompt.includes("export interface PhoneActionReceipt"), false);
   } finally {
     await f.close();
   }

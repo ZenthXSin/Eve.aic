@@ -23,10 +23,12 @@ const phone = Object.fromEntries(PHONE_METHODS.map((method) => [
   method,
   (args: Json = {}) => invoke("phone", method, args),
 ]));
-const scripts = Object.fromEntries(["status", "cancel", "result", "receipt"].map((method) => [
-  method,
-  (args: Json) => invoke("scripts", method, args),
-]));
+const scripts = Object.fromEntries(
+  ["status", "cancel", "result", "receipt", "contracts"].map((method) => [
+    method,
+    (args: Json) => invoke("scripts", method, args),
+  ]),
+);
 const mind = Object.fromEntries(
   ["rest", "remind", "watch", "cancelReminder", "compress", "retain", "status"].map((method) => [
     method,

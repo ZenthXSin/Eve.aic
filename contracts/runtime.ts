@@ -25,7 +25,7 @@ export const RUNTIME_METHODS = {
   ],
   timeline: ["page", "append"],
   records: ["page", "text"],
-  notes: ["create", "update", "get", "list", "versions", "search"],
+  notes: ["create", "update", "get", "list", "versions", "search", "self"],
   web: ["search", "fetch"],
   files: ["read", "write", "replace", "list", "search"],
   commands: ["start", "poll", "write", "cancel", "completions"],

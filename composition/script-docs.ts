@@ -15,6 +15,7 @@ export async function renderScriptContracts(
   const sections: string[] = [];
   let autoWait = false;
   let agents = false;
+  let contractLookup = false;
   let nativeThoughts = false;
   let web = false;
   let sendBurst = false;
@@ -26,6 +27,7 @@ export async function renderScriptContracts(
     // 源码仅作为已固定的数据读取；绝不 import 候选生成器或执行标记表达式。
     if (path === "contracts/phone.ts") sendBurst = /^\s*sendBurst\(/m.test(source);
     if (path === "contracts/script.ts") {
+      contractLookup = /^export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       agents = /^export const AGENT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       autoWait = /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       nativeThoughts = /^export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
@@ -45,7 +47,7 @@ export async function renderScriptContracts(
       : Deno.readTextFile(new URL("../contracts/web.ts", import.meta.url)));
     sections.push(`接口来源：${path}\n\`\`\`ts\n${source}\`\`\``);
   }
-  if (agents) {
+  if (agents && !contractLookup) {
     const path = "contracts/agents.ts";
     const source = await (readSource
       ? readSource(path)
@@ -75,5 +77,8 @@ export async function renderScriptContracts(
     `以下为当前契约原件；PhoneApi.${
       sendBurst ? "send/sendFile/sendBurst" : "send/sendFile"
     } 在 ScriptApi 中省去 actionId，由宿主提供。ScriptHostApi 供宿主领取任务/通知，不是 tools 内的额外对象。\n\n` +
+    (contractLookup
+      ? '详细发送回执与子代理完整契约按需读取：return await tools.scripts.contracts({name:"phone-details"}) 或 {name:"agents"}，用nextChar分页。子代理常用：list({})、send({agentId,text})、status({jobId})、message({seq,startChar?,limit?})；完整参数先查契约，不猜。\n\n'
+      : "") +
     sections.join("\n\n");
 }

@@ -381,6 +381,26 @@ export class ScriptRuntime {
     });
   }
 
+  async contracts(args: { name: string; startChar?: number; limit?: number }) {
+    if (
+      !args || !["phone-details", "agents"].includes(args.name) ||
+      Object.keys(args).some((k) => !["name", "startChar", "limit"].includes(k))
+    ) throw new KernelError("rejected", "契约名称无效");
+    const text = await Deno.readTextFile(
+      new URL(`../../contracts/${args.name}.ts`, import.meta.url),
+    );
+    const start = args.startChar ?? 0, limit = args.limit ?? 4096;
+    if (
+      !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(limit) || limit < 1 ||
+      limit > 8192
+    ) throw new KernelError("rejected", "契约分页无效");
+    const characters = Array.from(text), page = characters.slice(start, start + limit);
+    return {
+      text: page.join(""),
+      characters: characters.length,
+      ...(start + page.length < characters.length ? { nextChar: start + page.length } : {}),
+    };
+  }
   async #invoke(jobId: string, message: Extract<FromScript, { t: "invoke" }>): Promise<Json> {
     const live = this.#live.get(jobId)!;
     if (message.seq !== live.nextSeq + 1 || !Number.isSafeInteger(message.seq)) {
@@ -396,7 +416,7 @@ export class ScriptRuntime {
           message.method,
         )) &&
       !(message.namespace === "scripts" &&
-        ["status", "cancel", "result", "receipt"].includes(message.method)) &&
+        ["status", "cancel", "result", "receipt", "contracts"].includes(message.method)) &&
       !(message.namespace === "mind" &&
         ["rest", "remind", "watch", "cancelReminder", "compress", "retain", "status"].includes(
           message.method,
@@ -447,7 +467,7 @@ export class ScriptRuntime {
     try {
       if (live.finishing) throw new KernelError("unavailable", "脚本已取消，此动作未开始转发");
       const value = message.namespace === "scripts"
-        ? await this[message.method as "status" | "cancel" | "result" | "receipt"](
+        ? await this[message.method as "status" | "cancel" | "result" | "receipt" | "contracts"](
           args as never,
         ) as unknown as Json
         : await this.ctx.call<Json>(message.namespace, message.method, args, {

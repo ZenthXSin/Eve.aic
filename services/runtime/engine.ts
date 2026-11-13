@@ -78,7 +78,12 @@ export class RuntimeEngine {
     this.records = new FactJournal(`${directory}/consciousness`);
     this.transactions = new FactJournal(`${directory}/actions`);
     this.modelResponses = new FactJournal(`${directory}/model-responses`);
-    this.notes = new NoteStore(`${directory}/notes`, embed, this.records);
+    this.notes = new NoteStore(
+      `${directory}/notes`,
+      embed,
+      this.records,
+      options.semantic ? (text) => options.semantic!.count(text) : undefined,
+    );
     this.memory = new MemoryStore(`${directory}/memory`, this.records, embed);
     this.files = options.commandIdentity
       ? new RestrictedFileTools(
@@ -358,6 +363,9 @@ export class RuntimeEngine {
     ) {
       return await this.agents.invoke(method, args, id);
     }
+    if (namespace === "notes" && method === "self") {
+      return this.notes.self(args as never) as unknown as Json;
+    }
     // Capture before the first await: an admitted request keeps its original client and provenance.
     const selected = namespace === "model" && ["complete", "describeImage"].includes(method)
       ? this.options.modelSelection?.snapshot() ?? {
@@ -463,7 +471,9 @@ export class RuntimeEngine {
     if (namespace === "notes") {
       const value = method === "create" || method === "update"
         ? await this.notes.change(method, args, id)
-        : await this.notes[method as "get" | "list" | "versions" | "search"](args as never);
+        : await this.notes[method as "get" | "list" | "versions" | "search" | "self"](
+          args as never,
+        );
       if (method === "create" || method === "update") {
         await this.memory.observe(JSON.stringify(args));
       }

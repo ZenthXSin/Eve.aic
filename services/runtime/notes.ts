@@ -1,4 +1,4 @@
-import type { NoteRevision, NoteSource } from "../../contracts/notes.ts";
+import type { NoteApi, NoteRevision, NoteSource } from "../../contracts/notes.ts";
 import { fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
@@ -36,6 +36,9 @@ function valid(note: NoteRevision) {
   return note && /^[a-f0-9]{64}$/.test(note.id) && Number.isSafeInteger(note.revision) &&
     note.revision > 0 &&
     (note.alias === undefined || aliasValid(note.alias)) &&
+    (note.selfTokenCount === undefined ||
+      Number.isSafeInteger(note.selfTokenCount.tokens) && note.selfTokenCount.tokens >= 0 &&
+        typeof note.selfTokenCount.encoding === "string") &&
     (note.basedOnRevision === undefined ||
       Number.isSafeInteger(note.basedOnRevision) && note.basedOnRevision >= 1 &&
         note.basedOnRevision < note.revision) &&
@@ -46,8 +49,14 @@ function valid(note: NoteRevision) {
     new TextEncoder().encode(note.content).length <= 2_097_152 &&
     sourcesValid(note.sources);
 }
-/** 便签是按需读取的工具；版本原件只追加，永不自动挂载到提示词。 */
+/** 版本原件只追加；自我便签按显式约定挂载到本轮末尾，其他便签按需读取。 */
 export class NoteStore {
+  #selfCache?: {
+    seq: number;
+    generation: number;
+    about: NoteRevision | null;
+    ideas: { noteId: string; revision: number; text: string }[];
+  };
   readonly journal: FactJournal;
   #tail: Promise<unknown> = Promise.resolve();
   readonly quarantine: RollbackQuarantine;
@@ -55,6 +64,7 @@ export class NoteStore {
     directory: string,
     readonly embed?: (text: string, purpose?: "query" | "passage") => Promise<number[]>,
     readonly records?: FactJournal,
+    readonly count?: (text: string) => Promise<{ tokens: number; encoding: string }>,
   ) {
     this.journal = new FactJournal(directory);
     this.quarantine = new RollbackQuarantine(records);
@@ -166,11 +176,99 @@ export class NoteStore {
         ...(this.records ? { contextRecordSeq: this.quarantine.capture() } : {}),
       } as NoteRevision;
       if (!valid(note)) throw new KernelError("rejected", "便签需要标题、内容和有效来源");
+      if (note.alias === "关于我") {
+        const measured = this.count ? await this.count(note.content) : {
+          tokens: new TextEncoder().encode(note.content).length,
+          encoding: "utf8_byte_upper_bound",
+        };
+        if (!Number.isSafeInteger(measured.tokens) || measured.tokens < 0) {
+          throw new KernelError("rejected", "关于我的分词结果无效，原文未修改");
+        }
+        if (measured.tokens > 2000) {
+          throw new KernelError(
+            "rejected",
+            `关于我为 ${measured.tokens} token（${measured.encoding}），上限2000；请自行精简，原文未修改`,
+          );
+        }
+        note.selfTokenCount = measured;
+      }
       await this.journal.append("note", { ...note, requestId } as unknown as Json);
       return this.#annotate(note);
     });
     this.#tail = work.catch(() => {});
     return await work;
+  }
+  self(args: { idle?: boolean; limit?: number } = {}): Awaited<ReturnType<NoteApi["self"]>> {
+    if (args.idle !== undefined && typeof args.idle !== "boolean") {
+      throw new KernelError("rejected", "idle必须为布尔值");
+    }
+    const limit = args.limit ?? 3;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10) {
+      throw new KernelError("rejected", "浮现条数须为1至10");
+    }
+    const generation = this.quarantine.generation();
+    if (
+      !this.#selfCache || this.#selfCache.seq !== this.journal.events.length ||
+      this.#selfCache.generation !== generation
+    ) {
+      const all = [...this.#latest().values()];
+      const abouts = all.filter((n) => n.alias === "关于我"),
+        curiosities = all.filter((n) => n.alias === "想弄明白的事");
+      if (abouts.length > 1 || curiosities.length > 1) {
+        throw new KernelError("rejected", "自我便签短名冲突，请用永久编号核对");
+      }
+      const about = abouts[0] ?? null;
+      const ideas: { noteId: string; revision: number; text: string }[] = [];
+      for (const note of [about, curiosities[0]]) {
+        if (!note) continue;
+        let include = note.alias === "想弄明白的事";
+        for (const line of note.content.split(/\r?\n/)) {
+          if (/^\s*#{0,6}\s*最近想做的事\s*[:：]?\s*$/.test(line)) {
+            include = true;
+            continue;
+          }
+          if (/^\s*#{1,6}\s+/.test(line)) {
+            include = note.alias === "想弄明白的事";
+            continue;
+          }
+          if (include && line.trim() && !/^\s*[-*]\s+\[[xX]\]/.test(line)) {
+            ideas.push({ noteId: note.id, revision: note.revision, text: line });
+          }
+        }
+      }
+      this.#selfCache = { seq: this.journal.events.length, generation, about, ideas };
+    }
+    const { about, ideas } = this.#selfCache;
+    const tokens = about?.selfTokenCount ??
+      (about
+        ? {
+          tokens: new TextEncoder().encode(about.content).length,
+          encoding: "utf8_byte_upper_bound",
+        }
+        : undefined);
+    // Legacy oversized notes remain intact and readable; never silently truncate them into a persona.
+    if (tokens && tokens.tokens > 2000) {
+      throw new KernelError(
+        "rejected",
+        `已有关于我为 ${tokens.tokens} token（${tokens.encoding}），超过2000，请自行精简；原件保留`,
+      );
+    }
+    const chosen: typeof ideas = [];
+    const pool = args.idle
+      ? [...new Map(ideas.map((idea) => [idea.text.trim(), idea])).values()]
+      : [];
+    while (args.idle && pool.length && chosen.length < limit) {
+      const index = crypto.getRandomValues(new Uint32Array(1))[0] % pool.length;
+      chosen.push(pool[index]);
+      pool[index] = pool[pool.length - 1];
+      pool.pop();
+    }
+    return structuredClone({
+      aboutMe: about && tokens
+        ? { id: about.id, revision: about.revision, content: about.content, ...tokens }
+        : null,
+      ideas: chosen,
+    });
   }
   get(
     args: {

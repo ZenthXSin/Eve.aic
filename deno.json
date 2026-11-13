@@ -29,7 +29,8 @@
   },
   "lint": {
     "exclude": [
-      "tests/fixtures/counter-v2-typeerror/"
+      "tests/fixtures/counter-v2-typeerror/",
+      "adapters/qq/satori/"
     ]
   },
   "exclude": [
