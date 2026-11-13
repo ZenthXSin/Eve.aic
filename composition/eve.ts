@@ -79,7 +79,7 @@ export async function composeMindPlugin(
       JSON.stringify(module.href)
     };\nexport default createMindControls(${JSON.stringify(dataDirectory)}, ${
       JSON.stringify(nightlySelfCheck)
-    });\n`,
+    }, Date.now, 30 * 60_000);\n`,
     { mode: 0o600 },
   );
   await Deno.writeTextFile(
@@ -89,7 +89,13 @@ export async function composeMindPlugin(
         name: "mind-controls",
         version: "1.0.0",
         provides: { mind: "1.0.0" },
-        optional: { files: "^1.0.0", commands: "^1.0.0", notes: "^1.0.0", records: "^1.0.0" },
+        optional: {
+          files: "^1.0.0",
+          commands: "^1.0.0",
+          notes: "^1.0.0",
+          records: "^1.0.0",
+          phone: "^1.0.0",
+        },
         permissions: {
           read: [
             dataDirectory,

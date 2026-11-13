@@ -20,12 +20,17 @@ interface State {
   }[];
   facts: Json;
   nightlySelfCheck?: { signature: string; nextAt: string; lastDate?: string };
+  unreadReminder?: { nextCheck: number; lastError?: string };
 }
 export function createMindControls(
   directory: string,
   nightlySelfCheck?: NightlySelfCheck,
   clock: () => number = Date.now,
+  unreadReminderMs = 0,
 ) {
+  if (!Number.isSafeInteger(unreadReminderMs) || unreadReminderMs < 0) {
+    throw new KernelError("rejected", "未读提醒间隔须为非负整数");
+  }
   const nightly = nightlySelfCheck ? nightlySchedule(nightlySelfCheck) : undefined;
   let state: State = { schema: 1, events: [], alarms: [], facts: null };
   let lock: Deno.FsFile | undefined;
@@ -148,6 +153,7 @@ export function createMindControls(
               ...state.alarms,
               ...(state.conditions ?? []).map(({ code: _code, ...condition }) => condition),
             ],
+            ...(unreadReminderMs ? { unreadReminder: state.unreadReminder ?? null } : {}),
             ...(nightly && state.nightlySelfCheck
               ? {
                 nightlySelfCheck: {
@@ -175,6 +181,46 @@ export function createMindControls(
             const after = (args as { afterSeq?: number } | null)?.afterSeq ?? 0;
             if (!Number.isSafeInteger(after) || after < 0 || after > state.events.length) {
               throw new KernelError("rejected", "意识事件游标无效");
+            }
+            if (unreadReminderMs && (state.unreadReminder?.nextCheck ?? 0) <= clock()) {
+              let page: { items: Json[]; hasMore: boolean } | undefined;
+              let error: string | undefined;
+              try {
+                // 重新检查尚未打开的通知，不受 Eve 已领取通知的游标影响；手机端过滤静音。
+                const result = await ctx.call("phone", "notifications", { afterSeq: 0 }) as {
+                  items: Json[];
+                  hasMore: boolean;
+                };
+                if (!Array.isArray(result?.items) || typeof result.hasMore !== "boolean") {
+                  throw new Error("未读通知回执无效");
+                }
+                page = result;
+              } catch (cause) {
+                error = String(cause);
+              }
+              await change((next) => {
+                next.unreadReminder = {
+                  nextCheck: clock() +
+                    (error ? Math.min(60_000, unreadReminderMs) : unreadReminderMs),
+                  ...(error ? { lastError: error } : {}),
+                };
+                if (!page?.items.length) return;
+                const id = `unread_messages_${next.events.length + 1}`;
+                next.events.push({
+                  seq: next.events.length + 1,
+                  requestId: id,
+                  kind: "alarm",
+                  at: new Date(clock()).toISOString(),
+                  args: {
+                    reminderId: id,
+                    source: "unread_messages",
+                    text:
+                      "还有私信或未处理的消息通知，请打开相应会话查看；此提醒不代表消息已经读过或回复。",
+                    items: page.items,
+                    hasMore: page.hasMore,
+                  },
+                });
+              });
             }
             if (
               nightly && state.nightlySelfCheck &&
@@ -369,6 +415,12 @@ export function createMindControls(
         }
         canonical(loaded.facts);
         if (
+          loaded.unreadReminder !== undefined &&
+          (!Number.isFinite(loaded.unreadReminder?.nextCheck) ||
+            (loaded.unreadReminder.lastError !== undefined &&
+              typeof loaded.unreadReminder.lastError !== "string"))
+        ) throw new KernelError("corrupt", "未读提醒时间原件损坏");
+        if (
           loaded.nightlySelfCheck !== undefined && (
             typeof loaded.nightlySelfCheck?.signature !== "string" ||
             !Number.isFinite(Date.parse(loaded.nightlySelfCheck?.nextAt)) ||
@@ -379,6 +431,11 @@ export function createMindControls(
         state = loaded;
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      if (unreadReminderMs && !state.unreadReminder) {
+        await change((next) => {
+          next.unreadReminder = { nextCheck: clock() + unreadReminderMs };
+        });
       }
       if (nightly && state.nightlySelfCheck?.signature !== nightly.signature) {
         await change((next) => {
