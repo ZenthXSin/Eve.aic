@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { composeEvePlugin } from "../composition/eve.ts";
+import { composeRuntimePlugin } from "../composition/runtime.ts";
+import { Kernel } from "../kernel/kernel.ts";
 import type { Message } from "../contracts/model.ts";
 import { EveRuntime } from "../plugins/eve/runtime.ts";
 import { RuntimeEngine } from "../services/runtime/engine.ts";
@@ -206,6 +209,57 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     assert.equal(paid, 5);
     assert.equal(reflections().length, reflected + 1);
     assert.equal((reflections().at(-1)!.data as { ideas: unknown[] }).ideas.length, 3);
+    // Exercise the generated manifests and real worker-to-worker dependency checks too.
+    await eve.close();
+    const configFile = `${directory}/kernel-config.json`;
+    await Deno.writeTextFile(
+      configFile,
+      JSON.stringify({
+        eve: { ...config, defaultSleepMs: 1, directory: `${directory}/kernel-eve` },
+        runtime: { connectionFile, keyFile, proofFile },
+      }),
+    );
+    await composeEvePlugin(`${directory}/eve-plugin`, configFile);
+    await composeRuntimePlugin(`${directory}/runtime-plugin`, configFile);
+    await Deno.mkdir(`${directory}/host-plugin`);
+    const source = new URL("../", import.meta.url).pathname;
+    await Deno.writeTextFile(
+      `${directory}/host-plugin/mod.ts`,
+      `
+      import {definePlugin} from ${
+        JSON.stringify(new URL("../sdk/plugin.ts", import.meta.url).href)
+      };
+      export default definePlugin({load(ctx){
+        ctx.provide("tools",{list:()=>[]});
+        ctx.provide("scripts",{completions:()=>({items:[],throughSeq:0})});
+        ctx.provide("phone",{notifications:()=>({items:[],throughSeq:0})});
+        ctx.provide("mind",{poll:()=>({items:[],throughSeq:0}),update:()=>null});
+      }});
+    `,
+    );
+    await Deno.writeTextFile(
+      `${directory}/host-plugin/manifest.json`,
+      JSON.stringify({
+        name: "fixture-host",
+        version: "1.0.0",
+        provides: { tools: "1.0.0", scripts: "1.0.0", phone: "1.0.0", mind: "1.0.0" },
+        permissions: { read: [source] },
+      }),
+    );
+    const kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 10000 });
+    try {
+      for (const name of ["eve", "runtime", "host"]) {
+        await kernel.register(`${directory}/${name}-plugin`);
+      }
+      await kernel.start();
+      await kernel.call("eve", "pulse");
+      assert.equal(paid, 6);
+      assert.ok(requests.at(-1)!.some((m) => m.content.includes("我喜欢星星")));
+      assert.ok(!requests.at(-1)!.some((m) => m.content.includes("自我便签未挂载")));
+      assert.equal(requests.at(-1)!.at(-1)?.role, "user");
+    } finally {
+      assert.deepEqual(await kernel.stop(), []);
+    }
   } finally {
     await eve.close();
     client.close();

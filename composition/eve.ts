@@ -35,7 +35,13 @@ export async function composeEvePlugin(directory: string, configPath: string): P
           phone: "^1.0.0",
           mind: "^1.0.0",
           ...(config.remoteRecords
-            ? { agents: "^1.0.0", timeline: "^1.0.0", memory: "^1.0.0", commands: "^1.0.0" }
+            ? {
+              agents: "^1.0.0",
+              timeline: "^1.0.0",
+              memory: "^1.0.0",
+              commands: "^1.0.0",
+              notes: "^1.0.0",
+            }
             : {}),
         },
         permissions: {
