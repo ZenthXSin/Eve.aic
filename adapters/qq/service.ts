@@ -1,4 +1,4 @@
-import { QQ_OFFICIAL_PROTOCOL } from "./official/protocol.ts";
+import { QQ_THIRD_PARTY_SDK } from "./satori/api.ts";
 import { type QqModelCommandOptions, QqModelCommands } from "./model-command.ts";
 import { QqSendActions } from "./actions.ts";
 import { QqClient } from "./client.ts";
@@ -129,7 +129,7 @@ export async function startQqPhoneAdapter(
           timeline.available && reading.available && device.available && downloads.available &&
           (!modelCommands || modelCommands.available),
         gateway: status,
-        officialProtocol: QQ_OFFICIAL_PROTOCOL,
+        sdk: QQ_THIRD_PARTY_SDK,
         replyScope: client.sendScope,
       }),
       fence,

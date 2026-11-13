@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { QqClient } from "../adapters/qq/client.ts";
 import { QqGateway } from "../adapters/qq/gateway.ts";
-import { QQ_OFFICIAL_PROTOCOL } from "../adapters/qq/official/protocol.ts";
+import { QQ_THIRD_PARTY_SDK } from "../adapters/qq/satori/api.ts";
 
 const credentials = { appId: "official-fixture", appSecret: "not-a-real-secret" };
 function serve(handler: (r: Request) => Response | Promise<Response>) {
@@ -15,7 +15,7 @@ const request = {
   reply: { messageId: "source", sequence: 3 },
 };
 
-Deno.test("官方1.0.5：认证独立源、文件名及上传独立期限，主动媒体不携带旧被动字段", async () => {
+Deno.test("Satori 4.14.1：认证独立源、文件名及上传独立期限，主动媒体不携带旧被动字段", async () => {
   let tokens = 0, uploads = 0, messages = 0;
   const auth = serve(async (r) => {
     tokens++;
@@ -68,7 +68,7 @@ Deno.test("官方1.0.5：认证独立源、文件名及上传独立期限，主�
       "sent",
     );
     assert.deepEqual([tokens, uploads, messages], [1, 1, 1]);
-    assert.equal(QQ_OFFICIAL_PROTOCOL.version, "1.0.5");
+    assert.equal(QQ_THIRD_PARTY_SDK.version, "4.14.1");
   } finally {
     client.close();
     await auth.close();

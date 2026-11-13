@@ -1,5 +1,7 @@
 # QQ 官方协议来源
 
+> 2026-11-13：生产已改为直接替换升级和第三方 QQ SDK，当前机制见[直接替换与完整日志](./直接替换与完整日志.md)。下文保留之前版本的实现记录。
+
 Eve 使用独立持久发送账本和所有权控制。本次按腾讯官方
 [qqbot-nodejs 1.0.5](https://github.com/tencent-connect/qqbot-nodejs/releases/tag/1.0.5)
 更新协议；固定上游提交为 `429a0f1b798f3b0fcef3679e207dbc0469a1df2d`。

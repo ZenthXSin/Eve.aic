@@ -79,6 +79,7 @@ export interface BackendControl {
 }
 type Phase = "preparing" | "draining" | "activating" | "observing" | "rollback";
 interface Upgrade {
+  mode?: "replace";
   id: string;
   old: string;
   candidate: string;
@@ -228,6 +229,107 @@ export class Supervisor {
       await this.#addInstance(candidate);
       return await this.#upgrade(candidate.id, upgradeId);
     });
+  }
+  /** 停旧进程后从同一业务数据启动新程序；不复制账本、不调用观察模型。 */
+  stageReplacement(stage: (current: InstanceSpec) => Promise<InstanceSpec>, upgradeId: string) {
+    return this.#serial(async () => {
+      if (!/^upgrade_[a-zA-Z0-9_-]{1,128}$/.test(upgradeId)) {
+        throw new KernelError("rejected", "升级编号无效");
+      }
+      if (
+        this.#state.upgrade?.id === upgradeId || this.#state.lastOutcome?.upgradeId === upgradeId
+      ) return upgradeId;
+      if (this.#state.paused || this.#state.upgrade || !this.#state.current) {
+        throw new KernelError("rejected", "当前不能替换运行程序");
+      }
+      const old = this.instance(this.#state.current);
+      const candidate = await stage(old);
+      if (
+        old.id === candidate.id || !old.identity || candidate.identity?.uid !== old.identity.uid ||
+        candidate.identity.gid !== old.identity.gid
+      ) {
+        throw new KernelError("rejected", "直接替换须沿用原实例身份和业务数据");
+      }
+      await this.#addInstance(candidate);
+      this.#state.upgrade = {
+        id: upgradeId,
+        old: old.id,
+        candidate: candidate.id,
+        mode: "replace",
+        phase: "preparing",
+        deadline: this.now() + (this.options.confirmationMs ?? 300_000),
+        afterSeq: 0,
+        step: 0,
+      };
+      await this.#save();
+      await this.#tick();
+      return upgradeId;
+    });
+  }
+  async #replace(u: Upgrade, old: InstanceSpec, candidate: InstanceSpec) {
+    try {
+      if (u.phase !== "rollback" && this.now() >= u.deadline) {
+        throw new KernelError("timeout", "直接替换启动超时");
+      }
+      if (u.phase === "preparing") {
+        await this.#run(u, "old_deactivate", async () => {
+          try {
+            await this.options.driver.call(old, "deactivate");
+          } catch { /* May have stopped before the supervisor last persisted its phase. */ }
+        });
+        await this.#run(u, "old_terminate", () => this.options.driver.terminate(old));
+        await this.#run(u, "quiesce", () => this.options.backend.quiesce());
+        u.phase = "draining";
+        await this.#save();
+      }
+      if (u.phase === "draining") {
+        await this.#run(u, "candidate_start", () => this.options.driver.ensure(candidate));
+        if (!u.grant) {
+          const status = await this.options.guardian.status();
+          u.grant = {
+            instanceId: candidate.id,
+            requestId: `${u.id}_replace`,
+            expectedEpoch: status.epoch,
+          };
+          await this.#save();
+        }
+        if (!await this.#run(u, "candidate_grant", () => this.#applyGrant(candidate, u.grant!))) {
+          return;
+        }
+        u.candidateGranted = true;
+        u.phase = "activating";
+        await this.#save();
+      }
+      if (u.phase === "activating") {
+        await this.#run(
+          u,
+          "candidate_activate",
+          () => this.options.driver.call(candidate, "activate"),
+        );
+        await this.#run(u, "candidate_health", () => this.#status(candidate, true));
+        this.#state.current = candidate.id;
+        this.#state.standby = null;
+        this.#state.lastOutcome = {
+          upgradeId: u.id,
+          outcome: "confirmed",
+          at: this.now(),
+          reason: "direct_replacement_healthy",
+        };
+        this.#state.upgrade = null;
+        await this.#save();
+      }
+    } catch (error) {
+      u.failure = {
+        phase: u.phase,
+        operation: u.operation ?? u.phase,
+        kind: error instanceof KernelError ? error.kind : "remote",
+        message: error instanceof Error ? error.message : String(error),
+      };
+      u.reason = "replacement_failed";
+      u.phase = "rollback";
+      await this.#save();
+    }
+    if (u.phase === "rollback") await this.#rollback(u, old, candidate);
   }
   #serial<T>(operation: () => Promise<T>): Promise<T> {
     const work = this.#tail.then(() => {
@@ -444,12 +546,19 @@ export class Supervisor {
     }
     if (!u) return;
     const old = this.instance(u.old), candidate = this.instance(u.candidate);
+    if (u.mode === "replace") {
+      await this.#replace(u, old, candidate);
+      return;
+    }
     if (u.phase !== "rollback" && this.now() >= u.deadline) {
       u.reason = u.phase === "observing" ? "confirmation_timeout" : "preparation_timeout";
       u.phase = "rollback";
       await this.#save();
     }
     try {
+      if (u.phase !== "rollback" && this.now() >= u.deadline) {
+        throw new KernelError("timeout", "直接替换启动超时");
+      }
       if (u.phase === "preparing") {
         await this.#run(u, "candidate_start", () => this.options.driver.ensure(candidate));
         await this.#run(u, "candidate_register", () => this.#register(candidate));
@@ -706,7 +815,7 @@ export class Supervisor {
     }
   }
   async #restoreContinuity(u: Upgrade, old: InstanceSpec, candidate: InstanceSpec) {
-    if (!u.candidateGranted || u.rollbackHandoverDone) return;
+    if (u.mode === "replace" || !u.candidateGranted || u.rollbackHandoverDone) return;
     await this.options.driver.ensure(old);
     try {
       await this.options.driver.call(old, "deactivate");
@@ -725,6 +834,7 @@ export class Supervisor {
     } catch {
       await this.options.driver.terminate(candidate);
     }
+    if (u.mode === "replace") await this.options.driver.terminate(candidate);
     await this.options.backend.quiesce();
     const status = await this.options.guardian.status();
     if (status.mode === "paused") {
@@ -733,7 +843,7 @@ export class Supervisor {
       return;
     }
     // 先记录未确认范围，再给旧实例读；不能把候选经历静默当作旧版经历。
-    if (u.candidateGranted && !u.rollbackMarker) {
+    if (u.mode !== "replace" && u.candidateGranted && !u.rollbackMarker) {
       u.rollbackMarker = {
         upgradeId: u.id,
         sourceCommit: candidate.source.commit,
@@ -768,7 +878,7 @@ export class Supervisor {
     };
     this.#state.upgrade = null;
     await this.#save();
-    await this.options.driver.terminate(candidate);
+    if (u.mode !== "replace") await this.options.driver.terminate(candidate);
   }
   pause() {
     return this.#serial(async () => {
@@ -808,7 +918,7 @@ export class Supervisor {
     return this.#serial(async () => {
       if (!this.#state.paused || !(this.#state.current ?? this.#state.initial)) return;
       const u = this.#state.upgrade;
-      if (u && u.candidateGranted) {
+      if (u && u.mode !== "replace" && u.candidateGranted) {
         if (!u.rollbackMarker) {
           u.rollbackMarker = {
             upgradeId: u.id,
@@ -824,6 +934,7 @@ export class Supervisor {
       const instance = this.instance(
         this.#state.upgrade?.old ?? this.#state.current ?? this.#state.initial!,
       );
+      if (u?.mode === "replace") await this.options.driver.terminate(this.instance(u.candidate));
       if (u) await this.#restoreContinuity(u, instance, this.instance(u.candidate));
       await this.options.driver.ensure(instance);
       await this.options.backend.quiesce();
@@ -844,7 +955,9 @@ export class Supervisor {
       this.#state.paused = false;
       delete this.#state.pendingGrant;
       if (this.#state.upgrade) {
-        await this.options.driver.terminate(this.instance(this.#state.upgrade.candidate));
+        if (u?.mode !== "replace") {
+          await this.options.driver.terminate(this.instance(this.#state.upgrade.candidate));
+        }
         this.#state.lastOutcome = {
           upgradeId: this.#state.upgrade.id,
           outcome: "paused_and_rolled_back",

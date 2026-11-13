@@ -20,6 +20,7 @@ async function fixture(
     confirmationMs?: number;
     activationMs?: number;
     prepareError?: KernelError;
+    replacement?: boolean;
   } = {},
 ) {
   const directory = await Deno.makeTempDir({ prefix: "eve-supervisor-test-" });
@@ -32,6 +33,7 @@ async function fixture(
     await Deno.writeTextFile(credentialFile, `instance_${id}_credential_01234567890123456789`);
     instances.push({
       id,
+      ...(options.replacement ? { identity: { uid: 63021, gid: 63021 } } : {}),
       credentialFile,
       source: {
         commit: String(index + 1).repeat(40),
@@ -56,8 +58,12 @@ async function fixture(
   const handovers: { from: string; to: string; mode: string }[] = [];
   const channelErrors = new Map<string, string>();
   let restoreError = false;
+  let startError = false;
   const driver: InstanceDriver = {
     ensure(instance) {
+      if (instance.id === "new" && startError) {
+        throw new KernelError("unavailable", "new executable failed");
+      }
       if (!states.has(instance.id) || states.get(instance.id) === "dead") {
         states.set(instance.id, "standby");
       }
@@ -168,6 +174,10 @@ async function fixture(
   await supervisor.bootstrap("old");
   return {
     directory,
+    instances,
+    setStartError(value: boolean) {
+      startError = value;
+    },
     authority,
     states,
     proofs,
@@ -740,6 +750,56 @@ Deno.test("监督健康：持续依赖拒绝不能因进程在线而永远通过
     await f.supervisor().tick();
     assert.equal(f.supervisor().state.current, "old");
     assert.deepEqual(f.handovers.at(-1), { from: "new", to: "old", mode: "rollback" });
+  } finally {
+    await f.close();
+  }
+});
+
+for (const fail of [false, true]) {
+  Deno.test(`直接替换：同身份先停旧版，不交接不观察，${fail ? "启动失败恢复原版" : "健康后立即确认并可重启"}`, async () => {
+    const f = await fixture({ replacement: true });
+    try {
+      f.setStartError(fail);
+      await f.supervisor().stageReplacement(
+        () => Promise.resolve(f.instances[1]),
+        "upgrade_replace",
+      );
+      assert.equal(f.supervisor().state.current, fail ? "old" : "new");
+      assert.equal(f.supervisor().state.lastOutcome?.outcome, fail ? "rolled_back" : "confirmed");
+      assert.equal(f.states.get(fail ? "old" : "new"), "active");
+      assert.equal(f.states.get(fail ? "new" : "old"), "dead");
+      assert.deepEqual(f.handovers, []);
+      assert.deepEqual(f.markers, []);
+      assert.ok(!f.preparation.some((s) => s.includes("prepareObserver")));
+      await f.restart();
+      await f.supervisor().tick();
+      assert.equal(f.supervisor().state.current, fail ? "old" : "new");
+    } finally {
+      await f.close();
+    }
+  });
+}
+Deno.test("直接替换：出口排空期间监督重启，沿用原编号完成，不复制账本", async () => {
+  const f = await fixture({ replacement: true });
+  try {
+    const permit = await f.authority.begin({
+      permitId: "e".repeat(64),
+      proof: f.proofs.get("old")!,
+      resource: "command",
+      actionId: "replace_pending_exit",
+      requestHash: "f".repeat(64),
+    });
+    await f.supervisor().stageReplacement(
+      () => Promise.resolve(f.instances[1]),
+      "upgrade_replace_restart",
+    );
+    assert.equal(f.supervisor().state.upgrade?.phase, "draining");
+    await f.restart();
+    await f.authority.finish(permit.id, "completed");
+    await f.supervisor().tick();
+    assert.equal(f.supervisor().state.lastOutcome?.reason, "direct_replacement_healthy");
+    assert.equal(f.supervisor().state.current, "new");
+    assert.deepEqual(f.handovers, []);
   } finally {
     await f.close();
   }

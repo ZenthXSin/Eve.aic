@@ -168,20 +168,22 @@ Deno.test("升级脚本：真实worker经独立监督RPC，稳定动作编号且
       requestId: "upgrade_test",
       mode: "sync",
       code:
-        `const submitted=await tools.upgrades.request({commit:"${commit}"}); const status=await tools.upgrades.status();const sent=await tools.phone.sendFile({conversationId:"user:owner",path:"file.txt",kind:"file"});return {submitted,status,sent};`,
+        `const submitted=await tools.upgrades.request({commit:"${commit}"}); const status=await tools.upgrades.status();const logs=await tools.upgrades.logs();const sent=await tools.phone.sendFile({conversationId:"user:owner",path:"file.txt",kind:"file"});return {submitted,status,logs,sent};`,
     };
     const job = await kernel.call("scripts", "start", request) as unknown as ScriptSummary;
     assert.equal(job.status, "completed");
-    assert.equal(job.actions, 3);
-    assert.equal(calls.length, 2);
+    assert.equal(job.actions, 4);
+    assert.equal(calls.length, 3);
     assert.equal((calls[0].ownership as { actionId: string }).actionId, `script_${job.jobId}_1`);
     assert.deepEqual(calls[0].args, { commit });
     assert.deepEqual(calls[1].args, {});
+    assert.equal(calls[2].method, "logs");
+    assert.deepEqual(calls[2].args, {});
     const result = await kernel.call("scripts", "result", { jobId: job.jobId }) as { text: string };
-    assert.equal(JSON.parse(result.text).sent.actionId, `script_${job.jobId}_3`);
+    assert.equal(JSON.parse(result.text).sent.actionId, `script_${job.jobId}_4`);
     assert.equal(JSON.stringify(result).includes(proof.credential), false);
     assert.deepEqual(await kernel.call("scripts", "start", request), job);
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 3);
     const forged = await kernel.call("scripts", "start", {
       requestId: "forged_upgrade",
       mode: "sync",
@@ -189,7 +191,7 @@ Deno.test("升级脚本：真实worker经独立监督RPC，稳定动作编号且
         `const args={commit:"${commit}",_actionId:"forged"};return await tools.upgrades.request(args);`,
     }) as unknown as ScriptSummary;
     assert.equal(forged.status, "failed");
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 3);
     const forgedFile = await kernel.call("scripts", "start", {
       requestId: "forged_file",
       mode: "sync",

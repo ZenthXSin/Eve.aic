@@ -33,6 +33,7 @@ export async function readQqTestClient(configPath: string): Promise<QqClient> {
     return new QqClient({ appId, appSecret }, {
       sendScope: qq.replyScope ?? "private",
       attachmentReader,
+      diagnostics: (event) => console.log(JSON.stringify({ qqTransport: event })),
     });
   } catch {
     throw new QqRequestError({ category: "request" });

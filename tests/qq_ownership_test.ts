@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { QQ_OFFICIAL_PROTOCOL } from "../adapters/qq/official/protocol.ts";
+import { QQ_THIRD_PARTY_SDK } from "../adapters/qq/satori/api.ts";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
 import { QqInboundJournal } from "../adapters/qq/journal.ts";
@@ -390,7 +390,7 @@ Deno.test("QQ 正式服务组合传递 fence；真实 worker 只能携实例凭�
       assert.deepEqual(await keyless.call("health"), {
         available: true,
         gateway: { status: "ready" },
-        officialProtocol: QQ_OFFICIAL_PROTOCOL,
+        sdk: QQ_THIRD_PARTY_SDK,
         replyScope: "private",
         ownershipFenced: true,
       });

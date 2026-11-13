@@ -15,6 +15,7 @@ async function command(
   cwd?: string,
   env?: Record<string, string>,
   identity?: { uid: number; gid: number },
+  failureLog?: string,
 ) {
   const isolation = identity
     ? [
@@ -40,6 +41,26 @@ async function command(
   })
     .output();
   if (!output.success) {
+    if (failureLog) {
+      const log = await Deno.open(failureLog, { create: true, append: true, mode: 0o600 });
+      try {
+        for (
+          const bytes of [
+            new TextEncoder().encode(
+              JSON.stringify({ cmd, args, code: output.code }) + "\nstdout:\n",
+            ),
+            output.stdout,
+            new TextEncoder().encode("\nstderr:\n"),
+            output.stderr,
+          ]
+        ) {
+          let offset = 0;
+          while (offset < bytes.length) offset += await log.write(bytes.subarray(offset));
+        }
+      } finally {
+        log.close();
+      }
+    }
     throw new KernelError(
       "rejected",
       `${cmd} 校验失败，原始输出仅保留于私有诊断目录`,
@@ -99,7 +120,6 @@ async function validateTask(options: {
   });
   let child: Deno.ChildProcess | undefined;
   const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
-  let saved = 0;
   const pump = async (stream: ReadableStream<Uint8Array>) => {
     const reader = stream.getReader();
     readers.push(reader);
@@ -107,10 +127,8 @@ async function validateTask(options: {
       while (true) {
         const { value: chunk, done } = await reader.read();
         if (done) break;
-        const allowed = chunk.subarray(0, Math.max(0, 8_388_608 - saved));
-        saved += allowed.length;
         let offset = 0;
-        while (offset < allowed.length) offset += await log.write(allowed.subarray(offset));
+        while (offset < chunk.length) offset += await log.write(chunk.subarray(offset));
       }
     } finally {
       reader.releaseLock();
@@ -233,6 +251,9 @@ export async function pinSource(options: {
   if (!/^[a-f0-9]{40}$/.test(options.commit) || !options.directory.startsWith("/")) {
     throw new KernelError("rejected", "源码必须固定完整提交与绝对产物目录");
   }
+  await Deno.mkdir(options.directory, { mode: 0o755 });
+  await Deno.chmod(options.directory, 0o755);
+  const failureLog = `${options.directory}/source-command.log`;
   const actual = new TextDecoder().decode(
     await command(
       "git",
@@ -246,6 +267,7 @@ export async function pinSource(options: {
       options.repository,
       undefined,
       options.validationIdentity,
+      failureLog,
     ),
   ).trim();
   if (actual !== options.commit) throw new KernelError("rejected", "源码提交不匹配");
@@ -262,6 +284,7 @@ export async function pinSource(options: {
       options.repository,
       undefined,
       options.validationIdentity,
+      failureLog,
     ),
   );
   const entries = tree.split("\0").filter(Boolean).map((entry) => {
@@ -276,8 +299,6 @@ export async function pinSource(options: {
   });
   if (entries.length > 10_000) throw new KernelError("rejected", "候选源码文件数超限");
   let totalBytes = 0;
-  await Deno.mkdir(options.directory, { mode: 0o755 });
-  await Deno.chmod(options.directory, 0o755);
   const source = `${options.directory}/source`;
   await Deno.mkdir(source, { mode: 0o755 });
   await Deno.chmod(source, 0o755);
@@ -291,6 +312,7 @@ export async function pinSource(options: {
           options.repository,
           undefined,
           options.validationIdentity,
+          failureLog,
         ),
       ).trim(),
     );
@@ -313,6 +335,7 @@ export async function pinSource(options: {
       options.repository,
       undefined,
       options.validationIdentity,
+      failureLog,
     );
     await Deno.writeFile(path, bytes, {
       createNew: true,

@@ -27,6 +27,17 @@ export class UpgradeClient {
         (args.actionId !== undefined &&
           (typeof args.actionId !== "string" || !args.actionId || args.actionId.length > 256)))
     ) throw new KernelError("rejected", "升级状态参数无效");
+    if (
+      method === "logs" &&
+      (Object.keys(args).some((key) => !["source", "offset", "cursor", "limit"].includes(key)) ||
+        (args.source !== undefined && typeof args.source !== "string") ||
+        (args.cursor !== undefined && typeof args.cursor !== "string") ||
+        (args.offset !== undefined &&
+          (!Number.isSafeInteger(args.offset) || Number(args.offset) < 0)) ||
+        (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || Number(args.limit) < 1)))
+    ) {
+      throw new KernelError("rejected", "日志参数无效");
+    }
     let url: URL;
     let proof: OwnershipProof;
     try {
@@ -69,7 +80,7 @@ export class UpgradeClient {
           const part = await reader.read();
           if (part.done) break;
           size += part.value.length;
-          if (size > 1_048_576) {
+          if (method !== "logs" && size > 1_048_576) {
             await reader.cancel();
             throw new KernelError("unknown", "升级回执过大，请查询原动作");
           }

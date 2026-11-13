@@ -1,14 +1,15 @@
 // 独立适配器的 QQ HTTP 传输。不依赖内核或插件，不承担身份映射、通知和行为判断。
 // 返回平台事实；持久动作记录、入站日志和所有权交接由适配器服务另行接入。
 import { Buffer } from "node:buffer";
-import { gatewayPath, mediaUploadPath, messagePath } from "./official/routes.ts";
+import { sdkRequest } from "./satori/api.ts";
+import { type DiagnosticSink, qqHttps } from "./transport.ts";
 import {
   QQ_API_ORIGIN,
   QQ_REQUEST_TIMEOUT_MS,
   QQ_TOKEN_ORIGIN,
   QQ_TOKEN_TIMEOUT_MS,
   QQ_UPLOAD_TIMEOUT_MS,
-} from "./official/protocol.ts";
+} from "./satori/api.ts";
 
 export interface QqCredentials {
   appId: string;
@@ -18,6 +19,7 @@ export interface QqCredentials {
 export interface QqClientOptions {
   /** 生产必须由组合层注入低权限文件读取器；缺省拒绝本机路径上传。 */
   attachmentReader?: (path: string) => Promise<Uint8Array>;
+  diagnostics?: DiagnosticSink;
   /** 正式环境使用官方 HTTPS 地址；HTTP 只允许本机测试地址。 */
   baseUrl?: string;
   tokenBaseUrl?: string;
@@ -275,6 +277,7 @@ export class QqClient {
   #uploadTimeout: number;
   #tokenTimeout: number;
   #limit: number;
+  #diagnostics?: DiagnosticSink;
   #now: () => number;
   #token?: { value: string; expiresAt: number };
   #refresh?: Promise<string>;
@@ -312,6 +315,7 @@ export class QqClient {
     ) {
       requestError();
     }
+    this.#diagnostics = options.diagnostics;
     this.#base = base;
     this.#tokenBase = tokenBase;
     this.#credentials = { ...credentials };
@@ -343,7 +347,11 @@ export class QqClient {
     const signal = AbortSignal.any([this.#closed.signal, timeout]);
     let phase: "headers" | "body" = "headers";
     try {
-      const response = await fetch(new URL(path, options.origin ?? this.#base), {
+      const url = new URL(path, options.origin ?? this.#base);
+      const send = url.protocol === "https:"
+        ? (init: RequestInit) => qqHttps(url, init, this.#diagnostics)
+        : (init: RequestInit) => fetch(url, init);
+      const response = await send({
         ...init,
         redirect: "manual",
         signal,
@@ -375,6 +383,20 @@ export class QqClient {
         elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
       });
     }
+  }
+
+  async #sdk(
+    operation: Parameters<typeof sdkRequest>[0],
+    args: unknown[],
+    init: RequestInit,
+    options: { origin?: URL; timeoutMs?: number } = {},
+  ): Promise<ResponseInfo> {
+    const body = init.body === undefined ? [] : [JSON.parse(String(init.body))];
+    return await sdkRequest<ResponseInfo>(
+      operation,
+      [...args, ...body],
+      (path, wire) => this.#request(path, { ...init, ...wire }, options),
+    );
   }
 
   async #authenticate(): Promise<string> {
@@ -428,7 +450,7 @@ export class QqClient {
   /** 获取官方接入点并创建连接；Hello 到达后由网关处理器调用鉴权。 */
   async openGateway(): Promise<QqGatewayConnection> {
     const token = await this.#accessToken();
-    const response = await this.#request(gatewayPath(), {
+    const response = await this.#sdk("getGateway", [], {
       headers: { Authorization: `QQBot ${token}` },
     });
     const code = codeOf(response.data);
@@ -503,7 +525,7 @@ export class QqClient {
 
   async botIdentity(): Promise<{ id: string; username?: string; bot?: boolean }> {
     const token = await this.#accessToken();
-    const response = await this.#request("/users/@me", {
+    const response = await this.#sdk("getMe", [], {
       headers: { Authorization: `QQBot ${token}` },
     });
     const code = codeOf(response.data);
@@ -553,8 +575,9 @@ export class QqClient {
       }
       let upload: ResponseInfo;
       try {
-        upload = await this.#request(
-          mediaUploadPath(scope, target),
+        upload = await this.#sdk(
+          scope === "c2c" ? "sendFilePrivate" : "sendFileGuild",
+          [target],
           {
             method: "POST",
             headers: {
@@ -614,8 +637,9 @@ export class QqClient {
       body.media = { file_info: upload.data.file_info };
     }
     try {
-      response = await this.#request(
-        messagePath(scope, target),
+      response = await this.#sdk(
+        scope === "c2c" ? "sendPrivateMessage" : "sendMessage",
+        [target],
         {
           method: "POST",
           headers: {

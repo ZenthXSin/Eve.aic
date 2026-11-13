@@ -9,6 +9,7 @@ import type { InstanceSpec, Supervisor } from "./controller.ts";
 import { pinSource } from "./source.ts";
 import { readTrustedInstanceConfig } from "./driver.ts";
 import { refreshUpgradePrompt } from "./prompt.ts";
+import { LOG_UNITS, type LogSource, readLogFile, readServiceJournal } from "./logs.ts";
 
 export interface UpgradeReceipt {
   actionId: string;
@@ -26,6 +27,7 @@ export interface UpgradeReceipt {
 }
 export interface UpgradeOptions {
   directory: string;
+  mode?: "replace" | "observed";
   repository: string;
   artifactDirectory: string;
   instancePrivateDirectory: string;
@@ -85,7 +87,10 @@ export class UpgradeRequests {
               item.error = "submission_interrupted";
             } else {
               // registry先落盘而upgrade意图尚未落盘时，用预存稳定编号补齐。
-              await this.supervisor.upgrade(item.instanceId!, item.upgradeId);
+              if (this.options.mode === "observed") {
+                await this.supervisor.upgrade(item.instanceId!, item.upgradeId);
+              } else {await this.supervisor.stageReplacement(() =>
+                  Promise.resolve(this.supervisor.instance(item.instanceId!)), item.upgradeId);}
             }
           }
         }
@@ -123,6 +128,7 @@ export class UpgradeRequests {
       current.epoch !== proof.epoch || current.owner.expiresAt <= Date.now()
     ) throw new KernelError("unavailable", "旧版或过期实例不能申请升级");
     const args = data.args as Record<string, Json>;
+    if (data.method === "logs") return await this.#logs(args);
     if (data.method === "status") {
       if (
         !args || Object.keys(args).some((key) => key !== "actionId") ||
@@ -155,6 +161,73 @@ export class UpgradeRequests {
       !/^[a-f0-9]{40}$/.test(args.commit) || Object.keys(args).some((key) => key !== "commit")
     ) throw new KernelError("rejected", "升级只接受固定完整Git提交");
     return await this.#submit(args.commit, ownership.actionId, "instance");
+  }
+  async #logs(args: Record<string, Json>): Promise<Json> {
+    if (
+      !args ||
+      Object.keys(args).some((key) => !["source", "offset", "cursor", "limit"].includes(key))
+    ) {
+      throw new KernelError("rejected", "日志参数无效");
+    }
+    const sources: LogSource[] = LOG_UNITS.map((name) => ({
+      id: `journal:${name}`,
+      kind: "journal",
+    }));
+    const paths = new Map<string, string>();
+    for (const item of this.#receipts.values()) {
+      if (!item.instanceId || !/^[a-zA-Z0-9_-]{1,128}$/.test(item.instanceId)) continue;
+      paths.set(
+        `source:${item.instanceId}`,
+        `${this.options.artifactDirectory}/${item.instanceId}/source-command.log`,
+      );
+      paths.set(
+        `failure:${item.instanceId}`,
+        `${this.options.directory}/diagnostics/${item.instanceId}.log`,
+      );
+      for (const task of ["check", "test"]) {
+        paths.set(
+          `validation:${item.instanceId}:${task}`,
+          `${this.options.artifactDirectory}/${item.instanceId}/validation-${task}.log`,
+        );
+      }
+    }
+    for (const instance of this.supervisor.options.instances) {
+      paths.set(
+        `instance:${instance.id}`,
+        `${this.options.directory}/processes/${instance.id}.log`,
+      );
+    }
+    for (const [id, path] of paths) {
+      try {
+        const stat = await Deno.lstat(path);
+        if (stat.isFile && !stat.isSymlink) sources.push({ id, kind: "file", bytes: stat.size });
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+    }
+    if (args.source === undefined) {
+      if (Object.keys(args).length) {
+        throw new KernelError("rejected", "先列出日志源，再指定source分页");
+      }
+      return { sources: sources as unknown as Json };
+    }
+    if (typeof args.source !== "string" || !sources.some((s) => s.id === args.source)) {
+      throw new KernelError("not_found", "日志源不存在，请先查询logs({})");
+    }
+    if (args.source.startsWith("journal:")) {
+      if (args.offset !== undefined) throw new KernelError("rejected", "系统日志使用cursor");
+      return await readServiceJournal(
+        args.source.slice(8),
+        args.cursor as string | undefined,
+        args.limit as number | undefined,
+      );
+    }
+    if (args.cursor !== undefined) throw new KernelError("rejected", "文件日志使用offset");
+    return await readLogFile(
+      paths.get(args.source)!,
+      args.offset as number | undefined,
+      args.limit as number | undefined,
+    );
   }
   /** 只供独立监督控制入口调用；没有实例证明豁免标记或脚本契约。 */
   async requestAdministrator(args: Json, authorization: string | null): Promise<Json> {
@@ -223,7 +296,11 @@ export class UpgradeRequests {
       receipt.phase = "staging";
       receipt.operation = "stage_upgrade";
       await this.#save(receipt);
-      await this.supervisor.stageUpgrade(async (active) => {
+      const replace = this.options.mode !== "observed";
+      const stage = replace
+        ? this.supervisor.stageReplacement.bind(this.supervisor)
+        : this.supervisor.stageUpgrade.bind(this.supervisor);
+      await stage(async (active) => {
         const occupied = new Set(
           [
             this.supervisor.state.current,
@@ -231,23 +308,25 @@ export class UpgradeRequests {
             this.supervisor.state.upgrade?.candidate,
           ].filter(Boolean).map((id) => this.supervisor.instance(id!).identity?.uid),
         );
-        const identity = this.options.instanceIdentities.find((i) => !occupied.has(i.uid));
+        const identity = replace
+          ? active.identity
+          : this.options.instanceIdentities.find((i) => !occupied.has(i.uid));
         if (!identity) throw new KernelError("unavailable", "没有与并存实例隔离的运行身份");
-        await this.supervisor.options.driver.prepareIdentity?.(identity);
+        if (!replace) await this.supervisor.options.driver.prepareIdentity?.(identity);
+        const base = await readTrustedInstanceConfig(active);
         const p = `${this.options.instancePrivateDirectory}/${id}`,
-          r = `${this.options.instanceRuntimeDirectory}/${id}`;
+          r = replace ? base.instance.directory : `${this.options.instanceRuntimeDirectory}/${id}`;
         await Deno.mkdir(p, { mode: 0o750 });
         await Deno.chmod(p, 0o750);
         await Deno.chown(p, 0, identity.gid);
-        await Deno.mkdir(r, { mode: 0o700 });
+        if (!replace) await Deno.mkdir(r, { mode: 0o700 });
         await Deno.chown(r, identity.uid, identity.gid);
-        const base = await readTrustedInstanceConfig(active);
         const instance: InstanceSpec = {
           id,
           identity,
           source: artifact,
           configFile: `${p}/config.json`,
-          connectionFile: `${r}/connection.json`,
+          connectionFile: replace ? `${r}/connection-${id}.json` : `${r}/connection.json`,
           keyFile: `${p}/control.key`,
           credentialFile: `${p}/credential.key`,
           proofFile: `${p}/proof.json`,
@@ -273,9 +352,9 @@ export class UpgradeRequests {
         await Deno.writeTextFile(`${p}/prompt.md`, prompt, { mode: 0o440 });
         await Deno.chmod(`${p}/prompt.md`, 0o440);
         await Deno.chown(`${p}/prompt.md`, 0, identity.gid);
-        await Deno.mkdir(`${r}/mind`, { mode: 0o700 });
+        if (!replace) await Deno.mkdir(`${r}/mind`, { mode: 0o700 });
         // 控制状态在旧kernel真正停止后由 driver.handover 原子冻结，构建期间不复制活动队列。
-        await Deno.chown(`${r}/mind`, identity.uid, identity.gid);
+        if (!replace) await Deno.chown(`${r}/mind`, identity.uid, identity.gid);
         base.instance = {
           ...base.instance,
           id,
@@ -297,16 +376,16 @@ export class UpgradeRequests {
         };
         base.eve = {
           ...base.eve,
-          directory: `${r}/consciousness`,
+          directory: replace ? base.eve.directory : `${r}/consciousness`,
           sourceCommit: artifact.commit,
           promptFile: `${p}/prompt.md`,
         };
-        base.mindDirectory = `${r}/mind`;
-        base.kernelDataDirectory = `${r}/kernel`;
+        if (!replace) base.mindDirectory = `${r}/mind`;
+        if (!replace) base.kernelDataDirectory = `${r}/kernel`;
         base.scripts = {
           ...base.scripts,
-          directory: `${r}/scripts`,
-          cacheDirectory: `${r}/cache/scripts`,
+          directory: replace ? base.scripts.directory : `${r}/scripts`,
+          cacheDirectory: replace ? base.scripts.cacheDirectory : `${r}/cache/scripts`,
         };
         await writeDurableJson(instance.configFile, base);
         for (const path of [instance.configFile, instance.keyFile, instance.credentialFile]) {
@@ -320,6 +399,17 @@ export class UpgradeRequests {
       delete receipt.operation;
       await this.#save(receipt);
     } catch (error) {
+      await Deno.mkdir(`${this.options.directory}/diagnostics`, { recursive: true, mode: 0o700 });
+      await Deno.writeTextFile(
+        `${this.options.directory}/diagnostics/${receipt.instanceId}.log`,
+        JSON.stringify({
+          at: new Date().toISOString(),
+          phase: receipt.phase,
+          operation: receipt.operation,
+        }) + "\n" +
+          (error instanceof Error ? error.stack ?? error.message : String(error)) + "\n",
+        { mode: 0o600 },
+      );
       receipt.failure = {
         phase: receipt.phase ?? "preparing",
         operation: receipt.operation ?? "prepare_upgrade",

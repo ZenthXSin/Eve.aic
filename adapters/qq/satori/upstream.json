@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/satorijs/satori",
+  "package": "@satorijs/adapter-qq",
+  "version": "4.14.1",
+  "commit": "fa5ec61ac75c4fc3b204b5e2d01442f4bb29f410",
+  "integrity": "sha512-02YYEoGIjsDHCOaOmNrkRpGJuG62D3rb3xXLLBtBUQnnU5A3nM0oRMHFCCdtONylAD4P3YwULHY1zjuWStc9VQ==",
+  "tarball": "https://registry.npmjs.org/@satorijs/adapter-qq/-/adapter-qq-4.14.1.tgz",
+  "licenseSha256": "e60d87e606797ace86cbb510df9f75a9b858b5cc9f9dcfebfe47b31961a7c559",
+  "adaptation": "Published Internal request implementation and complete group/guild route tables extracted from lib/index.cjs; framework logger and makeArray/name helpers replaced locally. Eve injects verified TLS transport and retains its durable action journal and gateway lifecycle. All messages are proactive; no msg_id/msg_seq/event_id and no automatic POST retries. Local source is formatted with deno fmt.",
+  "files": [
+    "src/internal/internal.ts",
+    "src/internal/group.ts",
+    "src/internal/guild.ts"
+  ],
+  "derivedSha256": "c7ffc883450eece5dbbbfd6833a5082f493cc25c79c5f801cc000e4159b4f927"
+}

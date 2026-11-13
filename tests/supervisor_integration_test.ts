@@ -40,7 +40,7 @@ async function copy(directory: string, destination: string) {
     } else throw new Error("test source must not contain links");
   }
 }
-async function fixture(accept: boolean) {
+async function fixture(accept: boolean, replace = false) {
   const occupied = await command("/bin/ps", ["-eo", "uid="], root);
   assert.ok(
     !occupied.split("\n").some((line) =>
@@ -234,18 +234,20 @@ async function fixture(accept: boolean) {
   });
   const instances: InstanceSpec[] = [];
   for (const [index, id] of ["old", "candidate"].entries()) {
-    const identity = identities[index];
+    const identity = identities[replace ? 0 : index];
     const privateDirectory = `${directory}/private/${id}`;
-    const instanceDirectory = `${directory}/instances/${id}`;
+    const instanceDirectory = `${directory}/instances/${replace ? "old" : id}`;
     await Deno.mkdir(privateDirectory, { mode: 0o750 });
     await Deno.chmod(privateDirectory, 0o750);
     await Deno.chown(privateDirectory, 0, identity.gid);
-    await Deno.mkdir(instanceDirectory, { mode: 0o700 });
-    await Deno.chown(instanceDirectory, identity.uid, identity.gid);
-    for (const name of ["host", "eve", "scripts", "mind", "kernel", "script-cache"]) {
-      const path = `${instanceDirectory}/${name}`;
-      await Deno.mkdir(path, { mode: 0o700 });
-      await Deno.chown(path, identity.uid, identity.gid);
+    if (!replace || index === 0) {
+      await Deno.mkdir(instanceDirectory, { mode: 0o700 });
+      await Deno.chown(instanceDirectory, identity.uid, identity.gid);
+      for (const name of ["host", "eve", "scripts", "mind", "kernel", "script-cache"]) {
+        const path = `${instanceDirectory}/${name}`;
+        await Deno.mkdir(path, { mode: 0o700 });
+        await Deno.chown(path, identity.uid, identity.gid);
+      }
     }
     await Deno.writeTextFile(`${privateDirectory}/runtime.key`, token("runtime"));
     await Deno.writeTextFile(`${privateDirectory}/phone.key`, token("phone"));
@@ -260,7 +262,7 @@ async function fixture(accept: boolean) {
       identity,
       source: artifacts[index],
       configFile: `${privateDirectory}/config.json`,
-      connectionFile: `${instanceDirectory}/host/connection.json`,
+      connectionFile: `${instanceDirectory}/host/connection-${id}.json`,
       keyFile: `${privateDirectory}/control.key`,
       credentialFile: `${privateDirectory}/actor.key`,
       proofFile: `${privateDirectory}/proof.json`,
@@ -719,3 +721,54 @@ Deno.test({
     }
   },
 });
+
+for (const fail of [false, true]) {
+  Deno.test({
+    name: `真实低UID直接替换：共用原业务目录、脚本不重放、${
+      fail ? "候选校验失败恢复旧程序" : "跳过交接与观察并核实实际新版"
+    }`,
+    ignore: !isRoot,
+    async fn() {
+      const f = await fixture(true, true);
+      try {
+        await f.controller().bootstrap("old");
+        await waitFor(() => f.engine.records.events.some((e) => e.kind === "rest"));
+        const oldConfig = JSON.parse(await Deno.readTextFile(f.instances[0].configFile));
+        const newConfig = JSON.parse(await Deno.readTextFile(f.instances[1].configFile));
+        for (const field of ["kernelDataDirectory", "mindDirectory"]) {
+          assert.equal(oldConfig[field], newConfig[field]);
+        }
+        assert.equal(oldConfig.scripts.directory, newConfig.scripts.directory);
+        if (fail) {
+          await Deno.writeTextFile(
+            `${f.instances[1].source.directory}/runtime/instance.ts`,
+            "tampered",
+          );
+        }
+        await f.controller().stageReplacement(
+          () => Promise.resolve(f.instances[1]),
+          "upgrade_real_direct",
+        );
+        const current = f.instances[fail ? 0 : 1];
+        assert.equal(f.controller().state.current, current.id);
+        assert.equal(f.controller().state.lastOutcome?.outcome, fail ? "rolled_back" : "confirmed");
+        assert.equal(f.controller().state.standby, null);
+        assert.equal(f.observations(), 0);
+        const status = await f.driver.call<{ sourceCommit: string; state: string }>(
+          current,
+          "status",
+        );
+        assert.equal(status.sourceCommit, current.source.commit);
+        assert.equal(status.state, "active");
+        await f.driver.call(current, "deactivate");
+        await verifyInheritedScript(current);
+        assert.equal(f.engine.notes.journal.events.length, 1);
+        await f.restartSupervisor();
+        await f.controller().tick();
+        assert.equal(f.controller().state.current, current.id);
+      } finally {
+        await f.close();
+      }
+    },
+  });
+}
