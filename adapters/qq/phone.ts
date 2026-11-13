@@ -472,7 +472,11 @@ export class QqPhone {
   }
 
   async send(
-    args: PhoneSend & { attachment?: { path: string; kind: "image" | "file" } },
+    args: PhoneSend & {
+      attachment?: { path: string; kind: "image" | "file" };
+      /** 旧调用兼容；不在对外契约里展示。 */
+      replyTo?: { seq: number; sequence?: number };
+    },
     options: { beforeAttempt?: () => Promise<void> } = {},
   ) {
     conversation(args.conversationId);
@@ -672,7 +676,10 @@ export class QqPhone {
     return await this.downloads!.file(download, args);
   }
 
-  async sendFile(args: PhoneSendFile, options: { beforeAttempt?: () => Promise<void> } = {}) {
+  async sendFile(
+    args: PhoneSendFile & { replyTo?: { seq: number; sequence?: number } },
+    options: { beforeAttempt?: () => Promise<void> } = {},
+  ) {
     return await this.send({
       ...args,
       text: args.text ?? "",

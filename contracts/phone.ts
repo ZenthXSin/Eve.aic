@@ -154,8 +154,6 @@ export interface PhoneSend {
   actionId: string;
   conversationId: string;
   text: string;
-  /** @deprecated 兼容旧调用：仅校验本会话入站句柄，发送统一主动，不使用被动锚点或序号。 */
-  replyTo?: { seq: number; sequence?: number };
   /** 平台已提供的引用索引；不是平台消息编号。 */
   referenceIndex?: string;
   wakeup?: boolean;
@@ -230,8 +228,6 @@ export interface PhoneSendFile {
   path: string;
   kind: "image" | "file";
   text?: string;
-  /** @deprecated 兼容旧调用：仅校验本会话入站句柄，文件发送统一主动。 */
-  replyTo?: { seq: number; sequence?: number };
 }
 
 /** 两种看图方式由 Eve 明确选择；默认描述，任何失败都不自动切换。 */

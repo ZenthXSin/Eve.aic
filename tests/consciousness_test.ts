@@ -240,7 +240,7 @@ Deno.test("意识流：真实模型HTTP→原生脚本→手机动作，回复�
     Response.json(
       index === 1
         ? script(
-          'return await tools.phone.send({conversationId:"qq:user:user-a",text:"实际通过手机发出",replyTo:{seq:1,sequence:1}});',
+          'return await tools.phone.send({conversationId:"qq:user:user-a",text:"实际通过手机发出"});',
         )
         : completion(),
     )
