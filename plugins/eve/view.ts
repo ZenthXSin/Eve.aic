@@ -10,6 +10,7 @@ interface ActiveIndex {
   revision: number;
   ranges: { afterSeq: number; throughSeq: number }[];
   indices: number[];
+  kinds: Map<string, number[]>;
   view: ConsciousEvent[];
 }
 const activeIndexes = new WeakMap<ConsciousEvent[], ActiveIndex>();
@@ -20,7 +21,14 @@ export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
   events = activeSources.get(events) ?? events;
   let index = activeIndexes.get(events);
   if (!index) {
-    const current = { scanned: 0, revision: 0, ranges: [], indices: [], view: [] } as ActiveIndex;
+    const current = {
+      scanned: 0,
+      revision: 0,
+      ranges: [],
+      indices: [],
+      kinds: new Map(),
+      view: [],
+    } as ActiveIndex;
     current.view = new Proxy([] as ConsciousEvent[], {
       get(target, key, receiver) {
         if (key === "length") return current.indices.length;
@@ -60,13 +68,55 @@ export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
       index.indices = index.indices.filter((source) =>
         source + 1 <= range.afterSeq || source + 1 > range.throughSeq
       );
+      for (const [kind, positions] of index.kinds) {
+        index.kinds.set(
+          kind,
+          positions.filter((source) =>
+            source + 1 <= range.afterSeq || source + 1 > range.throughSeq
+          ),
+        );
+      }
     }
     if (
       !index.ranges.some((range) => event.seq > range.afterSeq && event.seq <= range.throughSeq)
-    ) index.indices.push(i);
+    ) {
+      index.indices.push(i);
+      let positions = index.kinds.get(event.kind);
+      if (!positions) index.kinds.set(event.kind, positions = []);
+      positions.push(i);
+    }
     index.scanned = i + 1;
   }
   return index.view;
+}
+
+// Warmed during the initial active-history scan; subsequent appends add only positions.
+// Keep no historical bodies here. Selected originals still pass journal validation on read.
+function selectedPositions(events: ConsciousEvent[], kind?: string) {
+  const source = activeSources.get(events) ?? events;
+  activeEvents(source);
+  const index = activeIndexes.get(source)!;
+  return { source, positions: kind === undefined ? index.indices : index.kinds.get(kind) ?? [] };
+}
+function afterPosition(positions: number[], afterSeq: number) {
+  let low = 0, high = positions.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (positions[mid] < afterSeq) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+function* selectedEvents(events: ConsciousEvent[], kind?: string, afterSeq = 0) {
+  const { source, positions } = selectedPositions(events, kind);
+  for (let i = afterPosition(positions, afterSeq); i < positions.length; i++) {
+    yield source[positions[i]];
+  }
+}
+export function lastActiveEvent(events: ConsciousEvent[], kind: string) {
+  const { source, positions } = selectedPositions(events, kind);
+  const position = positions.at(-1);
+  return position === undefined ? undefined : source[position];
 }
 
 export interface PendingTool {
@@ -169,8 +219,7 @@ function blocksUncached(
   // 投影边界是日志事实：后续追加经历不再滑动改写已经送进模型的前缀。
   // 无边界的旧日志先保持原件；runtime 可在明确的新 epoch 写下固定边界。
   let projectionThrough = 0;
-  for (const event of events) {
-    if (event.kind !== "context_projection") continue;
+  for (const event of selectedEvents(events, "context_projection")) {
     const throughSeq = (event.data as { throughSeq?: number } | null)?.throughSeq;
     if (
       !Number.isSafeInteger(throughSeq) || throughSeq! < 0 || throughSeq! >= event.seq
@@ -194,35 +243,33 @@ function blocksUncached(
     memoryItems.set(event.seq, items);
   };
   // 固定基线保留当时最新来源/强度。新 epoch 以前的投影不会因后来召回而挪动。
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i];
-    if (event.seq <= afterSeq) break;
+  const notices = selectedPositions(events, "notice");
+  const noticeStart = afterPosition(notices.positions, afterSeq);
+  for (let i = notices.positions.length - 1; i >= noticeStart; i--) {
+    const event = notices.source[notices.positions[i]];
     if (event.seq <= projectionThrough) projectMemory(event);
   }
   // epoch 以后的相同正文只略过新重复项；正文更新和非标准项仍追加。
-  for (const event of events) {
-    if (event.seq > Math.max(afterSeq, projectionThrough)) projectMemory(event);
+  for (const event of selectedEvents(events, "notice", Math.max(afterSeq, projectionThrough))) {
+    projectMemory(event);
   }
-  for (const event of events) {
-    if (event.kind === "retain") {
-      const data = event.data as {
-        responseSeq: number;
-        toolIndex: number;
-        mode: string;
-        summary?: string;
-      };
-      retention.set(`eve_${data.responseSeq}_${data.toolIndex}`, data);
-    }
-    if (
-      event.seq > afterSeq && event.seq <= projectionThrough && event.kind === "model_response"
-    ) {
+  for (const event of selectedEvents(events, "retain")) {
+    const data = event.data as {
+      responseSeq: number;
+      toolIndex: number;
+      mode: string;
+      summary?: string;
+    };
+    retention.set(`eve_${data.responseSeq}_${data.toolIndex}`, data);
+  }
+  for (const event of selectedEvents(events, "model_response", afterSeq)) {
+    if (event.seq <= projectionThrough) {
       const response = (event.data as unknown as { response: ModelResponse }).response;
       if (response.toolCalls.length) recentResponses.push(event.seq);
     }
   }
   const recentTools = new Set(recentResponses.slice(-8));
-  for (const event of events) {
-    if (event.seq <= afterSeq) continue;
+  for (const event of selectedEvents(events, undefined, afterSeq)) {
     let projectedData = event.data;
     if (event.kind === "notice") {
       const data = event.data as { source?: string; items?: Json[] };
@@ -349,13 +396,11 @@ function renderUncached(events: ConsciousEvent[], prompt: string): Message[] {
   events = activeEvents(events);
   let through = 0;
   let memory = "";
-  for (const event of events) {
-    if (event.kind === "compression") {
-      const data = event.data as { throughSeq: number; summary: string };
-      if (data.throughSeq >= through) {
-        through = data.throughSeq;
-        memory = data.summary;
-      }
+  for (const event of selectedEvents(events, "compression")) {
+    const data = event.data as { throughSeq: number; summary: string };
+    if (data.throughSeq >= through) {
+      through = data.throughSeq;
+      memory = data.summary;
     }
   }
   const messages: Message[] = [

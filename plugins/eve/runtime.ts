@@ -19,6 +19,7 @@ import {
   contextComposition,
   type ContextCounter,
   contextEstimate,
+  lastActiveEvent,
   mechanicalCompression,
   type PendingTool,
   pendingTools,
@@ -660,7 +661,7 @@ export class EveRuntime {
   }
   async #projectContext(tools: ToolSpec[]) {
     const events = this.journal.events;
-    const previous = activeEvents(events).findLast((event) => event.kind === "context_projection");
+    const previous = lastActiveEvent(events, "context_projection");
     const messages = this.#render();
     const estimated = contextEstimate(messages, tools, this.contextCounter);
     // 固定 epoch 只在首次迁移或值得支付一次缓存失效时前移。retain/压缩
@@ -777,7 +778,9 @@ export class EveRuntime {
     const pendingJobs = [...this.#observedJobs.values()].some((j) =>
       !["completed", "failed", "cancelled", "unknown"].includes(j.status)
     );
+    const selfContextStarted = performance.now();
     await this.#selfContext(!fresh && !hasActions && !pendingJobs);
+    const selfContextMs = performance.now() - selfContextStarted;
     const contextStarted = performance.now();
     // 必须先固定初次投影，再判断 500k 机械保护，避免旧 raw 历史误触压缩。
     let messages = await this.#projectContext(tools);
@@ -788,6 +791,7 @@ export class EveRuntime {
       await this.journal.append("compression", { ...compression, source: "system" });
       messages = await this.#projectContext(tools);
     }
+    const contextProjectionMs = performance.now() - contextStarted;
     const estimated = contextEstimate(messages, tools, this.contextCounter);
     this.#contextBlocked = estimated >= 500_000;
     if (this.#contextBlocked) {
@@ -822,7 +826,9 @@ export class EveRuntime {
       safeRemaining: Math.max(0, this.config.dailyTokenBudget - usage.safetyTotal),
       pendingTools: 0,
     };
+    const stateStarted = performance.now();
     await this.ctx.call("mind", "update", state as unknown as Json);
+    const stateUpdateMs = performance.now() - stateStarted;
     if (usage.safetyTotal + reservation > this.config.dailyTokenBudget) {
       if (this.journal.events.at(-1)?.kind !== "budget_wait") {
         await this.journal.append("budget_wait", {
@@ -836,7 +842,7 @@ export class EveRuntime {
     }
     // 感知追加一次，避免时间/用量改动稳定身份。没有固定QQ开场或自动消息。
     const band = Math.floor(estimated / 25_000);
-    const last = activeEvents(this.journal.events).findLast((event) => event.kind === "perception");
+    const last = lastActiveEvent(this.journal.events, "perception");
     if (
       !last || (last.data as { contextBand: number }).contextBand !== band ||
       (last.data as { day: string }).day !== day ||
@@ -898,6 +904,9 @@ export class EveRuntime {
         noticesMs,
         toolsListMs,
         recallMs,
+        selfContextMs,
+        contextProjectionMs,
+        stateUpdateMs,
         contextAndStateMs: performance.now() - contextStarted,
         preparationMs: performance.now() - preparationStarted,
       },

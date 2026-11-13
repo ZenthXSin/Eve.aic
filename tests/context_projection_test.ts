@@ -228,3 +228,72 @@ Deno.test("上下文缓存：回滚epoch恢复原投影且无效边界拒绝", (
     );
   }
 });
+
+Deno.test("轮次准备：预建索引后长压缩历史不再逐条读取，新增回执仍完整配对", () => {
+  const source = Array.from(
+    { length: 18_000 },
+    (_, i) => event(i + 1, "notice", { source: "phone", items: [{ text: `旧消息${i}` }] }),
+  );
+  source.push(event(source.length + 1, "context_projection", { throughSeq: source.length }));
+  source.push(event(source.length + 1, "compression", { throughSeq: 18_000, summary: "旧经历" }));
+  let reads = 0;
+  const events = new Proxy(source, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) reads++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const first = render(events, "身份");
+  reads = 0;
+  assert.deepEqual(render(events, "身份"), first);
+  assert.ok(reads < 30, `稳定轮次不应重新读取18000条旧经历，实际读取${reads}次`);
+  const responseSeq = source.length + 1;
+  source.push(event(responseSeq, "model_response", {
+    response: {
+      content: "新决定",
+      toolCalls: [{ id: "provider", name: "execute_script", args: { code: "return 1" } }],
+    },
+  }));
+  source.push(event(source.length + 1, "notice", { source: "phone", items: [{ text: "新消息" }] }));
+  assert.deepEqual(render(events, "身份"), first);
+  source.push(event(source.length + 1, "tool_result", {
+    callId: `eve_${responseSeq}_0`,
+    result: { output: "新回执" },
+  }));
+  reads = 0;
+  const next = render(events, "身份");
+  assert.ok(reads < 60, `增量轮次不应读取旧历史，实际读取${reads}次`);
+  assert.deepEqual(next.slice(0, first.length), first);
+  assert.deepEqual(next.slice(-3).map((message) => message.role), ["assistant", "tool", "user"]);
+  assert.ok(next.at(-1)!.content.includes("新消息"));
+  assert.deepEqual(next, render(structuredClone(source), "身份"));
+});
+
+Deno.test("轮次准备：热索引正确处理保留策略、连续压缩及回滚并与冷启动一致", () => {
+  const events = batches(10);
+  const check = () =>
+    assert.deepEqual(render(events, "身份"), render(structuredClone(events), "身份"));
+  check();
+  const accepted = events.length;
+  events.push(event(events.length + 1, "context_projection", { throughSeq: events.length }));
+  events.push(event(events.length + 1, "retain", {
+    responseSeq: 1,
+    toolIndex: 0,
+    mode: "summary",
+    summary: "保留摘要",
+  }));
+  check();
+  events.push(event(events.length + 1, "compression", { throughSeq: 3, summary: "第一批" }));
+  check();
+  events.push(event(events.length + 1, "compression", { throughSeq: 9, summary: "前三批" }));
+  check();
+  events.push(event(events.length + 1, "upgrade_rollback", {
+    afterSeq: accepted,
+    throughSeq: events.length,
+  }));
+  check();
+  events.push(event(events.length + 1, "context_projection", { throughSeq: events.length }));
+  check();
+  events.push(event(events.length + 1, "compression", { throughSeq: 6, summary: "确认的时间线" }));
+  check();
+});
