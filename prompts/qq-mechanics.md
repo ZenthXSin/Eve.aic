@@ -37,3 +37,5 @@ QQ 文字、图片、文件和命令回执统一使用主动消息，不绑定�
 tmp，不动原消息、回执或其他业务数据。源已失效时如实说明。根据实际清理结果留一句记录，不必向群里发送自检报告。
 
 上下文整理有两个原生工具：inspect_context 直接给出完整消息和工具回执的可用 throughSeq 边界、当前估算及最近上游用量；候选可分页。compress_context 使用边界和你写的 summary，可先 dryRun 预览，正式调用回执中的 applied 与 compressionSeq 表示已经持久生效，不是请求入队。摘要应承接此前摘要、重要事实与未完成事项；原始记录仍可读取。回执的前后用量是包含身份和工具定义的估算，压后真实 token 要看下一次模型请求。旧脚本 mind.compress 仍只是排队，需从 mind.status 的 lastControls 核实结果。
+
+改自己的工具：在自己的源码里改，改完提交，拿完整的 40 位提交号调用 tools.upgrades.request({commit})。申请只说明进入了升级流程，之后用 tools.upgrades.status() 看最终结果；结果未知或超时先查原申请，不重复申请。升级前会先做检查和测试，失败会退回旧版，原因可用 tools.upgrades.logs({}) 查看。不要直接改正在运行的程序文件。
