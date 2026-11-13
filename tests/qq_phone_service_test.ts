@@ -253,16 +253,28 @@ Deno.test("QQ 手机：RPC观察超时保留未知，实际发送继续，查询
   const delayed = new Promise<void>((resolve) => {
     allowReply = resolve;
   });
+  let sent!: () => void;
+  const sendEntered = new Promise<void>((resolve) => {
+    sent = resolve;
+  });
+  const sender = new PhoneRpcClient(f.rpc.url, KEY, 5000);
   const quick = new PhoneRpcClient(f.rpc.url, KEY, 30);
   try {
     await f.append(event(1));
-    f.beforeReply(() => delayed);
+    f.beforeReply(() => {
+      sent();
+      return delayed;
+    });
     const args = {
       actionId: "slow",
       conversationId: "qq:user:user-a",
       text: "晚一点的结果",
       replyTo: { seq: 1, sequence: 1 },
     };
+    // Wait for actual dispatch before timing out another observer of the same action.
+    // Disk admission and token acquisition need not fit inside a 30 ms observer deadline.
+    const sending = sender.call("send", args);
+    await Promise.race([sendEntered, sending]);
     await assert.rejects(
       quick.call("send", args),
       (error) =>
@@ -270,6 +282,7 @@ Deno.test("QQ 手机：RPC观察超时保留未知，实际发送继续，查询
     );
     assert.equal(f.count(), 1);
     allowReply();
+    assert.equal(((await sending) as { state: string }).state, "sent");
     const result = await f.client.call("send", args) as { state: string };
     assert.equal(result.state, "sent");
     assert.equal(
@@ -279,6 +292,7 @@ Deno.test("QQ 手机：RPC观察超时保留未知，实际发送继续，查询
     assert.equal(f.count(), 1);
   } finally {
     allowReply();
+    sender.close();
     quick.close();
     await f.close();
   }
