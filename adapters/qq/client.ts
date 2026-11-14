@@ -457,7 +457,10 @@ export class QqClient {
     let offset = 0;
     // Validate the entire plan before sending any bytes to a signed destination.
     const plan = sorted.map((part, i) => {
-      const size = part.block_size ?? blockSize;
+      const declaredSize = part.block_size ?? blockSize;
+      const size = typeof declaredSize === "string" && /^[1-9][0-9]*$/.test(declaredSize)
+        ? Number(declaredSize)
+        : declaredSize;
       if (
         part.index !== i + 1 || !Number.isSafeInteger(size) || Number(size) <= 0 ||
         offset >= bytes.length || !nonempty(part.presigned_url)
