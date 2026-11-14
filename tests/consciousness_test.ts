@@ -303,7 +303,7 @@ Deno.test("意识流：真实模型HTTP→原生脚本→手机动作，回复�
     assert.equal(
       latest.some((message) =>
         String((message as { content: string | null }).content ?? "").includes(
-          "可信关系：other",
+          '"relationship":"other"',
         )
       ),
       true,
@@ -964,10 +964,13 @@ Deno.test("原生上下文工具：查询边界、预览、落盘后重启补收
     const messages = body.messages as { role: string; content: string }[];
     if (index === 1) return native("inspect_context", {});
     const presented = messages.findLast((message) => message.role === "tool")!.content;
-    assert.ok(presented.startsWith("工具回执"));
-    assert.ok(presented.includes("完整原件："));
+    const structured = JSON.parse(presented);
+    assert.equal(structured.schema, "eve.tool_receipt.v1");
+    assert.equal(structured.original.method, "tools.records.text");
     const last = (await f.records()).findLast((event) => event.kind === "tool_result")!;
     const output = JSON.parse((last.data as { result: { output: string } }).result.output);
+    assert.deepEqual(structured.receipt.output, output);
+    assert.equal(structured.original.args.seq, last.seq);
     if (index === 2) {
       boundary = output.candidates.at(-1).throughSeq;
       return native("compress_context", {
