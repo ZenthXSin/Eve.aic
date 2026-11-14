@@ -1,3 +1,4 @@
+import { structuredToolReceipt } from "../../sdk/context-presentation.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import type { AdminBackend } from "./contracts.ts";
 import type { ToolCall } from "../../contracts/model.ts";
@@ -49,7 +50,7 @@ export interface LiveEvent {
 }
 
 /** 只展示实际留下的文字和动作元数据，不推断未返回的模型内容或脚本副作用。 */
-export function liveEvent(value: unknown): LiveEvent {
+export function liveEvent(value: unknown, toolName?: string): LiveEvent {
   const e = object(value), d = object(e.data), response = object(d.response);
   const result = object(d.result), call = object(d.call), error = object(d.error);
   const event: LiveEvent = {
@@ -134,7 +135,7 @@ export function liveEvent(value: unknown): LiveEvent {
       break;
     case "tool_result":
       {
-        const preview = observedPreview(result, 2048);
+        const preview = observedPreview(structuredToolReceipt(result, toolName).receipt, 8192);
         event.toolReceipt = preview.value;
         event.toolReceiptPartial = preview.partial;
       }
@@ -342,6 +343,14 @@ export class LiveReader {
         ? this.#through
         : Math.max(0, end - 80);
       const events = start === this.#through ? [...this.#events] : [];
+      const tools = new Map<string, string>();
+      const rememberTools = (event: LiveEvent) => {
+        for (const call of event.nativeCalls ?? []) tools.set(call.id, call.name);
+        if (event.kind === "tool_start" && event.callId && event.tool) {
+          tools.set(event.callId, event.tool);
+        }
+      };
+      events.forEach(rememberTools);
       let cursor = start;
       for (let page = 0; cursor < end && page < 10; page++) {
         const value = object(
@@ -355,7 +364,8 @@ export class LiveReader {
           throw new KernelError("corrupt", "实时记录窗口未能完整读取");
         }
         for (const raw of value.items) {
-          const event = liveEvent(raw);
+          const event = liveEvent(raw, tools.get(string(object(object(raw).data).callId)));
+          rememberTools(event);
           if (event.seq !== cursor + 1 || event.seq > end) {
             throw new KernelError("corrupt", "实时记录顺序无效");
           }

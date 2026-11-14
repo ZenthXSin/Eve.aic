@@ -763,4 +763,6 @@ button.legend-row span { display: inline-flex; align-items: center; }
 }
 @media (min-width: 761px) { .sheet { display: none; } }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+
+.workspace-value{border-left:2px solid var(--line);padding-left:12px;margin:10px 0}.workspace-value>.tools-detail-label{overflow-wrap:anywhere}
 `;

@@ -124,6 +124,34 @@ function resultPage(value: unknown): unknown {
     return value;
   }
 }
+/** Shared presentation for model context and admin previews. Never mutates stored facts. */
+export function structuredToolReceipt(data: unknown, tool?: string) {
+  let receipt = data;
+  if (object(data) && typeof data.output === "string" && tool && jsonOutputs.has(tool)) {
+    try {
+      receipt = { ...data, output: JSON.parse(data.output) };
+    } catch { /* Failed validation and ordinary text remain verbatim. */ }
+  }
+  const output = object(receipt) ? receipt.output : undefined;
+  const script = (tool === "execute_script" || tool === "read_script") &&
+      object(output) && typeof output.jobId === "string" && typeof output.status === "string"
+    ? output
+    : undefined;
+  if (script) {
+    receipt = {
+      ...receipt as ObjectValue,
+      output: {
+        ...script,
+        ...(script.result === undefined ? {} : {
+          result: Number(script.resultStartChar ?? 0) === 0
+            ? resultPage(script.result)
+            : script.result,
+        }),
+      },
+    };
+  }
+  return { receipt, script };
+}
 /** Model-only projection; journals and RPC recovery retain the original wire receipts. */
 export function presentContext(
   messages: Message[],
@@ -169,30 +197,7 @@ export function presentContext(
       };
     }
     const tool = message.toolCallId ? names.get(message.toolCallId) : undefined;
-    let receipt = data;
-    if (object(data) && typeof data.output === "string" && tool && jsonOutputs.has(tool)) {
-      try {
-        receipt = { ...data, output: JSON.parse(data.output) };
-      } catch { /* Failed validation and ordinary text remain verbatim. */ }
-    }
-    const output = object(receipt) ? receipt.output : undefined;
-    const script = (tool === "execute_script" || tool === "read_script") &&
-        object(output) && typeof output.jobId === "string" && typeof output.status === "string"
-      ? output
-      : undefined;
-    if (script) {
-      receipt = {
-        ...receipt as ObjectValue,
-        output: {
-          ...script,
-          ...(script.result === undefined ? {} : {
-            result: Number(script.resultStartChar ?? 0) === 0
-              ? resultPage(script.result)
-              : script.result,
-          }),
-        },
-      };
-    }
+    const { receipt, script } = structuredToolReceipt(data, tool);
     return {
       ...message,
       content: JSON.stringify({
