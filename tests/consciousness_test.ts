@@ -827,6 +827,7 @@ Deno.test("意识流：手机模型描述进入下一轮主意识文字，原图
   try {
     await f.pulse();
     await f.pulse();
+    await f.settleScript();
     await f.pulse();
     assert.equal(reads, 1);
     assert.equal(f.messages.length, 2);
@@ -903,6 +904,7 @@ Deno.test("意识流：Eve明确选择original时才将真实原图交给主模�
   try {
     await f.pulse();
     await f.pulse();
+    await f.settleScript();
     await f.pulse();
     assert.equal(reads, 1);
     assert.equal(f.messages.length, 2);
