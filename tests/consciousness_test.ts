@@ -1,3 +1,4 @@
+import { settleScript } from "./helpers/scripts.ts";
 import assert from "node:assert/strict";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
@@ -12,6 +13,7 @@ import { composeModelPlugin } from "../composition/model.ts";
 import { composePhonePlugin } from "../composition/phone.ts";
 import { composeScriptPlugin } from "../composition/scripts.ts";
 import { Kernel } from "../kernel/kernel.ts";
+import type { ScriptSummary } from "../contracts/script.ts";
 import type { Json } from "../kernel/protocol.ts";
 import { KernelError } from "../kernel/protocol.ts";
 import { type ConsciousEvent, ConsciousJournal } from "../plugins/eve/journal.ts";
@@ -143,7 +145,7 @@ async function fixture(
       directory: `${directory}/scripts`,
       cacheDirectory: `${directory}/cache`,
       denoBinary: Deno.execPath(),
-      defaultTimeoutMs: 10000,
+      defaultTimeoutMs: 60_000,
     },
     eve: {
       directory: `${directory}/consciousness`,
@@ -207,6 +209,21 @@ const plugin=createChatModelPlugin(${
     kernel: () => kernel,
     records,
     count: () => sends,
+    // The five-second sync wait can return a still-running cold script. Check its
+    // durable terminal receipt before asserting effects or simulating a restart.
+    settleScript: async (result?: Json) => {
+      if (result === undefined) {
+        const event = (await records()).findLast((e) => e.kind === "tool_result");
+        assert.ok(event);
+        result = (event.data as { result: Json }).result;
+      }
+      const { jobId } = JSON.parse((result as { output: string }).output);
+      const status = await settleScript(
+        kernel,
+        await kernel.call<ScriptSummary & Json>("scripts", "status", { jobId }),
+      );
+      assert.equal(status.status, "completed", JSON.stringify(status));
+    },
     outage: (value: boolean) => {
       unavailable = value;
     },
@@ -254,6 +271,7 @@ Deno.test("意识流：真实模型HTTP→原生脚本→手机动作，回复�
     assert.equal(pendingTools(first).length, 1);
     await f.restart();
     await f.pulse();
+    await f.settleScript();
     assert.equal(f.count(), 1);
     const after = await f.records();
     assert.equal(pendingTools(after).length, 0);
@@ -345,7 +363,8 @@ Deno.test("意识流：发送已经结束却脑子未收尾，恢复查询原脚
     const events = await f.records();
     const pending = pendingTools(events)[0];
     // 外部先执行同一已保存决定，模拟动作已做而意识流未拿到结果的窗口。
-    await f.kernel().call("tools", "execute", pending.call as unknown as Json);
+    const receipt = await f.kernel().call("tools", "execute", pending.call as unknown as Json);
+    await f.settleScript(receipt);
     assert.equal(f.count(), 1);
     await f.kernel().stop();
     const raw = new ConsciousJournal(`${f.directory}/consciousness`);
@@ -534,6 +553,7 @@ Deno.test("意识流：Eve通过真实脚本决定休息，持久提醒到时再
   try {
     await f.pulse();
     await f.pulse();
+    await f.settleScript();
     await f.pulse();
     assert.equal(f.messages.length, 1);
     const status = await f.kernel().call<{ wakeAt: number }>("eve", "status");

@@ -1,3 +1,4 @@
+import { settleScript } from "./helpers/scripts.ts";
 import assert from "node:assert/strict";
 import { composePhonePlugin } from "../composition/phone.ts";
 import { composeScriptPlugin } from "../composition/scripts.ts";
@@ -65,7 +66,7 @@ async function fixture() {
         directory: `${directory}/scripts`,
         denoBinary: Deno.execPath(),
         cacheDirectory: `${directory}/cache`,
-        defaultTimeoutMs: 10_000,
+        defaultTimeoutMs: 60_000,
       },
     }),
   );
@@ -82,17 +83,39 @@ async function fixture() {
   return {
     small,
     large,
-    requested,
+    async waitForRequest() {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          requested.promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("异步脚本没有发起实际手机读取")), 60_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
     release,
     phoneCalls: () => phoneCalls,
     kernel: () => kernel,
-    async execute(id: string, code: string, mode?: string) {
-      const result = await kernel.call<ToolResult & Json>("tools", "execute", {
+    async execute(id: string, code: string, mode?: string, settle = mode !== "async") {
+      let result = await kernel.call<ToolResult & Json>("tools", "execute", {
         id,
         name: "execute_script",
         args: { code, ...(mode === undefined ? {} : { mode }) },
       });
       assert.equal(result.status, "completed");
+      const job = JSON.parse(result.output) as NativeResult;
+      if (settle && ["queued", "checking", "running"].includes(job.status)) {
+        await settleScript(kernel, job);
+        // Reuse the original request to retrieve its complete native result page.
+        result = await kernel.call<ToolResult & Json>("tools", "execute", {
+          id,
+          name: "execute_script",
+          args: { code, ...(mode === undefined ? {} : { mode }) },
+        });
+      }
       return JSON.parse(result.output) as NativeResult;
     },
     async restart() {
@@ -142,17 +165,7 @@ Deno.test("原生脚本返回值：异步手机大原件完成后可通过原生
     const pending = await f.execute("async-phone-return", code, "async");
     assert.notEqual(pending.status, "completed");
     assert.equal(pending.result, undefined);
-    let deadline: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        f.requested.promise,
-        new Promise<never>((_, reject) => {
-          deadline = setTimeout(() => reject(new Error("异步脚本没有发起实际手机读取")), 10_000);
-        }),
-      ]);
-    } finally {
-      clearTimeout(deadline);
-    }
+    await f.waitForRequest();
     f.release.resolve();
     for (let attempt = 0;; attempt++) {
       const status = await f.kernel().call<ScriptSummary & Json>("scripts", "status", {
@@ -222,10 +235,12 @@ Deno.test("原生脚本：默认和sync最多等待5秒，原任务后台并行�
         "five-second-background",
         'return await tools.phone.file({handle:{conversationId:"qq:user:fixture",seq:3},index:1});',
         mode,
+        false,
       );
       assert.ok(performance.now() - started >= 4900, "先等待完整5秒");
       assert.ok(["queued", "checking", "running"].includes(job.status));
       assert.equal(job.result, undefined);
+      await f.waitForRequest();
       assert.equal(f.phoneCalls(), 1);
       const independent = await f.execute(
         "parallel-short",

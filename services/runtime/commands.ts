@@ -295,7 +295,9 @@ export class CommandSessions {
           `HOME=${this.unrestricted ? "/root" : cwd}`,
           "LANG=C.UTF-8",
           "/bin/bash",
-          "-lc",
+          "--noprofile",
+          "--norc",
+          "-c",
           args.cmd,
         ]
         : undefined;
@@ -306,7 +308,8 @@ export class CommandSessions {
           ? "/usr/bin/setpriv"
           : "/usr/bin/setsid",
         {
-          args: systemdArgs ?? [...identityArgs, "/bin/bash", "-lc", args.cmd],
+          args: systemdArgs ??
+            [...identityArgs, "/bin/bash", "--noprofile", "--norc", "-c", args.cmd],
           cwd,
           clearEnv: true,
           env: {

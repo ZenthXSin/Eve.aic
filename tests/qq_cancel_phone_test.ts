@@ -1,3 +1,4 @@
+import { settleScript } from "./helpers/scripts.ts";
 import assert from "node:assert/strict";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
@@ -359,7 +360,10 @@ const item = page.items.find(item => item.actionId === "failed-head");
 if (!item || !item.canCancel || !item.receiptDigest) throw new Error("not cancellable");
 return await tools.phone.cancelSend({actionId:item.actionId,expectedFingerprint:item.fingerprint,expectedReceiptDigest:item.receiptDigest});`,
     };
-    const job = await kernel!.call<ScriptSummary & Json>("scripts", "start", request);
+    const job = await settleScript(
+      kernel!,
+      await kernel!.call<ScriptSummary & Json>("scripts", "start", request),
+    );
     assert.equal(job.status, "completed", JSON.stringify(job));
     assert.equal(job.scriptStarted, true);
     assert.equal(job.actions, 2);
