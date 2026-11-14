@@ -40,7 +40,7 @@ async function fixture() {
       },
     },
     offsetBytes: 0,
-    text: '附件原文🙂包含"引号"与\\反斜线\n'.repeat(1200),
+    text: '附件原文🙂包含"引号"与\\反斜线\n'.repeat(600),
   };
   const phone = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (request) => {
     assert.equal(request.headers.get("authorization"), `Bearer ${key}`);

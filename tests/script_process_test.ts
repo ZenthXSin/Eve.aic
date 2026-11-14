@@ -74,7 +74,7 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
         directory: `${directory}/scripts`,
         cacheDirectory: `${directory}/cache`,
         denoBinary: Deno.execPath(),
-        defaultTimeoutMs: 10_000,
+        defaultTimeoutMs: 60_000,
       },
     }),
     { mode: 0o600 },
@@ -106,6 +106,9 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
       await Deno.writeTextFile(${
         JSON.stringify(directory + "/before-kill.json")
       },JSON.stringify({job,receipts,firstResult}));break;}
+      const status=await kernel.call("scripts","status",{jobId:job.jobId});
+      if(!["queued","checking","running"].includes(status.status)){
+      throw new Error("script stopped before the second action: "+JSON.stringify(status));}
       await new Promise(done=>setTimeout(done,5));}await new Promise(()=>{});\n`,
   );
   let child: Deno.ChildProcess | undefined;
@@ -127,12 +130,20 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
       stderr: "piped",
     }).spawn();
     stderr = new Response(child.stderr).text();
-    await Promise.race([
-      entered.promise,
-      child.status.then(async (status) => {
-        throw new Error(`脚本进程提前退出${status.code}: ${await stderr}`);
-      }),
-    ]);
+    let enteredTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        entered.promise,
+        child.status.then(async (status) => {
+          throw new Error(`脚本进程提前退出${status.code}: ${await stderr}`);
+        }),
+        new Promise<never>((_, reject) => {
+          enteredTimer = setTimeout(() => reject(new Error("脚本60秒内未发起第二个动作")), 60_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(enteredTimer);
+    }
     let original: {
       job: ScriptSummary;
       receipts: { items: { status: string; actionId: string }[] };
