@@ -48,11 +48,21 @@ export type ScriptStatus =
   | "failed"
   | "cancelled"
   | "unknown";
+/** Host monotonic timings, in milliseconds. Parallel stages must not be summed. */
+export interface ScriptTiming {
+  /** Obtained an empty standby sandbox; each sandbox still executes at most one job. */
+  prewarmed: boolean;
+  checkMs?: number;
+  workerWaitMs?: number;
+  preparationMs?: number;
+  executionMs?: number;
+}
 export interface ScriptSummary {
   jobId: string;
   status: ScriptStatus;
   scriptStarted: boolean;
   actions: number;
+  timing?: ScriptTiming;
   startedAt: string;
   finishedAt?: string;
   error?: { kind: string; message: string };

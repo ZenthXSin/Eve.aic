@@ -1,7 +1,12 @@
 // 独立的事实账本，不参与插件快照回滚；每个脚本与嵌套动作独立持久提交。
 import type { Json, WireError } from "../../kernel/protocol.ts";
 import { KernelError } from "../../kernel/protocol.ts";
-import type { ScriptCompletion, ScriptRequest, ScriptStatus } from "../../contracts/script.ts";
+import type {
+  ScriptCompletion,
+  ScriptRequest,
+  ScriptStatus,
+  ScriptTiming,
+} from "../../contracts/script.ts";
 import { createHash } from "node:crypto";
 import { canonical } from "../../kernel/calls.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
@@ -29,6 +34,7 @@ export interface JobRecord {
   finishedAt?: string;
   error?: WireError;
   result?: Json;
+  timing?: ScriptTiming;
   actions: ActionRecord[];
 }
 export interface ScriptState {
