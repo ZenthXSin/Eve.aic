@@ -118,7 +118,8 @@ const sendArgs = {
 Deno.test("QQ fenced RPC：无令牌拒绝读取/发送，换版采用原送达回执，旧实例不能消费入站", async () => {
   const f = await setup();
   const plain = new PhoneRpcClient(f.rpc.url, bridgeKey);
-  const old = new PhoneRpcClient(f.rpc.url, bridgeKey, 1000, () => Promise.resolve(f.proof));
+  // This case tests authority/receipt reuse, not a one-second HTTP deadline.
+  const old = new PhoneRpcClient(f.rpc.url, bridgeKey, 15_000, () => Promise.resolve(f.proof));
   let next: PhoneRpcClient | undefined;
   try {
     assert.deepEqual(await plain.call("health"), { available: true, ownershipFenced: true });
@@ -145,7 +146,7 @@ Deno.test("QQ fenced RPC：无令牌拒绝读取/发送，换版采用原送达�
     });
     if (grant.status !== "granted") throw new Error("not granted");
     const proof = { instanceId: "new", epoch: grant.owner.epoch, credential: newKey };
-    next = new PhoneRpcClient(f.rpc.url, bridgeKey, 1000, () => Promise.resolve(proof));
+    next = new PhoneRpcClient(f.rpc.url, bridgeKey, 15_000, () => Promise.resolve(proof));
     assert.deepEqual(await next.call("send", sendArgs), receipt);
     assert.equal(f.sends(), 1);
     await assert.rejects(
@@ -507,7 +508,8 @@ async function retryFixture(options: {
   const transport = new QqClient({ appId: "fixture", appSecret: "fixture" }, {
     baseUrl: `http://127.0.0.1:${platform.addr.port}`,
     sendScope: "private",
-    timeoutMs: 150,
+    // Explicit 429 retries must not become ambiguous transport failures on a busy host.
+    timeoutMs: 5_000,
   });
   await transport.authenticate();
   const incoming = new QqInboundJournal(`${directory}/inbound`);
@@ -606,15 +608,18 @@ const secondSend = {
 Deno.test("QQ 无限顺序重试：真实 RPC 先超时，后台四次明确限流后队首送达才发送第二条", async () => {
   const f = await retryFixture();
   const short = new PhoneRpcClient(f.url, bridgeKey, 60, () => Promise.resolve(f.proof));
-  const patient = new PhoneRpcClient(f.url, bridgeKey, 5_000, () => Promise.resolve(f.proof));
+  const patient = new PhoneRpcClient(f.url, bridgeKey, 15_000, () => Promise.resolve(f.proof));
   try {
     await assert.rejects(
       short.call("send", headSend),
       (error) => error instanceof PhoneRpcError && error.category === "unknown",
     );
+    // The caller timing out proves neither admission nor a durable first attempt.
+    // Wait for that real boundary before asserting the background queue state.
+    await until(() => f.firstAttemptSaved());
     assert.equal(f.guard.status().activePermits, 1);
     assert.equal(f.actions!.status(headSend.actionId)?.status, "running");
-    const second = await bounded(patient.call("send", secondSend));
+    const second = await bounded(patient.call("send", secondSend), 15_000);
     assert.ok(second && typeof second === "object" && !Array.isArray(second));
     assert.equal(second.state, "sent");
     const head = await patient.call("action", { actionId: headSend.actionId });

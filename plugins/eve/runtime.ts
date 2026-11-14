@@ -1,3 +1,4 @@
+import { READ_SCRIPT_TOOL, readScript } from "./script-reader.ts";
 import {
   continuityMessage,
   FOCUS_TOOL,
@@ -634,6 +635,21 @@ export class EveRuntime {
       await this.#saveToolResult(call.id, result);
       return;
     }
+    if (call.name === READ_SCRIPT_TOOL.name) {
+      try {
+        result = {
+          status: "completed",
+          output: JSON.stringify(await readScript(this.ctx, call.args)),
+        };
+      } catch (error) {
+        result = {
+          status: error instanceof KernelError && error.kind === "timeout" ? "unknown" : "failed",
+          error: toWireError(error) as unknown as Json,
+        };
+      }
+      await this.#saveToolResult(call.id, result);
+      return;
+    }
     if (CONTEXT_TOOLS.some((tool) => tool.name === call.name)) {
       try {
         // 已落盘压缩但尚未写回执时，重启只补齐原收据，不重新执行或推测生效。
@@ -798,6 +814,7 @@ export class EveRuntime {
     const provided = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
     const native = [
       WRITE_THOUGHT_TOOL,
+      READ_SCRIPT_TOOL,
       ...CONTEXT_TOOLS,
       ...(this.config.restReviewEnabled ? [FOCUS_TOOL, REST_TOOL] : []),
     ];

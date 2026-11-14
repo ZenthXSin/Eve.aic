@@ -66,6 +66,7 @@ async function fixture(response: ModelResponse) {
         assert.deepEqual(request.tools.map((t) => t.name), [
           "execute_script",
           "write_thought",
+          "read_script",
           "inspect_context",
           "compress_context",
         ]);
