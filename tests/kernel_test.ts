@@ -147,20 +147,38 @@ Deno.test("轮次循环：多轮、工具调用、重启后历史延续", async 
 
 Deno.test("换版成功：三段信号、状态延续、新能力可用", async () => {
   const { kernel, dataDir, events } = await boot([fixture("counter-v1")]);
-  assert.equal(await kernel.call("counter", "add", { n: 5 }), 5);
-  const swapping = kernel.swap("counter", fixture("counter-v2"));
-  await until(events, "swap_paused");
-  // 换版期间发出的调用被缓冲，换完后由新版本处理，并计入首批真实调用。
-  const during = kernel.call("counter", "add", { n: 2 });
-  const report = await swapping;
-  assert.equal(report.outcome, "confirmed");
-  assert.deepEqual(report.signals, ["ready", "healthy", "confirmed:real_calls"]);
-  assert.equal(await during, 7);
-  assert.equal(await kernel.call("counter", "version"), "1.1.0");
-  assert.equal(await kernel.call("counter", "double"), 14);
-  const receipts = (await Deno.readTextFile(`${dataDir}/receipts/swaps.jsonl`)).trim().split("\n");
-  assert.equal(JSON.parse(receipts[0]).outcome, "confirmed");
-  await kernel.stop();
+  const candidate = await Deno.makeTempDir({ prefix: "eve-counter-business-confirm-" });
+  try {
+    // This checks durable business calls; deadline/probe behavior has a separate test.
+    const manifest = JSON.parse(await Deno.readTextFile(`${fixture("counter-v2")}/manifest.json`));
+    manifest.confirm.deadlineMs = 10_000;
+    await Deno.writeTextFile(`${candidate}/manifest.json`, JSON.stringify(manifest));
+    const module = await Deno.readTextFile(`${fixture("counter-v2")}/mod.ts`);
+    await Deno.writeTextFile(
+      `${candidate}/mod.ts`,
+      module.replace(
+        '"../../../sdk/plugin.ts"',
+        JSON.stringify(new URL("../sdk/plugin.ts", import.meta.url).href),
+      ),
+    );
+    assert.equal(await kernel.call("counter", "add", { n: 5 }), 5);
+    const swapping = kernel.swap("counter", candidate);
+    await until(events, "swap_paused");
+    const during = kernel.call("counter", "add", { n: 2 });
+    const report = await swapping;
+    assert.equal(report.outcome, "confirmed");
+    assert.deepEqual(report.signals, ["ready", "healthy", "confirmed:real_calls"]);
+    assert.equal(await during, 7);
+    assert.equal(await kernel.call("counter", "version"), "1.1.0");
+    assert.equal(await kernel.call("counter", "double"), 14);
+    const receipts = (await Deno.readTextFile(`${dataDir}/receipts/swaps.jsonl`)).trim().split(
+      "\n",
+    );
+    assert.equal(JSON.parse(receipts[0]).outcome, "confirmed");
+  } finally {
+    await kernel.stop();
+    await Deno.remove(candidate, { recursive: true });
+  }
 });
 
 Deno.test("没有真实流量时由内核探测确认，不误判", async () => {
