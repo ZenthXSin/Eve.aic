@@ -13,9 +13,15 @@ export async function runAdminService(configPath: string) {
   ) {
     throw new Error("管理服务需要完整私有路径");
   }
+  if (
+    c.recoveryFiles !== undefined && (!Array.isArray(c.recoveryFiles) ||
+      !c.recoveryFiles.every((p: unknown) => typeof p === "string" && p.startsWith("/")))
+  ) {
+    throw new Error("启动状态文件需要绝对路径列表");
+  }
   await Deno.mkdir(c.directory, { recursive: true, mode: 0o700 });
   const server = await startAdminServer(
-    new AdminControlClient(c.backendConnectionFile, c.backendKeyFile),
+    new AdminControlClient(c.backendConnectionFile, c.backendKeyFile, c.recoveryFiles),
     {
       token: (await Deno.readTextFile(c.tokenFile)).replace(/\r?\n$/, ""),
       publicOrigin: c.publicOrigin,

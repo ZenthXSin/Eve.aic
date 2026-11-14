@@ -4,9 +4,40 @@ import type { AdminBackend, AdminControl, AdminQuery, AdminRequest } from "./con
 
 /** 仅管理进程读取此密钥。管理服务不持有 Eve 的所有权令牌或模型密钥。 */
 export class AdminControlClient implements AdminBackend {
-  constructor(readonly connectionFile: string, readonly keyFile: string) {}
-  status() {
-    return this.request({ method: "status" });
+  constructor(
+    readonly connectionFile: string,
+    readonly keyFile: string,
+    readonly recoveryFiles: string[] = [],
+  ) {}
+  async status() {
+    try {
+      return await this.request({ method: "status" });
+    } catch (error) {
+      // Only status can fall back to private startup projections. Never repeat a mutation.
+      if (!(error instanceof KernelError) || !["unknown", "unavailable"].includes(error.kind)) {
+        throw error;
+      }
+      const services: Json[] = [];
+      let fresh = false;
+      for (const path of this.recoveryFiles) {
+        try {
+          const value = JSON.parse(await Deno.readTextFile(path));
+          if (
+            !value || !["runtime", "guardian"].includes(value.service) ||
+            !["recovering", "ready", "failed"].includes(value.phase) ||
+            !Number.isSafeInteger(value.pid) || value.pid < 1 ||
+            !Number.isSafeInteger(value.updatedAt)
+          ) continue;
+          Deno.kill(value.pid, 0);
+          if (value.updatedAt <= Date.now() && Date.now() - value.updatedAt < 30_000) fresh = true;
+          services.push(value);
+        } catch {
+          /* Missing, expired or incomplete startup projections are not health evidence. */
+        }
+      }
+      if (!fresh || !services.length) throw error;
+      return { runtime: { available: false }, startup: { phase: "recovering", services } };
+    }
   }
   query(request: AdminQuery) {
     return this.request({ method: "query", request });

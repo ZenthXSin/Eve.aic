@@ -11,6 +11,7 @@ export function startOwnershipRpc(
   authority: OwnershipAuthority,
   adminKey: string,
   exitKey: string,
+  recovery?: { ready(): boolean; progress(): unknown },
 ) {
   if (
     ![adminKey, exitKey].every((key) => /^[a-zA-Z0-9_-]{32,256}$/.test(key)) || adminKey === exitKey
@@ -51,6 +52,15 @@ export function startOwnershipRpc(
       if (!data || typeof data !== "object" || Array.isArray(data)) {
         throw new KernelError("rejected", "请求格式无效");
       }
+      if (recovery && !recovery.ready()) {
+        if (data.method === "status" && (admin || exit)) {
+          return Response.json({
+            ok: true,
+            value: { available: false, recovery: recovery.progress() },
+          });
+        }
+        throw new KernelError("unavailable", "守护正在恢复历史记录，尚未开放动作");
+      }
       let value: unknown;
       const args = data.args;
       if (data.method === "register" && admin) {
@@ -70,8 +80,9 @@ export function startOwnershipRpc(
         await authority.finish(args?.id, args?.outcome as PermitOutcome, args?.resultHash);
         value = null;
       } else if (data.method === "outstanding" && (admin || exit)) value = authority.outstanding();
-      else if (data.method === "status" && (admin || exit)) value = authority.status();
-      else if (
+      else if (data.method === "status" && (admin || exit)) {
+        value = recovery ? { ...authority.status(), available: true } : authority.status();
+      } else if (
         (data.method === "renew" || data.method === "actorStatus") &&
         authorization === `Bearer ${args?.credential}`
       ) {

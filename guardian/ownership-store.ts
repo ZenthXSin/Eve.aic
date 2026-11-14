@@ -194,6 +194,9 @@ export class OwnershipStore {
       }
     }
   }
+  get recovery() {
+    return this.#changes.recovery;
+  }
   get available() {
     return this.#lock !== undefined && !this.#failed;
   }
@@ -251,28 +254,24 @@ export class OwnershipStore {
       }
       this.state.permits.forEach((p, i) => this.#permitPositions.set(p.id, i));
       this.state.cancellations.forEach((p, i) => this.#cancelPositions.set(p.id, i));
-      await this.#changes.initialize();
       const digest = await fingerprint(this.state as unknown as Json);
-      if (!this.#changes.count) await this.#changes.append("checkpoint", { digest });
-      else {
-        const first = this.#changes.events[0];
-        if (first.kind !== "checkpoint" || (first.data as { digest?: string }).digest !== digest) {
-          throw new KernelError("corrupt", "守护检查点与增量链不符，原件保留");
-        }
-        let after = 1;
-        while (after < this.#changes.count) {
-          const page = this.#changes.readPage(after, 128);
-          for (const event of page.events) {
-            if (event.kind !== "change" || !record(event.data)) {
-              throw new KernelError("corrupt", "未知守护增量记录");
-            }
-            this.#apply(event.data as Record<string, Json>);
+      await this.#changes.initialize((event) => {
+        if (event.seq === 1) {
+          if (
+            event.kind !== "checkpoint" || (event.data as { digest?: string }).digest !== digest
+          ) {
+            throw new KernelError("corrupt", "守护检查点与增量链不符，原件保留");
           }
-          after = page.nextSeq;
+        } else {
+          if (event.kind !== "change" || !record(event.data)) {
+            throw new KernelError("corrupt", "未知守护增量记录");
+          }
+          this.#apply(event.data as Record<string, Json>);
         }
-        if (!validateOwnershipState(this.state)) {
-          throw new KernelError("corrupt", "守护增量恢复状态无效，原件保留");
-        }
+      });
+      if (!this.#changes.count) await this.#changes.append("checkpoint", { digest });
+      if (!validateOwnershipState(this.state)) {
+        throw new KernelError("corrupt", "守护增量恢复状态无效，原件保留");
       }
     } catch (error) {
       await this.#changes.close().catch(() => {});

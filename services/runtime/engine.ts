@@ -32,6 +32,11 @@ interface RequestRecord {
   error?: WireError;
   terminal: boolean;
 }
+// Resident projection contains no terminal body. Originals stay in FactJournal;
+// reads use its synchronous verified view, without a second receipt cache.
+interface RequestIndex extends Omit<RequestRecord, "value" | "error"> {
+  resultSeq?: number;
+}
 interface Options {
   directory: string;
   workspace: string;
@@ -63,12 +68,14 @@ export class RuntimeEngine {
   readonly files: FileTools;
   readonly commands: CommandSessions;
   readonly budget: SharedBudget;
-  #requests = new Map<string, RequestRecord>();
+  #requests = new Map<string, RequestIndex>();
   #responseIndex = new Map<string, number>();
   #live = new Map<string, Promise<Json>>();
   #timelineTail: Promise<unknown> = Promise.resolve();
   #modelSelectionTail: Promise<unknown> = Promise.resolve();
   #closing = false;
+  #ready = false;
+  #recoveryStage = "pending";
   #modelBlocked: (ModelBlock & { modelName?: string; modelRevision?: number }) | null = null;
   constructor(readonly options: Options) {
     if (
@@ -132,25 +139,88 @@ export class RuntimeEngine {
     });
   }
   get available() {
-    return !this.#closing && this.transactions.available && this.records.available &&
+    return this.#ready && !this.#closing && this.transactions.available && this.records.available &&
       this.notes.journal.available && this.memory.journal.available &&
       this.budget.journal.available && this.budget.settingsJournal.available &&
       this.agents.available;
   }
+  get recovery() {
+    return {
+      stage: this.#recoveryStage,
+      journals: {
+        consciousness: this.records.recovery,
+        actions: this.transactions.recovery,
+        modelResponses: this.modelResponses.recovery,
+      },
+    };
+  }
   async initialize() {
+    this.#recoveryStage = "consciousness";
     await Deno.mkdir(this.options.workspace, { recursive: true, mode: 0o700 });
     try {
+      await this.records.initialize();
+      const resumed = this.records.events.findLast((event) => event.kind === "model_resume");
+      const after = Number(
+        (resumed?.data as { actionsThroughSeq?: number } | undefined)?.actionsThroughSeq ?? 0,
+      );
+      if (!Number.isSafeInteger(after) || after < 0) {
+        throw new KernelError("corrupt", "模型恢复事实水位无效，保留原件");
+      }
+      this.#recoveryStage = "actions";
+      await this.transactions.initialize((event) => {
+        const data = event.data as unknown as RequestRecord;
+        if (event.kind === "request") {
+          if (
+            !data || typeof data.id !== "string" || !/^[a-f0-9]{64}$/.test(data.hash) ||
+            this.#requests.has(data.id)
+          ) {
+            throw new KernelError("corrupt", "执行请求索引异常");
+          }
+          this.#requests.set(data.id, {
+            id: data.id,
+            hash: data.hash,
+            namespace: data.namespace,
+            method: data.method,
+            recovery: data.recovery,
+            terminal: false,
+          });
+        } else if (event.kind === "result") {
+          const request = this.#requests.get(data.id);
+          if (
+            !request || request.terminal ||
+            data.error === undefined && !Object.hasOwn(data, "value")
+          ) {
+            throw new KernelError("corrupt", "执行回执缺少原请求");
+          }
+          request.resultSeq = event.seq;
+          request.terminal = true;
+          if (
+            event.seq > after && request.namespace === "model" && request.method === "complete" &&
+            /^model_[1-9][0-9]*$/.test(data.id)
+          ) {
+            const status = data.error
+              ? providerRejection(new KernelError(data.error.kind, data.error.message))
+              : undefined;
+            if (status !== undefined) this.#blockModel(data.id, status, event.at, request.recovery);
+          }
+        } else throw new KernelError("corrupt", "未知执行记录");
+      });
+      if (after > this.transactions.count) {
+        throw new KernelError("corrupt", "模型恢复事实水位无效，保留原件");
+      }
       for (
-        const service of [
-          this.records,
-          this.transactions,
-          this.modelResponses,
-          this.notes,
-          this.memory,
-          this.commands,
-          this.budget,
-        ]
-      ) await service.initialize();
+        const [name, service] of [
+          ["modelResponses", this.modelResponses],
+          ["notes", this.notes],
+          ["memory", this.memory],
+          ["commands", this.commands],
+          ["budget", this.budget],
+        ] as const
+      ) {
+        this.#recoveryStage = name;
+        await service.initialize();
+      }
+      this.#recoveryStage = "reconciling";
       const responseIds = new Set<string>();
       for (const event of this.modelResponses.events) {
         const data = event.data as unknown as { id: string; response: ModelResponse };
@@ -165,23 +235,6 @@ export class RuntimeEngine {
         this.#responseIndex.set(data.id, event.seq);
         // 原响应已落盘而预算结算前中断时，用原用量补记；不再调用模型或重复强化记忆。
         await this.budget.response(data.id, data.response);
-      }
-      for (const event of this.transactions.events) {
-        const data = event.data as unknown as RequestRecord;
-        if (event.kind === "request") {
-          if (
-            !data || typeof data.id !== "string" || !/^[a-f0-9]{64}$/.test(data.hash) ||
-            this.#requests.has(data.id)
-          ) throw new KernelError("corrupt", "执行请求索引异常");
-          this.#requests.set(data.id, { ...data, terminal: false });
-        } else if (event.kind === "result") {
-          const previous = this.#requests.get(data.id);
-          if (
-            !previous || previous.terminal ||
-            data.error === undefined && !Object.hasOwn(data, "value")
-          ) throw new KernelError("corrupt", "执行回执缺少原请求");
-          Object.assign(previous, data, { terminal: true });
-        } else throw new KernelError("corrupt", "未知执行记录");
       }
       // Reconcile agent originals first, so a completed reply also restores its outer receipt.
       await this.agents.initialize();
@@ -227,31 +280,10 @@ export class RuntimeEngine {
           );
         }
       }
-      // Resume is a separate, authenticated fact. Pausing, new notifications and restarts
-      // never erase a permanent rejection of the online consciousness request.
-      const resumed = this.records.events.findLast((event) => event.kind === "model_resume");
-      const after = Number(
-        (resumed?.data as { actionsThroughSeq?: number } | undefined)?.actionsThroughSeq ?? 0,
-      );
-      if (!Number.isSafeInteger(after) || after < 0 || after > this.transactions.events.length) {
-        throw new KernelError("corrupt", "模型恢复事实水位无效，保留原件");
-      }
-      for (let index = after; index < this.transactions.events.length; index++) {
-        const event = this.transactions.events[index];
-        const data = event.data as unknown as RequestRecord;
-        const request = this.#requests.get(data.id);
-        if (
-          event.kind !== "result" || request?.namespace !== "model" ||
-          request.method !== "complete" || !/^model_[1-9][0-9]*$/.test(data.id)
-        ) continue;
-        const status = data.error
-          ? providerRejection(new KernelError(data.error.kind, data.error.message))
-          : undefined;
-        if (status !== undefined) {
-          this.#blockModel(data.id, status, event.at, request.recovery);
-        }
-      }
+      this.#recoveryStage = "ready";
+      this.#ready = true;
     } catch (error) {
+      this.#recoveryStage = "failed";
       await this.close().catch(() => {});
       throw error;
     }
@@ -334,18 +366,52 @@ export class RuntimeEngine {
     this.#modelBlocked = null;
     return this.modelStatus();
   }
-  async #result(record: RequestRecord, result: { value?: Json; error?: WireError }) {
-    await this.transactions.append("result", { id: record.id, ...result } as unknown as Json);
-    Object.assign(record, result, { terminal: true });
+  async #result(record: RequestIndex, result: { value?: Json; error?: WireError }) {
+    const event = await this.transactions.append(
+      "result",
+      { id: record.id, ...result } as unknown as Json,
+    );
+    record.resultSeq = event.seq;
+    record.terminal = true;
   }
-  #value(record: RequestRecord): Json {
+  #original(record: RequestIndex): { value?: Json; error?: WireError } {
     if (!record.terminal) throw new KernelError("unknown", "原动作正在执行或尚未核对");
-    if (record.error) throw new KernelError(record.error.kind, record.error.message);
-    return structuredClone(record.value!);
+    const seq = record.resultSeq;
+    if (
+      typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 1 ||
+      seq > this.transactions.count
+    ) {
+      throw new KernelError("corrupt", "执行回执原件序号无效，原件保留");
+    }
+    // FactJournal checks file/chain/anchor outside a scoped read cache. Inside
+    // withReadCache it reuses verified bounded raw bytes, but JSON.parse is
+    // fresh on *each* access. Never cache the mutable parsed value here.
+    const event = this.transactions.events[seq - 1];
+    const data = event?.data as { id?: string; value?: Json; error?: WireError } | undefined;
+    if (
+      event?.seq !== seq || event?.kind !== "result" || !data || typeof data !== "object" ||
+      data.id !== record.id || data.error === undefined && !Object.hasOwn(data, "value")
+    ) throw new KernelError("corrupt", "执行回执原件与索引不符，原件保留");
+    return data;
   }
-  receipt(id: string) {
+  #value(record: RequestIndex): Json {
+    const result = this.#original(record);
+    if (result.error) throw new KernelError(result.error.kind, result.error.message);
+    // The verified journal read already returns a fresh JSON parse, not a
+    // shared object. Do not clone the potentially large value a second time.
+    return result.value!;
+  }
+  receipt(id: string): RequestRecord | undefined {
     const record = this.#requests.get(id);
-    return record?.terminal ? structuredClone(record) : undefined;
+    if (!record?.terminal) return;
+    const result = this.#original(record);
+    // Preserve the synchronous public shape; resultSeq is internal only.
+    const { resultSeq: _seq, ...metadata } = record;
+    return {
+      ...structuredClone(metadata),
+      ...(Object.hasOwn(result, "value") ? { value: result.value } : {}),
+      ...(Object.hasOwn(result, "error") ? { error: result.error } : {}),
+    };
   }
   async validateRepeat(namespace: string, method: string, args: Record<string, Json>, id: string) {
     const old = this.#requests.get(id);
@@ -413,7 +479,7 @@ export class RuntimeEngine {
     if (old && old.hash !== hash) throw new KernelError("rejected", "同一动作编号不能改变参数");
     if (old) return this.#live.has(id) ? await this.#live.get(id)! : this.#value(old);
     const operation = (async () => {
-      const record: RequestRecord = { id, namespace, method, hash, recovery, terminal: false };
+      const record: RequestIndex = { id, namespace, method, hash, recovery, terminal: false };
       this.#requests.set(id, record);
       await this.transactions.append("request", record as unknown as Json);
       try {

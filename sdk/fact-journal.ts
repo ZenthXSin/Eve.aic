@@ -200,7 +200,12 @@ export class FactJournal {
     const nextSeq = afterSeq + events.length;
     return { events, throughSeq, nextSeq, hasMore: nextSeq < throughSeq };
   }
-  async initialize() {
+  #recovery = { phase: "pending", read: 0, total: 0 };
+  get recovery() {
+    return { ...this.#recovery };
+  }
+  /** Consume each verified original once; callbacks must be synchronous. */
+  async initialize(replay?: (event: FactEvent) => void) {
     if (this.#lock || this.#closed || this.#closing || this.#initializing || this.#failed) {
       throw new KernelError("unavailable", "事实日志已被持有或不可恢复");
     }
@@ -228,6 +233,7 @@ export class FactJournal {
         throw new KernelError("unavailable", "已有写入者持有事实日志");
       }
       this.#lock = lock;
+      this.#recovery.phase = "counting";
       let count = 0;
       for await (const entry of Deno.readDir(`${this.directory}/events`)) {
         if (!entry.isFile || !/^\d{16}\.json$/.test(entry.name)) {
@@ -235,17 +241,36 @@ export class FactJournal {
         }
         count++;
       }
-      // 文件名从 1 连续递增，无须把目录条目或正文整体加载再排序。
-      for (let seq = 1; seq <= count; seq++) {
-        const path = `${this.directory}/events/${filename(seq)}`;
-        const stat = await Deno.lstat(path);
-        if (!stat.isFile || stat.isSymlink || stat.size > MAX_RECORD_BYTES) {
-          throw new Error("invalid file");
+      this.#recovery = { phase: "reading", read: 0, total: count };
+      // Bounded prefetch overlaps filesystem waits. Validate and project in chain order;
+      // never retain the complete history or release the lock with unfinished reads.
+      for (let start = 1; start <= count; start += 4) {
+        const reads = await Promise.allSettled(
+          Array.from({ length: Math.min(4, count - start + 1) }, async (_, offset) => {
+            const seq = start + offset;
+            const path = `${this.directory}/events/${filename(seq)}`;
+            const stat = await Deno.lstat(path);
+            if (!stat.isFile || stat.isSymlink || stat.size > MAX_RECORD_BYTES) {
+              throw new Error("invalid file");
+            }
+            return await Deno.readTextFile(path);
+          }),
+        );
+        for (let offset = 0; offset < reads.length; offset++) {
+          const read = reads[offset];
+          if (read.status === "rejected") throw read.reason;
+          const seq = start + offset;
+          const event = this.#validate(read.value, seq, this.#digest(seq - 1));
+          this.#index(event);
+          replay?.(event);
+          this.#recovery.read = seq;
         }
-        const event = this.#validate(await Deno.readTextFile(path), seq, this.#digest(seq - 1));
-        this.#index(event);
+        // Keep status, shutdown and other services responsive during long recovery.
+        if (this.#recovery.read % 128 === 0) await new Promise((r) => setTimeout(r, 0));
       }
+      this.#recovery.phase = "ready";
     } catch (error) {
+      this.#recovery.phase = "failed";
       lock?.close();
       this.#lock = undefined;
       throw this.#fail(
