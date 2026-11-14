@@ -28,6 +28,11 @@ export const TOOL_CATALOG = [
     namespace: "native",
     methods: [
       "execute_script",
+      "read_script",
+      "inspect_context",
+      "compress_context",
+      "set_focus",
+      "rest",
       "write_thought",
       "confirm_upgrade",
       "save_observation_note",
