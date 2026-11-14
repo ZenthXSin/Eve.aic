@@ -38,6 +38,8 @@ export interface Message {
   content: string;
   toolCalls?: ToolCall[];
   toolCallId?: string;
+  /** 原生 Responses 输出原件；仅未节选的 assistant 轮次用于传输续接。 */
+  modelOutput?: Json[];
   /** 仅 user 消息允许；工具结果中的图片须在全部工具配对后作为 user 图像输入。 */
   images?: ModelImage[];
 }
@@ -65,6 +67,8 @@ export interface ModelRequest {
 export interface ModelResponse {
   content: string;
   toolCalls: ToolCall[];
+  /** 不透明推理与原生输出标识仅用于下一轮续接，不解释为工具动作。 */
+  modelOutput?: Json[];
   /** 不存在的用量字段保持未知，尤其不能把缺失缓存统计写成 0。 */
   usage?: {
     status: "reported" | "partial" | "invalid";

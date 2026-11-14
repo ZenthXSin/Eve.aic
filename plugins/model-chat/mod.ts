@@ -4,7 +4,7 @@ import { ChatModelClient, ChatModelError, type ChatModelOptions } from "./client
 
 export interface PrivateModelConfig extends Omit<ChatModelOptions, "apiKey"> {
   apiKeyFile: string;
-  protocol: "chat";
+  protocol: "chat" | "responses";
 }
 
 export async function readPrivateModelConfig(path: string): Promise<PrivateModelConfig> {
@@ -12,7 +12,8 @@ export async function readPrivateModelConfig(path: string): Promise<PrivateModel
     const file = JSON.parse(await Deno.readTextFile(path));
     const model = file.model;
     if (
-      model === null || typeof model !== "object" || model.protocol !== "chat" ||
+      model === null || typeof model !== "object" ||
+      !["chat", "responses"].includes(model.protocol) ||
       typeof model.apiKeyFile !== "string" || !model.apiKeyFile.startsWith("/")
     ) throw new Error();
     return model as PrivateModelConfig;
