@@ -674,6 +674,15 @@ Deno.test("脚本预热：空载待命且任务之间不共享全局状态，耗
       assert.equal(f.count(), 0);
       receipts.push(receipt);
     }
+    for (const requestId of ["same-code-send-first", "same-code-send-second"]) {
+      const job = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId,
+        code:
+          'return await tools.phone.send({conversationId:"qq:user:friend",text:"同源码新动作"});',
+      });
+      assert.equal((await settleScript(f.kernel(), job)).status, "completed");
+    }
+    assert.equal(f.count(), 2);
     const completions = await f.kernel().call<{ items: { job: Json }[] }>(
       "scripts",
       "completions",
