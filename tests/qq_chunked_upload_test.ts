@@ -7,6 +7,9 @@ const hash = (b: Uint8Array, alg = "md5") => createHash(alg).update(b).digest("h
 for (
   const mode of [
     "success",
+    "string-size",
+    "group",
+    "invalid-size",
     "put",
     "finish",
     "merge",
@@ -61,7 +64,20 @@ for (
           if (mode === "duplicate") parts[0].index = 1;
           if (mode === "short") parts.pop();
           if (mode === "external") parts[0].presigned_url = "https://example.org/private?secret";
-          return Response.json({ upload_id: "resource", block_size: size, parts });
+          return Response.json({
+            upload_id: "resource",
+            block_size: mode === "string-size"
+              ? String(size)
+              : mode === "invalid-size"
+              ? "3145728junk"
+              : size,
+            parts: mode === "string-size"
+              ? parts.map((p) => ({
+                ...p,
+                block_size: String(p.index === 1 ? size : bytes.length - size),
+              }))
+              : parts,
+          });
         }
         if (path.endsWith("upload_part_finish")) {
           finishes++;
@@ -98,27 +114,34 @@ for (
     const url = `http://127.0.0.1:${server.addr.port}`;
     const client = new QqClient({ appId: "test", appSecret: "secret" }, {
       baseUrl: url,
+      sendScope: "all",
       uploadTimeoutMs: mode === "timeout" ? 50 : 2000,
       attachmentReader: () => Promise.resolve(bytes),
     });
     try {
       const result = await client.sendText({
-        destination: { kind: "user", openId: "target" },
+        destination: { kind: mode === "group" ? "group" : "user", openId: "target" },
         text: "file",
         attachment: { path: "/test.zip", kind: "file" },
       });
       assert.equal(
         result.status,
-        mode === "success" ? "sent" : mode === "unknown" ? "unknown" : "failed",
+        ["success", "string-size", "group"].includes(mode)
+          ? "sent"
+          : mode === "unknown"
+          ? "unknown"
+          : "failed",
       );
-      assert.equal(messages, mode === "success" || mode === "unknown" ? 1 : 0);
+      assert.equal(messages, ["success", "string-size", "group", "unknown"].includes(mode) ? 1 : 0);
       if (result.status === "failed") {
         assert.equal(result.attempted, false);
         assert.equal(result.error.failureStage, "upload");
         assert.equal(JSON.stringify(result).includes("secret"), false);
       }
-      if (["duplicate", "short", "external"].includes(mode)) assert.equal(puts, 0);
-      if (mode === "success") assert.deepEqual([puts, finishes, merges, messages], [2, 2, 1, 1]);
+      if (["duplicate", "short", "external", "invalid-size"].includes(mode)) assert.equal(puts, 0);
+      if (["success", "string-size", "group"].includes(mode)) {
+        assert.deepEqual([puts, finishes, merges, messages], [2, 2, 1, 1]);
+      }
     } finally {
       client.close();
       await server.shutdown();
