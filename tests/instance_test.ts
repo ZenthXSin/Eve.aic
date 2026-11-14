@@ -111,7 +111,7 @@ async function fixture(
       connectionFile: `${directory}/instance.json`,
       guardianConnectionFile: `${directory}/guardian.json`,
       credentialFile: `${directory}/actor.key`,
-      leaseMs: options.renewalMs ?? 600,
+      leaseMs: options.renewalMs ?? 6000,
     },
     runtime: {
       connectionFile: `${directory}/runtime.json`,
@@ -354,7 +354,7 @@ Deno.test("固定版本宿主：拒绝同目录双宿主与旧代际激活和读
 });
 
 Deno.test("固定版本宿主：600毫秒租约覆盖慢分页准备，准备返回后停止续租", async () => {
-  const f = await fixture({ leaseMs: 600 });
+  const f = await fixture({ leaseMs: 600, renewalMs: 600 });
   try {
     for (let i = 0; i < 3; i++) await f.engine.records.append("notice", { origin: `old-${i}` });
     const dispatch = f.engine.dispatch.bind(f.engine);
@@ -384,7 +384,7 @@ Deno.test("固定版本宿主：600毫秒租约覆盖慢分页准备，准备返
 });
 
 Deno.test("固定版本宿主：优雅停止在途模型超过租期时仍保存真实回复", async () => {
-  const f = await fixture({ leaseMs: 600, modelDelayMs: 1500 });
+  const f = await fixture({ leaseMs: 600, renewalMs: 600, modelDelayMs: 1500 });
   try {
     await f.call("activate");
     await waitFor(() => f.requests.length === 1);
@@ -498,6 +498,7 @@ Deno.test("续租：通信未知在有效租约内重试，明确失效仍停用
     assert.equal((await f.call("status") as { state: string }).state, "active");
     await f.authority.pause({ requestId: "real-pause", expectedEpoch: f.authority.status().epoch });
     await waitFor(async () => (await f.call("status") as { state: string }).state === "lease_lost");
+    await waitFor(async () => JSON.parse(await Deno.readTextFile(diagnosticPath)).retry === false);
     const diagnostic = JSON.parse(await Deno.readTextFile(diagnosticPath));
     assert.equal(diagnostic.retry, false);
     assert.equal(diagnostic.error.kind, "unavailable");
@@ -514,9 +515,16 @@ Deno.test("续租：通信持续未知不得越过最后确认的租约期限继
     await f.call("activate");
     f.failRenewals(1000);
     await waitFor(async () => (await f.call("status") as { state: string }).state === "lease_lost");
-    const diagnostic = JSON.parse(
-      await Deno.readTextFile(`${f.directory}/instance/lease-failure.json`),
-    );
+    const diagnosticPath = `${f.directory}/instance/lease-failure.json`;
+    await waitFor(async () => {
+      try {
+        return JSON.parse(await Deno.readTextFile(diagnosticPath)).retry === false;
+      } catch (error) {
+        if (error instanceof Deno.errors.NotFound) return false;
+        throw error;
+      }
+    });
+    const diagnostic = JSON.parse(await Deno.readTextFile(diagnosticPath));
     assert.equal(diagnostic.error.kind, "unknown");
     assert.equal(diagnostic.retry, false);
     assert.ok(Date.parse(diagnostic.at) >= diagnostic.leaseExpiresAt);
