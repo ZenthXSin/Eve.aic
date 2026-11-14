@@ -132,7 +132,7 @@ export class QqPhone {
     readonly autoDownloadAttachments = false,
   ) {}
 
-  async #snapshot(options: { storedNotifications?: boolean } = {}) {
+  async #snapshot(options: { storedNotifications?: boolean; notificationAfterSeq?: number } = {}) {
     const incoming = this.incoming();
     if (
       incoming.length < this.#contactsThrough ||
@@ -242,6 +242,12 @@ export class QqPhone {
     if (this.autoDownloadAttachments && this.downloads) {
       for (const row of rows) {
         if (row.message.direction !== "incoming") continue;
+        // Notifications cannot return rows at/before their cursor. Leave those originals
+        // untouched, and check their local attachment state only when actually opened.
+        if (
+          options.notificationAfterSeq !== undefined &&
+          row.message.seq <= options.notificationAfterSeq
+        ) continue;
         for (const [index, attachment] of (row.message.attachments ?? []).entries()) {
           const id = `${row.message.conversationId}:${row.message.seq}:${index + 1}`;
           let local;
@@ -506,7 +512,7 @@ export class QqPhone {
   async notifications(args: { afterSeq?: number } = {}) {
     const after = args.afterSeq ?? 0;
     integer(after, 0);
-    const rows = await this.#snapshot();
+    const rows = await this.#snapshot({ notificationAfterSeq: after });
     if (after > (rows.at(-1)?.message.seq ?? 0)) throw new QqPhoneError("request");
     const eligible = rows.filter((row) =>
       row.notify && row.message.seq > after &&

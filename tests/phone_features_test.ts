@@ -684,3 +684,41 @@ Deno.test("手机备注短名：群与私信共用唯一索引，动作按原编
     await f.close();
   }
 });
+
+Deno.test("通知增量读取不探测游标前历史附件，新通知和旧消息打开仍实时检查", async () => {
+  const f = await fixture(true);
+  try {
+    const first = await f.incoming(1, "user-a", `${f.origin}/asset`);
+    await f.phone.prefetchAttachments(first);
+    const old = await f.phone.message({ handle: { conversationId: "qq:user:user-a", seq: 1 } });
+    const saved = old.attachments[0].download;
+    assert.equal(saved?.state, "ready");
+    let probes = 0;
+    const local = f.files.local.bind(f.files);
+    f.files.local = (id) => {
+      probes++;
+      return local(id);
+    };
+    const empty = await f.phone.notifications({ afterSeq: 1 });
+    assert.deepEqual(empty, { items: [], throughSeq: 1, hasMore: false });
+    assert.equal(probes, 0);
+    const second = await f.incoming(2, "user-a", `${f.origin}/asset`);
+    await f.phone.prefetchAttachments(second);
+    probes = 0;
+    const page = await f.phone.notifications({ afterSeq: 1 });
+    assert.equal(probes, 1);
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].handle.seq, 2);
+    assert.equal(page.items[0].attachments[0].download?.state, "ready");
+    assert.equal(page.throughSeq, 2);
+    if (saved?.state !== "ready") throw new Error("missing fixture attachment");
+    await Deno.remove(saved.path);
+    const reopened = await f.phone.message({ handle: old.handle });
+    assert.equal(reopened.attachments[0].download?.state, "cleared");
+    const fromStart = await f.phone.notifications({ afterSeq: 0 });
+    assert.equal(fromStart.items[0].attachments[0].download?.state, "cleared");
+    assert.equal(f.requests.length, 0);
+  } finally {
+    await f.close();
+  }
+});
