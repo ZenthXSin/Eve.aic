@@ -342,6 +342,7 @@ export class EveRuntime {
       }
     }
   }
+  #noticeTiming: Record<string, number> = {};
   async #notices(): Promise<boolean> {
     this.#restApplied = false;
     this.#phoneFresh = false;
@@ -349,17 +350,38 @@ export class EveRuntime {
     this.#alarmFresh = false;
     this.#commandFresh = false;
     let fresh = false;
+    this.#noticeTiming = {};
+    const measure = async <T>(name: string, operation: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      try {
+        return await operation();
+      } finally {
+        this.#noticeTiming[name] = performance.now() - started;
+      }
+    };
     // Reads are independent; apply their receipts in the established deterministic order.
     const [, phone, tasks, completed, controls, agents] = await Promise.all([
-      this.#refreshBudget(),
-      this.ctx.call<Json>("phone", "notifications", { afterSeq: this.#phoneThrough }),
-      this.ctx.call<Json>("scripts", "completions", { afterSeq: this.#scriptThrough }),
+      measure("budgetMs", () => this.#refreshBudget()),
+      measure(
+        "phoneMs",
+        () => this.ctx.call<Json>("phone", "notifications", { afterSeq: this.#phoneThrough }),
+      ),
+      measure(
+        "scriptsMs",
+        () => this.ctx.call<Json>("scripts", "completions", { afterSeq: this.#scriptThrough }),
+      ),
       this.config.remoteRecords
-        ? this.ctx.call("commands", "completions", { afterSeq: this.#commandThrough })
+        ? measure(
+          "commandsMs",
+          () => this.ctx.call("commands", "completions", { afterSeq: this.#commandThrough }),
+        )
         : Promise.resolve(undefined),
-      this.ctx.call<Json>("mind", "poll", { afterSeq: this.#mindThrough }),
+      measure("mindMs", () => this.ctx.call<Json>("mind", "poll", { afterSeq: this.#mindThrough })),
       this.config.agentsEnabled
-        ? this.ctx.call<Json>("agents", "notifications", { afterSeq: this.#agentThrough })
+        ? measure(
+          "agentsMs",
+          () => this.ctx.call<Json>("agents", "notifications", { afterSeq: this.#agentThrough }),
+        )
         : Promise.resolve(undefined),
     ]);
     const page = phone as unknown as { items: Json[]; throughSeq: number; hasMore: boolean };
@@ -738,39 +760,7 @@ export class EveRuntime {
     const toolsStarted = performance.now();
     const tools = await this.#tools();
     const toolsListMs = performance.now() - toolsStarted;
-    const recallStarted = performance.now();
-    if (this.config.remoteRecords) {
-      if (this.#sharedBudget?.paused) return;
-      const query = recallQuery(activeEvents(this.journal.events));
-      const anchor = activeEvents(this.journal.events).findLast((e) =>
-        e.kind === "model_response" || e.kind === "tool_result" ||
-        e.kind === "notice" && (e.data as { source?: string }).source !== "memory"
-      )?.seq ?? 0;
-      const lastRecall = activeEvents(this.journal.events).findLast((e) =>
-        e.kind === "notice" && (e.data as { source?: string }).source === "memory"
-      );
-      if (query && (lastRecall?.data as { anchor?: number } | undefined)?.anchor !== anchor) {
-        let recalled: { items: Json[] };
-        try {
-          recalled = await this.ctx.call("memory", "recall", {
-            query,
-            limit: 3,
-            _actionId: `recall_${anchor}`,
-          }) as {
-            items: Json[];
-          };
-        } catch (error) {
-          if (
-            !(error instanceof KernelError && ["unavailable", "not_found"].includes(error.kind))
-          ) {
-            throw error;
-          }
-          recalled = { items: [] };
-        }
-        await this.journal.append("notice", { source: "memory", anchor, items: recalled.items });
-      }
-    }
-    const recallMs = performance.now() - recallStarted;
+    if (this.config.remoteRecords && this.#sharedBudget?.paused) return;
     const lastResponse = activeEvents(this.journal.events).findLast((e) =>
       e.kind === "model_response"
     );
@@ -779,9 +769,62 @@ export class EveRuntime {
     const pendingJobs = [...this.#observedJobs.values()].some((j) =>
       !["completed", "failed", "cancelled", "unknown"].includes(j.status)
     );
-    const selfContextStarted = performance.now();
-    await this.#selfContext(!fresh && !hasActions && !pendingJobs);
-    const selfContextMs = performance.now() - selfContextStarted;
+    let recallMs = 0, selfContextMs = 0;
+    // Both reads follow notices/tools; self notes do not depend on recall's journal append.
+    // Settle both before any retry, so a late read cannot mutate the next round.
+    const prepared = await Promise.allSettled([
+      (async () => {
+        const started = performance.now();
+        try {
+          if (this.config.remoteRecords) {
+            const query = recallQuery(activeEvents(this.journal.events));
+            const anchor = activeEvents(this.journal.events).findLast((e) =>
+              e.kind === "model_response" || e.kind === "tool_result" ||
+              e.kind === "notice" && (e.data as { source?: string }).source !== "memory"
+            )?.seq ?? 0;
+            const lastRecall = activeEvents(this.journal.events).findLast((e) =>
+              e.kind === "notice" && (e.data as { source?: string }).source === "memory"
+            );
+            if (query && (lastRecall?.data as { anchor?: number } | undefined)?.anchor !== anchor) {
+              let recalled: { items: Json[] };
+              try {
+                recalled = await this.ctx.call("memory", "recall", {
+                  query,
+                  limit: 3,
+                  _actionId: `recall_${anchor}`,
+                }) as {
+                  items: Json[];
+                };
+              } catch (error) {
+                if (
+                  !(error instanceof KernelError &&
+                    ["unavailable", "not_found"].includes(error.kind))
+                ) {
+                  throw error;
+                }
+                recalled = { items: [] };
+              }
+              await this.journal.append("notice", {
+                source: "memory",
+                anchor,
+                items: recalled.items,
+              });
+            }
+          }
+        } finally {
+          recallMs = performance.now() - started;
+        }
+      })(),
+      (async () => {
+        const started = performance.now();
+        try {
+          await this.#selfContext(!fresh && !hasActions && !pendingJobs);
+        } finally {
+          selfContextMs = performance.now() - started;
+        }
+      })(),
+    ]);
+    for (const result of prepared) if (result.status === "rejected") throw result.reason;
     const contextStarted = performance.now();
     // 必须先固定初次投影，再判断 500k 机械保护，避免旧 raw 历史误触压缩。
     let messages = await this.#projectContext(tools);
@@ -903,6 +946,7 @@ export class EveRuntime {
       runtimeTiming: {
         pendingScanMs,
         noticesMs,
+        noticeReads: this.#noticeTiming,
         toolsListMs,
         recallMs,
         selfContextMs,

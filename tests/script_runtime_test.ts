@@ -646,3 +646,42 @@ Deno.test("脚本：详细契约可按需读取并分页，未知名称拒绝，
     await f.close();
   }
 });
+
+Deno.test("脚本预热：空载待命且任务之间不共享全局状态，耗时回执重启后不变", async () => {
+  const f = await fixture();
+  try {
+    const receipts: ScriptSummary[] = [];
+    for (const requestId of ["prewarm-first", "prewarm-second"]) {
+      const started = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId,
+        code: `const state = globalThis as typeof globalThis & { previous?: string };
+          const previous = state.previous ?? null; state.previous = "another job"; return previous;`,
+      });
+      const job = await settleScript(f.kernel(), started);
+      const receipt = await f.kernel().call<ScriptSummary & Json>("scripts", "status", {
+        jobId: job.jobId,
+      });
+      assert.equal(receipt.status, "completed");
+      assert.equal(receipt.timing?.prewarmed, true);
+      for (const field of ["checkMs", "workerWaitMs", "preparationMs", "executionMs"] as const) {
+        assert.ok(Number.isFinite(receipt.timing?.[field]));
+        assert.ok(receipt.timing![field]! >= 0);
+      }
+      const result = await f.kernel().call<{ text: string }>("scripts", "result", {
+        jobId: job.jobId,
+      });
+      assert.equal(result.text, "null");
+      assert.equal(f.count(), 0);
+      receipts.push(receipt);
+    }
+    await f.restart();
+    for (const receipt of receipts) {
+      assert.deepEqual(
+        await f.kernel().call("scripts", "status", { jobId: receipt.jobId }),
+        receipt,
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});

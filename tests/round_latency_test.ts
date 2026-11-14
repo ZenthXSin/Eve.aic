@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { FactJournal } from "../sdk/fact-journal.ts";
+import type { Json } from "../kernel/protocol.ts";
 import { EveRuntime } from "../plugins/eve/runtime.ts";
 import { pendingTools } from "../plugins/eve/view.ts";
 import type { ConsciousEvent } from "../plugins/eve/journal.ts";
@@ -107,6 +109,108 @@ Deno.test("轮次：独立通知并行读取，模型决定和工具回执后立
   } finally {
     clearTimeout(timer);
     await runtime.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("轮次准备：记忆与自我便签并行就绪后才组装模型上下文", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-round-prepare-" });
+  const source = new FactJournal(`${directory}/source`);
+  let release!: () => void, complete!: () => void;
+  const gate = new Promise<void>((done) => release = done);
+  const model = new Promise<void>((done) => complete = done);
+  const entered = new Set<string>();
+  const ctx = {
+    async call(contract: string, method: string, args: Record<string, Json>) {
+      const address = `${contract}.${method}`;
+      if (address === "timeline.page") {
+        const page = source.readPage(Number(args.afterSeq));
+        return { items: page.events, throughSeq: page.nextSeq, hasMore: page.hasMore };
+      }
+      if (address === "timeline.append") return await source.append(String(args.kind), args.data);
+      if (address === "model.budget") {
+        return {
+          dailyTokenBudget: 50000000,
+          timeZone: "Asia/Tokyo",
+          paused: false,
+          day: "2026-11-14",
+          knownNoncachedTokens: 0,
+          unknownReservedTokens: 0,
+          safetyTotal: 0,
+          safeRemaining: 50000000,
+        };
+      }
+      if (
+        ["phone.notifications", "scripts.completions", "commands.completions", "mind.poll"]
+          .includes(address)
+      ) {
+        return { items: [], throughSeq: 0 };
+      }
+      if (address === "mind.update") return {};
+      if (address === "tools.list") return [];
+      if (["notes.self", "memory.recall"].includes(address)) {
+        entered.add(address);
+        if (entered.size === 2) release();
+        await gate;
+        return address === "notes.self"
+          ? {
+            aboutMe: { id: "self", revision: 1, tokens: 1, encoding: "test", content: "self-note" },
+            ideas: [],
+          }
+          : { items: [{ text: "recalled-memory" }] };
+      }
+      if (address === "model.complete") {
+        assert.equal(entered.size, 2);
+        const text = JSON.stringify(args.messages);
+        assert.ok(text.includes("self-note"));
+        assert.ok(text.includes("recalled-memory"));
+        complete();
+        return { content: "done", toolCalls: [] };
+      }
+      throw new Error(address);
+    },
+  } as unknown as PluginContext;
+  const runtime = new EveRuntime(ctx, {
+    directory: `${directory}/journal`,
+    promptFile: `${directory}/prompt`,
+    sourceCommit: "test",
+    modelTimeoutMs: 5000,
+    maxOutputTokens: 100,
+    pollMs: 60000,
+    defaultSleepMs: 3600000,
+    dailyTokenBudget: 50000000,
+    remoteRecords: true,
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await source.initialize();
+    await source.append("model_response", {
+      response: { content: "需要召回的上一轮", toolCalls: [] },
+    });
+    await Deno.writeTextFile(`${directory}/prompt`, "test");
+    await runtime.initialize();
+    runtime.start();
+    await Promise.race([
+      model,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("独立准备没有并行完成")), 5000);
+      }),
+    ]);
+    const timing = source.events.findLast((event) => event.kind === "model_start")!.data as {
+      runtimeTiming: { noticeReads: Record<string, number> };
+    };
+    assert.deepEqual(Object.keys(timing.runtimeTiming.noticeReads).sort(), [
+      "budgetMs",
+      "commandsMs",
+      "mindMs",
+      "phoneMs",
+      "scriptsMs",
+    ]);
+  } finally {
+    release();
+    clearTimeout(timer);
+    await runtime.close();
+    await source.close();
     await Deno.remove(directory, { recursive: true });
   }
 });

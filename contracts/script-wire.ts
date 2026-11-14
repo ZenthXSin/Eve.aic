@@ -1,6 +1,7 @@
 import type { Json, WireError } from "../kernel/protocol.ts";
 
 export type FromScript =
+  | { t: "ready" }
   | { t: "invoke"; seq: number; namespace: string; method: string; args: Json }
   | { t: "finished"; value: Json }
   | { t: "failed"; error: WireError };

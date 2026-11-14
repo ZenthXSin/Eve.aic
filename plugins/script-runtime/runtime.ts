@@ -1,16 +1,20 @@
 import { PHONE_METHODS } from "../../contracts/phone-rpc.ts";
 import { RUNTIME_METHODS } from "../../contracts/runtime.ts";
 import { UPGRADE_METHODS } from "../../contracts/upgrades.ts";
-import type { ScriptRequest, ScriptSummary } from "../../contracts/script.ts";
+import type { ScriptRequest, ScriptSummary, ScriptTiming } from "../../contracts/script.ts";
 import type { FromScript } from "../../contracts/script-wire.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError, toWireError, type WireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
 import { imageTextView } from "../../sdk/image-text.ts";
 import { type JobRecord, ScriptStore } from "./store.ts";
+import { ScriptWorkerSlot } from "./worker-slot.ts";
 
 interface LiveJob {
-  worker?: Worker;
+  slot?: ScriptWorkerSlot;
+  started: number;
+  dispatched?: number;
+  timing: ScriptTiming;
   checker?: Deno.ChildProcess;
   timer?: ReturnType<typeof setTimeout>;
   done: Promise<void>;
@@ -49,6 +53,7 @@ function summary(job: JobRecord): ScriptSummary {
     status: job.status,
     scriptStarted: job.scriptStarted,
     actions: job.actions.length,
+    ...(job.timing ? { timing: job.timing } : {}),
     startedAt: job.startedAt,
     ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
     ...(job.error ? { error: job.error } : {}),
@@ -72,6 +77,7 @@ export class ScriptRuntime {
   #live = new Map<string, LiveJob>();
   #starting = new Map<string, Promise<ScriptSummary>>();
   #closing = false;
+  #warmWorker?: ScriptWorkerSlot;
   #retiring = new Set<Promise<void>>();
   constructor(readonly ctx: PluginContext, readonly config: ScriptConfig) {
     this.store = new ScriptStore(`${config.directory}/ledger`);
@@ -164,6 +170,17 @@ export class ScriptRuntime {
       if (error instanceof KernelError && error.kind === "storage") throw error;
       throw new KernelError("corrupt", "脚本状态或原请求校验失败，原件保留");
     }
+    this.#prewarm();
+  }
+  #prewarm() {
+    if (this.#closing || this.#warmWorker && !this.#warmWorker.failed) return;
+    // Only one empty sandbox is retained; executed sandboxes are never reused.
+    try {
+      this.#warmWorker = new ScriptWorkerSlot();
+    } catch {
+      // Optional warmup cannot make an otherwise healthy ledger unavailable.
+      this.#warmWorker = undefined;
+    }
   }
   #identity(request: ScriptRequest): Json {
     return { code: request.code, timeoutMs: request.timeoutMs ?? this.config.defaultTimeoutMs };
@@ -211,7 +228,15 @@ export class ScriptRuntime {
       const done = new Promise<void>((finish) => {
         resolve = finish;
       });
-      const live: LiveJob = { done, resolve, invocations: new Set(), nextSeq: 0, finishing: false };
+      const live: LiveJob = {
+        done,
+        resolve,
+        invocations: new Set(),
+        nextSeq: 0,
+        finishing: false,
+        started: performance.now(),
+        timing: { prewarmed: false },
+      };
       this.#live.set(jobId, live);
       const expire = () => {
         void this.#finish(jobId, "unknown", {
@@ -280,68 +305,16 @@ export class ScriptRuntime {
       await Deno.writeTextFile(path, code, { mode: 0o600, createNew: true });
     }
     if (live.finishing) return;
-    const checker = new Deno.Command(this.config.denoBinary, {
-      args: ["check", "--no-config", "--no-lock", "--no-remote", "--no-npm", path],
-      clearEnv: true,
-      env: { DENO_DIR: this.config.cacheDirectory },
-      stdin: "null",
-      stdout: "null",
-      stderr: "piped",
-    }).spawn();
-    live.checker = checker;
-    let diagnostic = "";
-    const decoder = new TextDecoder();
-    for await (const chunk of checker.stderr) {
-      if (diagnostic.length < 16_384) {
-        diagnostic += decoder.decode(chunk, { stream: true }).slice(0, 16_384 - diagnostic.length);
-      }
-    }
-    const checked = await checker.status;
-    live.checker = undefined;
-    if (live.finishing) return;
-    if (!checked.success) {
-      await this.#finish(jobId, "failed", {
-        kind: "rejected",
-        message: `脚本类型检查未通过，未开始执行：${diagnostic}`,
-      });
-      return;
-    }
-    if (await Deno.readTextFile(path) !== code) {
-      throw new KernelError("corrupt", "类型检查期间脚本原件发生变化，未执行");
-    }
-    await this.store.change((state) => {
-      const job = state.jobs[this.store.jobIndex(jobId)];
-      job.status = "running";
-      job.scriptStarted = true;
-    });
-    if (live.finishing) return;
-    const worker = new Worker(
-      new URL("./worker.ts", import.meta.url),
-      {
-        type: "module",
-        name: `eve-script-${jobId.slice(0, 12)}`,
-        deno: {
-          permissions: {
-            read: [
-              path,
-              new URL("../../contracts/", import.meta.url).pathname,
-              new URL("../../kernel/protocol.ts", import.meta.url).pathname,
-              new URL("./worker.ts", import.meta.url).pathname,
-            ],
-            write: false,
-            net: false,
-            run: false,
-            env: false,
-            ffi: false,
-            sys: false,
-          },
-        },
-      } as unknown as WorkerOptions,
-    );
-    live.worker = worker;
+    // Start an empty sandbox while checking; no user code can run yet.
+    const warm = this.#warmWorker;
+    this.#warmWorker = undefined;
+    const slot = warm && !warm.failed ? warm : new ScriptWorkerSlot();
+    live.slot = slot;
+    live.timing.prewarmed = slot === warm;
+    const worker = slot.worker;
     worker.onmessage = (event: MessageEvent<FromScript>) => {
       const message = event.data;
-      if (live.finishing) return;
+      if (live.finishing || message.t === "ready") return;
       if (message.t === "finished") {
         void this.#finish(jobId, "completed", undefined, message.value).catch(() => {});
       } else if (message.t === "failed") {
@@ -374,11 +347,57 @@ export class ScriptRuntime {
         message: `脚本worker失败：${event.message}`,
       }).catch(() => {});
     };
+    const checkStarted = performance.now();
+    const checker = new Deno.Command(this.config.denoBinary, {
+      args: ["check", "--no-config", "--no-lock", "--no-remote", "--no-npm", path],
+      clearEnv: true,
+      env: { DENO_DIR: this.config.cacheDirectory },
+      stdin: "null",
+      stdout: "null",
+      stderr: "piped",
+    }).spawn();
+    live.checker = checker;
+    let diagnostic = "";
+    const decoder = new TextDecoder();
+    for await (const chunk of checker.stderr) {
+      if (diagnostic.length < 16_384) {
+        diagnostic += decoder.decode(chunk, { stream: true }).slice(0, 16_384 - diagnostic.length);
+      }
+    }
+    const checked = await checker.status;
+    live.timing.checkMs = performance.now() - checkStarted;
+    live.checker = undefined;
+    if (live.finishing) return;
+    if (!checked.success) {
+      await this.#finish(jobId, "failed", {
+        kind: "rejected",
+        message: `脚本类型检查未通过，未开始执行：${diagnostic}`,
+      });
+      return;
+    }
+    if (await Deno.readTextFile(path) !== code) {
+      throw new KernelError("corrupt", "类型检查期间脚本原件发生变化，未执行");
+    }
+    const workerWaitStarted = performance.now();
+    const ready = await slot.ready;
+    live.timing.workerWaitMs = performance.now() - workerWaitStarted;
+    if (live.finishing) return;
+    if (!ready) throw new KernelError("unavailable", "脚本隔离worker未就绪，未执行");
+    live.timing.preparationMs = performance.now() - live.started;
+    await this.store.change((state) => {
+      const job = state.jobs[this.store.jobIndex(jobId)];
+      job.timing = { ...live.timing };
+      job.status = "running";
+      job.scriptStarted = true;
+    });
+    if (live.finishing) return;
+    live.dispatched = performance.now();
     // 执行请求保存的不可变源码，而不是再次读取可能被并发改写的同一路径。
     worker.postMessage({
       t: "start",
       moduleUrl: `data:application/typescript,${encodeURIComponent(code)}`,
     });
+    this.#prewarm();
   }
 
   async contracts(args: { name: string; startChar?: number; limit?: number }) {
@@ -508,13 +527,17 @@ export class ScriptRuntime {
     if (!live || live.finishing) return;
     live.finishing = true;
     clearTimeout(live.timer);
-    live.worker?.terminate();
+    live.slot?.close();
+    if (live.dispatched !== undefined) {
+      live.timing.executionMs = performance.now() - live.dispatched;
+    }
     try {
       live.checker?.kill("SIGKILL");
     } catch { /* 已停 */ }
     try {
       await this.store.change((state) => {
         const job = state.jobs[this.store.jobIndex(jobId)];
+        job.timing = { ...live.timing };
         const pending = job.actions.some((action) =>
           action.status === "started" || action.status === "unknown"
         );
@@ -533,6 +556,7 @@ export class ScriptRuntime {
       });
     } finally {
       live.resolve();
+      this.#prewarm();
       const retiring = (async () => {
         await live.runner;
         await Promise.allSettled([...live.invocations]);
@@ -675,6 +699,8 @@ export class ScriptRuntime {
   }
   async close() {
     this.#closing = true;
+    this.#warmWorker?.close();
+    this.#warmWorker = undefined;
     try {
       for (const [id, live] of this.#live) if (!live.finishing) await this.cancel({ jobId: id });
       await Promise.allSettled(

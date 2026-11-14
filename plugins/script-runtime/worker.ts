@@ -82,3 +82,6 @@ self.onmessage = async (event: MessageEvent<ToScript>) => {
     send({ t: "failed", error: toWireError(error) });
   }
 };
+
+// Bootstrap acknowledgement contains no script execution or tool invocation.
+send({ t: "ready" });
