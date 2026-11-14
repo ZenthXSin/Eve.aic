@@ -128,6 +128,7 @@ Deno.test("生活接续：重心跨工具、休息、重启与压缩保留，版
     await f.eve.pulse();
     const event = f.eve.journal.events.find((e) => e.kind === "focus")!;
     assert.ok(event);
+    assert.equal(f.eve.status().continuity?.focusRecordSeq, event.seq);
     await f.eve.pulse();
     assert.ok(JSON.stringify(f.messages[1]).includes("研究星星"));
     await f.eve.pulse();

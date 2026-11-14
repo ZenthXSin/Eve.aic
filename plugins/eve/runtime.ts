@@ -1171,6 +1171,16 @@ export class EveRuntime {
       contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
       contextComposition: this.#contextComposition ?? null,
       modelBlocked: this.#modelBlocked,
+      ...(this.config.restReviewEnabled
+        ? {
+          continuity: {
+            enabled: true,
+            focusRecordSeq: lastActiveEvent(this.journal.events, "focus")?.seq ?? 0,
+            pendingRestReviewSeq: pendingRestReview(this.journal.events)?.seq ?? null,
+            lastRestSeq: lastActiveEvent(this.journal.events, "rest")?.seq ?? null,
+          },
+        }
+        : {}),
     };
   }
   async resumeModel(expectedRequestId: string) {
