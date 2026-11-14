@@ -393,15 +393,29 @@ Deno.test("固定版本宿主：600毫秒租约覆盖慢分页准备，准备返
 });
 
 Deno.test("固定版本宿主：优雅停止在途模型超过租期时仍保存真实回复", async () => {
-  const f = await fixture({ leaseMs: 600, renewalMs: 600, modelDelayMs: 1500 });
+  // Preserve the important inequality (model duration > two lease periods), while
+  // allowing real loopback RPC and durable fsync to run on a loaded small host.
+  // The separate 600ms preparation/lease-loss tests keep subsecond coverage.
+  const leaseMs = 5000;
+  const f = await fixture({ leaseMs, renewalMs: leaseMs, modelDelayMs: 11000 });
   try {
     await f.call("activate");
     await waitFor(() => f.requests.length === 1);
+    const initialExpiry = f.authority.status().owner!.expiresAt;
     await f.call("deactivate");
+    assert.ok(
+      f.authority.status().owner!.expiresAt > initialExpiry + leaseMs,
+      "排空期间必须真实续租跨过原租期，不能仅仅延长停止等待",
+    );
     assert.equal((await f.call("status") as Record<string, Json>).state, "standby");
     assert.equal(
       f.engine.records.events.filter((event) => event.kind === "model_response").length,
       1,
+      JSON.stringify({
+        originalResponses: f.engine.modelResponses.events.length,
+        failures: f.engine.records.events.filter((event) => event.kind === "model_failure"),
+        owner: f.authority.status().owner,
+      }),
     );
     assert.equal(
       f.engine.records.events.filter((event) => event.kind === "model_failure").length,
