@@ -400,8 +400,9 @@ Deno.test("脚本：显式异步，忙worker可终止，完成通知持久且只
     const live = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
       requestId: "busy",
       mode: "async",
-      // 本例验证主动取消；独立脚本的类型检查不应先耗尽默认的五秒期限。
-      timeoutMs: 30_000,
+      // 本例验证主动取消及并行进展；慢主机上，独立脚本的检查可能超过30秒。
+      // 执行期限本身由专门的期限用例验证，不能让它先把 busy 任务标成 unknown。
+      timeoutMs: 300_000,
       code: "while(true) {}",
     });
     assert.equal(["queued", "checking", "running"].includes(live.status), true);
