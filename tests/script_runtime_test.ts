@@ -674,6 +674,13 @@ Deno.test("脚本预热：空载待命且任务之间不共享全局状态，耗
       assert.equal(f.count(), 0);
       receipts.push(receipt);
     }
+    const completions = await f.kernel().call<{ items: { job: Json }[] }>(
+      "scripts",
+      "completions",
+      {},
+    );
+    // Completion identity stays compatible with the previous runtime on rollback.
+    assert.ok(completions.items.every((item) => !Object.hasOwn(item.job as object, "timing")));
     await f.restart();
     for (const receipt of receipts) {
       assert.deepEqual(

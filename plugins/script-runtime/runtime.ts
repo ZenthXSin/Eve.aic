@@ -47,13 +47,13 @@ function validError(error: unknown): error is WireError {
   const value = error as WireError;
   return ERROR_KINDS.has(value.kind) && typeof value.message === "string";
 }
-function summary(job: JobRecord): ScriptSummary {
+function summary(job: JobRecord, includeTiming = true): ScriptSummary {
   return {
     jobId: job.jobId,
     status: job.status,
     scriptStarted: job.scriptStarted,
     actions: job.actions.length,
-    ...(job.timing ? { timing: job.timing } : {}),
+    ...(includeTiming && job.timing ? { timing: job.timing } : {}),
     startedAt: job.startedAt,
     ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
     ...(job.error ? { error: job.error } : {}),
@@ -133,7 +133,7 @@ export class ScriptRuntime {
           event.seq !== ++last || !ids.has(event.job.jobId) || !TERMINAL.has(event.job.status) ||
           notified.has(event.job.jobId) ||
           canonical(event.job as unknown as Json) !==
-            canonical(summary(this.store.job(event.job.jobId)) as unknown as Json)
+            canonical(summary(this.store.job(event.job.jobId), false) as unknown as Json)
         ) {
           throw new KernelError("corrupt", "脚本完成记录损坏，原件保留");
         }
@@ -161,7 +161,7 @@ export class ScriptRuntime {
                 action.error = { kind: "unknown", message: "宿主中断，执行结果待核对" };
               }
             }
-            state.completions.push({ seq: state.completions.length + 1, job: summary(job) });
+            state.completions.push({ seq: state.completions.length + 1, job: summary(job, false) });
           }
         });
       }
@@ -552,7 +552,7 @@ export class ScriptRuntime {
             action.error = { kind: "unknown", message: "脚本已结束等待，动作执行结果仍待核对" };
           }
         }
-        state.completions.push({ seq: state.completions.length + 1, job: summary(job) });
+        state.completions.push({ seq: state.completions.length + 1, job: summary(job, false) });
       });
     } finally {
       live.resolve();
