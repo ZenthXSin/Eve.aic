@@ -55,6 +55,11 @@ export class FactJournal {
   #count = 0;
   #lock?: Deno.FsFile;
   #failed = false;
+  #failure?: KernelError;
+  #fail(error: KernelError): KernelError {
+    this.#failed = true;
+    return this.#failure ??= error;
+  }
   #tail: Promise<unknown> = Promise.resolve();
   #closed = false;
   #closing = false;
@@ -163,8 +168,7 @@ export class FactJournal {
       }
       return event;
     } catch {
-      this.#failed = true;
-      throw new KernelError("corrupt", "事实日志原件变化或读取失败，原件保留");
+      throw this.#fail(new KernelError("corrupt", "事实日志原件变化或读取失败，原件保留"));
     }
   }
   /** 每页目标 8 MiB；单份较大原件独占一页，最大 12 MiB，保持原件完整。 */
@@ -234,12 +238,13 @@ export class FactJournal {
         this.#index(event);
       }
     } catch (error) {
-      this.#failed = true;
       lock?.close();
       this.#lock = undefined;
-      throw error instanceof KernelError
-        ? error
-        : new KernelError("corrupt", "事实日志读取失败或来源链不连续，原件保留");
+      throw this.#fail(
+        error instanceof KernelError
+          ? error
+          : new KernelError("corrupt", "事实日志读取失败或来源链不连续，原件保留"),
+      );
     } finally {
       this.#initializing = false;
       finished();
@@ -292,8 +297,7 @@ export class FactJournal {
         }
         event = this.#validate(raw, this.#count + 1, this.#digest(this.#count));
       } catch {
-        this.#failed = true;
-        throw new KernelError("corrupt", "导入原件与已有事实链不符，原件保留");
+        throw this.#fail(new KernelError("corrupt", "导入原件与已有事实链不符，原件保留"));
       }
       return await this.#store(event);
     });
@@ -310,9 +314,11 @@ export class FactJournal {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
       }
       await writeDurableJson(path, event);
-    } catch {
-      this.#failed = true;
-      throw new KernelError("storage", "事实日志存盘失败，保留原件");
+    } catch (error) {
+      // Report only a known filesystem category, never arbitrary exception text or paths.
+      const category = Object.entries(Deno.errors).find(([, type]) => error instanceof type)?.[0] ??
+        "unknown";
+      throw this.#fail(new KernelError("storage", `事实日志存盘失败（${category}），保留原件`));
     }
     this.#index(event);
     return structuredClone(event);
@@ -324,6 +330,6 @@ export class FactJournal {
     this.#closed = true;
     this.#lock?.close();
     this.#lock = undefined;
-    if (this.#failed) throw new KernelError("storage", "事实日志关闭时有存盘失败");
+    if (this.#failure) throw this.#failure;
   }
 }
