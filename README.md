@@ -63,7 +63,8 @@ Issue548 确认，接线尚未完成；上线私信通知尚未发出。
 
 ```bash
 deno task check   # 先完成全源码和测试的类型检查
-deno task test    # 再以两个独立进程并行执行完整运行回归，复用前一步的类型检查结果
+deno task test    # 全量串行运行回归，避免发布主机负载干扰短期限专项，复用前一步类型检查
+DENO_JOBS=2 deno task test --parallel # 性能充足的主机/CI 可用两个独立进程执行相同完整回归
 deno task demo    # 演示启动、轮次循环、一次成功换版、一次回滚
 deno task test:qq # QQ HTTP 传输验证，只访问本机回环服务
 ```
