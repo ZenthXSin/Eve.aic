@@ -21,6 +21,9 @@ const CHUNK_RECORDS = 4096;
 function filename(seq: number) {
   return `${String(seq).padStart(16, "0")}.json`;
 }
+function filesystemCategory(error: unknown): string {
+  return Object.entries(Deno.errors).find(([, type]) => error instanceof type)?.[0] ?? "unknown";
+}
 function indexOf(property: PropertyKey): number | undefined {
   if (typeof property !== "string" || !/^(0|[1-9]\d*)$/.test(property)) return;
   const index = Number(property);
@@ -167,8 +170,13 @@ export class FactJournal {
         cache.bytes += raw.length * 2;
       }
       return event;
-    } catch {
-      throw this.#fail(new KernelError("corrupt", "事实日志原件变化或读取失败，原件保留"));
+    } catch (error) {
+      throw this.#fail(
+        new KernelError(
+          "corrupt",
+          `事实日志原件变化或读取失败（${filesystemCategory(error)}），原件保留`,
+        ),
+      );
     }
   }
   /** 每页目标 8 MiB；单份较大原件独占一页，最大 12 MiB，保持原件完整。 */
@@ -316,8 +324,7 @@ export class FactJournal {
       await writeDurableJson(path, event);
     } catch (error) {
       // Report only a known filesystem category, never arbitrary exception text or paths.
-      const category = Object.entries(Deno.errors).find(([, type]) => error instanceof type)?.[0] ??
-        "unknown";
+      const category = filesystemCategory(error);
       throw this.#fail(new KernelError("storage", `事实日志存盘失败（${category}），保留原件`));
     }
     this.#index(event);
@@ -330,6 +337,13 @@ export class FactJournal {
     this.#closed = true;
     this.#lock?.close();
     this.#lock = undefined;
-    if (this.#failure) throw this.#failure;
+    if (this.#failure) {
+      const error = new KernelError(
+        "storage",
+        `事实日志关闭时保留首因：${this.#failure.kind}: ${this.#failure.message}`,
+      );
+      error.cause = this.#failure;
+      throw error;
+    }
   }
 }

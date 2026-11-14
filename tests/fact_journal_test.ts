@@ -210,8 +210,14 @@ Deno.test("事实日志：存盘失败保留安全错误类别，关闭仍报告
     });
     assert.equal(journal.available, false);
     assert.equal(journal.count, 1);
-    await assert.rejects(journal.close(), (error) => error === failure);
-    await assert.rejects(journal.close(), (error) => error === failure);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await assert.rejects(
+        journal.close(),
+        (error) =>
+          error instanceof KernelError && error.kind === "storage" && error.cause === failure &&
+          error.message.includes("NotADirectory") && !error.message.includes(directory),
+      );
+    }
     assert.deepEqual(
       JSON.parse(await Deno.readTextFile(`${directory}/originals/0000000000000001.json`)),
       first,
