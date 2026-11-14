@@ -53,3 +53,34 @@ Deno.test("脚本检查缓存：被改写的检查原件拒绝复用并保留诊
     await Deno.remove(directory, { recursive: true });
   }
 });
+
+Deno.test("脚本检查缓存：每次仍运行Deno检查，契约改变使成功缓存失效", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-check-dependencies-" });
+  const sources = new ScriptCheckSources(`${directory}/cache`);
+  try {
+    const api = `${directory}/api.ts`;
+    await Deno.writeTextFile(api, "export interface Api { ok(): number }");
+    const body = "return tools.ok();";
+    const code = `import type { Api } from ${JSON.stringify(new URL(`file://${api}`).href)};
+      export default async function run(tools: Api) { ${body} }`;
+    const source = await sources.acquire(`${directory}/job.ts`, code, body);
+    const check = () =>
+      new Deno.Command(Deno.execPath(), {
+        args: ["check", "--no-config", "--no-lock", "--no-remote", "--no-npm", source.path],
+        clearEnv: true,
+        env: { DENO_DIR: `${directory}/cache` },
+        stdout: "null",
+        stderr: "piped",
+      }).output();
+    assert.equal((await check()).success, true);
+    assert.equal((await check()).success, true);
+    await Deno.writeTextFile(api, "export interface Api { changed(): number }");
+    const invalidated = await check();
+    assert.equal(invalidated.success, false);
+    assert.match(new TextDecoder().decode(invalidated.stderr), /ok/);
+    await source.release();
+  } finally {
+    await sources.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
