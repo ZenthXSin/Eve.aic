@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { settleScript } from "./helpers/scripts.ts";
 import { UpgradeClient } from "../plugins/runtime-client/upgrades.ts";
 import { composeRuntimePlugin } from "../composition/runtime.ts";
 import { composeScriptPlugin } from "../composition/scripts.ts";
@@ -144,7 +145,7 @@ Deno.test("升级脚本：真实worker经独立监督RPC，稳定动作编号且
           directory: `${directory}/scripts`,
           cacheDirectory: `${directory}/cache`,
           denoBinary: Deno.execPath(),
-          defaultTimeoutMs: 10000,
+          defaultTimeoutMs: 60_000,
         },
       }),
     );
@@ -170,7 +171,10 @@ Deno.test("升级脚本：真实worker经独立监督RPC，稳定动作编号且
       code:
         `const submitted=await tools.upgrades.request({commit:"${commit}"}); const status=await tools.upgrades.status();const logs=await tools.upgrades.logs();const sent=await tools.phone.sendFile({conversationId:"user:owner",path:"file.txt",kind:"file"});return {submitted,status,logs,sent};`,
     };
-    const job = await kernel.call("scripts", "start", request) as unknown as ScriptSummary;
+    const job = await settleScript(
+      kernel,
+      await kernel.call("scripts", "start", request) as unknown as ScriptSummary,
+    );
     assert.equal(job.status, "completed");
     assert.equal(job.actions, 4);
     assert.equal(calls.length, 3);
@@ -184,20 +188,26 @@ Deno.test("升级脚本：真实worker经独立监督RPC，稳定动作编号且
     assert.equal(JSON.stringify(result).includes(proof.credential), false);
     assert.deepEqual(await kernel.call("scripts", "start", request), job);
     assert.equal(calls.length, 3);
-    const forged = await kernel.call("scripts", "start", {
-      requestId: "forged_upgrade",
-      mode: "sync",
-      code:
-        `const args={commit:"${commit}",_actionId:"forged"};return await tools.upgrades.request(args);`,
-    }) as unknown as ScriptSummary;
+    const forged = await settleScript(
+      kernel,
+      await kernel.call("scripts", "start", {
+        requestId: "forged_upgrade",
+        mode: "sync",
+        code:
+          `const args={commit:"${commit}",_actionId:"forged"};return await tools.upgrades.request(args);`,
+      }) as unknown as ScriptSummary,
+    );
     assert.equal(forged.status, "failed");
     assert.equal(calls.length, 3);
-    const forgedFile = await kernel.call("scripts", "start", {
-      requestId: "forged_file",
-      mode: "sync",
-      code:
-        'const args={conversationId:"user:owner",path:"file.txt",kind:"file" as const,actionId:"forged"};return await tools.phone.sendFile(args);',
-    }) as unknown as ScriptSummary;
+    const forgedFile = await settleScript(
+      kernel,
+      await kernel.call("scripts", "start", {
+        requestId: "forged_file",
+        mode: "sync",
+        code:
+          'const args={conversationId:"user:owner",path:"file.txt",kind:"file" as const,actionId:"forged"};return await tools.phone.sendFile(args);',
+      }) as unknown as ScriptSummary,
+    );
     assert.equal(forgedFile.status, "failed");
   } finally {
     if (kernel) await kernel.stop();

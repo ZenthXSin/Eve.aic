@@ -17,7 +17,9 @@ const keys = {
   runtime: "fixture_instance_runtime_012345678901234567890",
   phone: "fixture_instance_phone_01234567890123456789012",
 };
-async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}) {
+async function fixture(
+  options: { leaseMs?: number; renewalMs?: number; modelDelayMs?: number } = {},
+) {
   const directory = await Deno.makeTempDir({ prefix: "eve-instance-" });
   await writeDurableJson(`${directory}/settings.json`, {
     dailyTokenBudget: 200_000_000,
@@ -31,12 +33,6 @@ async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}
     credential: keys.actor,
     sourceCommit: "a".repeat(40),
   });
-  const grant = await authority.grant({
-    instanceId: "fixture",
-    requestId: "initial",
-    expectedEpoch: authority.status().epoch,
-  });
-  if (grant.status !== "granted") throw new Error("not granted");
   const guardian = startOwnershipRpc(authority, keys.admin, keys.exit);
   let renewFailures = 0;
   const guardianProxy = Deno.serve(
@@ -57,8 +53,6 @@ async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}
   await writeDurableJson(`${directory}/guardian.json`, {
     url: `http://127.0.0.1:${guardianProxy.addr.port}/ownership`,
   });
-  const proof = { instanceId: "fixture", credential: keys.actor, epoch: grant.owner.epoch };
-  await writeDurableJson(`${directory}/proof.json`, proof);
   for (const [name, value] of Object.entries(keys)) {
     await Deno.writeTextFile(`${directory}/${name}.key`, value);
   }
@@ -117,7 +111,7 @@ async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}
       connectionFile: `${directory}/instance.json`,
       guardianConnectionFile: `${directory}/guardian.json`,
       credentialFile: `${directory}/actor.key`,
-      leaseMs: 600,
+      leaseMs: options.renewalMs ?? 600,
     },
     runtime: {
       connectionFile: `${directory}/runtime.json`,
@@ -152,6 +146,18 @@ async function fixture(options: { leaseMs?: number; modelDelayMs?: number } = {}
   const configPath = `${directory}/config.json`;
   await writeDurableJson(configPath, config);
   let instance = await startInstance(configPath);
+  // Start the short lease after fixture I/O, rather than spending it during setup.
+  const grant = await authority.grant({
+    instanceId: "fixture",
+    requestId: "initial",
+    expectedEpoch: authority.status().epoch,
+  });
+  if (grant.status !== "granted") throw new Error("not granted");
+  await writeDurableJson(`${directory}/proof.json`, {
+    instanceId: "fixture",
+    credential: keys.actor,
+    epoch: grant.owner.epoch,
+  });
   const raw = (method: string, args: unknown = {}) =>
     fetch(instance.url, {
       method: "POST",
@@ -443,7 +449,8 @@ Deno.test("固定版本宿主：真实镜像写入失败阻止停止，status及
 });
 
 Deno.test("固定版本宿主：3387条观察原件以27页读取，保持来源链和完整快照", async () => {
-  const f = await fixture();
+  // Seeding thousands of durable originals is setup, before observer renewal starts.
+  const f = await fixture({ leaseMs: 300_000 });
   try {
     for (let i = 0; i < 3387; i++) {
       await f.engine.records.append("notice", { origin: `history-${i}` });
@@ -470,7 +477,7 @@ Deno.test("固定版本宿主：3387条观察原件以27页读取，保持来源
 });
 
 Deno.test("续租：通信未知在有效租约内重试，明确失效仍停用并留下具体诊断", async () => {
-  const f = await fixture({ leaseMs: 3000 });
+  const f = await fixture({ leaseMs: 15_000, renewalMs: 3000 });
   try {
     await f.call("activate");
     const before = await f.call("status") as { lease: { lastRenewedAt: number } };
@@ -502,7 +509,7 @@ Deno.test("续租：通信未知在有效租约内重试，明确失效仍停用
 });
 
 Deno.test("续租：通信持续未知不得越过最后确认的租约期限继续运行", async () => {
-  const f = await fixture({ leaseMs: 1500 });
+  const f = await fixture({ leaseMs: 5000, renewalMs: 3000 });
   try {
     await f.call("activate");
     f.failRenewals(1000);

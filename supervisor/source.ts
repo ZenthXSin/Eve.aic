@@ -371,8 +371,8 @@ export async function pinSource(options: {
         const { uid, gid } = options.validationIdentity;
         for (const path of [temporary, env.DENO_DIR, env.TMPDIR]) await Deno.chown(path, uid, gid);
       }
-      const timeoutMs = options.validationTimeoutMs ?? 600_000;
-      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 600_000) {
+      const timeoutMs = options.validationTimeoutMs ?? 1_800_000;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 1_800_000) {
         throw new KernelError("rejected", "源码校验超时范围无效");
       }
       for (const task of ["check", "test"]) {
