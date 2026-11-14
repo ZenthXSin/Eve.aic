@@ -54,6 +54,16 @@ async function fixture(responses: ModelResponse[]) {
           throughSeq: mindEvents.length,
         });
       }
+      if (namespace === "scripts" && method === "status") {
+        return Promise.resolve({ jobId: "old-job", status: "completed", actions: 1 });
+      }
+      if (namespace === "scripts" && method === "result") {
+        return Promise.resolve({
+          text: '{"message":"原任务真实结果"}',
+          characters: 24,
+          truncated: false,
+        });
+      }
       if (namespace === "scripts" && method === "completions") {
         return Promise.resolve({
           items: completed && Number((args as { afterSeq: number }).afterSeq) < 1
@@ -278,6 +288,35 @@ Deno.test("休息收尾：后台任务可带着休息，完成通知仍能唤醒
     await f.eve.pulse();
     assert.equal(f.messages.length, 2);
     assert.ok(JSON.stringify(f.messages[1]).includes(decision.resume));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("原生脚本读取接线：工具表可用，结果直接进入下一轮结构化上下文，重启不重放", async () => {
+  const f = await fixture([
+    response("read_script", { jobId: "old-job" }),
+    response("rest", decision),
+  ]);
+  try {
+    await f.eve.pulse();
+    await f.eve.pulse();
+    const result = f.eve.journal.events.find((e) => e.kind === "tool_result");
+    assert.ok(result);
+    assert.equal((result.data as { result: { status: string } }).result.status, "completed");
+    await f.eve.pulse();
+    const tool = f.messages[1].find((m) => m.role === "tool");
+    assert.ok(tool);
+    const structured = JSON.parse(tool.content);
+    assert.equal(structured.tool, "read_script");
+    assert.equal(structured.task.jobId, "old-job");
+    assert.equal(structured.receipt.output.result.value.message, "原任务真实结果");
+    await f.eve.pulse();
+    await f.eve.pulse();
+    const count = f.eve.journal.events.filter((e) => e.kind === "tool_result").length;
+    await f.restart();
+    await f.eve.pulse();
+    assert.equal(f.eve.journal.events.filter((e) => e.kind === "tool_result").length, count);
   } finally {
     await f.close();
   }

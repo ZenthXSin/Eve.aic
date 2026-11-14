@@ -94,20 +94,46 @@ export function readable(value: unknown, depth = 0): string {
       : "（空）";
   }
   return Object.entries(value as Record<string, unknown>).map(([key, child]) => {
-    // Script output is JSON text in the transport, but should be read as its returned value.
-    if ((key === "output" || key === "result") && typeof child === "string") {
-      try {
-        child = JSON.parse(child);
-      } catch { /* Arbitrary text stays verbatim. */ }
-    }
     return `${indent}${labels[key] ?? key}：${readable(child, depth + 1)}`;
   }).join("\n");
 }
+type ObjectValue = Record<string, unknown>;
+function object(value: unknown): value is ObjectValue {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+const jsonOutputs = new Set([
+  "execute_script",
+  "read_script",
+  "write_thought",
+  "inspect_context",
+  "compress_context",
+  "set_focus",
+  "rest",
+]);
+/** Decode only the documented script result page, never arbitrary body/text/output fields. */
+function resultPage(value: unknown): unknown {
+  if (
+    !object(value) || typeof value.text !== "string" ||
+    typeof value.characters !== "number" || typeof value.truncated !== "boolean"
+  ) return value;
+  if (value.truncated || value.nextChar !== undefined) return value;
+  try {
+    const { text, ...page } = value;
+    return { ...page, encoding: "json", value: JSON.parse(text as string) };
+  } catch {
+    return value;
+  }
+}
+/** Model-only projection; journals and RPC recovery retain the original wire receipts. */
 export function presentContext(
   messages: Message[],
   rawCalls: ReadonlySet<string> = new Set(),
   records: ReadonlyMap<string, number> = new Map(),
 ): Message[] {
+  const names = new Map<string, string>();
+  for (const message of messages) {
+    for (const call of message.toolCalls ?? []) names.set(call.id, call.name);
+  }
   return messages.map((message) => {
     if (
       message.role !== "tool" && message.role !== "user" ||
@@ -117,24 +143,88 @@ export function presentContext(
     try {
       data = JSON.parse(message.content);
     } catch {
-      return message;
+      if (message.role !== "tool") return message;
+      data = message.content;
     }
-    const envelope = data as Record<string, unknown> | null;
     if (
       message.role === "user" &&
-      (!envelope || envelope.source !== "host" || !Number.isSafeInteger(envelope.record))
+      (!object(data) || data.source !== "host" || !Number.isSafeInteger(data.record))
     ) return message;
     const record = message.toolCallId
       ? records.get(message.toolCallId)
-      : envelope && typeof envelope.record === "number"
-      ? envelope.record
+      : object(data) && typeof data.record === "number"
+      ? data.record
       : undefined;
+    const reference = record === undefined ? {} : {
+      original: {
+        method: "tools.records.text",
+        args: { seq: record, startChar: 0, limit: 8192 },
+        pagination: "nextChar",
+      },
+    };
+    if (message.role === "user") {
+      return {
+        ...message,
+        content: JSON.stringify({ schema: "eve.host_notice.v1", data, ...reference }),
+      };
+    }
+    const tool = message.toolCallId ? names.get(message.toolCallId) : undefined;
+    let receipt = data;
+    if (object(data) && typeof data.output === "string" && tool && jsonOutputs.has(tool)) {
+      try {
+        receipt = { ...data, output: JSON.parse(data.output) };
+      } catch { /* Failed validation and ordinary text remain verbatim. */ }
+    }
+    const output = object(receipt) ? receipt.output : undefined;
+    const script = (tool === "execute_script" || tool === "read_script") &&
+        object(output) && typeof output.jobId === "string" && typeof output.status === "string"
+      ? output
+      : undefined;
+    if (script) {
+      receipt = {
+        ...receipt as ObjectValue,
+        output: {
+          ...script,
+          ...(script.result === undefined ? {} : {
+            result: Number(script.resultStartChar ?? 0) === 0
+              ? resultPage(script.result)
+              : script.result,
+          }),
+        },
+      };
+    }
     return {
       ...message,
-      content: (message.role === "tool" ? "工具回执（仅表示所列真实状态）\n" : "主机通知\n") +
-        readable(data) + (record
-          ? `\n完整原件：tools.records.text({seq:${record},startChar:0,limit:8192})，按nextChar继续。`
-          : ""),
+      content: JSON.stringify({
+        schema: "eve.tool_receipt.v1",
+        ...(message.toolCallId ? { callId: message.toolCallId } : {}),
+        ...(tool ? { tool } : {}),
+        callStatus: object(data) && typeof data.status === "string" ? data.status : "unreported",
+        ...(script
+          ? {
+            task: {
+              jobId: script.jobId,
+              status: script.status,
+              ...(script.status === "completed" ? {} : {
+                inspect: {
+                  tool: "read_script",
+                  args: { jobId: script.jobId },
+                },
+              }),
+              ...(object(script.result) && typeof script.result.nextChar === "number"
+                ? {
+                  continuation: {
+                    tool: "read_script",
+                    args: { jobId: script.jobId, startChar: script.result.nextChar, limit: 8192 },
+                  },
+                }
+                : {}),
+            },
+          }
+          : {}),
+        receipt,
+        ...reference,
+      }),
     };
   });
 }
