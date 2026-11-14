@@ -377,7 +377,9 @@ Deno.test("QQ 手机：真实独立适配器子进程、网关入站与worker发
       const { socket, response } = Deno.upgradeWebSocket(r);
       sockets.push(socket);
       connections++;
-      socket.onopen = () => socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 100 } }));
+      // Exercise business flow independently of subsecond scheduling; watchdog tests cover expiry.
+      socket.onopen = () =>
+        socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 30_000 } }));
       socket.onmessage = (incoming) => {
         const data = JSON.parse(incoming.data);
         if (data.op === 1) socket.send(JSON.stringify({ op: 11 }));
@@ -997,7 +999,9 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
       const { socket, response } = Deno.upgradeWebSocket(r);
       sockets.add(socket);
       socket.onclose = () => sockets.delete(socket);
-      socket.onopen = () => socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 100 } }));
+      // Exercise business flow independently of subsecond scheduling; watchdog tests cover expiry.
+      socket.onopen = () =>
+        socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 30_000 } }));
       socket.onmessage = (incoming) => {
         const data = JSON.parse(incoming.data);
         if (data.op === 1) socket.send(JSON.stringify({ op: 11 }));
