@@ -1,3 +1,4 @@
+import { MODEL_SERVICE_STOP_SECONDS } from "../sdk/model-timeouts.ts";
 import type { SourceArtifact } from "../supervisor/source.ts";
 import { verifySource } from "../supervisor/source.ts";
 import { writeEvePrompt } from "../composition/eve.ts";
@@ -57,7 +58,9 @@ function unit(
       after.join(" ")
     }\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory=${directory}\nExecStart=${options.deno} run --allow-read --allow-write --allow-run --allow-env --allow-net --unstable-worker-options ${directory}/${entry} ${config}${
       args.length ? " " + args.join(" ") : ""
-    }\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=180\nKillMode=control-group\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths=${options.privateDirectory} ${options.runtimeDirectory} ${options.qqDirectory} ${options.workspaceDirectory} ${
+    }\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=${
+      ["runtime", "supervisor"].includes(name) ? MODEL_SERVICE_STOP_SECONDS : 180
+    }\nKillMode=control-group\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths=${options.privateDirectory} ${options.runtimeDirectory} ${options.qqDirectory} ${options.workspaceDirectory} ${
       name === "supervisor"
         ? (options.artifactDirectory ??
           options.source.directory.slice(0, options.source.directory.lastIndexOf("/")))

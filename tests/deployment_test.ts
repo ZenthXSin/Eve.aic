@@ -1,3 +1,4 @@
+import { instanceStopControlDeadlineMs } from "../sdk/lifecycle-timeouts.ts";
 import assert from "node:assert/strict";
 import {
   buildDeploymentPlan,
@@ -80,6 +81,10 @@ Deno.test({
       }, options);
       assert.equal(plan.units.length, 5);
       for (const u of plan.units) {
+        const seconds = Number(/TimeoutStopSec=(\d+)/.exec(u.content)?.[1]);
+        if (/eve-rebuild-(runtime|supervisor)\.service/.test(u.name)) {
+          assert.ok(seconds * 1000 > instanceStopControlDeadlineMs(existing.model.timeoutMs));
+        } else assert.equal(seconds, 180);
         assert.match(u.content, /KillMode=control-group/);
         assert.match(u.content, /NoNewPrivileges=yes/);
         assert.match(u.content, /ProtectSystem=strict/);

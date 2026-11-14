@@ -30,6 +30,24 @@ const completion = (content = "结果", usage?: unknown) => ({
   ...(usage === undefined ? {} : { usage }),
 });
 
+function streamed(payload: { choices: { finish_reason: string; message: unknown }[] }): Response {
+  const choice = payload.choices[0];
+  const message = choice.message as Record<string, unknown>;
+  const calls = message.tool_calls as Record<string, unknown>[] | undefined;
+  const delta = {
+    ...message,
+    ...(calls ? { tool_calls: calls.map((call, index) => ({ ...call, index })) } : {}),
+  };
+  return new Response(
+    `data: ${
+      JSON.stringify({ choices: [{ index: 0, delta, finish_reason: choice.finish_reason }] })
+    }\n\ndata: [DONE]\n\n`,
+    {
+      headers: { "content-type": "text/event-stream" },
+    },
+  );
+}
+
 function server(handler: (r: Request) => Response | Promise<Response>) {
   const instance = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, handler);
   return { url: `http://127.0.0.1:${instance.addr.port}`, close: () => instance.shutdown() };
@@ -182,7 +200,8 @@ Deno.test("模型传输：真实 HTTP 参数、固定会话、无 temperature，
     assert.equal(body.reasoning_effort, "high");
     assert.equal(body.prompt_cache_key, options.sessionId);
     assert.equal(body.max_completion_tokens, 8192);
-    assert.equal(body.stream, false);
+    assert.equal(body.stream, true);
+    assert.deepEqual(body.stream_options, { include_usage: true });
     if (bodies.length === 1) {
       return Response.json({
         choices: [{
@@ -387,7 +406,7 @@ Deno.test("模型插件：真实 worker 经内核工具回传，不把凭据放�
     const body = await r.json();
     calls++;
     if (calls === 1) {
-      return Response.json({
+      return streamed({
         choices: [{
           finish_reason: "tool_calls",
           message: {
@@ -403,7 +422,7 @@ Deno.test("模型插件：真实 worker 经内核工具回传，不把凭据放�
       });
     }
     assert.equal(body.messages.at(-1).content, "真实worker");
-    return Response.json(completion("拿到了真实worker"));
+    return streamed(completion("拿到了真实worker"));
   });
   const directory = await Deno.makeTempDir({ prefix: "eve-model-test-" });
   const root = new URL("..", import.meta.url).pathname;

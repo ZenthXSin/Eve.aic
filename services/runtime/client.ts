@@ -1,3 +1,4 @@
+import { MODEL_RPC_TIMEOUT_MS } from "../../sdk/model-timeouts.ts";
 import type { OwnershipProof } from "../../contracts/ownership.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 
@@ -32,7 +33,12 @@ export class RuntimeClient {
           ...(namespace === "agents" ? { "x-eve-namespace": "agents" } : {}),
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.any([this.#controller.signal, AbortSignal.timeout(300000)]),
+        signal: AbortSignal.any([
+          this.#controller.signal,
+          AbortSignal.timeout(
+            namespace === "model" && method === "complete" ? MODEL_RPC_TIMEOUT_MS : 300000,
+          ),
+        ]),
         redirect: "error",
       });
       if (!response.ok || !response.body) {
