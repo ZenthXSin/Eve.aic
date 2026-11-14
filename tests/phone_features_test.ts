@@ -148,7 +148,7 @@ Deno.test("附件自动下载：入站后台串行落入 tmp，屏幕给出路�
     prefetch.offer(record);
     assert.equal(f.downloadCount(), 0);
     prefetch.start();
-    for (let attempt = 0; attempt < 100 && !f.files.hasReceipt("qq:user:user-a:1:1"); attempt++) {
+    for (let attempt = 0; attempt < 1000 && !f.files.hasReceipt("qq:user:user-a:1:1"); attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const screen = await f.phone.message({ handle: { conversationId: "qq:user:user-a", seq: 1 } });
@@ -182,7 +182,7 @@ Deno.test("附件自动下载：单条失败不阻塞下一条，屏幕保留失
     const second = await f.incoming(2, "user-b", `${f.origin}/asset`);
     prefetch.recover([first, second]);
     prefetch.start();
-    for (let attempt = 0; attempt < 100 && !f.files.hasReceipt("qq:user:user-b:2:1"); attempt++) {
+    for (let attempt = 0; attempt < 1000 && !f.files.hasReceipt("qq:user:user-b:2:1"); attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(

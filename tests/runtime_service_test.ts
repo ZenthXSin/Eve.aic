@@ -1,3 +1,4 @@
+import { settleScript } from "./helpers/scripts.ts";
 import assert from "node:assert/strict";
 import { RuntimeEngine } from "../services/runtime/engine.ts";
 import { RuntimeClient } from "../services/runtime/client.ts";
@@ -347,7 +348,7 @@ Deno.test("真实内核 worker→脚本→独立工具出口：便签文件与we
         directory: `${f.directory}/scripts`,
         cacheDirectory: `${f.directory}/cache`,
         denoBinary: Deno.execPath(),
-        defaultTimeoutMs: 10000,
+        defaultTimeoutMs: 60_000,
       },
     });
     await composeRuntimePlugin(`${f.directory}/runtime-plugin`, configPath);
@@ -373,7 +374,10 @@ Deno.test("真实内核 worker→脚本→独立工具出口：便签文件与we
       code:
         'const file=await tools.files.write({path:"from-script.txt",text:"脚本实际写入",expectedSha256:"absent"}); await tools.notes.create({title:"现场",alias:"现场",content:"写入了文件",sources:[{kind:"experienced",at:new Date().toISOString(),description:file.path}]}); await tools.notes.update({id:"现场",content:"短名修改已完成"}); const note=await tools.notes.get({id:"现场"}); const search=await tools.web.search({query:"fixture docs"}); const page=await tools.web.fetch({url:search.results[0].url}); return {file,note,page};',
     };
-    const job = await kernel.call("scripts", "start", request) as unknown as ScriptSummary;
+    const job = await settleScript(
+      kernel,
+      await kernel.call("scripts", "start", request) as unknown as ScriptSummary,
+    );
     assert.equal(job.status, "completed");
     assert.equal(job.actions, 6);
     const receipts = await kernel.call("scripts", "receipts", { jobId: job.jobId }) as {
@@ -528,9 +532,10 @@ Deno.test("actual kernel worker → script → agents supports typed create/conf
       },
     }) as { status?: string; output?: string; result?: { text?: string } };
     assert.equal(result.status, "completed");
-    const job = JSON.parse(result.output!);
+    const job = await settleScript(kernel, JSON.parse(result.output!));
+    const page = await kernel.call<{ text: string }>("scripts", "result", { jobId: job.jobId });
     assert.equal(job.status, "completed", JSON.stringify(job));
-    const actual = JSON.parse(job.result.text);
+    const actual = JSON.parse(page.text);
     assert.equal(actual.configured.config.reasoningEffort, "medium");
     assert.equal(actual.job.agentId, actual.configured.agentId);
     await f.engine().dispatch("agents", "send", {

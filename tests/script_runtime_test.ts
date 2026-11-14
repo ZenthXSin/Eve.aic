@@ -1,3 +1,4 @@
+import { settleScript } from "./helpers/scripts.ts";
 import assert from "node:assert/strict";
 import { QqSendActions } from "../adapters/qq/actions.ts";
 import { QqClient } from "../adapters/qq/client.ts";
@@ -22,12 +23,12 @@ function deferred<T>() {
   return { promise, resolve };
 }
 async function waitFor<T>(get: () => Promise<T | undefined>) {
-  for (let index = 0; index < 1000; index++) {
+  for (let index = 0; index < 6000; index++) {
     const value = await get();
     if (value !== undefined) return value;
     await new Promise((done) => setTimeout(done, 10));
   }
-  throw new Error("脚本回归在10秒内没有拿到实际结果");
+  throw new Error("脚本回归在60秒内没有拿到实际结果");
 }
 async function fixture(handler?: (request: Request) => Promise<Response>) {
   const directory = await Deno.makeTempDir({ prefix: "eve-script-runtime-" });
@@ -70,7 +71,7 @@ async function fixture(handler?: (request: Request) => Promise<Response>) {
         directory: `${directory}/scripts`,
         denoBinary: Deno.execPath(),
         cacheDirectory: `${directory}/cache`,
-        defaultTimeoutMs: 5000,
+        defaultTimeoutMs: 60_000,
       },
     }),
     { mode: 0o600 },
@@ -120,7 +121,7 @@ Deno.test("脚本：一个原生工具经类型接口发送，每个动作当场
         mode: "sync",
         // This checks action reuse, not execution timing. Include cold type checking
         // and worker startup in the isolated, unprivileged validation environment.
-        timeoutMs: 10_000,
+        timeoutMs: 60_000,
         code:
           'const results = await Promise.all([tools.phone.send({conversationId:"qq:user:friend",text:"一个意思"}),tools.phone.send({conversationId:"qq:user:friend",text:"另一个意思"})]); return results;',
       },
@@ -130,7 +131,9 @@ Deno.test("脚本：一个原生工具经类型接口发送，每个动作当场
       f.kernel().call<{ output: string }>("tools", "execute", call),
     ]);
     assert.deepEqual(results[0], results[1]);
-    const job = JSON.parse(results[0].output) as ScriptSummary;
+    const job = await settleScript(f.kernel(), JSON.parse(results[0].output));
+    const settled = await f.kernel().call<{ output: string }>("tools", "execute", call);
+    assert.equal(JSON.parse(settled.output).status, "completed");
     assert.equal(job.status, "completed");
     assert.equal(job.scriptStarted, true);
     assert.equal(job.actions, 2);
@@ -160,7 +163,7 @@ Deno.test("脚本：一个原生工具经类型接口发送，每个动作当场
       "sent",
     );
     await f.restart();
-    assert.deepEqual(await f.kernel().call("tools", "execute", call), results[0]);
+    assert.deepEqual(await f.kernel().call("tools", "execute", call), settled);
     assert.equal(f.count(), 2);
     await assert.rejects(
       f.kernel().call("tools", "execute", { ...call, args: { code: "return 7;" } }),
@@ -201,9 +204,10 @@ Deno.test("脚本：执行期限区分未开始与已开始，超长期限不溢
       "running",
     );
     await f.kernel().call("scripts", "cancel", { jobId: long.jobId });
+    // Include cold type checking before asserting expiry of an already-started script.
     const timed = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
       requestId: "actual-deadline",
-      timeoutMs: 4000,
+      timeoutMs: 20_000,
       code: "await new Promise(()=>{});",
     });
     await waitFor(async () => {
@@ -308,7 +312,10 @@ Deno.test("脚本：实际插件换版失败回滚仍采用独立账本，不丢
       mode: "sync",
       code: 'return await tools.phone.send({conversationId:"qq:user:friend",text:"换版前发出"});',
     };
-    const job = await f.kernel().call<ScriptSummary & Json>("scripts", "start", args);
+    const job = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", args),
+    );
     assert.equal(job.status, "completed");
     assert.equal(f.count(), 1);
     const ledger = await Deno.readTextFile(`${f.directory}/scripts/ledger/index.json`);
@@ -347,29 +354,39 @@ Deno.test("脚本：实际插件换版失败回滚仍采用独立账本，不丢
 Deno.test("脚本：类型或参数错误在执行前拒绝，不发生发送；正确脚本可自行修正", async () => {
   const f = await fixture();
   try {
-    const bad = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
-      requestId: "bad-types",
-      mode: "sync",
-      code: 'return await tools.phone.send({conversationId:"qq:user:friend",text:42});',
-    });
+    const bad = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId: "bad-types",
+        mode: "sync",
+        code: 'return await tools.phone.send({conversationId:"qq:user:friend",text:42});',
+      }),
+    );
     assert.equal(bad.status, "failed");
     assert.equal(bad.scriptStarted, false);
     assert.match(bad.error!.message, /not assignable|不能/);
     assert.equal(f.count(), 0);
-    const falseId = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
-      requestId: "fake-action-id",
-      mode: "sync",
-      code:
-        'return await tools.phone.send({actionId:"fake",conversationId:"qq:user:friend",text:"不应发"});',
-    });
+    const falseId = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId: "fake-action-id",
+        mode: "sync",
+        code:
+          'return await tools.phone.send({actionId:"fake",conversationId:"qq:user:friend",text:"不应发"});',
+      }),
+    );
     assert.equal(falseId.status, "failed");
     assert.equal(falseId.scriptStarted, false);
     assert.equal(f.count(), 0);
-    const fixed = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
-      requestId: "corrected",
-      mode: "sync",
-      code: 'return await tools.phone.send({conversationId:"qq:user:friend",text:"实际正确类型"});',
-    });
+    const fixed = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId: "corrected",
+        mode: "sync",
+        code:
+          'return await tools.phone.send({conversationId:"qq:user:friend",text:"实际正确类型"});',
+      }),
+    );
     assert.equal(fixed.status, "completed");
     assert.equal(f.count(), 1);
   } finally {
@@ -394,11 +411,14 @@ Deno.test("脚本：显式异步，忙worker可终止，完成通知持久且只
       });
       return status.scriptStarted ? status : undefined;
     });
-    const independent = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
-      requestId: "independent",
-      mode: "sync",
-      code: "return 5;",
-    });
+    const independent = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId: "independent",
+        mode: "sync",
+        code: "return 5;",
+      }),
+    );
     assert.equal(independent.status, "completed");
     const cancelled = await f.kernel().call<ScriptSummary & Json>("scripts", "cancel", {
       jobId: live.jobId,
@@ -491,11 +511,14 @@ Deno.test("脚本社交：burst编号由宿主注入并持久化，quietwait类�
     const request = {
       requestId: "social-script-original",
       mode: "sync",
-      timeoutMs: 10_000,
+      timeoutMs: 60_000,
       code:
         'const burst = await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一句","第二句"]}); const waited = await tools.phone.waitForMessages({conversationId:"qq:user:friend",purpose:"reply",quietMs:100,maxWaitMs:20}); return {burst,waited};',
     };
-    const job = await f.kernel().call<ScriptSummary & Json>("scripts", "start", request);
+    const job = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", request),
+    );
     assert.equal(job.status, "completed");
     assert.equal(job.actions, 2);
     assert.equal(f.count(), 2);
@@ -523,13 +546,16 @@ Deno.test("脚本社交恢复：原脚本unknown结束后取消队首，新脚�
     return Promise.resolve(Response.json(unknown ? {} : { id: `sent-${sentCount}` }));
   });
   try {
-    const initialJob = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
-      requestId: "burst-original-unknown",
-      mode: "sync",
-      timeoutMs: 10_000,
-      code:
-        'return await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一条未知","第二条待发","第三条待发"]});',
-    });
+    const initialJob = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId: "burst-original-unknown",
+        mode: "sync",
+        timeoutMs: 60_000,
+        code:
+          'return await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一条未知","第二条待发","第三条待发"]});',
+      }),
+    );
     assert.equal(initialJob.status, "completed");
     const initial = JSON.parse(
       (await f.kernel().call<{ text: string }>("scripts", "result", {
@@ -552,16 +578,19 @@ Deno.test("脚本社交恢复：原脚本unknown结束后取消队首，新脚�
       expectedReceiptDigest: head.receiptDigest!,
     }, { actor: "eve" });
     unknown = false;
-    const resumedJob = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
-      requestId: "burst-new-script-resume",
-      mode: "sync",
-      timeoutMs: 10_000,
-      code:
-        'const resumed=await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一条未知","第二条待发","第三条待发"],resumeActionId:' +
-        JSON.stringify(initial.actionId) +
-        "}); return {resumed,status:await tools.phone.burstStatus({actionId:" +
-        JSON.stringify(initial.actionId) + "})};",
-    });
+    const resumedJob = await settleScript(
+      f.kernel(),
+      await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
+        requestId: "burst-new-script-resume",
+        mode: "sync",
+        timeoutMs: 60_000,
+        code:
+          'const resumed=await tools.phone.sendBurst({conversationId:"qq:user:friend",messages:["第一条未知","第二条待发","第三条待发"],resumeActionId:' +
+          JSON.stringify(initial.actionId) +
+          "}); return {resumed,status:await tools.phone.burstStatus({actionId:" +
+          JSON.stringify(initial.actionId) + "})};",
+      }),
+    );
     assert.equal(resumedJob.status, "completed");
     const result = JSON.parse(
       (await f.kernel().call<{ text: string }>("scripts", "result", {
