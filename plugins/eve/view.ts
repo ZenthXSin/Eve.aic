@@ -349,6 +349,11 @@ function blocksUncached(
         role: "assistant",
         content: projected.content,
         ...(calls.length ? { toolCalls: calls } : {}),
+        // A retained/omitted or historical projected turn must never recover hidden raw output.
+        ...(response.modelOutput && event.seq > projectionThrough &&
+            allCalls.every((call) => !retention.has(call.id))
+          ? { modelOutput: response.modelOutput }
+          : {}),
       };
       if (allCalls.length) {
         current = {

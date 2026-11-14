@@ -12,9 +12,11 @@ import {
 } from "../../contracts/model.ts";
 import { MODEL_MAX_DURATION_MS } from "../../sdk/model-timeouts.ts";
 import { ChatStream } from "./stream.ts";
+import { responsesBody, responsesResult, ResponsesStream } from "./responses.ts";
 import { permanentModelStatus } from "../../sdk/model-failure.ts";
 
 export interface ChatModelOptions {
+  protocol?: "chat" | "responses";
   baseUrl: string;
   model: string;
   apiKey: string;
@@ -306,8 +308,8 @@ export class ChatModelClient {
     ) fail("configuration");
     const path = base.pathname.replace(/\/$/, "");
     base.pathname = path.endsWith("/v1")
-      ? `${path}/chat/completions`
-      : `${path}/v1/chat/completions`;
+      ? `${path}/${config.protocol === "responses" ? "responses" : "chat/completions"}`
+      : `${path}/v1/${config.protocol === "responses" ? "responses" : "chat/completions"}`;
     this.#endpoint = base;
     this.#config = config;
   }
@@ -329,7 +331,8 @@ export class ChatModelClient {
     let body: string;
     try {
       snapshot = structuredClone(request);
-      body = JSON.stringify(await requestBody(snapshot, config));
+      const chat = await requestBody(snapshot, config);
+      body = JSON.stringify(config.protocol === "responses" ? responsesBody(chat, snapshot) : chat);
     } catch (error) {
       if (error instanceof ChatModelError) throw error;
       fail("request");
@@ -387,7 +390,9 @@ export class ChatModelClient {
         }
       };
       const stream = isStream
-        ? new ChatStream(limit, () => arm("idle", this.#config.idleTimeoutMs!))
+        ? config.protocol === "responses"
+          ? new ResponsesStream(limit, () => arm("idle", this.#config.idleTimeoutMs!))
+          : new ChatStream(limit, () => arm("idle", this.#config.idleTimeoutMs!))
         : null;
       let bytes = 0;
       const chunks: string[] = [];
@@ -409,7 +414,18 @@ export class ChatModelClient {
       const tail = decode();
       if (stream) {
         stream.feed(tail);
-        return modelResponse(stream.result(), snapshot);
+        const raw = config.protocol === "responses"
+          ? responsesResult(stream.result())
+          : stream.result();
+        return {
+          ...modelResponse(raw, snapshot),
+          ...(config.protocol === "responses"
+            ? {
+              modelOutput:
+                (stream.result() as { output: NonNullable<ModelResponse["modelOutput"]> }).output,
+            }
+            : {}),
+        };
       }
       chunks.push(tail);
       let decoded: unknown;
@@ -417,6 +433,12 @@ export class ChatModelClient {
         decoded = JSON.parse(chunks.join(""));
       } catch {
         fail("invalid_response");
+      }
+      if (config.protocol === "responses") {
+        return {
+          ...modelResponse(responsesResult(decoded), snapshot),
+          modelOutput: (decoded as { output: NonNullable<ModelResponse["modelOutput"]> }).output,
+        };
       }
       return modelResponse(decoded, snapshot);
     } catch (error) {

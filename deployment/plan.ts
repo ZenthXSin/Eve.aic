@@ -121,7 +121,9 @@ export function buildDeploymentPlan(
     qq = existing.qq as Record<string, unknown>,
     phone = existing.phone as Record<string, unknown>;
   if (
-    !model || model.protocol !== "chat" || typeof model.apiKeyFile !== "string" || !qq ||
+    !model || typeof model.protocol !== "string" ||
+    !["chat", "responses"].includes(model.protocol) ||
+    typeof model.apiKeyFile !== "string" || !qq ||
     (qq.replyScope !== undefined && qq.replyScope !== "private" && qq.replyScope !== "all") ||
     qq.sandbox !== false || !phone ||
     typeof phone.ownerPlatformUserId !== "string" || !phone.ownerPlatformUserId
