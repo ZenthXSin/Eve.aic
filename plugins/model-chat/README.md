@@ -27,8 +27,9 @@ reset progress deadlines. Timeouts remain redacted transport errors, with `timeo
 categories. Requests are never automatically replayed after an uncertain outcome.
 
 Model RPCs allow 30 minutes plus 30 seconds for receipt persistence. Graceful shutdown allows that
-pending model RPC to finish. Other tool/RPC waits retain their existing limits. Close cancels
-in-flight I/O and releases timers/readers.
+pending model RPC to finish. Other tool/RPC waits retain their existing limits. Generated
+runtime/supervisor systemd units allow 32 minutes for graceful shutdown so the service manager does
+not cut off that drain. Close cancels in-flight I/O and releases timers/readers.
 
 Retained text/tool/reasoning bytes use `maxResponseBytes` (default 2 MiB). Individual SSE events are
 bounded as well, with a separate larger wire budget for the repeated JSON/SSE framing around
