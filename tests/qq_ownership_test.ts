@@ -281,7 +281,9 @@ Deno.test("QQ 正式服务组合传递 fence；真实 worker 只能携实例凭�
       }
       const { socket, response } = Deno.upgradeWebSocket(r);
       sockets.push(socket);
-      socket.onopen = () => socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 100 } }));
+      // Exercise business flow independently of subsecond scheduling; watchdog tests cover expiry.
+      socket.onopen = () =>
+        socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 30_000 } }));
       socket.onmessage = (event) => {
         const data = JSON.parse(event.data);
         if (data.op === 1) socket.send(JSON.stringify({ op: 11 }));
@@ -473,7 +475,7 @@ async function retryFixture(options: {
         const { socket, response } = Deno.upgradeWebSocket(request);
         sockets.push(socket);
         socket.onopen = () =>
-          socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 100 } }));
+          socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 30_000 } }));
         socket.onmessage = (event) => {
           const data = JSON.parse(event.data);
           if (data.op === 1) socket.send(JSON.stringify({ op: 11 }));
