@@ -1,5 +1,6 @@
 // 独立适配器的 QQ HTTP 传输。不依赖内核或插件，不承担身份映射、通知和行为判断。
 // 返回平台事实；持久动作记录、入站日志和所有权交接由适配器服务另行接入。
+import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { sdkRequest } from "./satori/api.ts";
 import { type DiagnosticSink, qqHttps } from "./transport.ts";
@@ -340,7 +341,7 @@ export class QqClient {
   async #request(
     path: string,
     init: RequestInit,
-    options: { origin?: URL; timeoutMs?: number } = {},
+    options: { origin?: URL; timeoutMs?: number; raw?: boolean } = {},
   ): Promise<ResponseInfo> {
     const startedAt = performance.now();
     const timeout = AbortSignal.timeout(options.timeoutMs ?? this.#timeout);
@@ -359,7 +360,10 @@ export class QqClient {
       phase = "body";
       let data: Record<string, unknown>;
       try {
-        data = await readObject(response, this.#limit);
+        if (options.raw || response.status === 204) {
+          await response.body?.cancel();
+          data = {};
+        } else data = await readObject(response, this.#limit);
       } catch (error) {
         // A known HTTP rejection remains useful even when a gateway serves HTML.
         // A body timeout still retains the unknown delivery boundary.
@@ -397,6 +401,107 @@ export class QqClient {
       [...args, ...body],
       (path, wire) => this.#request(path, { ...init, ...wire }, options),
     );
+  }
+
+  /** Large resources use QQ's signed binary upload, without forwarding bot credentials. */
+  async #uploadChunks(
+    bytes: Uint8Array,
+    name: string,
+    target: string,
+    privateChat: boolean,
+    token: string,
+  ): Promise<ResponseInfo> {
+    const deadline = performance.now() + this.#uploadTimeout;
+    const remaining = () => {
+      const ms = Math.ceil(deadline - performance.now());
+      if (ms <= 0) throw new QqRequestError({ category: "transport", transportReason: "timeout" });
+      return ms;
+    };
+    const hash = (data: Uint8Array, algorithm = "md5") =>
+      createHash(algorithm).update(data).digest("hex");
+    const post = async (
+      operation: Parameters<typeof sdkRequest>[0],
+      data: unknown,
+      statuses: number[],
+    ) => {
+      const response = await this.#sdk(operation, [target], {
+        method: "POST",
+        headers: { Authorization: `QQBot ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      }, { timeoutMs: remaining() });
+      const code = codeOf(response.data);
+      if (!statuses.includes(response.httpStatus) || (code !== undefined && code !== 0)) {
+        throw new QqRequestError(errorInfo(response, code));
+      }
+      return response;
+    };
+    const prepare = await post(privateChat ? "uploadPreparePrivate" : "uploadPrepareGuild", {
+      file_type: 4,
+      file_size: String(bytes.length),
+      file_name: name,
+      md5: hash(bytes),
+      sha1: hash(bytes, "sha1"),
+      md5_10m: hash(bytes.subarray(0, 10002432)),
+    }, [200, 201]);
+    const { upload_id: uploadId, parts, block_size: blockSize } = prepare.data;
+    const invalid = () => {
+      throw new QqRequestError({ category: "invalid_response" });
+    };
+    if (!nonempty(uploadId) || !Array.isArray(parts) || !parts.length || parts.length > 4096) {
+      invalid();
+    }
+    const sorted = (parts as unknown[]).map((part) => {
+      if (!object(part)) return invalid();
+      return part;
+    }).sort((a, b) => Number(a.index) - Number(b.index));
+    let offset = 0;
+    // Validate the entire plan before sending any bytes to a signed destination.
+    const plan = sorted.map((part, i) => {
+      const size = part.block_size ?? blockSize;
+      if (
+        part.index !== i + 1 || !Number.isSafeInteger(size) || Number(size) <= 0 ||
+        offset >= bytes.length || !nonempty(part.presigned_url)
+      ) return invalid();
+      let url: URL;
+      try {
+        url = new URL(part.presigned_url as string);
+      } catch {
+        return invalid();
+      }
+      const localFixture = this.#base.protocol === "http:" && url.origin === this.#base.origin;
+      if (
+        url.username || url.password || url.hash ||
+        (!localFixture &&
+          (url.protocol !== "https:" || url.port ||
+            !/\.(?:myqcloud\.com|qq\.com)$/.test(url.hostname)))
+      ) return invalid();
+      const end = Math.min(offset + Number(size), bytes.length);
+      const chunk = bytes.subarray(offset, end);
+      offset = end;
+      return { url, chunk, index: i + 1 };
+    });
+    if (offset !== bytes.length) invalid();
+    for (const { url, chunk, index } of plan) {
+      const uploaded = await this.#request(url.href, {
+        method: "PUT",
+        body: new Uint8Array(chunk),
+      }, { timeoutMs: remaining(), raw: true });
+      if (uploaded.httpStatus < 200 || uploaded.httpStatus >= 300) {
+        throw new QqRequestError(errorInfo(uploaded));
+      }
+      await post(privateChat ? "uploadPartFinishPrivate" : "uploadPartFinishGuild", {
+        upload_id: uploadId,
+        part_index: index,
+        block_size: String(chunk.length),
+        md5: hash(chunk),
+      }, [200, 201, 202, 204]);
+    }
+    return await post(privateChat ? "sendFilePrivate" : "sendFileGuild", {
+      file_type: 4,
+      srv_send_msg: false,
+      file_name: name,
+      upload_id: uploadId,
+    }, [200, 201]);
   }
 
   async #authenticate(): Promise<string> {
@@ -575,32 +680,46 @@ export class QqClient {
       }
       let upload: ResponseInfo;
       try {
-        upload = await this.#sdk(
-          scope === "c2c" ? "sendFilePrivate" : "sendFileGuild",
-          [target],
-          {
-            method: "POST",
-            headers: {
-              Authorization: `QQBot ${token}`,
-              "Content-Type": "application/json; charset=utf-8",
+        upload = request.attachment.kind === "file" && bytes.length > 5 * 1024 * 1024
+          ? await this.#uploadChunks(
+            bytes,
+            fileName(request.attachment.path),
+            target,
+            scope === "c2c",
+            token,
+          )
+          : await this.#sdk(
+            scope === "c2c" ? "sendFilePrivate" : "sendFileGuild",
+            [target],
+            {
+              method: "POST",
+              headers: {
+                Authorization: `QQBot ${token}`,
+                "Content-Type": "application/json; charset=utf-8",
+              },
+              body: JSON.stringify({
+                file_type: request.attachment.kind === "image" ? 1 : 4,
+                file_data: Buffer.from(bytes).toString("base64"),
+                srv_send_msg: false,
+                ...(request.attachment.kind === "file"
+                  ? { file_name: fileName(request.attachment.path) }
+                  : {}),
+              }),
             },
-            body: JSON.stringify({
-              file_type: request.attachment.kind === "image" ? 1 : 4,
-              file_data: Buffer.from(bytes).toString("base64"),
-              srv_send_msg: false,
-              ...(request.attachment.kind === "file"
-                ? { file_name: fileName(request.attachment.path) }
-                : {}),
-            }),
-          },
-          { timeoutMs: this.#uploadTimeout },
-        );
+            { timeoutMs: this.#uploadTimeout },
+          );
       } catch (error) {
+        if (error instanceof QqRequestError && error.info.category === "authentication") {
+          this.invalidateToken();
+        }
         return {
           // srv_send_msg:false only uploads a resource; /messages has not been attempted.
           status: "failed",
           attempted: false,
-          error: { ...(error as QqRequestError).info, failureStage: "upload" },
+          error: {
+            ...(error instanceof QqRequestError ? error.info : { category: "request" as const }),
+            failureStage: "upload",
+          },
         };
       }
       let code: number | undefined;
@@ -610,10 +729,13 @@ export class QqClient {
         return {
           status: "failed",
           attempted: false,
-          error: { ...(error as QqRequestError).info, failureStage: "upload" },
+          error: {
+            ...(error instanceof QqRequestError ? error.info : { category: "request" as const }),
+            failureStage: "upload",
+          },
         };
       }
-      if (upload.httpStatus !== 200 || (code !== undefined && code !== 0)) {
+      if (![200, 201].includes(upload.httpStatus) || (code !== undefined && code !== 0)) {
         const error = { ...errorInfo(upload, code), failureStage: "upload" as const };
         if (error.category === "authentication") this.invalidateToken();
         return {

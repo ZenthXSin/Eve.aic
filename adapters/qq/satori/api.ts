@@ -19,7 +19,11 @@ export async function sdkRequest<T>(
     | "sendPrivateMessage"
     | "sendMessage"
     | "sendFilePrivate"
-    | "sendFileGuild",
+    | "sendFileGuild"
+    | "uploadPreparePrivate"
+    | "uploadPrepareGuild"
+    | "uploadPartFinishPrivate"
+    | "uploadPartFinishGuild",
   args: unknown[],
   transport: (path: string, init: RequestInit) => Promise<T & { data: Record<string, unknown> }>,
 ): Promise<T> {
