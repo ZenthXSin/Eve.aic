@@ -1,3 +1,4 @@
+import { MODEL_RPC_TIMEOUT_MS } from "../../sdk/model-timeouts.ts";
 import type { Message, ModelResponse, ToolSpec } from "../../contracts/model.ts";
 import type { NoteApi } from "../../contracts/notes.ts";
 import { presentContext } from "../../sdk/context-presentation.ts";
@@ -922,7 +923,7 @@ export class EveRuntime {
           tools,
           ...(this.config.remoteRecords ? { _actionId: requestId } : {}),
         } as unknown as Json,
-        { timeoutMs: this.config.modelTimeoutMs },
+        { timeoutMs: Math.max(this.config.modelTimeoutMs, MODEL_RPC_TIMEOUT_MS) },
       ) as unknown as ModelResponse;
       if (!response || typeof response.content !== "string" || !Array.isArray(response.toolCalls)) {
         throw new KernelError("rejected", "模型回复不符合当前契约");

@@ -1,3 +1,5 @@
+import { ChatModelError } from "./errors.ts";
+export { ChatModelError } from "./errors.ts";
 // Chat Completions 传输。配置与凭据捕获一次，单一稳定会话，不设置 temperature。
 import {
   MODEL_IMAGE_MAX_BYTES,
@@ -8,6 +10,8 @@ import {
   type ModelResponse,
   type ToolCall,
 } from "../../contracts/model.ts";
+import { MODEL_MAX_DURATION_MS } from "../../sdk/model-timeouts.ts";
+import { ChatStream } from "./stream.ts";
 import { permanentModelStatus } from "../../sdk/model-failure.ts";
 
 export interface ChatModelOptions {
@@ -17,25 +21,13 @@ export interface ChatModelOptions {
   sessionId: string;
   reasoningEffort?: string;
   maxOutputTokens: number;
+  /** Legacy setting now supplies the first-token and progress-idle deadlines. */
   timeoutMs: number;
+  connectTimeoutMs?: number;
+  firstTokenTimeoutMs?: number;
+  idleTimeoutMs?: number;
+  maxDurationMs?: number;
   maxResponseBytes?: number;
-}
-
-export class ChatModelError extends Error {
-  constructor(
-    readonly category:
-      | "configuration"
-      | "request"
-      | "transport"
-      | "http"
-      | "provider_rejected"
-      | "invalid_response",
-    readonly httpStatus?: number,
-  ) {
-    // 服务端正文、URL 和 fetch 原文可能含凭据，不写入错误消息或 cause。
-    super(`模型请求未完成：${category}${httpStatus === undefined ? "" : ` (${httpStatus})`}`);
-    this.name = "ChatModelError";
-  }
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -186,7 +178,8 @@ async function requestBody(
     ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
     max_completion_tokens: config.maxOutputTokens,
     prompt_cache_key: config.sessionId,
-    stream: false,
+    stream: true,
+    stream_options: { include_usage: true },
   };
 }
 
@@ -277,13 +270,26 @@ export class ChatModelClient {
   #closed = new AbortController();
 
   constructor(options: ChatModelOptions) {
-    const config = { ...options, maxResponseBytes: options.maxResponseBytes ?? 2_097_152 };
+    const config = {
+      ...options,
+      connectTimeoutMs: options.connectTimeoutMs ?? options.timeoutMs,
+      firstTokenTimeoutMs: options.firstTokenTimeoutMs ?? options.timeoutMs,
+      idleTimeoutMs: options.idleTimeoutMs ?? options.timeoutMs,
+      maxDurationMs: options.maxDurationMs ?? MODEL_MAX_DURATION_MS,
+      maxResponseBytes: options.maxResponseBytes ?? 2_097_152,
+    };
     if (
       typeof config.model !== "string" || !config.model.trim() ||
       typeof config.apiKey !== "string" || !config.apiKey.trim() ||
       typeof config.sessionId !== "string" || !/^[a-zA-Z0-9_.:-]{1,256}$/.test(config.sessionId) ||
       !positive(config.maxOutputTokens) || !positive(config.timeoutMs) ||
       config.timeoutMs > 2_147_483_647 || !positive(config.maxResponseBytes) ||
+      ![
+        config.connectTimeoutMs,
+        config.firstTokenTimeoutMs,
+        config.idleTimeoutMs,
+        config.maxDurationMs,
+      ].every((n) => positive(n) && n <= MODEL_MAX_DURATION_MS) ||
       (config.reasoningEffort !== undefined &&
         (typeof config.reasoningEffort !== "string" || !config.reasoningEffort.trim()))
     ) fail("configuration");
@@ -328,17 +334,32 @@ export class ChatModelClient {
       if (error instanceof ChatModelError) throw error;
       fail("request");
     }
+    const controller = new AbortController();
+    let timeoutPhase: ChatModelError["timeoutPhase"];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expire = (phase: NonNullable<ChatModelError["timeoutPhase"]>) => {
+      if (!controller.signal.aborted) {
+        timeoutPhase = phase;
+        controller.abort();
+      }
+    };
+    const arm = (phase: "connect" | "first_token" | "idle", ms: number) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => expire(phase), ms);
+    };
+    const totalTimer = setTimeout(() => expire("total"), config.maxDurationMs!);
+    const signal = AbortSignal.any([this.#closed.signal, controller.signal]);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
+      arm("connect", config.connectTimeoutMs!);
       const response = await fetch(this.#endpoint, {
         method: "POST",
         redirect: "manual",
-        signal: AbortSignal.any([
-          this.#closed.signal,
-          AbortSignal.timeout(this.#config.timeoutMs),
-        ]),
+        signal,
         headers: {
           Authorization: `Bearer ${this.#config.apiKey}`,
           "Content-Type": "application/json",
+          Accept: "text/event-stream",
           session_id: config.sessionId,
           "X-Session-ID": config.sessionId,
         },
@@ -352,39 +373,66 @@ export class ChatModelClient {
         );
       }
       if (!response.body) fail("invalid_response");
-      const reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let bytes = 0;
-      try {
-        while (true) {
-          const next = await reader.read();
-          if (next.done) break;
-          bytes += next.value.length;
-          if (bytes > this.#config.maxResponseBytes!) {
-            await reader.cancel();
-            fail("invalid_response");
-          }
-          chunks.push(next.value);
+      arm("first_token", config.firstTokenTimeoutMs!);
+      reader = response.body.getReader();
+      const limit = config.maxResponseBytes!;
+      const isStream = response.headers.get("content-type")?.split(";", 1)[0].trim()
+        .toLowerCase() === "text/event-stream";
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const decode = (bytes?: Uint8Array, streaming = false) => {
+        try {
+          return decoder.decode(bytes, { stream: streaming });
+        } catch {
+          fail("invalid_response");
         }
-      } finally {
-        reader.releaseLock();
+      };
+      const stream = isStream
+        ? new ChatStream(limit, () => arm("idle", config.idleTimeoutMs!))
+        : null;
+      let bytes = 0;
+      const chunks: string[] = [];
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        bytes += next.value.length;
+        // SSE repeats field names per token. Bound wire overhead separately from retained output.
+        if (bytes > (isStream ? limit * 64 + 1_048_576 : limit)) fail("invalid_response");
+        const text = decode(next.value, true);
+        if (stream) {
+          stream.feed(text);
+          if (stream.done) break;
+        } else {
+          // Compatibility for upstreams that ignore stream and return a complete JSON document.
+          chunks.push(text);
+        }
       }
-      const data = new Uint8Array(bytes);
-      let offset = 0;
-      for (const chunk of chunks) {
-        data.set(chunk, offset);
-        offset += chunk.length;
+      const tail = decode();
+      if (stream) {
+        stream.feed(tail);
+        return modelResponse(stream.result(), snapshot);
       }
+      chunks.push(tail);
       let decoded: unknown;
       try {
-        decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data));
+        decoded = JSON.parse(chunks.join(""));
       } catch {
         fail("invalid_response");
       }
       return modelResponse(decoded, snapshot);
     } catch (error) {
+      if (timeoutPhase) throw new ChatModelError("transport", undefined, timeoutPhase);
       if (error instanceof ChatModelError) throw error;
       throw new ChatModelError("transport");
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(totalTimer);
+      controller.abort();
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch { /* The fetch may already have been aborted. */ }
+        reader.releaseLock();
+      }
     }
   }
 }
