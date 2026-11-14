@@ -102,6 +102,8 @@ Deno.test("QQ 网关：Identify心跳继续，事件落盘前不前移恢复序�
   const handlerEntered = deferred<void>();
   const allowSave = deferred<void>();
   const handledSecond = deferred<void>();
+  const heartbeatReceived = deferred<void>();
+  let heartbeatDeadline: ReturnType<typeof setTimeout> | undefined;
   let heartbeatWhileSaving = false;
   let requestedReconnect = false;
   const auth: Record<string, unknown>[] = [];
@@ -111,6 +113,7 @@ Deno.test("QQ 网关：Identify心跳继续，事件落盘前不前移恢复序�
       if (payload.op === 1) {
         if (connection === 1 && payload.d === 0) {
           heartbeatWhileSaving = true;
+          heartbeatReceived.resolve();
           if (!requestedReconnect) {
             requestedReconnect = true;
             emit(socket, { op: 7 });
@@ -134,7 +137,7 @@ Deno.test("QQ 网关：Identify心跳继续，事件落盘前不前移恢复序�
         }
       }
     };
-  });
+  }, 1000);
   const journal = new QqInboundJournal(`${directory}/inbound`);
   const checkpoint = new FileGatewayCheckpoint(`${directory}/gateway/session.json`);
   let consumerCalls = 0;
@@ -160,7 +163,18 @@ Deno.test("QQ 网关：Identify心跳继续，事件落盘前不前移恢复序�
     running = gateway.run(controller.signal);
     await handlerEntered.promise;
     assert.equal((await checkpoint.load())?.sequence, 0);
-    await new Promise((r) => setTimeout(r, 40));
+    // Keep saving blocked until the server actually observes the old watermark heartbeat.
+    // This checks ordering independently of the host's ability to schedule within 40ms.
+    await Promise.race([
+      heartbeatReceived.promise,
+      new Promise<never>((_, reject) => {
+        heartbeatDeadline = setTimeout(
+          () => reject(new Error("heartbeat did not reach server")),
+          5000,
+        );
+      }),
+    ]);
+    clearTimeout(heartbeatDeadline);
     assert.equal(heartbeatWhileSaving, true);
     // 断线发生在消费仍等待时，已接收事件保存完才允许第二连接。
     allowSave.resolve();
@@ -172,6 +186,7 @@ Deno.test("QQ 网关：Identify心跳继续，事件落盘前不前移恢复序�
     assert.equal(journal.records().length, 2);
     assert.equal(local.count().connections, 2);
   } finally {
+    clearTimeout(heartbeatDeadline);
     allowSave.resolve();
     controller.abort();
     await running?.catch(() => {});
