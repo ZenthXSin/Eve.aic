@@ -1,14 +1,11 @@
 // 可独立运行的接收器；持有目录排他锁，先保留消息再提交网关水位。这里不调模型、不发消息。
 import { QqClient } from "./client.ts";
 import { FileGatewayCheckpoint } from "./checkpoint.ts";
-import { QqGateway } from "./gateway.ts";
+import { QqGateway, type QqGatewayStatus } from "./gateway.ts";
 import { qqMessage } from "./inbound.ts";
 import { type InboundRecord, QqInboundJournal } from "./journal.ts";
 
-export interface QqReceiverStatus {
-  status: "connecting" | "connected" | "hello" | "ready" | "resumed" | "disconnected";
-  code?: number;
-}
+export type QqReceiverStatus = QqGatewayStatus;
 
 export class QqReceiver {
   #running = false;

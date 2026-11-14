@@ -13,18 +13,43 @@ export class QqGatewayError extends Error {
   }
 }
 
+export type QqDisconnectReason =
+  | "remote"
+  | "connection_timeout"
+  | "heartbeat_timeout"
+  | "heartbeat_transport"
+  | "transport_error"
+  | "server_reconnect"
+  | "invalid_session"
+  | "consumer_backlog"
+  | "local_failure"
+  | "stopped";
+
+export interface QqGatewayStatus {
+  status: "connecting" | "connected" | "hello" | "ready" | "resumed" | "disconnected";
+  code?: number;
+  reason?: QqDisconnectReason;
+  closeTimedOut?: boolean;
+}
+
+interface ConnectionResult {
+  code: number;
+  ready: boolean;
+  livedMs: number;
+  reason: QqDisconnectReason;
+  closeTimedOut: boolean;
+  reconnectDelayMs?: number;
+}
+
 export interface QqGatewayOptions {
   /** 只选需接收的事件。C2C 为 1<<25；发送范围另在传输层设置。 */
   intents: number;
   onDispatch(event: QqDispatch): Promise<void>;
   checkpoint: GatewayCheckpoint;
-  onStatus?(
-    event: {
-      status: "connecting" | "connected" | "hello" | "ready" | "resumed" | "disconnected";
-      code?: number;
-    },
-  ): void;
+  onStatus?(event: QqGatewayStatus): void;
   connectTimeoutMs?: number;
+  /** 本地关闭不能无限依赖 close 回调；仍须等待已入队事件持久化后才重连。 */
+  closeTimeoutMs?: number;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
   rateLimitBackoffMs?: number;
@@ -57,6 +82,7 @@ export class QqGateway {
   constructor(readonly client: QqClient, options: QqGatewayOptions) {
     this.#options = {
       connectTimeoutMs: 30_000,
+      closeTimeoutMs: 5_000,
       initialBackoffMs: 1000,
       maxBackoffMs: 60_000,
       rateLimitBackoffMs: 60_000,
@@ -70,6 +96,7 @@ export class QqGateway {
     for (
       const duration of [
         this.#options.connectTimeoutMs,
+        this.#options.closeTimeoutMs,
         this.#options.initialBackoffMs,
         this.#options.maxBackoffMs,
         this.#options.rateLimitBackoffMs,
@@ -120,7 +147,7 @@ export class QqGateway {
   async #connection(
     connection: QqGatewayConnection,
     signal: AbortSignal,
-  ): Promise<{ code: number; ready: boolean; livedMs: number; reconnectDelayMs?: number }> {
+  ): Promise<ConnectionResult> {
     const startedAt = performance.now();
     const socket = connection.socket;
     let ready = false;
@@ -129,6 +156,10 @@ export class QqGateway {
     let awaitingHeartbeat = false;
     let fatal: QqGatewayError | undefined;
     let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    let reason: QqDisconnectReason | undefined;
+    let closeTimedOut = false;
     let heartbeatIntervalMs = 0;
     let reconnectDelayMs: number | undefined;
     let queue: Promise<void> = Promise.resolve();
@@ -137,29 +168,51 @@ export class QqGateway {
     const closed = new Promise<number>((resolve) => {
       resolveClosed = resolve;
     });
-    const close = (code: number, reason: string) => {
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
       receiving = false;
-      if (socket.readyState === WebSocket.CLOSED) return;
+      clearTimeout(closeTimer);
+      clearTimeout(heartbeatTimer);
+      clearTimeout(timeout);
+      resolveClosed(code);
+    };
+    const close = (code: number, cause: QqDisconnectReason) => {
+      receiving = false;
+      reason ??= cause;
+      clearTimeout(heartbeatTimer);
+      clearTimeout(timeout);
+      if (settled) return;
+      if (socket.readyState === WebSocket.CLOSED) {
+        finish(code);
+        return;
+      }
+      if (closeTimer !== undefined) return;
+      // 和 CowAgent 的外层重连监督一样，不假定库总会调用 onclose。
+      closeTimer = setTimeout(() => {
+        closeTimedOut = true;
+        finish(code);
+      }, this.#options.closeTimeoutMs);
       try {
-        socket.close(code, reason);
+        socket.close(code, cause);
       } catch {
-        resolveClosed(1006);
+        finish(1006);
       }
     };
     const timeout = setTimeout(
-      () => close(4000, "connection deadline"),
+      () => close(4000, "connection_timeout"),
       this.#options.connectTimeoutMs,
     );
     const abort = () => close(1000, "stopped");
     signal.addEventListener("abort", abort, { once: true });
     const fail = (error: QqGatewayError) => {
       fatal ??= error;
-      close(4000, "local failure");
+      close(4000, "local_failure");
     };
     const heartbeat = (requested = false) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
+      if (!receiving || signal.aborted || !hello || socket.readyState !== WebSocket.OPEN) return;
       if (awaitingHeartbeat && !requested) {
-        close(4000, "heartbeat deadline");
+        close(4000, "heartbeat_timeout");
         return;
       }
       // A server request must be answered even while an earlier ACK is outstanding.
@@ -172,20 +225,15 @@ export class QqGateway {
       try {
         socket.send(JSON.stringify({ op: 1, d: this.#session?.sequence ?? null }));
       } catch {
-        close(4000, "heartbeat transport");
+        close(4000, "heartbeat_transport");
       }
     };
-    socket.onopen = () => this.#options.onStatus?.({ status: "connected" });
-    socket.onclose = (event) => {
-      receiving = false;
-      resolveClosed(event.code);
+    socket.onopen = () => {
+      if (receiving && !signal.aborted) this.#options.onStatus?.({ status: "connected" });
     };
+    socket.onclose = (event) => finish(event.code);
     socket.onerror = () => {
-      try {
-        socket.close();
-      } catch {
-        resolveClosed(1006);
-      }
+      if (receiving) close(4000, "transport_error");
     };
     socket.onmessage = (incoming) => {
       if (!receiving || fatal || signal.aborted) return;
@@ -225,7 +273,7 @@ export class QqGateway {
       } else if (data.op === 1) {
         heartbeat(true);
       } else if (data.op === 7) {
-        close(4000, "server reconnect");
+        close(4000, "server_reconnect");
       } else if (data.op === 9) {
         if (typeof data.d !== "boolean") {
           fail(new QqGatewayError("protocol"));
@@ -242,7 +290,7 @@ export class QqGateway {
             await this.#checkpoint(undefined);
             this.client.invalidateToken();
           }
-          close(4000, "invalid session");
+          close(4000, "invalid_session");
         }).catch((error) =>
           fail(error instanceof QqGatewayError ? error : new QqGatewayError("protocol"))
         );
@@ -257,7 +305,7 @@ export class QqGateway {
         const event = data as unknown as QqDispatch;
         if (pending >= 64) {
           // 不确认尚未入队的序号，让平台从已持久化水位补发，避免无限内存队列。
-          close(4000, "consumer backlog");
+          close(4000, "consumer_backlog");
           return;
         }
         pending++;
@@ -267,8 +315,11 @@ export class QqGateway {
           if (status) {
             ready = true;
             clearTimeout(timeout);
-            this.#options.onStatus?.({ status });
-            if (!signal.aborted && !awaitingHeartbeat) heartbeat();
+            // 旧连接的 READY 落盘可能晚于关闭，不能覆盖当前断线状态或再发心跳。
+            if (receiving && !signal.aborted) {
+              this.#options.onStatus?.({ status });
+              if (!awaitingHeartbeat) heartbeat();
+            }
           }
         }).catch((error) =>
           fail(error instanceof QqGatewayError ? error : new QqGatewayError("handler"))
@@ -285,8 +336,17 @@ export class QqGateway {
       // 断线不能中断已开始的落盘；等完成后才允许下一连接恢复序号。
       await queue;
       if (fatal) throw fatal;
-      return { code, ready, livedMs: performance.now() - startedAt, reconnectDelayMs };
+      return {
+        code,
+        ready,
+        livedMs: performance.now() - startedAt,
+        reason: reason ?? "remote",
+        closeTimedOut,
+        reconnectDelayMs,
+      };
     } finally {
+      receiving = false;
+      clearTimeout(closeTimer);
       clearTimeout(heartbeatTimer);
       clearTimeout(timeout);
       signal.removeEventListener("abort", abort);
@@ -312,7 +372,7 @@ export class QqGateway {
       }
       while (!signal.aborted) {
         this.#options.onStatus?.({ status: "connecting" });
-        let result: { code: number; ready: boolean; livedMs: number; reconnectDelayMs?: number };
+        let result: ConnectionResult;
         let platformDelay = 0;
         try {
           result = await this.#connection(await this.client.openGateway(), signal);
@@ -330,10 +390,21 @@ export class QqGateway {
               error.info.retryAfterMs ?? 0,
             );
           }
-          result = { code: 1006, ready: false, livedMs: 0 };
+          result = {
+            code: 1006,
+            ready: false,
+            livedMs: 0,
+            reason: "transport_error",
+            closeTimedOut: false,
+          };
         }
         if (signal.aborted) break;
-        this.#options.onStatus?.({ status: "disconnected", code: result.code });
+        this.#options.onStatus?.({
+          status: "disconnected",
+          code: result.code,
+          reason: result.reason,
+          closeTimedOut: result.closeTimedOut,
+        });
         if ([4001, 4002, 4010, 4011, 4012, 4013, 4014, 4914, 4915].includes(result.code)) {
           throw new QqGatewayError("closed", result.code);
         }

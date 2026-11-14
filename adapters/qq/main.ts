@@ -70,7 +70,13 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     directory,
     key,
     (status) =>
-      console.log(JSON.stringify({ adapter: "qq", gateway: status.status, code: status.code })),
+      console.log(JSON.stringify({
+        adapter: "qq",
+        gateway: status.status,
+        code: status.code,
+        reason: status.reason,
+        closeTimedOut: status.closeTimedOut,
+      })),
     fence,
     {
       captureActivationBoundary: startupConfig.qq?.captureActivationBoundary === true,
