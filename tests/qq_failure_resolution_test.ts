@@ -582,7 +582,16 @@ Deno.test("QQ活跃队首重试期间可取消等待中的零尝试后项，并�
     });
     await waitForFile(`${directory}/records/pending-follower.json`);
     const original = await Deno.readTextFile(`${directory}/records/pending-follower.json`);
-    const items = (await actions.listSendQueue()).items;
+    // The durable file is renamed before directory fsync and the in-memory projection.
+    // Wait for admission through the public queue, not the earlier filesystem milestone.
+    const admissionDeadline = Date.now() + 10000;
+    let items: SendQueueItem[];
+    for (;;) {
+      items = (await actions.listSendQueue()).items;
+      if (items.some((item) => item.actionId === "pending-follower")) break;
+      assert.ok(Date.now() < admissionDeadline, "pending follower was not admitted to the queue");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     const pending = items.find((item) => item.actionId === "pending-follower")!;
     assert.equal(items.find((item) => item.actionId === "head")!.canCancel, false);
     assert.equal(pending.canCancel, true);

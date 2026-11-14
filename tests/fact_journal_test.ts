@@ -194,6 +194,40 @@ Deno.test("事实日志：运行中意外出现的目标原件禁止覆盖，并
   }
 });
 
+Deno.test("事实日志：存盘失败保留安全错误类别，关闭仍报告最初错误而不掩盖现场", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-fact-first-failure-" });
+  const journal = new FactJournal(directory);
+  try {
+    await journal.initialize();
+    const first = await journal.append("notice", "唯一原件");
+    await Deno.rename(`${directory}/events`, `${directory}/originals`);
+    await Deno.writeTextFile(`${directory}/events`, "模拟存储目录故障");
+    let failure: unknown;
+    await assert.rejects(journal.append("notice", "不得提交"), (error) => {
+      failure = error;
+      return error instanceof KernelError && error.kind === "storage" &&
+        error.message.includes("NotADirectory") && !error.message.includes(directory);
+    });
+    assert.equal(journal.available, false);
+    assert.equal(journal.count, 1);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await assert.rejects(
+        journal.close(),
+        (error) =>
+          error instanceof KernelError && error.kind === "storage" && error.cause === failure &&
+          error.message.includes("NotADirectory") && !error.message.includes(directory),
+      );
+    }
+    assert.deepEqual(
+      JSON.parse(await Deno.readTextFile(`${directory}/originals/0000000000000001.json`)),
+      first,
+    );
+  } finally {
+    await journal.close().catch(() => {});
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
 Deno.test("事实日志：导入原件保留历史序号时间摘要，重复幂等且冲突拒绝", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-fact-import-" });
   const journal = new FactJournal(directory);

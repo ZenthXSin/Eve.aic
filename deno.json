@@ -3,7 +3,7 @@
     "worker-options"
   ],
   "tasks": {
-    "test": "DENO_JOBS=2 deno test --parallel --no-check --allow-read --allow-write --allow-run --allow-env --allow-net=127.0.0.1,127.0.0.2 tests/",
+    "test": "DENO_JOBS=2 deno test --parallel --reporter=tap --no-check --allow-read --allow-write --allow-run --allow-env --allow-net=127.0.0.1,127.0.0.2 tests/",
     "test:qq": "deno test --allow-net=127.0.0.1,127.0.0.2 tests/qq_client_test.ts",
     "check": "deno check deployment/ runtime/ supervisor/ services/ guardian/ kernel/ sdk/ contracts/ plugins/ adapters/ composition/ demo/ tests/*.ts",
     "demo": "deno run --allow-read --allow-write --allow-run --allow-env demo/run.ts"
