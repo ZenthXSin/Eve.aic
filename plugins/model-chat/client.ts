@@ -347,11 +347,11 @@ export class ChatModelClient {
       clearTimeout(timer);
       timer = setTimeout(() => expire(phase), ms);
     };
-    const totalTimer = setTimeout(() => expire("total"), config.maxDurationMs!);
+    const totalTimer = setTimeout(() => expire("total"), this.#config.maxDurationMs!);
     const signal = AbortSignal.any([this.#closed.signal, controller.signal]);
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
-      arm("connect", config.connectTimeoutMs!);
+      arm("connect", this.#config.connectTimeoutMs!);
       const response = await fetch(this.#endpoint, {
         method: "POST",
         redirect: "manual",
@@ -373,9 +373,9 @@ export class ChatModelClient {
         );
       }
       if (!response.body) fail("invalid_response");
-      arm("first_token", config.firstTokenTimeoutMs!);
+      arm("first_token", this.#config.firstTokenTimeoutMs!);
       reader = response.body.getReader();
-      const limit = config.maxResponseBytes!;
+      const limit = this.#config.maxResponseBytes!;
       const isStream = response.headers.get("content-type")?.split(";", 1)[0].trim()
         .toLowerCase() === "text/event-stream";
       const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -387,7 +387,7 @@ export class ChatModelClient {
         }
       };
       const stream = isStream
-        ? new ChatStream(limit, () => arm("idle", config.idleTimeoutMs!))
+        ? new ChatStream(limit, () => arm("idle", this.#config.idleTimeoutMs!))
         : null;
       let bytes = 0;
       const chunks: string[] = [];

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { ChatModelClient, ChatModelError } from "../plugins/model-chat/client.ts";
-import type { ModelRequest } from "../contracts/model.ts";
+import type { ModelCallOptions, ModelRequest } from "../contracts/model.ts";
 import { MODEL_MAX_DURATION_MS, MODEL_RPC_TIMEOUT_MS } from "../sdk/model-timeouts.ts";
 import { eveStopDeadlineMs } from "../sdk/lifecycle-timeouts.ts";
 
@@ -296,4 +296,25 @@ Deno.test("stream: timeout configuration is validated and outer waits allow the 
   }
   assert.ok(MODEL_RPC_TIMEOUT_MS > MODEL_MAX_DURATION_MS);
   assert.ok(eveStopDeadlineMs(120_000) > MODEL_RPC_TIMEOUT_MS);
+});
+
+Deno.test("stream: per-call agent options cannot override captured transport limits or deadlines", async () => {
+  const local = fixture(() =>
+    stream([event({ role: "assistant" }), event({ content: "OK" }, "stop"), done], 20)
+  );
+  const client = local.client();
+  try {
+    const response = await client.complete(request, {
+      model: "agent-model",
+      connectTimeoutMs: 1,
+      firstTokenTimeoutMs: 1,
+      idleTimeoutMs: 1,
+      maxDurationMs: 1,
+      maxResponseBytes: 1,
+    } as unknown as ModelCallOptions);
+    assert.equal(response.content, "OK");
+  } finally {
+    client.close();
+    await local.close();
+  }
 });
