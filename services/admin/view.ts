@@ -225,12 +225,13 @@ function paintStatus(value){
   const r=value?.runtime??{},s=value?.supervisor??value,o=value?.ownership??{},b=r.budget??value.budget??{},blocked=r.model?.blocked??null;
   blockedRequestId=blocked?.requestId??null;
   const paused=s.paused===true||b.paused===true,available=r.available;
-  const state=blocked?'模型已阻塞':paused?'已暂停':available===false?'服务不可用':available===true?'运行中':'状态待确认';
-  const tone=blocked||available===false?'error':paused||available!==true?'warn':'ok';
+  const recovering=value?.startup?.phase==='recovering';
+  const state=recovering?'恢复中':blocked?'模型已阻塞':paused?'已暂停':available===false?'服务不可用':available===true?'运行中':'状态待确认';
+  const tone=recovering?'warn':blocked||available===false?'error':paused||available!==true?'warn':'ok';
   el('liveBadge').textContent=state;el('liveBadge').className='badge'+(tone==='ok'?'':' '+tone);
   el('hero').setAttribute('data-tone',tone);
-  el('greeting').textContent=blocked?'模型请求被拒绝，已停止重试':paused?'Eve 已暂停':available===true?'Eve 正在运行':'暂时无法确认运行状态';
-  el('healthSummary').textContent=blocked?'上游拒绝了模型请求。请到设置中核对原因，再决定是否解除。':paused?'运行管理者已暂停当前执行。准备好后可以恢复运行。':available===true?'执行服务可用。':'请刷新，并核对管理服务与执行服务的连接。';
+  el('greeting').textContent=recovering?'Eve 正在恢复历史记录':blocked?'模型请求被拒绝，已停止重试':paused?'Eve 已暂停':available===true?'Eve 正在运行':'暂时无法确认运行状态';
+  el('healthSummary').textContent=recovering?(value.startup.services??[]).map(x=>{const p=x.progress??{};return x.service+'：'+(x.phase==='ready'?'已就绪':x.phase==='failed'?'恢复失败':p.total?String(p.read??0)+' / '+p.total+' 条':p.stage??p.phase??'恢复中');}).join('；'):blocked?'上游拒绝了模型请求。请到设置中核对原因，再决定是否解除。':paused?'运行管理者已暂停当前执行。准备好后可以恢复运行。':available===true?'执行服务可用。':'请刷新，并核对管理服务与执行服务的连接。';
   el('runningHint').textContent=s.current??'未提供';
   el('modelValue').textContent=r.model?.current?.model??'—';
   el('modelHint').textContent=r.model?.current?.revision!==undefined?'配置版本 '+r.model.current.revision:'等待模型配置';

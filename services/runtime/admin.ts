@@ -18,6 +18,7 @@ export function startRuntimeAdmin(
   engine: RuntimeEngine,
   key: string,
   quiesce: () => Promise<void>,
+  ready: () => boolean = () => engine.available,
 ) {
   if (!/^[a-zA-Z0-9_-]{32,256}$/.test(key)) {
     throw new KernelError("rejected", "执行服务管理凭据无效");
@@ -144,6 +145,10 @@ export function startRuntimeAdmin(
     };
   };
   const invoke = async (method: string, args: Record<string, Json>): Promise<Json> => {
+    if (method === "status" && !ready()) {
+      return { available: false, recovery: engine.recovery };
+    }
+    if (!ready()) throw new KernelError("unavailable", "执行服务正在恢复历史记录");
     if (method === "status") {
       return {
         available: engine.available,

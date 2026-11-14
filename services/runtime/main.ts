@@ -1,3 +1,5 @@
+import { RecoveryReporter } from "../../sdk/recovery.ts";
+import { dirname, join } from "node:path";
 import { readPrivateModelConfig } from "../../plugins/model-chat/mod.ts";
 import { ChatModelClient } from "../../plugins/model-chat/client.ts";
 import { FileOwnershipExit } from "../../composition/ownership.ts";
@@ -80,21 +82,36 @@ export async function runRuntimeService(configPath: string) {
     "runtime",
     new FileOwnershipExit(c.guardianConnectionFile, c.exitKeyFile),
   );
+  let ready = false;
   let rpc: Awaited<ReturnType<typeof startRuntimeRpc>> | undefined;
   let admin: ReturnType<typeof startRuntimeAdmin> | undefined;
   let modelControl: ReturnType<typeof startRuntimeModelControl> | undefined;
+  const reporter = new RecoveryReporter(
+    c.recoveryFile ?? join(dirname(c.directory), "startup/runtime.json"),
+    "runtime",
+    () => engine.recovery,
+  );
   let resolve!: () => void;
   const done = new Promise<void>((r) => resolve = r), stop = () => resolve();
   try {
-    await selection?.initialize();
-    await engine.initialize();
-    await fence.initialize();
-    rpc = await startRuntimeRpc(engine, (await Deno.readTextFile(c.keyFile)).trim(), fence);
     const adminKey = (await Deno.readTextFile(c.adminKeyFile)).trim();
     if (adminKey === (await Deno.readTextFile(c.keyFile)).trim()) {
       throw new Error("管理与实例凭据必须独立");
     }
-    admin = startRuntimeAdmin(engine, adminKey, () => rpc!.quiesce());
+    admin = startRuntimeAdmin(engine, adminKey, () => rpc!.quiesce(), () => ready);
+    await writeDurableJson(c.adminConnectionFile, { url: admin.url });
+    Deno.addSignalListener("SIGTERM", stop);
+    Deno.addSignalListener("SIGINT", stop);
+    await reporter.start();
+    try {
+      await selection?.initialize();
+      await engine.initialize();
+      await fence.initialize();
+      rpc = await startRuntimeRpc(engine, (await Deno.readTextFile(c.keyFile)).trim(), fence);
+    } catch (error) {
+      await reporter.finish("failed");
+      throw error;
+    }
     if (selection) {
       const modelKey = (await Deno.readTextFile(c.modelControl.keyFile)).trim();
       if ([adminKey, (await Deno.readTextFile(c.keyFile)).trim()].includes(modelKey)) {
@@ -116,11 +133,11 @@ export async function runRuntimeService(configPath: string) {
       await writeDurableJson(c.connectionFile, { url: rpc.url });
       await Deno.chmod(c.connectionFile, 0o644);
     }
-    await writeDurableJson(c.adminConnectionFile, { url: admin.url });
-    Deno.addSignalListener("SIGTERM", stop);
-    Deno.addSignalListener("SIGINT", stop);
+    ready = true;
+    await reporter.finish("ready");
     await done;
   } finally {
+    await reporter.close();
     Deno.removeSignalListener("SIGTERM", stop);
     Deno.removeSignalListener("SIGINT", stop);
     if (modelControl) await modelControl.close();

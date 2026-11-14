@@ -1,3 +1,5 @@
+import { RecoveryReporter } from "../sdk/recovery.ts";
+import { dirname, join } from "node:path";
 import { writeDurableJson } from "../sdk/durable-json.ts";
 import { OwnershipAuthority } from "./ownership.ts";
 import { startOwnershipRpc } from "./rpc.ts";
@@ -12,7 +14,12 @@ export async function runOwnershipService(configPath: string) {
     )
   ) throw new Error("守护使用独立私有绝对路径");
   const authority = new OwnershipAuthority(config.directory, config.leaseMs);
-  await authority.initialize();
+  let ready = false;
+  const reporter = new RecoveryReporter(
+    config.recoveryFile ?? join(dirname(config.directory), "startup/guardian.json"),
+    "guardian",
+    () => authority.store.recovery,
+  );
   let rpc: ReturnType<typeof startOwnershipRpc> | undefined;
   let resolve!: () => void;
   const done = new Promise<void>((finish) => {
@@ -25,6 +32,7 @@ export async function runOwnershipService(configPath: string) {
       authority,
       (await Deno.readTextFile(config.adminKeyFile)).trim(),
       (await Deno.readTextFile(config.exitKeyFile)).trim(),
+      { ready: () => ready, progress: () => authority.store.recovery },
     );
     await writeDurableJson(`${config.directory}/connection.json`, { url: rpc.url });
     if (config.connectionFile) {
@@ -37,9 +45,19 @@ export async function runOwnershipService(configPath: string) {
     Deno.addSignalListener("SIGINT", stop);
     Deno.addSignalListener("SIGTERM", stop);
     listening = true;
+    await reporter.start();
+    try {
+      await authority.initialize();
+      ready = true;
+      await reporter.finish("ready");
+    } catch (error) {
+      await reporter.finish("failed");
+      throw error;
+    }
     console.log(JSON.stringify({ ownership: "ready", epoch: authority.status().epoch }));
     await done;
   } finally {
+    await reporter.close();
     if (listening) {
       Deno.removeSignalListener("SIGINT", stop);
       Deno.removeSignalListener("SIGTERM", stop);
