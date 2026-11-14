@@ -18,7 +18,8 @@ const keys = {
   phone: "fixture_instance_phone_01234567890123456789012",
 };
 async function fixture(
-  options: { leaseMs?: number; renewalMs?: number; modelDelayMs?: number } = {},
+  options: { leaseMs?: number; renewalMs?: number; modelDelayMs?: number; nativeRest?: boolean } =
+    {},
 ) {
   const directory = await Deno.makeTempDir({ prefix: "eve-instance-" });
   await writeDurableJson(`${directory}/settings.json`, {
@@ -67,7 +68,13 @@ async function fixture(
         requests.push(request);
         const result = {
           content: "我已经看到了，现在先休息。",
-          toolCalls: [],
+          toolCalls: options.nativeRest
+            ? [{
+              id: "rest-native",
+              name: "rest",
+              args: { reason: "资料先放着", unfinished: ["阅读资料"], resume: "醒来继续读" },
+            }]
+            : [],
           usage: {
             status: "reported" as const,
             inputTokens: 100,
@@ -213,14 +220,16 @@ Deno.test("固定版本宿主：真实插件在线运行、并发控制串行、
     assert.equal(status.state, "active");
     assert.equal(status.sourceCommit, "a".repeat(40));
     assert.equal((status.plugins as Json[]).length, 5);
-    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.engine.records.events.filter((event) => event.kind === "rest_review").length, 1);
+    assert.ok(JSON.stringify(f.requests[1].messages).includes("beforeRest"));
     await f.authority.pause({ requestId: "user-pause", expectedEpoch: f.authority.status().epoch });
     await waitFor(async () =>
       (await f.call("status") as Record<string, Json>).state === "lease_lost"
     );
     const denied = await (await f.raw("activate")).json();
     assert.equal(denied.ok, false);
-    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests.length, 2);
     await Promise.all([f.call("deactivate"), f.call("deactivate")]);
   } finally {
     await f.close();
@@ -528,6 +537,24 @@ Deno.test("续租：通信持续未知不得越过最后确认的租约期限继
     assert.equal(diagnostic.error.kind, "unknown");
     assert.equal(diagnostic.retry, false);
     assert.ok(Date.parse(diagnostic.at) >= diagnostic.leaseExpiresAt);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("固定版本宿主：原生收尾贯通真实插件与远端日志，一次模型调用即可持久休息", async () => {
+  const f = await fixture({ nativeRest: true });
+  try {
+    await f.call("activate");
+    await waitFor(() => f.engine.records.events.some((event) => event.kind === "rest"));
+    assert.equal(f.requests.length, 1);
+    assert.ok(f.requests[0].tools.some((tool) => tool.name === "set_focus"));
+    const rest = f.engine.records.events.find((event) => event.kind === "rest")!;
+    assert.equal((rest.data as { resume: string }).resume, "醒来继续读");
+    assert.equal(f.engine.records.events.filter((event) => event.kind === "rest_review").length, 0);
+    await f.restart();
+    await f.call("activate");
+    assert.equal(f.requests.length, 1);
   } finally {
     await f.close();
   }
