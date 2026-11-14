@@ -31,7 +31,14 @@ export async function readEveConfig(path: string): Promise<EveConfig> {
   } catch {
     throw new KernelError("rejected", "预算时区无效");
   }
-  return { ...value, agentsEnabled: value.remoteRecords === true && value.agentsEnabled !== false };
+  if (value.restReviewEnabled !== undefined && typeof value.restReviewEnabled !== "boolean") {
+    throw new KernelError("rejected", "休息收尾开关无效");
+  }
+  return {
+    ...value,
+    restReviewEnabled: value.restReviewEnabled ?? value.remoteRecords === true,
+    agentsEnabled: value.remoteRecords === true && value.agentsEnabled !== false,
+  };
 }
 export function createEvePlugin(configPath: string) {
   let runtime: EveRuntime | undefined;

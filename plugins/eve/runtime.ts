@@ -1,3 +1,11 @@
+import {
+  continuityMessage,
+  FOCUS_TOOL,
+  focusArgs,
+  pendingRestReview,
+  REST_TOOL,
+  restArgs,
+} from "./continuity.ts";
 import { MODEL_RPC_TIMEOUT_MS } from "../../sdk/model-timeouts.ts";
 import type { Message, ModelResponse, ToolSpec } from "../../contracts/model.ts";
 import type { NoteApi } from "../../contracts/notes.ts";
@@ -40,6 +48,7 @@ export interface EveConfig {
   timeZone?: string;
   remoteRecords?: boolean;
   agentsEnabled?: boolean;
+  restReviewEnabled?: boolean;
 }
 export class EveRuntime {
   readonly journal: ConsciousJournal | RemoteJournal;
@@ -109,6 +118,7 @@ export class EveRuntime {
     return [
       ...presentContext(messages, this.#rawCalls, this.#receiptRecords),
       ...this.#selfMessages,
+      ...(this.config.restReviewEnabled ? [continuityMessage(events, this.#observedJobs)] : []),
     ];
   }
   #render() {
@@ -465,7 +475,7 @@ export class EveRuntime {
         fresh = true;
         this.#alarmFresh = true;
       } else if (event.kind === "rest") {
-        this.#restApplied = true;
+        this.#restApplied = !this.config.restReviewEnabled;
         wakeAt =
           event.args !== null && typeof event.args === "object" && !Array.isArray(event.args) &&
             typeof event.args.wakeAt === "string"
@@ -497,6 +507,14 @@ export class EveRuntime {
         );
         if (result) await this.journal.append("retain", event.args);
         else outcome = { status: "rejected", reason: "对应工具回执尚未确认，未修改当前视图" };
+      }
+      if (event.kind === "rest" && this.config.restReviewEnabled && wakeAt !== undefined) {
+        await this.journal.append("rest_review", {
+          wakeAt,
+          reason: "Eve通过mind.rest申请休息",
+          requestId: event.requestId,
+        });
+        wakeAt = 0;
       }
       await this.journal.append("mind_applied", {
         throughSeq: event.seq,
@@ -557,6 +575,65 @@ export class EveRuntime {
       });
     }
     let result: Json;
+    if (call.name === FOCUS_TOOL.name && this.config.restReviewEnabled) {
+      try {
+        let focus = activeEvents(this.journal.events).find((e) =>
+          e.kind === "focus" && (e.data as { callId?: string }).callId === call.id
+        );
+        if (!focus) {
+          const args = focusArgs(call.args);
+          const previous = lastActiveEvent(this.journal.events, "focus");
+          if (args.expectedSeq !== (previous?.seq ?? 0)) {
+            throw new KernelError("rejected", "近期重心已变化，请基于当前上下文中的版本修改");
+          }
+          focus = await this.journal.append("focus", { callId: call.id, ...args });
+        }
+        result = {
+          status: "completed",
+          output: JSON.stringify({
+            recorded: true,
+            record: focus.seq,
+            ...focus.data as Record<string, Json>,
+          }),
+        };
+      } catch (error) {
+        if (!(error instanceof KernelError && error.kind === "rejected")) throw error;
+        result = { status: "failed", error: toWireError(error) as unknown as Json };
+      }
+      await this.#saveToolResult(call.id, result);
+      return;
+    }
+    if (call.name === REST_TOOL.name && this.config.restReviewEnabled) {
+      try {
+        const original = activeEvents(this.journal.events).find((e) =>
+          e.seq === pending.responseSeq
+        );
+        const calls = (original?.data as unknown as { response: ModelResponse })?.response
+          .toolCalls;
+        if (calls?.length !== 1) {
+          throw new KernelError("rejected", "rest须为本轮唯一工具；先完成其他动作，再决定休息");
+        }
+        const applied = activeEvents(this.journal.events).find((e) =>
+          e.kind === "rest_decision" && (e.data as { callId?: string }).callId === call.id
+        );
+        if (!applied) {
+          const decision = restArgs(call.args);
+          await this.journal.append("rest_decision", { callId: call.id, ...decision });
+        }
+        result = {
+          status: "completed",
+          output: JSON.stringify({
+            decisionRecorded: true,
+            message: "收尾决定已持久保存，下一步处理新通知后进入休息；新事件仍可唤醒",
+          }),
+        };
+      } catch (error) {
+        if (!(error instanceof KernelError && error.kind === "rejected")) throw error;
+        result = { status: "failed", error: toWireError(error) as unknown as Json };
+      }
+      await this.#saveToolResult(call.id, result);
+      return;
+    }
     if (CONTEXT_TOOLS.some((tool) => tool.name === call.name)) {
       try {
         // 已落盘压缩但尚未写回执时，重启只补齐原收据，不重新执行或推测生效。
@@ -719,7 +796,11 @@ export class EveRuntime {
   }
   async #tools(): Promise<ToolSpec[]> {
     const provided = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
-    const native = [WRITE_THOUGHT_TOOL, ...CONTEXT_TOOLS];
+    const native = [
+      WRITE_THOUGHT_TOOL,
+      ...CONTEXT_TOOLS,
+      ...(this.config.restReviewEnabled ? [FOCUS_TOOL, REST_TOOL] : []),
+    ];
     if (provided.some((tool) => native.some((item) => item.name === tool.name))) {
       throw new KernelError("rejected", "意识流原生工具不能由外部覆盖");
     }
@@ -739,12 +820,37 @@ export class EveRuntime {
       if (!this.#closing) this.#continueImmediately = true;
       return;
     }
+    let appliedRest = false;
+    if (this.config.restReviewEnabled) {
+      const decision = lastActiveEvent(this.journal.events, "rest_decision");
+      const previous = lastActiveEvent(this.journal.events, "rest");
+      if (decision && decision.seq > (previous?.seq ?? 0)) {
+        const data = decision.data as { callId: string; wakeAt?: string };
+        const receipt = activeEvents(this.journal.events).findLast((e) =>
+          e.kind === "tool_result" && (e.data as { callId: string }).callId === data.callId
+        );
+        if (receipt) {
+          this.#wake = data.wakeAt && Date.parse(data.wakeAt) > Date.now()
+            ? Date.parse(data.wakeAt)
+            : Date.now() + this.config.defaultSleepMs;
+          await this.journal.append("rest", {
+            ...decision.data as Record<string, Json>,
+            wakeAt: this.#wake,
+            sourceCommit: this.config.sourceCommit,
+            decisionSeq: decision.seq,
+          });
+          appliedRest = true;
+        }
+      }
+    }
     const noticesStarted = performance.now();
     const fresh = await this.#notices();
     const noticesMs = performance.now() - noticesStarted;
     if (
-      this.#restApplied && !this.#phoneFresh && !this.#alarmFresh && !this.#commandFresh &&
-      !this.#agentFresh
+      (this.#restApplied || appliedRest) &&
+      (this.config.restReviewEnabled
+        ? !fresh
+        : !this.#phoneFresh && !this.#alarmFresh && !this.#commandFresh && !this.#agentFresh)
     ) return;
     if (fresh) {
       this.#wake = 0;
@@ -1016,12 +1122,29 @@ export class EveRuntime {
     this.#failures = 0;
     this.#retryAt = 0;
     if (response.toolCalls.length === 0) {
-      this.#wake = Date.now() + this.config.defaultSleepMs;
-      await this.journal.append("rest", {
-        wakeAt: this.#wake,
-        sourceCommit: this.config.sourceCommit,
-        reason: "本步没有继续动作；默认长唤醒，Eve可改",
-      });
+      const review = pendingRestReview(this.journal.events);
+      if (this.config.restReviewEnabled && !review) {
+        await this.journal.append("rest_review", {
+          wakeAt: Date.now() + this.config.defaultSleepMs,
+          responseSeq: this.journal.events.at(-1)!.seq,
+          reason: "本步没有继续动作，睡前核对一次未完成事项与自己的打算",
+        });
+        this.#wake = 0;
+        this.#continueImmediately = true;
+      } else {
+        const requested = (review?.data as { wakeAt?: number } | undefined)?.wakeAt;
+        this.#wake = requested && requested > Date.now()
+          ? requested
+          : Date.now() + this.config.defaultSleepMs;
+        await this.journal.append("rest", {
+          wakeAt: this.#wake,
+          sourceCommit: this.config.sourceCommit,
+          reason: "本步没有继续动作；默认长唤醒，Eve可改",
+          ...(this.config.restReviewEnabled
+            ? { summary: response.content, reviewSeq: review!.seq }
+            : {}),
+        });
+      }
     } else {
       this.#wake = 0;
       this.#continueImmediately = true;
@@ -1048,6 +1171,16 @@ export class EveRuntime {
       contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
       contextComposition: this.#contextComposition ?? null,
       modelBlocked: this.#modelBlocked,
+      ...(this.config.restReviewEnabled
+        ? {
+          continuity: {
+            enabled: true,
+            focusRecordSeq: lastActiveEvent(this.journal.events, "focus")?.seq ?? 0,
+            pendingRestReviewSeq: pendingRestReview(this.journal.events)?.seq ?? null,
+            lastRestSeq: lastActiveEvent(this.journal.events, "rest")?.seq ?? null,
+          },
+        }
+        : {}),
     };
   }
   async resumeModel(expectedRequestId: string) {
