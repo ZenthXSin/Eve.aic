@@ -41,7 +41,9 @@ selection; other models, Responses requests and calls without tools keep their e
 The model, credentials, reasoning effort, streaming deadlines and cache session are preserved.
 
 The compatibility request declares the actual tools in a fixed system message and requests
-`response_format: { type: "json_object" }`. Completed assistant content must contain one envelope
+`response_format: { type: "json_object" }`. A fixed final system message repeats the output format
+for providers that ignore JSON mode after long histories, preserving the earlier conversation
+prefix. Completed assistant content must contain one envelope
 `{"content":"...","toolCalls":[{"id":"...","name":"...","args":{}}]}`. If the provider prepends
 plain assistant prose, the envelope must start on a new line and consume the entire remaining
 content; the prose is preserved as assistant content. Code fences, multiple objects and trailing
