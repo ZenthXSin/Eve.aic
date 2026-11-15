@@ -11,6 +11,7 @@ import { startRuntimeRpc } from "./rpc.ts";
 import { startRuntimeAdmin } from "./admin.ts";
 import { ModelSelection } from "./model-selection.ts";
 import { startRuntimeModelControl, validateModelControlConfig } from "./model-control.ts";
+import { readAgentModels } from "./agent-models.ts";
 
 export async function runRuntimeService(configPath: string) {
   const config = JSON.parse(await Deno.readTextFile(configPath));
@@ -56,6 +57,7 @@ export async function runRuntimeService(configPath: string) {
     apiKey: (await Deno.readTextFile(model.apiKeyFile)).trim(),
   };
   const client = new ChatModelClient(modelOptions);
+  const agentModels = await readAgentModels(config.agentModels, modelOptions);
   const selection = c.modelControl
     ? new ModelSelection(`${c.directory}/model-selection`, modelOptions)
     : undefined;
@@ -69,6 +71,7 @@ export async function runRuntimeService(configPath: string) {
     allowedRoots: c.allowedRoots,
     settingsFile: c.settingsFile,
     model: client,
+    agentModels,
     maxOutputTokens: model.maxOutputTokens,
     modelName: model.model,
     modelSelection: selection,

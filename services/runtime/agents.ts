@@ -115,7 +115,13 @@ export class AgentService {
   #accepted = new Map<string, Set<() => void>>();
   #mutations: Promise<unknown> = Promise.resolve();
   #closing = false;
-  constructor(readonly directory: string, readonly hooks: AgentHooks) {
+  constructor(
+    readonly directory: string,
+    readonly hooks: AgentHooks,
+    readonly defaults: Partial<
+      Record<AgentRole, Pick<AgentConfig, "model" | "reasoningEffort">>
+    > = {},
+  ) {
     this.journal = new FactJournal(directory);
   }
   get available() {
@@ -279,6 +285,7 @@ export class AgentService {
       name: roles[type].name,
       reasoningEffort: "high",
       instructions: "",
+      ...this.defaults[type],
       ...previous,
     };
     if (args.name !== undefined) {
