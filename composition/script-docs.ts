@@ -15,7 +15,6 @@ export async function renderScriptContracts(
   const sections: string[] = [];
   let autoWait = false;
   let agents = false;
-  let semanticSearch = false;
   let contractLookup = false;
   let nativeThoughts = false;
   let web = false;
@@ -26,7 +25,6 @@ export async function renderScriptContracts(
     const source = await (readSource ? readSource(path) : Deno.readTextFile(file));
     // 旧源码没有该声明，必须逐字复原旧前言来识别现役提示生成区。
     // 源码仅作为已固定的数据读取；绝不 import 候选生成器或执行标记表达式。
-    if (path === "contracts/memory.ts") semanticSearch = source.includes("indexStatus()");
     if (path === "contracts/phone.ts") sendBurst = /^\s*sendBurst\(/m.test(source);
     if (path === "contracts/script.ts") {
       contractLookup = /^export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 1;\r?$/m.test(source);
@@ -41,13 +39,6 @@ export async function renderScriptContracts(
     sections.push(
       `接口来源：contracts/${file.pathname.split("/").at(-1)}\n\`\`\`ts\n${source}\`\`\``,
     );
-  }
-  if (semanticSearch) {
-    const path = "contracts/search.ts";
-    const source = await (readSource
-      ? readSource(path)
-      : Deno.readTextFile(new URL("../contracts/search.ts", import.meta.url)));
-    sections.push(`接口来源：${path}\n\`\`\`ts\n${source}\`\`\``);
   }
   if (web) {
     const path = "contracts/web.ts";

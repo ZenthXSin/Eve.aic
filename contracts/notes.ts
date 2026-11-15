@@ -94,6 +94,6 @@ export interface NoteApi {
     throughSeq: number;
     hasMore: boolean;
     retrieval?: "literal" | "regex" | "semantic" | "hybrid";
-    index?: import("./search.ts").SearchStatus;
+    index?: import("./memory.ts").SearchStatus;
   }>;
 }

@@ -2,7 +2,7 @@ import { AgentService } from "./agents.ts";
 import type { AgentConfig } from "../../contracts/agents.ts";
 import type { AgentModels } from "./agent-models.ts";
 import type { SemanticSearch } from "./search.ts";
-import type { SearchQuery } from "../../contracts/search.ts";
+import type { SearchQuery } from "../../contracts/memory.ts";
 import type {
   ModelCallOptions,
   ModelImage,

@@ -1,5 +1,5 @@
 import { KernelError } from "../../kernel/protocol.ts";
-import type { SearchQuery, SearchResult, SearchStatus } from "../../contracts/search.ts";
+import type { SearchQuery, SearchResult, SearchStatus } from "../../contracts/memory.ts";
 
 export interface SemanticSearch {
   search(args: SearchQuery): Promise<SearchResult>;

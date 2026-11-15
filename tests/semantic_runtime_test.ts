@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { RuntimeEngine } from "../services/runtime/engine.ts";
-import type { SearchHit, SearchStatus } from "../contracts/search.ts";
+import type { SearchHit, SearchStatus } from "../contracts/memory.ts";
 
 Deno.test("semantic results revalidate current notes and rolled back history without changing originals", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-semantic-runtime-" });
