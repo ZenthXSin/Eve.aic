@@ -13,6 +13,7 @@ import {
 } from "../../contracts/model.ts";
 import { MODEL_MAX_DURATION_MS } from "../../sdk/model-timeouts.ts";
 import { ChatStream } from "./stream.ts";
+import { jsonToolRequest, jsonToolResponse } from "./json-tools.ts";
 import { responsesBody, responsesResult, ResponsesStream } from "./responses.ts";
 import { permanentModelStatus } from "../../sdk/model-failure.ts";
 
@@ -31,6 +32,8 @@ export interface ChatModelOptions {
   idleTimeoutMs?: number;
   maxDurationMs?: number;
   maxResponseBytes?: number;
+  /** Exact model IDs using a validated JSON content envelope instead of native tool_calls. */
+  jsonToolModels?: readonly string[];
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -280,6 +283,11 @@ export class ChatModelClient {
       idleTimeoutMs: options.idleTimeoutMs ?? options.timeoutMs,
       maxDurationMs: options.maxDurationMs ?? MODEL_MAX_DURATION_MS,
       maxResponseBytes: options.maxResponseBytes ?? 2_097_152,
+      jsonToolModels: options.jsonToolModels === undefined
+        ? undefined
+        : Array.isArray(options.jsonToolModels)
+        ? [...options.jsonToolModels]
+        : options.jsonToolModels,
     };
     if (
       typeof config.model !== "string" || !config.model.trim() ||
@@ -294,7 +302,12 @@ export class ChatModelClient {
         config.maxDurationMs,
       ].every((n) => positive(n) && n <= MODEL_MAX_DURATION_MS) ||
       (config.reasoningEffort !== undefined &&
-        (typeof config.reasoningEffort !== "string" || !config.reasoningEffort.trim()))
+        (typeof config.reasoningEffort !== "string" || !config.reasoningEffort.trim())) ||
+      (config.jsonToolModels !== undefined &&
+        (!Array.isArray(config.jsonToolModels) || config.jsonToolModels.length > 256 ||
+          config.jsonToolModels.some((model) =>
+            typeof model !== "string" || !model.trim() || model.length > 256
+          ) || new Set(config.jsonToolModels).size !== config.jsonToolModels.length))
     ) fail("configuration");
     let base: URL;
     try {
@@ -336,10 +349,19 @@ export class ChatModelClient {
     }
     let snapshot: ModelRequest;
     let body: string;
+    let jsonTools = false;
     try {
       snapshot = structuredClone(request);
       const chat = await requestBody(snapshot, config);
-      body = JSON.stringify(config.protocol === "responses" ? responsesBody(chat, snapshot) : chat);
+      jsonTools = config.protocol !== "responses" && snapshot.tools.length > 0 &&
+        (this.#config.jsonToolModels?.includes(config.model) ?? false);
+      body = JSON.stringify(
+        config.protocol === "responses"
+          ? responsesBody(chat, snapshot)
+          : jsonTools
+          ? jsonToolRequest(chat)
+          : chat,
+      );
     } catch (error) {
       if (error instanceof ChatModelError) throw error;
       fail("request");
@@ -425,7 +447,7 @@ export class ChatModelClient {
           ? responsesResult(stream.result())
           : stream.result();
         return {
-          ...modelResponse(raw, snapshot),
+          ...modelResponse(jsonTools ? jsonToolResponse(raw) : raw, snapshot),
           ...(config.protocol === "responses"
             ? {
               modelOutput:
@@ -447,7 +469,7 @@ export class ChatModelClient {
           modelOutput: (decoded as { output: NonNullable<ModelResponse["modelOutput"]> }).output,
         };
       }
-      return modelResponse(decoded, snapshot);
+      return modelResponse(jsonTools ? jsonToolResponse(decoded) : decoded, snapshot);
     } catch (error) {
       if (timeoutPhase) throw new ChatModelError("transport", undefined, timeoutPhase);
       if (error instanceof ChatModelError) throw error;
