@@ -41,9 +41,12 @@ selection; other models, Responses requests and calls without tools keep their e
 The model, credentials, reasoning effort, streaming deadlines and cache session are preserved.
 
 The compatibility request declares the actual tools in a fixed system message and requests
-`response_format: { type: "json_object" }`. Completed assistant content must be exactly
-`{"content":"...","toolCalls":[{"id":"...","name":"...","args":{}}]}`. Existing assistant/tool
-history is encoded as paired JSON actions and data receipts without modifying stored messages.
-Unknown tools, duplicate IDs, malformed arguments, extra envelope fields, incomplete streams and
-empty results are rejected. Reasoning text is never interpreted as an action. Each completion still
-makes one upstream request; there is no automatic retry or silent protocol fallback.
+`response_format: { type: "json_object" }`. Completed assistant content must contain one envelope
+`{"content":"...","toolCalls":[{"id":"...","name":"...","args":{}}]}`. If the provider prepends
+plain assistant prose, the envelope must start on a new line and consume the entire remaining
+content; the prose is preserved as assistant content. Code fences, multiple objects and trailing
+explanations are rejected. Existing assistant/tool history is encoded as paired JSON actions and
+data receipts without modifying stored messages. Unknown tools, duplicate IDs, malformed arguments,
+extra envelope fields, incomplete streams and empty results are rejected. Reasoning text is never
+interpreted as an action. Each completion still makes one upstream request; there is no automatic
+retry or silent protocol fallback.

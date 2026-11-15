@@ -52,6 +52,27 @@ function invalid(): never {
   throw new ChatModelError("invalid_response");
 }
 
+function completedEnvelope(content: string): { value: unknown; preface: string } {
+  try {
+    return { value: JSON.parse(content), preface: "" };
+  } catch {
+    // Some providers ignore json_object and prepend assistant prose. Accept only
+    // the first object, on a new line, consuming the entire remaining content.
+    // Do not search inside code fences, nested objects or trailing explanations.
+    const start = content.indexOf("{");
+    const preface = content.slice(0, start);
+    if (
+      start < 1 || !preface.trim() || /[{}\[\]`]/.test(preface) ||
+      !/\n[ \t]*$/.test(preface)
+    ) invalid();
+    try {
+      return { value: JSON.parse(content.slice(start)), preface: preface.trim() };
+    } catch {
+      invalid();
+    }
+  }
+}
+
 /** Normalize only the completed assistant content; existing tool validation still applies. */
 export function jsonToolResponse(raw: unknown): unknown {
   if (!object(raw) || !Array.isArray(raw.choices) || raw.choices.length !== 1) invalid();
@@ -62,12 +83,7 @@ export function jsonToolResponse(raw: unknown): unknown {
     (choice.message.tool_calls !== undefined &&
       (!Array.isArray(choice.message.tool_calls) || choice.message.tool_calls.length > 0))
   ) invalid();
-  let value: unknown;
-  try {
-    value = JSON.parse(choice.message.content);
-  } catch {
-    invalid();
-  }
+  const { value, preface } = completedEnvelope(choice.message.content);
   if (
     !object(value) || Object.keys(value).some((key) => !["content", "toolCalls"].includes(key)) ||
     typeof value.content !== "string" || !Array.isArray(value.toolCalls)
@@ -88,7 +104,11 @@ export function jsonToolResponse(raw: unknown): unknown {
     ...raw,
     choices: [{
       ...choice,
-      message: { role: "assistant", content: value.content, tool_calls: calls },
+      message: {
+        role: "assistant",
+        content: preface ? [preface, value.content].filter(Boolean).join("\n\n") : value.content,
+        tool_calls: calls,
+      },
     }],
   };
 }
