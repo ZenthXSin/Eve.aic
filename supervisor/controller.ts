@@ -515,7 +515,10 @@ export class Supervisor {
           }
           await this.options.backend.quiesce();
           await this.options.driver.ensure(current);
-          if (!this.#state.pendingGrant) {
+          if (
+            !this.#state.pendingGrant ||
+            this.#state.pendingGrant.expectedEpoch !== status.epoch
+          ) {
             this.#state.pendingGrant = {
               instanceId: current.id,
               requestId: `restart_${crypto.randomUUID()}`,
@@ -939,7 +942,10 @@ export class Supervisor {
       await this.options.driver.ensure(instance);
       await this.options.backend.quiesce();
       const status = await this.options.guardian.status();
-      if (!this.#state.pendingGrant) {
+      if (
+        !this.#state.pendingGrant ||
+        this.#state.pendingGrant.expectedEpoch !== status.epoch
+      ) {
         this.#state.pendingGrant = {
           instanceId: instance.id,
           requestId: `resume_${crypto.randomUUID()}`,

@@ -14,6 +14,7 @@ import { LOG_UNITS, type LogSource, readLogFile, readServiceJournal } from "./lo
 export interface UpgradeReceipt {
   actionId: string;
   requestedBy?: "instance" | "administrator";
+  validation?: "full" | "source-only";
   commit: string;
   state: "preparing" | "submitted" | "failed";
   instanceId?: string;
@@ -61,7 +62,9 @@ export class UpgradeRequests {
         !/^[a-f0-9]{40}$/.test(item.commit) ||
         !["preparing", "submitted", "failed"].includes(item.state) ||
         (item.requestedBy !== undefined &&
-          !["instance", "administrator"].includes(item.requestedBy))
+          !["instance", "administrator"].includes(item.requestedBy)) ||
+        (item.validation !== undefined && !["full", "source-only"].includes(item.validation)) ||
+        (item.validation === "source-only" && item.requestedBy !== "administrator")
       ) throw new KernelError("corrupt", "升级申请原件损坏");
       this.#receipts.set(item.actionId, item);
     }
@@ -236,16 +239,24 @@ export class UpgradeRequests {
     }
     if (
       !args || typeof args !== "object" || Array.isArray(args) ||
-      Object.keys(args).some((key) => !["commit", "requestId"].includes(key)) ||
+      Object.keys(args).some((key) => !["commit", "requestId", "validation"].includes(key)) ||
       typeof args.commit !== "string" || !/^[a-f0-9]{40}$/.test(args.commit) ||
-      typeof args.requestId !== "string" || !/^[a-zA-Z0-9_.:-]{1,64}$/.test(args.requestId)
+      typeof args.requestId !== "string" || !/^[a-zA-Z0-9_.:-]{1,64}$/.test(args.requestId) ||
+      (args.validation !== undefined && args.validation !== "full" &&
+        args.validation !== "source-only")
     ) throw new KernelError("rejected", "管理员升级需要完整Git提交和1至64字符稳定申请编号");
-    return await this.#submit(args.commit, `administrator_${args.requestId}`, "administrator");
+    return await this.#submit(
+      args.commit,
+      `administrator_${args.requestId}`,
+      "administrator",
+      args.validation as "full" | "source-only" | undefined,
+    );
   }
   async #submit(
     commit: string,
     actionId: string,
     requestedBy: "instance" | "administrator",
+    validation: "full" | "source-only" = "full",
   ): Promise<Json> {
     if (this.#closed) throw new KernelError("unavailable", "升级申请器已关闭");
     const operation = this.#tail.then(async () => {
@@ -255,6 +266,9 @@ export class UpgradeRequests {
           throw new KernelError("rejected", "同一申请不能更换发起来源");
         }
         if (old.commit !== commit) throw new KernelError("rejected", "同一申请不能换提交");
+        if ((old.validation ?? "full") !== validation) {
+          throw new KernelError("rejected", "同一申请不能更换校验方式");
+        }
         return old;
       }
       if (this.#work || this.supervisor.state.upgrade || this.supervisor.state.paused) {
@@ -264,6 +278,7 @@ export class UpgradeRequests {
       const receipt: UpgradeReceipt = {
         actionId,
         requestedBy,
+        validation,
         commit,
         state: "preparing",
         instanceId,
@@ -289,6 +304,9 @@ export class UpgradeRequests {
         directory: `${this.options.artifactDirectory}/${id}`,
         deno: this.options.deno,
         validationIdentity: this.options.commandIdentity,
+        // Administrator may explicitly use prior focused validation for an urgent replacement.
+        // Git extraction, artifact hashing and verification before launch still always run.
+        validate: receipt.validation !== "source-only",
       });
       receipt.upgradeId = `upgrade_${
         (await fingerprint([receipt.actionId, receipt.commit])).slice(0, 48)
