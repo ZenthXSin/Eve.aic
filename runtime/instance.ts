@@ -315,6 +315,9 @@ export async function startInstance(configPath: string) {
     });
   const control = async (method: string, args: Record<string, Json> = {}): Promise<Json> => {
     if (closed) throw new KernelError("unavailable", "实例正在停止");
+    if (method === "memory") {
+      return kernel ? await kernel.memory() : { host: { ...Deno.memoryUsage() }, workers: [] };
+    }
     if (method === "status") {
       let eve: Json = null;
       if (kernel) {

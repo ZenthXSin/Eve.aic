@@ -95,6 +95,7 @@ export class Kernel {
   #order: string[] = [];
   #providers = new Map<string, string>();
   #idempotent = new Map<string, Promise<{ request: string; execution: Promise<Json> }>>();
+  #completedCalls = new Set<string>();
   #swapping = false;
   #started = false;
   #stopping = false;
@@ -274,6 +275,24 @@ export class Kernel {
     }));
   }
 
+  async memory() {
+    const host = { ...Deno.memoryUsage() };
+    const workers = await Promise.all([...this.#entries].map(async ([name, entry]) => {
+      if (!entry.instance?.alive) return { name, available: false as const };
+      try {
+        return { name, available: true as const, ...await entry.instance.memory() };
+      } catch {
+        return { name, available: false as const };
+      }
+    }));
+    return {
+      host,
+      workers,
+      retainedCalls: this.#idempotent.size,
+      completedCallIds: this.#completedCalls.size,
+    };
+  }
+
   /** 从内核外部（宿主、测试、守护）调用某个契约。 */
   call<T extends Json = Json>(
     contract: string,
@@ -333,7 +352,21 @@ export class Kernel {
       const request = await fingerprint(args);
       let pending = this.#idempotent.get(id);
       if (!pending) {
-        pending = this.#prepareCall(id, request, caller, contract, method, key, args, deadline);
+        const forget = () => {
+          this.#completedCalls.add(id);
+          if (this.#idempotent.get(id) === pending) this.#idempotent.delete(id);
+        };
+        pending = this.#prepareCall(
+          id,
+          request,
+          caller,
+          contract,
+          method,
+          key,
+          args,
+          deadline,
+          forget,
+        );
         this.#idempotent.set(id, pending);
         pending.catch(() => {});
       }
@@ -363,6 +396,7 @@ export class Kernel {
     key: string,
     args: Json,
     deadline: number,
+    forget: () => void,
   ): Promise<{ request: string; execution: Promise<Json> }> {
     const previous = await this.#store.loadCall(id);
     if (previous) {
@@ -375,7 +409,11 @@ export class Kernel {
           ),
         );
       execution.catch(() => {});
+      if (previous.status !== "started") forget();
       return { request: previous.request, execution };
+    }
+    if (this.#completedCalls.has(id)) {
+      throw new KernelError("corrupt", "已完成调用的原回执缺失，禁止重新执行");
     }
     const record: CallRecord = {
       schema: 1,
@@ -397,6 +435,9 @@ export class Kernel {
         value,
         updatedAt: new Date().toISOString(),
       });
+      // A durable terminal receipt owns the result now. Keeping its resolved
+      // promise here would retain every model/tool body for this process lifetime.
+      forget();
       return value;
     }, async (error) => {
       const wire = toWireError(error);
@@ -406,6 +447,7 @@ export class Kernel {
         error: wire,
         updatedAt: new Date().toISOString(),
       });
+      forget();
       throw error;
     });
     execution.catch(() => {});

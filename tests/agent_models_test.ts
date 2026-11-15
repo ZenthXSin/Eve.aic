@@ -74,7 +74,7 @@ Deno.test("agent role profiles isolate credentials, inherit transport and preser
       "agents",
       "send",
       { agentId: "agent_coding", text: "code" },
-      "agent_code",
+      "script_coding_task_1",
     );
     await engine.dispatch(
       "agents",
@@ -97,7 +97,7 @@ Deno.test("agent role profiles isolate credentials, inherit transport and preser
       "agents",
       "send",
       { agentId: second.agentId, text: "code" },
-      "agent_second_code",
+      "script_second_coding_task_2",
     );
     assert.deepEqual(calls, [
       { key: "Bearer coding-fixture-key", model: "gpt-6-astra", reasoning: "high", stream: true },
@@ -117,6 +117,12 @@ Deno.test("agent role profiles isolate credentials, inherit transport and preser
       "shared-model",
       "another-model",
     ]);
+    assert.deepEqual(
+      engine.modelResponses.events.map((e) =>
+        (e.data as { credentialProfile: string }).credentialProfile
+      ),
+      ["agent:coding", "shared", "shared", "agent:coding"],
+    );
     for (const journal of [engine.agents.journal, engine.transactions, engine.modelResponses]) {
       assert.equal(JSON.stringify(journal.events).includes("fixture-key"), false);
     }

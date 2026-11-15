@@ -17,6 +17,8 @@ const ZERO = "0".repeat(64);
 // Keep a single original below the 16 MiB RPC envelope without cutting its data.
 const MAX_RECORD_BYTES = 12_582_912;
 const PAGE_BYTES = 8_388_608;
+// Rendering a turn needs a few recent passes, not a second 64 MiB history heap.
+const READ_CACHE_BYTES = 8_388_608;
 const CHUNK_RECORDS = 4096;
 function filename(seq: number) {
   return `${String(seq).padStart(16, "0")}.json`;
@@ -165,7 +167,7 @@ export class FactJournal {
       if (event.digest !== this.#digest(seq)) throw new Error("changed original");
       const cache = this.#readCache;
       // Account UTF-16 storage conservatively, without retaining unbounded history.
-      if (cache && cache.bytes + raw.length * 2 <= 64 * 1024 * 1024) {
+      if (cache && cache.bytes + raw.length * 2 <= READ_CACHE_BYTES) {
         cache.records.set(seq, raw);
         cache.bytes += raw.length * 2;
       }

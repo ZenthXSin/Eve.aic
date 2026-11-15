@@ -36,11 +36,13 @@ interface RequestRecord {
   error?: WireError;
   terminal: boolean;
 }
-// Resident projection contains no terminal body. Originals stay in FactJournal;
-// reads use its synchronous verified view, without a second receipt cache.
+// Only live requests retain metadata. Completed requests keep two sequence numbers;
+// metadata and receipts are read from verified originals on demand.
 interface RequestIndex extends Omit<RequestRecord, "value" | "error"> {
+  requestSeq: number;
   resultSeq?: number;
 }
+type RequestLocation = RequestIndex | number | readonly [requestSeq: number, resultSeq: number];
 interface Options {
   directory: string;
   workspace: string;
@@ -74,7 +76,7 @@ export class RuntimeEngine {
   readonly files: FileTools;
   readonly commands: CommandSessions;
   readonly budget: SharedBudget;
-  #requests = new Map<string, RequestIndex>();
+  #requests = new Map<string, RequestLocation>();
   #responseIndex = new Map<string, number>();
   #live = new Map<string, Promise<Json>>();
   #timelineTail: Promise<unknown> = Promise.resolve();
@@ -192,32 +194,28 @@ export class RuntimeEngine {
           ) {
             throw new KernelError("corrupt", "执行请求索引异常");
           }
-          this.#requests.set(data.id, {
-            id: data.id,
-            hash: data.hash,
-            namespace: data.namespace,
-            method: data.method,
-            recovery: data.recovery,
-            terminal: false,
-          });
+          this.#requests.set(data.id, event.seq);
         } else if (event.kind === "result") {
-          const request = this.#requests.get(data.id);
+          const location = this.#requests.get(data.id);
           if (
-            !request || request.terminal ||
+            typeof location !== "number" ||
             data.error === undefined && !Object.hasOwn(data, "value")
           ) {
             throw new KernelError("corrupt", "执行回执缺少原请求");
           }
-          request.resultSeq = event.seq;
-          request.terminal = true;
+          this.#requests.set(data.id, [location, event.seq]);
           if (
-            event.seq > after && request.namespace === "model" && request.method === "complete" &&
-            /^model_[1-9][0-9]*$/.test(data.id)
+            event.seq > after && /^model_[1-9][0-9]*$/.test(data.id)
           ) {
+            const request = this.#request(data.id)!;
             const status = data.error
               ? providerRejection(new KernelError(data.error.kind, data.error.message))
               : undefined;
-            if (status !== undefined) this.#blockModel(data.id, status, event.at, request.recovery);
+            if (
+              status !== undefined && request.namespace === "model" && request.method === "complete"
+            ) {
+              this.#blockModel(data.id, status, event.at, request.recovery);
+            }
           }
         } else throw new KernelError("corrupt", "未知执行记录");
       });
@@ -237,25 +235,25 @@ export class RuntimeEngine {
         await service.initialize();
       }
       this.#recoveryStage = "reconciling";
-      const responseIds = new Set<string>();
       for (const event of this.modelResponses.events) {
         const data = event.data as unknown as { id: string; response: ModelResponse };
         if (
           event.kind !== "response" || !data || typeof data.id !== "string" ||
-          responseIds.has(data.id) || !data.response || typeof data.response.content !== "string" ||
+          this.#responseIndex.has(data.id) || !data.response ||
+          typeof data.response.content !== "string" ||
           !Array.isArray(data.response.toolCalls)
         ) {
           throw new KernelError("corrupt", "模型响应原件索引无效，保留现场");
         }
-        responseIds.add(data.id);
         this.#responseIndex.set(data.id, event.seq);
         // 原响应已落盘而预算结算前中断时，用原用量补记；不再调用模型或重复强化记忆。
         await this.budget.response(data.id, data.response);
       }
       // Reconcile agent originals first, so a completed reply also restores its outer receipt.
       await this.agents.initialize();
-      for (const r of this.#requests.values()) {
-        if (!r.terminal) {
+      for (const [id, location] of this.#requests) {
+        if (typeof location === "number") {
+          const r = this.#request(id)!;
           let value: Json | undefined;
           if (r.namespace === "agents" && r.method === "send") {
             try {
@@ -389,6 +387,28 @@ export class RuntimeEngine {
     );
     record.resultSeq = event.seq;
     record.terminal = true;
+    this.#requests.set(record.id, [record.requestSeq, event.seq]);
+  }
+  #request(id: string): RequestIndex | undefined {
+    const location = this.#requests.get(id);
+    if (location === undefined) return;
+    if (typeof location === "object" && !Array.isArray(location)) return location as RequestIndex;
+    const requestSeq = typeof location === "number" ? location : location[0];
+    const event = this.transactions.events[requestSeq - 1];
+    const data = event?.data as unknown as RequestRecord | undefined;
+    if (event?.kind !== "request" || data?.id !== id || !/^[a-f0-9]{64}$/.test(data.hash)) {
+      throw new KernelError("corrupt", "执行请求原件与索引不符，原件保留");
+    }
+    return {
+      id,
+      hash: data.hash,
+      namespace: data.namespace,
+      method: data.method,
+      recovery: data.recovery,
+      requestSeq,
+      terminal: typeof location !== "number",
+      ...(typeof location === "number" ? {} : { resultSeq: location[1] }),
+    };
   }
   #original(record: RequestIndex): { value?: Json; error?: WireError } {
     if (!record.terminal) throw new KernelError("unknown", "原动作正在执行或尚未核对");
@@ -418,11 +438,11 @@ export class RuntimeEngine {
     return result.value!;
   }
   receipt(id: string): RequestRecord | undefined {
-    const record = this.#requests.get(id);
+    const record = this.#request(id);
     if (!record?.terminal) return;
     const result = this.#original(record);
     // Preserve the synchronous public shape; resultSeq is internal only.
-    const { resultSeq: _seq, ...metadata } = record;
+    const { resultSeq: _seq, requestSeq: _requestSeq, ...metadata } = record;
     return {
       ...structuredClone(metadata),
       ...(Object.hasOwn(result, "value") ? { value: result.value } : {}),
@@ -430,7 +450,7 @@ export class RuntimeEngine {
     };
   }
   async validateRepeat(namespace: string, method: string, args: Record<string, Json>, id: string) {
-    const old = this.#requests.get(id);
+    const old = this.#request(id);
     if (old && old.hash !== await fingerprint({ namespace, method, args })) {
       throw new KernelError("rejected", "同一动作编号不能改变参数");
     }
@@ -468,7 +488,7 @@ export class RuntimeEngine {
     // Capture before the first await: an admitted request keeps its original client and provenance.
     const role = (args._agentConfig as unknown as Partial<AgentConfig> | undefined)?.role;
     const agentModel = namespace === "model" && method === "complete" &&
-        id.startsWith("agent_") && role &&
+        args._purpose === "isolated" && role &&
         Object.hasOwn(this.options.agentModels ?? {}, role)
       ? this.options.agentModels![role]
       : undefined;
@@ -495,17 +515,33 @@ export class RuntimeEngine {
           : {}),
       }
       : namespace === "model" && method === "complete" && selected
-      ? { modelName: selected.modelName, modelRevision: selected.revision }
+      ? {
+        modelName: selected.modelName,
+        modelRevision: selected.revision,
+        credentialProfile: agentModel ? `agent:${role}` : "shared",
+      }
       : null) as unknown as Json;
-    const old = this.#requests.get(id);
+    const old = this.#request(id);
     if (old && old.hash !== hash) throw new KernelError("rejected", "同一动作编号不能改变参数");
     if (old) return this.#live.has(id) ? await this.#live.get(id)! : this.#value(old);
     const operation = (async () => {
-      const record: RequestIndex = { id, namespace, method, hash, recovery, terminal: false };
+      const metadata = { id, namespace, method, hash, recovery, terminal: false };
+      // Publish the admission before the durable write yields. Concurrent repeats
+      // must share this attempt even when the journal is still flushing.
+      const record: RequestIndex = { ...metadata, requestSeq: 0 };
       this.#requests.set(id, record);
-      await this.transactions.append("request", record as unknown as Json);
+      const event = await this.transactions.append("request", metadata as unknown as Json);
+      record.requestSeq = event.seq;
+      this.#requests.set(id, event.seq);
       try {
-        const value = await this.#invoke(namespace, method, captured, id, selected);
+        const value = await this.#invoke(
+          namespace,
+          method,
+          captured,
+          id,
+          selected,
+          agentModel ? `agent:${role}` : "shared",
+        );
         canonical(value);
         await this.#result(record, { value });
         return value;
@@ -542,6 +578,7 @@ export class RuntimeEngine {
     args: Record<string, Json>,
     id: string,
     selected?: ModelSnapshot,
+    credentialProfile = "shared",
   ): Promise<Json> {
     if (namespace === "agents") return await this.agents.invoke(method, args, id);
     if (namespace === "timeline") {
@@ -680,6 +717,7 @@ export class RuntimeEngine {
       const savedResponse = await this.modelResponses.append("response", {
         id,
         response,
+        credentialProfile,
         ...(selected?.modelName || overrides?.model
           ? {
             modelName: overrides?.model ?? selected?.modelName,

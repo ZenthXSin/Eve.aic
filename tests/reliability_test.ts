@@ -164,6 +164,46 @@ Deno.test("保存失败阻止成功回执，停止明确报错", async () => {
   }
 });
 
+Deno.test("已落盘的幂等结果释放内存副本，重复查询读取原件且调用方不能改写回执", async () => {
+  const { kernel, dataDir } = await boot([fixture("counter-v1")]);
+  try {
+    const options = { idempotencyKey: "retained" };
+    assert.equal(await kernel.call("counter", "add", { n: 7 }, options), 7);
+    const memory = await kernel.memory();
+    assert.equal(memory.retainedCalls, 0);
+    assert.equal(memory.completedCallIds, 1);
+    assert.equal(memory.workers[0].available, true);
+    assert.ok(memory.workers[0].heapUsed! > 0);
+    const receipt = await kernel.callStatus("counter", "add", "retained");
+    assert.equal(receipt?.status, "completed");
+    const path = `${dataDir}/calls/${receipt!.id}.json`;
+    // The result was durably saved. A later read must consult that original,
+    // rather than return a process-lifetime resolved Promise hiding corruption.
+    await Deno.writeTextFile(path, "damaged original");
+    await errorKind(kernel.call("counter", "add", { n: 7 }, options), "corrupt");
+    assert.equal(await kernel.call("counter", "get"), 7);
+  } finally {
+    await kernel.stop();
+    await Deno.remove(dataDir, { recursive: true });
+  }
+});
+
+Deno.test("释放幂等正文后原件丢失仍禁止重放", async () => {
+  const { kernel, dataDir } = await boot([fixture("counter-v1")]);
+  try {
+    const options = { idempotencyKey: "missing" };
+    assert.equal(await kernel.call("counter", "add", { n: 3 }, options), 3);
+    const receipt = await kernel.callStatus("counter", "add", "missing");
+    const path = `${dataDir}/calls/${receipt!.id}.json`;
+    await Deno.rename(path, path + ".preserved");
+    await errorKind(kernel.call("counter", "add", { n: 3 }, options), "corrupt");
+    assert.equal(await kernel.call("counter", "get"), 3);
+  } finally {
+    await kernel.stop();
+    await Deno.remove(dataDir, { recursive: true });
+  }
+});
+
 Deno.test("并发输入沿同一意识流排队，两轮完整保存", async () => {
   const { kernel, dataDir } = await boot(
     ["model-mock", "tools-echo", "turn-loop"].map((p) => `${ROOT}plugins/${p}`),
