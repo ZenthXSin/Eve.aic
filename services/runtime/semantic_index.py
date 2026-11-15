@@ -83,19 +83,17 @@ class Index:
             db.close()
 
     def files(self):
-        for collection, folder in [("notes", self.backend / "notes/events"),
-                                   ("agents", self.backend / "agents/events"),
-                                   ("memory", self.backend / "memory/events"),
-                                   ("records", self.backend / "consciousness/events")]:
-            if folder.is_dir():
-                for p in sorted(folder.glob("[0-9]*.json"), reverse=True):
-                    yield collection, p, int(p.stem)
+        folders = [("notes", self.backend / "notes/events", False),
+                   ("agents", self.backend / "agents/events", False)]
         if self.phone:
-            for sub in ["inbound", "outbox/records"]:
-                folder = self.phone / sub
-                if folder.is_dir():
-                    for p in sorted(folder.glob("*.json"), reverse=True):
-                        yield "chat", p, int(p.name[:16]) if p.name[:16].isdigit() else 0
+            folders.extend(("chat", self.phone / sub, True) for sub in ["inbound", "outbox/records"])
+        folders.extend([("memory", self.backend / "memory/events", False),
+                        ("records", self.backend / "consciousness/events", False)])
+        for collection, folder, phone in folders:
+            if folder.is_dir():
+                for p in sorted(folder.glob("*.json" if phone else "[0-9]*.json"), reverse=True):
+                    seq = int(p.name[:16]) if p.name[:16].isdigit() else 0
+                    yield collection, p, seq
 
     def discover(self, limit=100):
         if time.monotonic() < self._next_scan:
