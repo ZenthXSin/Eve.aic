@@ -59,6 +59,7 @@ async function fixture(
   const channelErrors = new Map<string, string>();
   let restoreError = false;
   let startError = false;
+  let activationError = false;
   const driver: InstanceDriver = {
     ensure(instance) {
       if (instance.id === "new" && startError) {
@@ -92,6 +93,7 @@ async function fixture(
       }
       if (method === "activate") {
         await authority.actorStatus(proofs.get(instance.id)!);
+        if (activationError) throw new KernelError("unavailable", "activation interrupted");
         if (instance.id === "new") now += options.activationMs ?? 0;
         assert.ok(
           ![...states.entries()].some(([id, state]) => id !== instance.id && state === "active"),
@@ -175,6 +177,9 @@ async function fixture(
   return {
     directory,
     instances,
+    setActivationError(value: boolean) {
+      activationError = value;
+    },
     setStartError(value: boolean) {
       startError = value;
     },
@@ -800,6 +805,25 @@ Deno.test("直接替换：出口排空期间监督重启，沿用原编号完成
     assert.equal(f.supervisor().state.lastOutcome?.reason, "direct_replacement_healthy");
     assert.equal(f.supervisor().state.current, "new");
     assert.deepEqual(f.handovers, []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("explicit resume renews a stale grant after activation failure and pause", async () => {
+  const f = await fixture();
+  try {
+    await f.supervisor().pause();
+    f.setActivationError(true);
+    await assert.rejects(() => f.supervisor().resume(), /activation interrupted/);
+    assert.ok(f.supervisor().state.pendingGrant);
+    await f.supervisor().pause();
+    await f.restart();
+    f.setActivationError(false);
+    await f.supervisor().resume();
+    assert.equal(f.supervisor().state.paused, false);
+    assert.equal(f.supervisor().state.pendingGrant, undefined);
+    assert.equal(f.authority.status().mode, "active");
   } finally {
     await f.close();
   }
