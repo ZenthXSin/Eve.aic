@@ -24,7 +24,7 @@ export const RUNTIME_METHODS = {
     "close",
   ],
   timeline: ["page", "append"],
-  records: ["page", "text"],
+  records: ["page", "text", "search", "indexStatus"],
   notes: ["create", "update", "get", "list", "versions", "search", "self"],
   web: ["search", "fetch"],
   files: ["read", "write", "replace", "list", "search"],

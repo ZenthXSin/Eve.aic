@@ -35,6 +35,11 @@ export interface MemoryApi {
   get(args: { id: string }): Promise<MemoryView>;
 }
 export interface RecordApi {
+  /** 按含义/关键词搜索便签、聊天、子代理与意识历史；后台索引进度随结果返回。
+   * 用 source.collection 选择 notes.get / phone.message / agents.message / records.text 展开原件。
+   * 新记录尚未索引时，结果不代表完整历史；可用 indexStatus 查看进度。 */
+  search(args: import("./search.ts").SearchQuery): Promise<import("./search.ts").SearchResult>;
+  indexStatus(): Promise<import("./search.ts").SearchStatus>;
   page(
     args?: { afterSeq?: number },
   ): Promise<

@@ -1,6 +1,8 @@
 import { AgentService } from "./agents.ts";
 import type { AgentConfig } from "../../contracts/agents.ts";
 import type { AgentModels } from "./agent-models.ts";
+import type { SemanticSearch } from "./search.ts";
+import type { SearchQuery } from "../../contracts/search.ts";
 import type {
   ModelCallOptions,
   ModelImage,
@@ -57,6 +59,7 @@ interface Options {
   accessMode?: "restricted" | "unrestricted";
   fileRuntime?: FileRuntime;
   semantic?: Pick<LocalSemantic, "embed" | "count">;
+  searchIndex?: SemanticSearch;
   web?: WebApi;
 }
 /** 真实执行与回执不随内核/插件回退；令牌校验由独立 HTTP 出口包围整个执行。 */
@@ -106,6 +109,7 @@ export class RuntimeEngine {
       embed,
       this.records,
       options.semantic ? (text) => options.semantic!.count(text) : undefined,
+      options.searchIndex,
     );
     this.memory = new MemoryStore(`${directory}/memory`, this.records, embed);
     this.files = unrestricted
@@ -557,6 +561,39 @@ export class RuntimeEngine {
       return await operation as unknown as Json;
     }
     if (namespace === "records") {
+      if (method === "indexStatus") {
+        if (!this.options.searchIndex) throw new KernelError("unavailable", "本机语义索引未配置");
+        return await this.options.searchIndex.status() as unknown as Json;
+      }
+      if (method === "search") {
+        if (!this.options.searchIndex) throw new KernelError("unavailable", "本机语义索引未配置");
+        const result = await this.options.searchIndex.search(args as unknown as SearchQuery);
+        result.items = result.items.filter((hit) => {
+          const source = hit.source;
+          if (source.collection === "records") {
+            const original = this.records.events[source.seq - 1];
+            return original?.digest === source.digest &&
+              !this.notes.quarantine.excluded(source.seq, source.toolStartSeq).length;
+          }
+          if (source.collection === "notes") {
+            try {
+              return this.notes.get({ id: source.id! }).note.revision === source.revision;
+            } catch {
+              return false;
+            }
+          }
+          if (source.collection === "memory") {
+            try {
+              const memory = this.memory.get({ id: source.id! });
+              return !memory.quarantined && memory.level < 4;
+            } catch {
+              return false;
+            }
+          }
+          return true;
+        });
+        return result as unknown as Json;
+      }
       if (method === "page") return this.#recordPage(args, false) as unknown as Json;
       if (!Number.isSafeInteger(args.seq) || Number(args.seq) < 1) {
         throw new KernelError("rejected", "需要原记录编号");

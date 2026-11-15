@@ -78,7 +78,7 @@ export interface NoteApi {
   search(
     args: {
       query: string;
-      mode?: "literal" | "regex" | "semantic";
+      mode?: "literal" | "regex" | "semantic" | "hybrid";
       group?: string;
       afterSeq?: number;
     },
@@ -93,5 +93,7 @@ export interface NoteApi {
     }[];
     throughSeq: number;
     hasMore: boolean;
+    retrieval?: "literal" | "regex" | "semantic" | "hybrid";
+    index?: import("./search.ts").SearchStatus;
   }>;
 }

@@ -159,7 +159,11 @@ export function startRuntimeAdmin(
         notesThroughSeq: engine.notes.journal.events.length,
         memoryThroughSeq: engine.memory.journal.events.length,
         receiptsThroughSeq: engine.transactions.events.length,
-        semanticModel: "TODO",
+        semanticModel: engine.options.searchIndex
+          ? await engine.options.searchIndex.status().catch(() => ({
+            available: false,
+          })) as unknown as Json
+          : "TODO",
         model: engine.modelStatus(),
       };
     }
