@@ -90,6 +90,7 @@ export type ToWorker =
   | { t: "reply"; id: number; ok: true; value: Json }
   | { t: "reply"; id: number; ok: false; error: WireError }
   | { t: "probe"; id: number }
+  | { t: "memory"; id: number }
   | { t: "flush"; id: number };
 // 状态提交回执与具体 setState 对应，不能用收到消息代替保存完成。
 export type StateReply =
@@ -97,6 +98,7 @@ export type StateReply =
   | { t: "state_saved"; id: number; ok: false; error: WireError };
 
 export type FromWorker =
+  | { t: "memory"; id: number; usage: { heapTotal: number; heapUsed: number; external: number } }
   | { t: "loaded"; provides: string[] }
   | { t: "enabled" }
   | { t: "disabled" }

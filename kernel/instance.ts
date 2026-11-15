@@ -54,6 +54,7 @@ export class Instance {
   #calls = new Map<number, Waiter<Json>>();
   #probes = new Map<number, Waiter<void>>();
   #flushes = new Map<number, Waiter<void>>();
+  #memory = new Map<number, Waiter<{ heapTotal: number; heapUsed: number; external: number }>>();
   #lifecycle: { expect: string; stage: string; waiter: Waiter<FromWorker> } | undefined;
 
   constructor(
@@ -109,6 +110,14 @@ export class Instance {
   #receive(message: FromWorker): void {
     if (!this.#alive) return;
     switch (message.t) {
+      case "memory": {
+        const waiter = this.#memory.get(message.id);
+        if (!waiter) break;
+        this.#memory.delete(message.id);
+        clearTimeout(waiter.timer);
+        waiter.resolve(message.usage);
+        break;
+      }
       case "loaded":
       case "enabled":
       case "disabled": {
@@ -232,6 +241,19 @@ export class Instance {
     }
   }
 
+  memory(): Promise<{ heapTotal: number; heapUsed: number; external: number }> {
+    if (!this.#alive) return Promise.reject(new Error("插件不在运行"));
+    const id = this.#nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#memory.delete(id);
+        reject(new Error("插件内存采样超时"));
+      }, 2000);
+      this.#memory.set(id, { resolve, reject, timer });
+      this.#post({ t: "memory", id });
+    });
+  }
+
   /** 健康探测；不健康或超时都抛错。 */
   probe(): Promise<void> {
     if (!this.#alive) return Promise.reject(new Error("插件不在运行"));
@@ -324,5 +346,10 @@ export class Instance {
     }
     this.#probes.clear();
     this.#flushes.clear();
+    for (const waiter of this.#memory.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(reason));
+    }
+    this.#memory.clear();
   }
 }

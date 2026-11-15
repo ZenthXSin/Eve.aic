@@ -138,6 +138,11 @@ async function handleCall(message: Extract<ToWorker, { t: "call" }>): Promise<vo
 scope.onmessage = (event) => {
   const message = event.data;
   switch (message.t) {
+    case "memory": {
+      const { heapTotal, heapUsed, external } = Deno.memoryUsage();
+      send({ t: "memory", id: message.id, usage: { heapTotal, heapUsed, external } });
+      break;
+    }
     case "init":
       init(message).catch((error) =>
         send({ t: "failed", stage: "load", message: describe(error) })

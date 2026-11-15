@@ -434,3 +434,22 @@ Deno.test("receipt index: duplicate dispatch itself detects a missing original b
     await f.close();
   }
 });
+
+Deno.test("receipt metadata stays on disk: changed request fails closed after completion", async () => {
+  const f = await fixture({
+    fetch() {
+      return Promise.resolve({ content: "original" });
+    },
+  } as unknown as WebApi);
+  try {
+    await f.engine.initialize();
+    await f.engine.dispatch("web", "fetch", args, "saved");
+    const path = f.root + "/data/actions/events/0000000000000001.json";
+    const original = JSON.parse(await Deno.readTextFile(path));
+    original.data.recovery = { changed: true };
+    await Deno.writeTextFile(path, JSON.stringify(original));
+    assert.throws(() => f.engine.receipt("saved"), isKind("corrupt"));
+  } finally {
+    await f.close();
+  }
+});
