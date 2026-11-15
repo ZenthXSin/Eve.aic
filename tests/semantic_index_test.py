@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import struct
 import sys
@@ -91,6 +92,22 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(result["items"][0]["source"]["toolStartSeq"], 1)
         self.assertTrue(result["items"][0]["untrusted"])
         self.assertFalse(self.index.search({"query": "feline", "collection": "records", "afterSeq": 2})["items"])
+
+    def test_agent_accepted_reads_job_id_from_message(self):
+        folder = self.backend / "agents/events"
+        bodies = self.backend / "agents/bodies"
+        folder.mkdir(parents=True)
+        bodies.mkdir()
+        raw = json.dumps("猫的编码任务", ensure_ascii=False).encode()
+        hashed = hashlib.sha256(raw).hexdigest()
+        (bodies / (hashed + ".json")).write_bytes(raw + b"\n")
+        (folder / "0000000000000001.json").write_text(json.dumps({"seq": 1, "kind": "accepted", "at": "2026-11-15", "data": {
+            "agentId": "agent_coding", "job": {"jobId": "job1"}, "message": {"jobId": "job1", "direction": "outgoing",
+            "status": "queued", "body": {"hash": hashed}}}}))
+        self.drain()
+        result = self.index.search({"query": "feline", "collection": "agents", "mode": "semantic"})
+        self.assertEqual(result["items"][0]["source"]["jobId"], "job1")
+        self.assertEqual(self.index.status()["errors"], 0)
 
     def test_model_version_cannot_mix(self):
         other = Encoder()

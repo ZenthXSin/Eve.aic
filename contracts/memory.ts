@@ -76,6 +76,7 @@ export interface SearchStatus {
   >;
   chunks: number;
   discoveryStarted: boolean;
+  discoveryComplete?: boolean;
   errors: number;
   lastError: { error: string; source?: string; seq?: number } | null;
 }

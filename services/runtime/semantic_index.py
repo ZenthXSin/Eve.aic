@@ -62,6 +62,7 @@ class Index:
                 raise ValueError("Model/index version changed; use a new index directory")
             db.execute("INSERT OR IGNORE INTO meta VALUES('version',?)", (version,))
         self.discovered = False
+        self.scan_complete = False
         self.last_error = None
         self._files = iter(())
         self._next_scan = 0
@@ -105,6 +106,7 @@ class Index:
                     collection, path, seq = next(self._files)
                 except StopIteration:
                     if self.discovered:
+                        self.scan_complete = True
                         self._next_scan = time.monotonic() + 30
                     self.discovered = True
                     self._files = self.files()
@@ -153,7 +155,7 @@ class Index:
             checks.append({"path": str(body), "sha256": digest(body_raw)})
             text = json.loads(body_raw)
             title = message["direction"] + " / " + message["status"]
-            refs.update(agentId=data["agentId"], jobId=data["jobId"], status=message["status"])
+            refs.update(agentId=data["agentId"], jobId=message["jobId"], status=message["status"])
         elif collection == "records":
             refs["digest"] = event["digest"]
             if kind == "model_response":
@@ -249,7 +251,7 @@ class Index:
         with self.db() as db:
             row = db.execute("SELECT id,offset,substr(text,offset+1,1200) AS remaining,length(text) AS total "
                              "FROM docs WHERE active=1 AND done=0 ORDER BY CASE collection WHEN 'notes' THEN 0 "
-                             "WHEN 'agents' THEN 1 WHEN 'chat' THEN 2 WHEN 'memory' THEN 3 ELSE 4 END,seq DESC LIMIT 1").fetchone()
+                             "WHEN 'agents' THEN 1 WHEN 'chat' THEN 2 WHEN 'memory' THEN 3 ELSE 4 END,offset,seq DESC LIMIT 1").fetchone()
         if not row:
             return False
         text = self.encoder.chunk(row["remaining"])
@@ -274,7 +276,7 @@ class Index:
             errors = db.execute("SELECT COUNT(*) FROM sources WHERE state='error'").fetchone()[0]
             chunks = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         return {"model": self.encoder.model, "revision": self.encoder.revision, "dimensions": self.encoder.dimensions,
-                "collections": collections, "chunks": chunks, "discoveryStarted": self.discovered,
+                "collections": collections, "chunks": chunks, "discoveryStarted": self.discovered, "discoveryComplete": self.scan_complete,
                 "errors": errors, "lastError": self.last_error}
 
     def search(self, args):
