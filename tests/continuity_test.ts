@@ -272,7 +272,16 @@ Deno.test("休息收尾：旧mind.rest先核对，保留请求唤醒时间，不
   }
 });
 Deno.test("休息收尾：后台任务可带着休息，完成通知仍能唤醒并进入接续", async () => {
-  const f = await fixture([response("rest", decision), response("act")]);
+  const f = await fixture([
+    response("rest", decision),
+    response("rest", decision),
+    response("act"),
+  ]);
+  const pending = (messages: Message[]) =>
+    JSON.parse(
+      messages.findLast((m) => m.content.startsWith("当前生活接续"))!.content.split("\n")[1],
+    )
+      .pendingJobs;
   try {
     await f.eve.journal.append("tool_result", {
       callId: "earlier",
@@ -283,11 +292,50 @@ Deno.test("休息收尾：后台任务可带着休息，完成通知仍能唤醒
     await f.eve.pulse();
     await f.eve.pulse();
     assert.equal(f.messages.length, 1);
-    assert.ok(JSON.stringify(f.messages[0]).includes("pending-job"));
+    assert.deepEqual(pending(f.messages[0]), [{ jobId: "pending-job", status: "queued" }]);
     f.completeJob();
     await f.eve.pulse();
     assert.equal(f.messages.length, 2);
     assert.ok(JSON.stringify(f.messages[1]).includes(decision.resume));
+    assert.deepEqual(pending(f.messages[1]), [], "完成通知应清除待办");
+    await f.eve.pulse();
+    // A receipt written after the completion can still describe an earlier queued state.
+    await f.eve.journal.append("tool_result", {
+      callId: "late",
+      result: { output: JSON.stringify({ jobId: "pending-job", status: "queued" }) },
+    });
+    await f.restart();
+    f.wake();
+    await f.eve.pulse();
+    assert.deepEqual(pending(f.messages[2]), [], "重启和迟到的旧回执不能复活已完成任务");
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("完整轮次缓存：生活状态只在变化时追加，跨工具、重启与唤醒保留输入前缀", async () => {
+  const f = await fixture([
+    response("set_focus", { expectedSeq: 0, items: [focus] }),
+    response("act"),
+    response("rest", decision),
+    response("act"),
+  ]);
+  try {
+    await f.eve.pulse();
+    await f.eve.pulse();
+    await f.eve.pulse();
+    assert.deepEqual(f.messages[1].slice(0, f.messages[0].length), f.messages[0]);
+    const states = f.eve.journal.events.filter((e) => e.kind === "context_state").length;
+    await f.eve.pulse();
+    await f.restart();
+    await f.eve.pulse();
+    assert.deepEqual(f.messages[2].slice(0, f.messages[1].length), f.messages[1]);
+    assert.equal(f.eve.journal.events.filter((e) => e.kind === "context_state").length, states);
+    await f.eve.pulse();
+    f.wake();
+    await f.eve.pulse();
+    assert.deepEqual(f.messages[3].slice(0, f.messages[2].length), f.messages[2]);
+    assert.ok(JSON.stringify(f.messages[3]).includes(decision.resume));
   } finally {
     await f.close();
   }

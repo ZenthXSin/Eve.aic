@@ -231,7 +231,11 @@ export class Supervisor {
     });
   }
   /** 停旧进程后从同一业务数据启动新程序；不复制账本、不调用观察模型。 */
-  stageReplacement(stage: (current: InstanceSpec) => Promise<InstanceSpec>, upgradeId: string) {
+  stageReplacement(
+    stage: (current: InstanceSpec) => Promise<InstanceSpec>,
+    upgradeId: string,
+    allowPaused = false,
+  ) {
     return this.#serial(async () => {
       if (!/^upgrade_[a-zA-Z0-9_-]{1,128}$/.test(upgradeId)) {
         throw new KernelError("rejected", "升级编号无效");
@@ -239,7 +243,7 @@ export class Supervisor {
       if (
         this.#state.upgrade?.id === upgradeId || this.#state.lastOutcome?.upgradeId === upgradeId
       ) return upgradeId;
-      if (this.#state.paused || this.#state.upgrade || !this.#state.current) {
+      if (this.#state.paused && !allowPaused || this.#state.upgrade || !this.#state.current) {
         throw new KernelError("rejected", "当前不能替换运行程序");
       }
       const old = this.instance(this.#state.current);
@@ -251,6 +255,25 @@ export class Supervisor {
         throw new KernelError("rejected", "直接替换须沿用原实例身份和业务数据");
       }
       await this.#addInstance(candidate);
+      if (this.#state.paused) {
+        const ownership = await this.options.guardian.status();
+        if (ownership.mode !== "paused" || ownership.activePermits !== 0) {
+          throw new KernelError("unavailable", "暂停替换需要所有权已暂停且出口已排空");
+        }
+        await this.options.driver.terminate(old);
+        await this.options.backend.quiesce();
+        this.#state.current = candidate.id;
+        this.#state.standby = null;
+        delete this.#state.pendingGrant;
+        this.#state.lastOutcome = {
+          upgradeId,
+          outcome: "staged",
+          at: this.now(),
+          reason: "replacement_staged_while_paused",
+        };
+        await this.#save();
+        return upgradeId;
+      }
       this.#state.upgrade = {
         id: upgradeId,
         old: old.id,
@@ -960,6 +983,14 @@ export class Supervisor {
       this.#state.current = instance.id;
       this.#state.paused = false;
       delete this.#state.pendingGrant;
+      if (this.#state.lastOutcome?.reason === "replacement_staged_while_paused") {
+        this.#state.lastOutcome = {
+          ...this.#state.lastOutcome,
+          outcome: "confirmed",
+          at: this.now(),
+          reason: "direct_replacement_healthy",
+        };
+      }
       if (this.#state.upgrade) {
         if (u?.mode !== "replace") {
           await this.options.driver.terminate(this.instance(this.#state.upgrade.candidate));

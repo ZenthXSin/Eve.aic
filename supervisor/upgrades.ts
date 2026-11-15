@@ -85,15 +85,23 @@ export class UpgradeRequests {
             this.supervisor.state.lastOutcome?.upgradeId !== item.upgradeId &&
             this.supervisor.state.current !== item.instanceId
           ) {
-            if (this.supervisor.state.paused || upgrade) {
+            if (
+              upgrade || this.supervisor.state.paused &&
+                (item.requestedBy !== "administrator" || this.options.mode === "observed")
+            ) {
               item.state = "failed";
               item.error = "submission_interrupted";
             } else {
               // registry先落盘而upgrade意图尚未落盘时，用预存稳定编号补齐。
               if (this.options.mode === "observed") {
                 await this.supervisor.upgrade(item.instanceId!, item.upgradeId);
-              } else {await this.supervisor.stageReplacement(() =>
-                  Promise.resolve(this.supervisor.instance(item.instanceId!)), item.upgradeId);}
+              } else {
+                await this.supervisor.stageReplacement(
+                  () => Promise.resolve(this.supervisor.instance(item.instanceId!)),
+                  item.upgradeId,
+                  item.requestedBy === "administrator",
+                );
+              }
             }
           }
         }
@@ -271,7 +279,11 @@ export class UpgradeRequests {
         }
         return old;
       }
-      if (this.#work || this.supervisor.state.upgrade || this.supervisor.state.paused) {
+      if (
+        this.#work || this.supervisor.state.upgrade ||
+        this.supervisor.state.paused &&
+          (requestedBy !== "administrator" || this.options.mode === "observed")
+      ) {
         throw new KernelError("unavailable", "已有升级或暂停尚未完成");
       }
       const instanceId = `candidate_${(await fingerprint([actionId, commit])).slice(0, 32)}`;
@@ -318,7 +330,7 @@ export class UpgradeRequests {
       const stage = replace
         ? this.supervisor.stageReplacement.bind(this.supervisor)
         : this.supervisor.stageUpgrade.bind(this.supervisor);
-      await stage(async (active) => {
+      const prepare = async (active: InstanceSpec) => {
         const occupied = new Set(
           [
             this.supervisor.state.current,
@@ -411,7 +423,8 @@ export class UpgradeRequests {
           await Deno.chown(path, 0, identity.gid);
         }
         return instance;
-      }, receipt.upgradeId);
+      };
+      await stage(prepare, receipt.upgradeId, receipt.requestedBy === "administrator");
       receipt.state = "submitted";
       delete receipt.phase;
       delete receipt.operation;

@@ -113,8 +113,19 @@ function* selectedEvents(events: ConsciousEvent[], kind?: string, afterSeq = 0) 
     yield source[positions[i]];
   }
 }
-export function lastActiveEvent(events: ConsciousEvent[], kind: string) {
+export function lastActiveEvent(
+  events: ConsciousEvent[],
+  kind: string,
+  matches?: (event: ConsciousEvent) => boolean,
+) {
   const { source, positions } = selectedPositions(events, kind);
+  if (matches) {
+    for (let i = positions.length - 1; i >= 0; i--) {
+      const event = source[positions[i]];
+      if (matches(event)) return event;
+    }
+    return;
+  }
   const position = positions.at(-1);
   return position === undefined ? undefined : source[position];
 }
@@ -202,6 +213,18 @@ export function blocks(
   const source = activeSources.get(events) ?? events;
   return withFactReadCache(source, () => blocksUncached(events, afterSeq));
 }
+function stateMessages(event: ConsciousEvent): Message[] {
+  const data = event.data as { slot?: string; messages?: Message[] };
+  if (
+    !data || !["self", "continuity"].includes(data.slot ?? "") ||
+    !Array.isArray(data.messages) ||
+    data.messages.some((message) =>
+      !message || message.role !== "user" || typeof message.content !== "string" ||
+      Object.keys(message).some((key) => !["role", "content"].includes(key))
+    )
+  ) throw new KernelError("corrupt", "上下文状态原件无效");
+  return data.messages;
+}
 function blocksUncached(
   events: ConsciousEvent[],
   afterSeq = 0,
@@ -270,6 +293,12 @@ function blocksUncached(
   }
   const recentTools = new Set(recentResponses.slice(-8));
   for (const event of selectedEvents(events, undefined, afterSeq)) {
+    if (event.kind === "context_state") {
+      const messages = stateMessages(event);
+      if (current) current.deferred.push(...messages);
+      else result.push({ throughSeq: event.seq, messages });
+      continue;
+    }
     let projectedData = event.data;
     if (event.kind === "notice") {
       const data = event.data as { source?: string; items?: Json[] };
@@ -408,6 +437,14 @@ function renderUncached(events: ConsciousEvent[], prompt: string): Message[] {
       memory = data.summary;
     }
   }
+  // Carry each latest state across compression without relocating it between
+  // ordinary turns. Newer revisions remain append-only in the visible timeline.
+  const carriedStates = new Map<string, Message[]>();
+  for (const event of selectedEvents(events, "context_state")) {
+    if (event.seq > through) break;
+    const messages = stateMessages(event);
+    carriedStates.set((event.data as { slot: string }).slot, messages);
+  }
   const messages: Message[] = [
     { role: "system", content: prompt },
     ...(through
@@ -416,6 +453,7 @@ function renderUncached(events: ConsciousEvent[], prompt: string): Message[] {
         content: `保留的时间线（原文截至意识记录 ${through}）：\n${memory}`,
       }]
       : []),
+    ...[...carriedStates.values()].flat(),
     ...blocks(events, through).flatMap((block) => block.messages),
   ];
   // 原图只在明确选择后进入；超出图像传输容量时保留出处与原件，标明移出的旧图。
