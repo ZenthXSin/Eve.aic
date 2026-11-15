@@ -34,3 +34,16 @@ not cut off that drain. Close cancels in-flight I/O and releases timers/readers.
 Retained text/tool/reasoning bytes use `maxResponseBytes` (default 2 MiB). Individual SSE events are
 bounded as well, with a separate larger wire budget for the repeated JSON/SSE framing around
 individual tokens.
+
+For a provider confirmed to drop native `tool_calls`, private `model.jsonToolModels` can list exact
+model IDs that use the JSON tool protocol. This is opt-in per model, including per-call model
+selection; other models, Responses requests and calls without tools keep their existing transport.
+The model, credentials, reasoning effort, streaming deadlines and cache session are preserved.
+
+The compatibility request declares the actual tools in a fixed system message and requests
+`response_format: { type: "json_object" }`. Completed assistant content must be exactly
+`{"content":"...","toolCalls":[{"id":"...","name":"...","args":{}}]}`. Existing assistant/tool
+history is encoded as paired JSON actions and data receipts without modifying stored messages.
+Unknown tools, duplicate IDs, malformed arguments, extra envelope fields, incomplete streams and
+empty results are rejected. Reasoning text is never interpreted as an action. Each completion still
+makes one upstream request; there is no automatic retry or silent protocol fallback.
