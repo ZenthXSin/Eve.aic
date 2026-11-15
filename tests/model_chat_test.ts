@@ -504,3 +504,53 @@ Deno.test("model per-call options isolate subagent model, effort and cache sessi
     await local.close();
   }
 });
+
+for (const protocol of ["chat", "responses"] as const) {
+  Deno.test(`${protocol}: long agent cache sessions are bounded, stable and distinct`, async () => {
+    const sessions: string[] = [];
+    const local = server(async (incoming) => {
+      const body = await incoming.json();
+      assert.equal(
+        new URL(incoming.url).pathname,
+        `/v1/${protocol === "chat" ? "chat/completions" : "responses"}`,
+      );
+      const key = body.prompt_cache_key;
+      assert.equal(typeof key, "string");
+      assert.ok(key.length > 0 && key.length <= 64);
+      assert.equal(incoming.headers.get("session_id"), key);
+      assert.equal(incoming.headers.get("X-Session-ID"), key);
+      sessions.push(key);
+      return Response.json(
+        protocol === "chat" ? completion("OK") : {
+          status: "completed",
+          output: [{
+            role: "assistant",
+            type: "message",
+            content: [{ type: "output_text", text: "OK" }],
+          }],
+        },
+      );
+    });
+    const first = `agent_${"a".repeat(64)}`;
+    const second = `agent_${"a".repeat(63)}b`;
+    const config = { ...options, protocol, baseUrl: local.url, sessionId: first };
+    const client = new ChatModelClient(config);
+    const restarted = new ChatModelClient(config);
+    try {
+      await client.complete(request);
+      await client.complete(request, { sessionId: second });
+      await client.complete(request, { sessionId: "s".repeat(64) });
+      await client.complete(request, { sessionId: "s".repeat(65) });
+      await client.complete(request, { sessionId: "s".repeat(256) });
+      await restarted.complete(request);
+      assert.equal(sessions[0], sessions[5]);
+      assert.equal(new Set(sessions.slice(0, 5)).size, 5);
+      assert.equal(sessions[2], "s".repeat(64));
+      assert.notEqual(sessions[0], first.slice(0, 64));
+    } finally {
+      client.close();
+      restarted.close();
+      await local.close();
+    }
+  });
+}
