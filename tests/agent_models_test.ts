@@ -10,6 +10,9 @@ Deno.test("agent role profiles isolate credentials, inherit transport and preser
   const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (req) => {
     assert.equal(new URL(req.url).pathname, "/v1/chat/completions");
     const body = await req.json();
+    assert.ok(body.prompt_cache_key.length <= 64);
+    assert.equal(req.headers.get("session_id"), body.prompt_cache_key);
+    assert.equal(req.headers.get("X-Session-ID"), body.prompt_cache_key);
     calls.push({
       key: req.headers.get("authorization"),
       model: body.model,
@@ -87,6 +90,7 @@ Deno.test("agent role profiles isolate credentials, inherit transport and preser
       tools: [],
     }, "model_1");
     const second = await engine.agents.create({ role: "coding" }, "second_coder");
+    assert.equal(second.agentId.length, 70);
     assert.equal(second.config.model, "gpt-6-astra");
     await engine.agents.configure({
       agentId: second.agentId,

@@ -1,4 +1,5 @@
 import { ChatModelError } from "./errors.ts";
+import { createHash } from "node:crypto";
 export { ChatModelError } from "./errors.ts";
 // Chat Completions 传输。配置与凭据捕获一次，单一稳定会话，不设置 temperature。
 import {
@@ -327,6 +328,12 @@ export class ChatModelClient {
       overrides.reasoningEffort !== undefined &&
         !["none", "minimal", "low", "medium", "high", "xhigh"].includes(overrides.reasoningEffort)
     ) fail("request");
+    // Generated agent IDs are 70 characters. Upstreams cap prompt_cache_key at
+    // 64; preserve existing short sessions and hash the full long ID so separate
+    // agents remain distinct. Normalize headers too: gateways may reuse them.
+    if (config.sessionId.length > 64) {
+      config.sessionId = createHash("sha256").update(config.sessionId).digest("hex");
+    }
     let snapshot: ModelRequest;
     let body: string;
     try {
