@@ -1,4 +1,6 @@
 import { AgentService } from "./agents.ts";
+import type { AgentConfig } from "../../contracts/agents.ts";
+import type { AgentModels } from "./agent-models.ts";
 import type {
   ModelCallOptions,
   ModelImage,
@@ -49,6 +51,7 @@ interface Options {
   maxOutputTokens: number;
   modelName?: string;
   modelSelection?: Pick<ModelSelection, "snapshot" | "current">;
+  agentModels?: AgentModels;
   commandIdentity?: CommandIdentity;
   commandUseSystemd?: boolean;
   accessMode?: "restricted" | "unrestricted";
@@ -123,20 +126,29 @@ export class RuntimeEngine {
       unrestricted,
     );
     this.budget = new SharedBudget(`${directory}/budget`, options.settingsFile);
-    this.agents = new AgentService(`${directory}/agents`, {
-      result: (id) => this.#modelResult(id) as unknown as ModelResponse | undefined,
-      complete: async (request, config, id) =>
-        await this.dispatch(
-          "model",
-          "complete",
-          { ...request, _purpose: "isolated", _agentConfig: config } as unknown as Record<
-            string,
-            Json
-          >,
-          id,
-        ) as unknown as ModelResponse,
-      invoke: (namespace, method, args, id) => this.dispatch(namespace, method, args, id),
-    });
+    this.agents = new AgentService(
+      `${directory}/agents`,
+      {
+        result: (id) => this.#modelResult(id) as unknown as ModelResponse | undefined,
+        complete: async (request, config, id) =>
+          await this.dispatch(
+            "model",
+            "complete",
+            { ...request, _purpose: "isolated", _agentConfig: config } as unknown as Record<
+              string,
+              Json
+            >,
+            id,
+          ) as unknown as ModelResponse,
+        invoke: (namespace, method, args, id) => this.dispatch(namespace, method, args, id),
+      },
+      Object.fromEntries(
+        Object.entries(options.agentModels ?? {}).map(([role, profile]) => [role, {
+          model: profile.modelName,
+          reasoningEffort: profile.reasoningEffort,
+        }]),
+      ),
+    );
   }
   get available() {
     return this.#ready && !this.#closing && this.transactions.available && this.records.available &&
@@ -450,8 +462,14 @@ export class RuntimeEngine {
       return await this.notes.self(args as never) as unknown as Json;
     }
     // Capture before the first await: an admitted request keeps its original client and provenance.
+    const role = (args._agentConfig as unknown as Partial<AgentConfig> | undefined)?.role;
+    const agentModel = namespace === "model" && method === "complete" &&
+        id.startsWith("agent_") && role &&
+        Object.hasOwn(this.options.agentModels ?? {}, role)
+      ? this.options.agentModels![role]
+      : undefined;
     const selected = namespace === "model" && ["complete", "describeImage"].includes(method)
-      ? this.options.modelSelection?.snapshot() ?? {
+      ? agentModel ?? this.options.modelSelection?.snapshot() ?? {
         client: this.options.model,
         modelName: this.options.modelName ?? "",
         maxOutputTokens: this.options.maxOutputTokens,
@@ -706,6 +724,7 @@ export class RuntimeEngine {
       }
     }
     this.options.model.close();
+    for (const profile of Object.values(this.options.agentModels ?? {})) profile.client.close();
     if (errors.length) throw new KernelError("storage", "执行服务停止有失败，原件保留");
   }
 }
