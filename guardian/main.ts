@@ -28,6 +28,7 @@ export async function runOwnershipService(configPath: string) {
   const stop = () => resolve();
   let listening = false;
   try {
+    await Deno.mkdir(config.directory, { recursive: true, mode: 0o700 });
     rpc = startOwnershipRpc(
       authority,
       (await Deno.readTextFile(config.adminKeyFile)).trim(),

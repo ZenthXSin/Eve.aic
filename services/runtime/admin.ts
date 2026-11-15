@@ -37,6 +37,7 @@ export function startRuntimeAdmin(
       !(ADMIN_READS[request.resource] as readonly string[]).includes(request.operation) ||
       !request.args || typeof request.args !== "object" || Array.isArray(request.args)
     ) throw new KernelError("rejected", "管理查询不在契约内");
+    if (!ready()) throw new KernelError("unavailable", "执行服务正在恢复历史记录");
     const { resource, operation, args } = request;
     if (resource === "agents") {
       if (operation === "get") return await engine.agents.message(args) as unknown as Json;
@@ -145,6 +146,7 @@ export function startRuntimeAdmin(
     };
   };
   const invoke = async (method: string, args: Record<string, Json>): Promise<Json> => {
+    if (method === "query") return await query(args as unknown as AdminQuery);
     if (method === "status" && !ready()) {
       return { available: false, recovery: engine.recovery };
     }
@@ -161,7 +163,6 @@ export function startRuntimeAdmin(
         model: engine.modelStatus(),
       };
     }
-    if (method === "query") return await query(args as unknown as AdminQuery);
     if (method === "resumeModel") {
       return await serial(async () => {
         if (
