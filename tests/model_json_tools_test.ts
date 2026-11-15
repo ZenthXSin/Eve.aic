@@ -96,6 +96,21 @@ Deno.test("JSON tools: streaming fragments ignore reasoning and require DONE", a
   }
 });
 
+Deno.test("JSON tools: preserves assistant preface before one complete final envelope", async () => {
+  let content = "先核对真实回执。\n\n" + JSON.stringify({ ...action, content: "开始处理。" });
+  const local = fixture(() => Response.json(completion(content)));
+  try {
+    const result = await local.client.complete(request);
+    assert.equal(result.content, "先核对真实回执。\n\n开始处理。");
+    assert.deepEqual(result.toolCalls, action.toolCalls);
+    content = "先核对真实回执。\n" + JSON.stringify(action);
+    assert.equal((await local.client.complete(request)).content, "先核对真实回执。");
+  } finally {
+    local.client.close();
+    await local.close();
+  }
+});
+
 Deno.test("JSON tools: history preserves pairing as data without changing the original request", async () => {
   const history: ModelRequest = {
     ...request,
@@ -146,6 +161,12 @@ Deno.test("JSON tools: malformed, empty, unknown and duplicate actions are rejec
     completion("", "stop", { reasoning_content: JSON.stringify(action) }),
     completion("准备行动"),
     completion("```json\n" + JSON.stringify(action) + "\n```"),
+    completion("准备行动：" + JSON.stringify(action)),
+    completion("准备行动。\n" + JSON.stringify(action) + "\n补充说明"),
+    completion("准备行动。\n" + JSON.stringify(action) + "\n" + JSON.stringify(action)),
+    completion('{"example":true}\n' + JSON.stringify(action)),
+    completion("准备行动。\n" + JSON.stringify(action).slice(0, -1)),
+    completion("准备行动。\n" + JSON.stringify({ ...action, extra: true })),
     completion(JSON.stringify({ content: "", toolCalls: [] })),
     completion(JSON.stringify({ ...action, extra: true })),
     completion(JSON.stringify({ content: "完成" })),
