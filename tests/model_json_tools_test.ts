@@ -46,6 +46,8 @@ Deno.test("JSON tools: completed content restores tool calls and carries real us
     assert.equal(body.prompt_cache_key, "main-session");
     assert.equal(incoming.headers.get("Authorization"), "Bearer fixture-secret");
     assert.deepEqual(body.messages[0], request.messages[0]);
+    assert.equal(body.messages.at(-1).role, "system");
+    assert.ok(body.messages.at(-1).content.includes("只允许content和toolCalls两个字段"));
     assert.ok(body.messages[1].content.includes(JSON.stringify([{
       type: "function",
       function: {
