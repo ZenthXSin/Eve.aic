@@ -116,11 +116,27 @@ export class EveRuntime {
       }
     }
     this.#presentationScanned = events.length;
-    return [
-      ...presentContext(messages, this.#rawCalls, this.#receiptRecords),
-      ...this.#selfMessages,
-      ...(this.config.restReviewEnabled ? [continuityMessage(events, this.#observedJobs)] : []),
-    ];
+    return presentContext(messages, this.#rawCalls, this.#receiptRecords);
+  }
+  async #saveContextState(slot: "self" | "continuity", messages: Message[]) {
+    const previous = lastActiveEvent(
+      this.journal.events,
+      "context_state",
+      (event) => (event.data as { slot?: string }).slot === slot,
+    );
+    const saved = (previous?.data as { messages?: Message[] } | undefined)?.messages ?? [];
+    if (JSON.stringify(saved) === JSON.stringify(messages)) return;
+    // Keep state at the position where Eve first saw it. Moving a transient tail
+    // behind each new tool turn destroys the conversation prefix on every request.
+    await this.journal.append("context_state", { slot, messages } as unknown as Json);
+  }
+  async #saveContextStates() {
+    await this.#saveContextState("self", this.#selfMessages);
+    if (this.config.restReviewEnabled) {
+      await this.#saveContextState("continuity", [
+        continuityMessage(this.journal.events, this.#observedJobs),
+      ]);
+    }
   }
   #render() {
     return this.#present(render(this.journal.events, this.#prompt));
@@ -131,15 +147,33 @@ export class EveRuntime {
   #timer?: ReturnType<typeof setTimeout>;
   #toolStartedAt = new Map<string, number>();
   #continueImmediately = false;
-  #observedJobs = new Map<string, { callId: string; status: string }>();
+  #observedJobs = new Map<string, { callId?: string; status: string }>();
+  #rememberJobSummary(summary: Json, callId?: string) {
+    if (!summary || typeof summary !== "object" || Array.isArray(summary)) return;
+    if (typeof summary.jobId !== "string" || typeof summary.status !== "string") return;
+    const previous = this.#observedJobs.get(summary.jobId);
+    const final = ["completed", "failed", "cancelled"];
+    // A late queued/running receipt must not resurrect a finished or uncertain job.
+    const status = previous &&
+        (final.includes(previous.status) ||
+          previous.status === "unknown" && !final.includes(summary.status))
+      ? previous.status
+      : summary.status;
+    this.#observedJobs.set(summary.jobId, { callId: callId ?? previous?.callId, status });
+  }
+  #rememberCompletions(items: Json) {
+    if (!Array.isArray(items)) return;
+    for (const item of items) {
+      if (item && typeof item === "object" && !Array.isArray(item) && item.job) {
+        this.#rememberJobSummary(item.job);
+      }
+    }
+  }
   #rememberJob(callId: string, result: Json) {
     try {
       const output = (result as { output?: string })?.output;
       if (typeof output !== "string") return;
-      const summary = JSON.parse(output);
-      if (typeof summary.jobId === "string" && typeof summary.status === "string") {
-        this.#observedJobs.set(summary.jobId, { callId, status: summary.status });
-      }
+      this.#rememberJobSummary(JSON.parse(output), callId);
     } catch { /* 非脚本回执不建立任务索引。 */ }
   }
   async #saveToolResult(callId: string, result: Json) {
@@ -210,7 +244,10 @@ export class EveRuntime {
         ) this.#imageActions.add(data.actionId);
         if (data.source === "agents") this.#agentThrough = Number(data.throughSeq);
         if (data.source === "phone") this.#phoneThrough = Number(data.throughSeq);
-        if (data.source === "scripts") this.#scriptThrough = Number(data.throughSeq);
+        if (data.source === "scripts") {
+          this.#scriptThrough = Number(data.throughSeq);
+          this.#rememberCompletions(data.items);
+        }
         if (data.source === "commands") this.#commandThrough = Number(data.throughSeq);
         if ((Array.isArray(data.items) && data.items.length) || data.source === "reminder") {
           this.#wake = 0;
@@ -442,6 +479,7 @@ export class EveRuntime {
         items: newItems,
         alreadyObserved: completion.items.length - newItems.length,
       });
+      this.#rememberCompletions(newItems);
       this.#scriptThrough = completion.throughSeq;
       if (newItems.length) {
         fresh = true;
@@ -948,6 +986,7 @@ export class EveRuntime {
       })(),
     ]);
     for (const result of prepared) if (result.status === "rejected") throw result.reason;
+    await this.#saveContextStates();
     const contextStarted = performance.now();
     // 必须先固定初次投影，再判断 500k 机械保护，避免旧 raw 历史误触压缩。
     let messages = await this.#projectContext(tools);

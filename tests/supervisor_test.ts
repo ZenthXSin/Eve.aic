@@ -55,6 +55,7 @@ async function fixture(
   let seq = 20;
   const markers: unknown[] = [];
   const preparation: string[] = [];
+  const ensured: string[] = [];
   const handovers: { from: string; to: string; mode: string }[] = [];
   const channelErrors = new Map<string, string>();
   let restoreError = false;
@@ -62,6 +63,7 @@ async function fixture(
   let activationError = false;
   const driver: InstanceDriver = {
     ensure(instance) {
+      ensured.push(instance.id);
       if (instance.id === "new" && startError) {
         throw new KernelError("unavailable", "new executable failed");
       }
@@ -188,6 +190,7 @@ async function fixture(
     proofs,
     markers,
     preparation,
+    ensured,
     handovers,
     channelErrors,
     setRestoreError(value: boolean) {
@@ -784,6 +787,36 @@ for (const fail of [false, true]) {
     }
   });
 }
+Deno.test("暂停替换：管理员更新不启动任何实例，重启仍暂停，恢复时才启动新版", async () => {
+  const f = await fixture({ replacement: true });
+  try {
+    await f.supervisor().pause();
+    await assert.rejects(() =>
+      f.supervisor().stageReplacement(() => Promise.resolve(f.instances[1]), "upgrade_paused")
+    );
+    await f.supervisor().stageReplacement(
+      () => Promise.resolve(f.instances[1]),
+      "upgrade_paused",
+      true,
+    );
+    assert.equal(f.supervisor().state.paused, true);
+    assert.equal(f.supervisor().state.current, "new");
+    assert.equal(f.supervisor().state.lastOutcome?.outcome, "staged");
+    assert.equal(f.states.get("old"), "dead");
+    assert.equal(f.states.has("new"), false);
+    assert.equal(f.authority.status().mode, "paused");
+    await f.restart();
+    await f.supervisor().tick();
+    assert.ok(!f.ensured.includes("new"));
+    await f.supervisor().resume();
+    assert.equal(f.supervisor().state.current, "new");
+    assert.equal(f.supervisor().state.lastOutcome?.outcome, "confirmed");
+    assert.equal(f.states.get("new"), "active");
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test("直接替换：出口排空期间监督重启，沿用原编号完成，不复制账本", async () => {
   const f = await fixture({ replacement: true });
   try {

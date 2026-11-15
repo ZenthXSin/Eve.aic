@@ -139,6 +139,26 @@ Deno.test("上下文组成：仅返回分类计数和明确估算，不泄露正
   assert.ok(!JSON.stringify(composition).includes("private-id"));
 });
 
+Deno.test("上下文状态：自我便签和生活接续不滑动，压缩携带最新版本，回滚排除错误版本", () => {
+  const state = (seq: number, slot: string, text: string) =>
+    event(seq, "context_state", { slot, messages: [{ role: "user", content: text }] });
+  const events = [state(1, "self", "关于我 v1"), state(2, "continuity", "旧接续")];
+  const first = render(events, "身份");
+  events.push(event(3, "model_response", { response: { content: "决定", toolCalls: [] } }));
+  events.push(state(4, "self", "关于我 v2"));
+  events.push(state(5, "continuity", "新接续"));
+  assert.deepEqual(render(events, "身份").slice(0, first.length), first);
+  events.push(event(6, "compression", { throughSeq: 5, summary: "旧经历摘要" }));
+  const compressed = render(events, "身份");
+  assert.deepEqual(compressed.slice(2).map((m) => m.content), ["关于我 v2", "新接续"]);
+  assert.deepEqual(render(JSON.parse(JSON.stringify(events)), "身份"), compressed);
+  events.push(state(7, "self", "候选自我偏好 v3"));
+  events.push(event(8, "upgrade_rollback", { afterSeq: 6, throughSeq: 7 }));
+  const rollback = render(events, "身份");
+  assert.ok(!JSON.stringify(rollback).includes("候选自我偏好 v3"));
+  assert.ok(JSON.stringify(rollback).includes("关于我 v2"));
+});
+
 function appendBatch(events: ConsciousEvent[]) {
   const offset = events.length;
   for (const item of batches(1)) {

@@ -137,8 +137,7 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     await eve.pulse();
     assert.equal(paid, 2);
     assert.equal(requests[1][0].content, "稳定身份");
-    assert.equal(requests[1].at(-1)?.role, "user");
-    assert.ok(requests[1].at(-2)?.content.includes("我喜欢星星"));
+    assert.ok(requests[1].some((m) => m.role === "user" && m.content.includes("我喜欢星星")));
     const reflections = () => eve.journal.events.filter((e) => e.kind === "self_reflection");
     assert.equal((reflections()[0].data as { ideas: unknown[] }).ideas.length, 3);
     assert.equal(eve.status().lastError, null);
@@ -169,6 +168,7 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     await engine.budget.updateSettings(settings);
     await eve.pulse();
     assert.equal(paid, 3);
+    assert.deepEqual(requests[2].slice(0, requests[1].length), requests[1]);
     assert.equal(eve.status().lastError, null);
     assert.equal(eve.journal.events.filter((e) => e.kind === "model_response").length, 3);
     config.defaultSleepMs = 0;
@@ -191,7 +191,8 @@ Deno.test("远端意识流：采用独立模型原结果，未知语义服务不
     assert.equal(commandNotice.length, 1);
     assert.equal((commandNotice[0].data as { items: { exitCode: number }[] }).items[0].exitCode, 0);
     // A fresh command notification must not surface idle ideas.
-    assert.ok(requests.at(-1)!.at(-1)?.content.includes("我喜欢星星"));
+    assert.ok(requests.at(-1)!.some((m) => m.content.includes("我喜欢星星")));
+    assert.deepEqual(requests.at(-1)!.slice(0, requests[2].length), requests[2]);
     const reflected = reflections().length;
     settings.dailyTokenBudget = 0;
     await engine.budget.updateSettings(settings);
