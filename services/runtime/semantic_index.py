@@ -8,6 +8,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import semantic_chat
+
 COLLECTIONS = ("notes", "chat", "agents", "records", "memory")
 
 
@@ -61,6 +63,7 @@ class Index:
             if old and old[0] != version:
                 raise ValueError("Model/index version changed; use a new index directory")
             db.execute("INSERT OR IGNORE INTO meta VALUES('version',?)", (version,))
+            semantic_chat.migrate(db)
         self.discovered = False
         self.scan_complete = False
         self.last_error = None
@@ -68,6 +71,7 @@ class Index:
         self._next_scan = 0
         self._timeline_stamp = None
         self._timeline = {}
+        self._embed_collection = 0
 
     @contextmanager
     def db(self):
@@ -86,7 +90,7 @@ class Index:
         folders = [("notes", self.backend / "notes/events", False),
                    ("agents", self.backend / "agents/events", False)]
         if self.phone:
-            folders.extend(("chat", self.phone / sub, True) for sub in ["inbound", "outbox/records"])
+            folders.extend(("chat", self.phone / sub, True) for sub in ["outbox/records", "inbound"])
         folders.extend([("memory", self.backend / "memory/events", False),
                         ("records", self.backend / "consciousness/events", False)])
         for collection, folder, phone in folders:
@@ -104,6 +108,11 @@ class Index:
                     collection, path, seq = next(self._files)
                 except StopIteration:
                     if self.discovered:
+                        # Originals may be removed outside this rebuildable projection.
+                        for chat in db.execute("SELECT path FROM chat_messages").fetchall():
+                            if not Path(chat[0]).is_file():
+                                semantic_chat.remove(db, chat[0])
+                                db.execute("UPDATE docs SET active=0 WHERE path=?", (chat[0],))
                         self.scan_complete = True
                         self._next_scan = time.monotonic() + 30
                     self.discovered = True
@@ -182,6 +191,9 @@ class Index:
             elif kind == "notice" and data.get("source") not in {"phone", "agents", "scripts"}:
                 text = searchable(data)
         elif collection == "chat":
+            with self.db() as db:
+                semantic_chat.update(db, event, str(path), checks)
+                interaction = semantic_chat.evidence(db, str(path))
             if "message" in event:
                 message = event["message"].get("message", event["message"])
                 text = message.get("text", message.get("content", ""))
@@ -199,6 +211,13 @@ class Index:
                 destination = request.get("destination", {})
                 if not refs.get("conversationId") and destination.get("openId"):
                     refs["conversationId"] = "qq:" + destination.get("kind", "") + ":" + destination["openId"]
+            if interaction:
+                title = "QQ / " + interaction[0]
+                checks.extend(interaction[1])
+                if not self.valid_checks(interaction[1]):
+                    text = ""
+            else:
+                text = ""
         if collection == "chat" and self.phone:
             timeline = self.phone / "timeline/index.json"
             if timeline.exists():
@@ -215,11 +234,22 @@ class Index:
                 "refs": json.dumps(refs, ensure_ascii=False), "checks": json.dumps(checks),
                 "note_id": note_id, "note_revision": revision}
 
+    @staticmethod
+    def valid_checks(checks):
+        for check in checks:
+            try:
+                if digest(Path(check["path"]).read_bytes()) != check["sha256"]:
+                    return False
+            except OSError:
+                return False
+        return True
+
     def prepare(self):
         with self.db() as db:
             row = db.execute("SELECT * FROM sources WHERE state='pending' ORDER BY "
                              "CASE collection WHEN 'notes' THEN 0 WHEN 'agents' THEN 1 WHEN 'chat' THEN 2 "
-                             "WHEN 'memory' THEN 3 ELSE 4 END,seq DESC LIMIT 1").fetchone()
+                             "WHEN 'memory' THEN 3 ELSE 4 END,"
+                             "CASE WHEN collection='chat' AND seq=0 THEN 0 ELSE 1 END,seq DESC LIMIT 1").fetchone()
         if not row:
             return False
         try:
@@ -246,10 +276,13 @@ class Index:
             return False
 
     def embed_one(self):
+        # Give every collection progress even while long agent/tool histories backfill.
+        order = COLLECTIONS[self._embed_collection:] + COLLECTIONS[:self._embed_collection]
         with self.db() as db:
-            row = db.execute("SELECT id,offset,substr(text,offset+1,1200) AS remaining,length(text) AS total "
-                             "FROM docs WHERE active=1 AND done=0 ORDER BY CASE collection WHEN 'notes' THEN 0 "
-                             "WHEN 'agents' THEN 1 WHEN 'chat' THEN 2 WHEN 'memory' THEN 3 ELSE 4 END,offset,seq DESC LIMIT 1").fetchone()
+            row = db.execute("SELECT id,collection,offset,substr(text,offset+1,1200) AS remaining,length(text) AS total "
+                             "FROM docs WHERE active=1 AND done=0 ORDER BY CASE collection " +
+                             " ".join(f"WHEN ? THEN {i}" for i in range(len(order))) +
+                             " END,offset,seq DESC LIMIT 1", order).fetchone()
         if not row:
             return False
         text = self.encoder.chunk(row["remaining"])
@@ -262,6 +295,7 @@ class Index:
             cid = db.execute("SELECT id FROM chunks WHERE doc_id=? AND start=?", (row["id"], row["offset"])).fetchone()[0]
             db.execute("INSERT OR REPLACE INTO lexical(rowid,tokens) VALUES(?,?)", (cid, " ".join(terms(text))))
             db.execute("UPDATE docs SET offset=?,done=? WHERE id=?", (end if done else max(row["offset"] + 1, end - 40), int(done), row["id"]))
+        self._embed_collection = (COLLECTIONS.index(row["collection"]) + 1) % len(COLLECTIONS)
         return True
 
     def status(self):
@@ -330,17 +364,14 @@ class Index:
                     merged[cid] = merged.get(cid, 0) + 1 / (60 + i + 1)
             items, seen = [], set()
             for cid in sorted(merged, key=merged.get, reverse=True):
-                row = db.execute("SELECT d.id,d.refs,d.checks,d.at,d.kind,d.title,c.text AS excerpt,c.start,c.end FROM chunks c "
-                                 "JOIN docs d ON d.id=c.doc_id WHERE c.id=?", (cid,)).fetchone()
-                if row["id"] in seen:
+                row = db.execute("SELECT d.id,d.collection,d.refs,d.checks,d.at,d.kind,d.title,c.text AS excerpt,c.start,c.end FROM chunks c "
+                                 "JOIN docs d ON d.id=c.doc_id WHERE c.id=? AND d.active=1", (cid,)).fetchone()
+                if not row or row["id"] in seen:
                     continue
-                valid = True
-                for check in json.loads(row["checks"]):
-                    try:
-                        if digest(Path(check["path"]).read_bytes()) != check["sha256"]:
-                            valid = False
-                    except OSError:
-                        valid = False
+                valid = self.valid_checks(json.loads(row["checks"]))
+                if row["collection"] == "chat":
+                    interaction = semantic_chat.evidence(db, row["id"])
+                    valid = valid and interaction is not None and self.valid_checks(interaction[1])
                 if not valid:
                     db.execute("UPDATE docs SET active=0 WHERE id=?", (row["id"],))
                     continue

@@ -79,7 +79,7 @@ class SearchTest(unittest.TestCase):
     def test_chat_handles_and_complete_tool_pair(self):
         (self.phone / "timeline/index.json").write_text(json.dumps({"entries": [{"key": "incoming:1", "seq": 99}]}))
         (self.phone / "inbound/0000000000000001-fixture.json").write_text(json.dumps({"seq": 1, "message": {
-            "message": {"text": "猫吃饭", "conversationId": "qq:group:test", "sentAt": "2026-11-15"}}}, ensure_ascii=False))
+            "notify": True, "message": {"text": "猫吃饭", "conversationId": "qq:group:test", "sentAt": "2026-11-15"}}}, ensure_ascii=False))
         for seq, kind, data in [(1, "tool_start", {"callId": "same", "call": {"name": "cat", "args": {}}}),
                                 (2, "tool_result", {"callId": "same", "result": {"text": "猫已喂好"}})]:
             (self.backend / "consciousness/events" / f"{seq:016d}.json").write_text(json.dumps({"seq": seq, "kind": kind,
@@ -114,6 +114,105 @@ class SearchTest(unittest.TestCase):
         other.revision = "v2"
         with self.assertRaises(ValueError):
             Index(self.root / "index", self.backend, self.phone, other)
+
+    def incoming(self, seq, *, group="test", event="GROUP_MESSAGE_CREATE", own=None, reply=None, mentions=None):
+        private = event == "C2C_MESSAGE_CREATE"
+        kind = "user" if private else "group"
+        text = f"猫的消息{seq}"
+        p = self.phone / "inbound" / f"{seq:016d}-fixture.json"
+        p.write_text(json.dumps({"seq": seq, "raw": {"t": event, "d": {"content": text, "mentions": mentions or []}},
+                                "message": {"destination": {"kind": kind, "openId": group},
+                                "deduplication": {"messageIndex": own}, "referenceIndex": reply,
+                                "notify": private or event == "GROUP_AT_MESSAGE_CREATE",
+                                "message": {"conversationId": f"qq:{kind}:{group}", "text": text}}}))
+        return p
+
+    def outgoing(self, action, *, group="test", status="sent", own=None, reply=None):
+        folder = self.phone / "outbox/records"
+        folder.mkdir(parents=True, exist_ok=True)
+        p = folder / (action + ".json")
+        p.write_text(json.dumps({"actionId": action, "status": "finished" if status != "started" else "started",
+                                "request": {"destination": {"kind": "group", "openId": group},
+                                            "text": "猫的回答", "referenceIndex": reply},
+                                "result": {"status": status, "messageId": "not-a-reference-index", "referenceIndex": own}}))
+        return p
+
+    def chat_paths(self):
+        with self.index.db() as db:
+            return {Path(r[0]).name for r in db.execute("SELECT path FROM docs WHERE collection='chat' AND active=1")}
+
+    def test_chat_routes_only_direct_interaction_and_confirmed_sends(self):
+        self.incoming(1)  # ordinary group chat
+        private = self.incoming(2, event="C2C_MESSAGE_CREATE")
+        mention = self.incoming(3, event="GROUP_AT_MESSAGE_CREATE")
+        direct = self.incoming(4, mentions=[{"scope": "single", "is_you": True}])
+        self.incoming(5, mentions=[{"scope": "all", "is_you": True}])
+        self.incoming(6, mentions=[{"scope": "single", "is_you": False}])
+        sent = self.outgoing("sent")
+        for state in ["failed", "unknown", "started"]:
+            self.outgoing(state, status=state)
+        self.drain()
+        self.assertEqual(self.chat_paths(), {p.name for p in [private, mention, direct, sent]})
+        self.assertEqual(self.index.status()["errors"], 0)
+
+    def test_later_reply_admits_question_and_quoted_eve_with_unique_indexes(self):
+        question = self.incoming(1, own="question")
+        quote = self.incoming(2, reply="answer")
+        self.incoming(3, group="another", reply="answer")
+        self.incoming(4, reply="not-a-reference-index")
+        self.drain()
+        self.assertFalse(self.chat_paths())
+        answer = self.outgoing("answer", own="answer", reply="question")
+        self.drain()
+        self.assertEqual(self.chat_paths(), {p.name for p in [question, quote, answer]})
+        hits = self.index.search({"query": "feline", "collection": "chat", "mode": "semantic"})["items"]
+        self.assertEqual(len(hits), 3)
+        # A duplicate index makes the quote ambiguous, even if it belongs to someone else.
+        duplicate = self.incoming(5, own="answer")
+        self.drain()
+        self.assertNotIn(quote.name, self.chat_paths())
+        duplicate.unlink()
+        self.drain()
+        self.assertIn(quote.name, self.chat_paths())
+        # A changed delivery receipt cannot keep its old dependent Q&A searchable.
+        self.outgoing("answer", status="unknown", own="answer", reply="question")
+        self.assertFalse(self.index.search({"query": "feline", "collection": "chat"})["items"])
+        self.drain()
+        self.assertFalse(self.chat_paths())
+
+    def test_chat_routing_migration_purges_old_vectors_and_preserves_other_sources(self):
+        question = self.incoming(1, event="GROUP_AT_MESSAGE_CREATE")
+        self.note(1, 1, "猫的便签")
+        self.drain()
+        with self.index.db() as db:
+            old_chunks = [r[0] for r in db.execute("SELECT id FROM chunks WHERE doc_id=?", (str(question),))]
+            self.assertTrue(old_chunks)
+            db.execute("DELETE FROM meta WHERE key='chat_routing'")
+        # The source is ordinary group chatter under the new rules.
+        self.incoming(1)
+        self.index = Index(self.root / "index", self.backend, self.phone, Encoder())
+        with self.index.db() as db:
+            self.assertFalse(db.execute("SELECT 1 FROM docs WHERE collection='chat'").fetchone())
+            for cid in old_chunks:
+                self.assertFalse(db.execute("SELECT 1 FROM chunks WHERE id=?", (cid,)).fetchone())
+                self.assertFalse(db.execute("SELECT 1 FROM lexical WHERE rowid=?", (cid,)).fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM docs WHERE collection='notes'").fetchone())
+        self.drain()
+        self.assertFalse(self.chat_paths())
+        self.assertTrue(question.is_file())
+        self.assertTrue(self.index.search({"query": "feline", "collection": "notes"})["items"])
+
+    def test_large_notes_do_not_block_chat_embedding(self):
+        self.note(1, 1, "猫的长文" * 500)
+        self.incoming(1, event="C2C_MESSAGE_CREATE")
+        self.index._files = self.index.files()
+        self.index.discover(1000)
+        while self.index.prepare():
+            pass
+        self.index.embed_one()
+        self.index.embed_one()
+        self.assertEqual(self.index.status()["collections"]["notes"]["completed"], 0)
+        self.assertEqual(self.index.status()["collections"]["chat"]["completed"], 1)
 
 
 if __name__ == "__main__":
