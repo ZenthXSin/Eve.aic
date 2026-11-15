@@ -12,6 +12,7 @@ import { startRuntimeAdmin } from "./admin.ts";
 import { ModelSelection } from "./model-selection.ts";
 import { startRuntimeModelControl, validateModelControlConfig } from "./model-control.ts";
 import { readAgentModels } from "./agent-models.ts";
+import { LocalSearch } from "./search.ts";
 
 export async function runRuntimeService(configPath: string) {
   const config = JSON.parse(await Deno.readTextFile(configPath));
@@ -76,6 +77,9 @@ export async function runRuntimeService(configPath: string) {
     modelName: model.model,
     modelSelection: selection,
     semantic,
+    searchIndex: c.searchIndex
+      ? new LocalSearch(c.searchIndex.connectionFile, c.searchIndex.keyFile)
+      : undefined,
     commandIdentity: c.commandIdentity,
     commandUseSystemd: true,
     accessMode: c.accessMode,

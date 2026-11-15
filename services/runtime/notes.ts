@@ -5,6 +5,7 @@ import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
 import { regexMatches } from "./regex.ts";
 import { RollbackQuarantine } from "./quarantine.ts";
+import type { SemanticSearch } from "./search.ts";
 
 export function textPage(text: string, start = 0, limit = 4096) {
   if (
@@ -67,6 +68,7 @@ export class NoteStore {
     readonly embed?: (text: string, purpose?: "query" | "passage") => Promise<number[]>,
     readonly records?: FactJournal,
     readonly count?: (text: string) => Promise<{ tokens: number; encoding: string }>,
+    readonly searchIndex?: SemanticSearch,
   ) {
     this.journal = new FactJournal(directory);
     this.quarantine = new RollbackQuarantine(records);
@@ -352,7 +354,7 @@ export class NoteStore {
   ) {
     if (
       typeof args.query !== "string" || !args.query || args.query.length > 512 ||
-      !["literal", "regex", "semantic"].includes(args.mode ?? "literal")
+      !["literal", "regex", "semantic", "hybrid"].includes(args.mode ?? "literal")
     ) throw new KernelError("rejected", "搜索参数无效");
     const after = args.afterSeq ?? 0;
     if (!Number.isSafeInteger(after) || after < 0) {
@@ -371,7 +373,40 @@ export class NoteStore {
         throw new KernelError("rejected", "搜索期间发生换版回滚，请重新读取已接受的便签版本");
       }
     };
-    if (args.mode === "semantic") {
+    if ((args.mode === "semantic" || args.mode === "hybrid") && this.searchIndex) {
+      const result = await this.searchIndex.search({
+        query: args.query,
+        mode: args.mode,
+        collection: "notes",
+        limit: 40,
+        ...(args.group === undefined ? {} : { group: args.group }),
+        afterSeq: after,
+      });
+      assertCurrent();
+      const items = result.items.filter((hit) => {
+        const note = latest.get(hit.source.id ?? "");
+        return note && note.revision === hit.source.revision;
+      }).slice(0, 8).map((hit) => {
+        const note = latest.get(hit.source.id!)!;
+        return {
+          id: note.id,
+          ...(note.alias === undefined ? {} : { alias: note.alias }),
+          revision: note.revision,
+          title: note.title,
+          excerpt: hit.excerpt,
+          score: hit.score,
+          ...this.quarantine.annotation(note.contextRecordSeq),
+        };
+      });
+      return {
+        items,
+        throughSeq: this.journal.events.length,
+        hasMore: false,
+        retrieval: result.retrieval,
+        index: result.index,
+      };
+    }
+    if (args.mode === "semantic" || args.mode === "hybrid") {
       if (!this.embed) {
         throw new KernelError("unavailable", "语义检索模型接入为 TODO，请先使用 literal 或 regex");
       }
