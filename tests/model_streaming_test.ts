@@ -136,6 +136,56 @@ Deno.test("stream: parallel tool fragments assembled by index, arguments validat
   }
 });
 
+Deno.test("stream: gateway usage with an empty trailing choice preserves completed text and tools", async () => {
+  const usage = {
+    prompt_tokens: 100,
+    completion_tokens: 20,
+    total_tokens: 120,
+    prompt_tokens_details: { cached_tokens: 80 },
+  };
+  const accounting = `data: ${
+    JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: null }], usage })
+  }\r\n\r\n`;
+  let tool = false;
+  const local = fixture(() =>
+    stream([
+      tool
+        ? event({
+          tool_calls: [{
+            index: 0,
+            id: "call-one",
+            type: "function",
+            function: { name: "echo", arguments: '{"text":"收到"}' },
+          }],
+        }, "tool_calls")
+        : event({ content: "收到" }, "stop"),
+      accounting,
+      done,
+    ])
+  );
+  const client = local.client();
+  try {
+    for (tool of [false, true]) {
+      const result = await client.complete(request);
+      assert.equal(result.content, tool ? "" : "收到");
+      assert.deepEqual(
+        result.toolCalls,
+        tool ? [{ id: "call-one", name: "echo", args: { text: "收到" } }] : [],
+      );
+      assert.deepEqual(result.usage, {
+        status: "reported",
+        inputTokens: 100,
+        outputTokens: 20,
+        totalTokens: 120,
+        cachedInputTokens: 80,
+      });
+    }
+  } finally {
+    client.close();
+    await local.close();
+  }
+});
+
 Deno.test("stream: truncated/error/invalid streams never return partial content or tools", async () => {
   const bad = [
     event({ content: "partial" }),
@@ -159,6 +209,19 @@ Deno.test("stream: truncated/error/invalid streams never return partial content 
     event({ role: "user", content: "bad role" }, "stop") + done,
     event({ content: "" }, "stop") + done,
     event({ content: "a" }, "stop") + event({ content: "late" }) + done,
+    event({ content: "a" }, "stop") + event({}) + done,
+    event({ content: "a" }, "stop") + `data: ${
+      JSON.stringify({
+        choices: [{ index: 0, delta: { content: "late" }, finish_reason: null }],
+        usage: { prompt_tokens: 100 },
+      })
+    }\n\n` + done,
+    event({ content: "a" }, "stop") + `data: ${
+      JSON.stringify({
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 100 },
+      })
+    }\n\n` + done,
     "data: {broken}\n\n",
   ];
   let wire = "";
