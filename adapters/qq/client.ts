@@ -386,11 +386,15 @@ export class QqClient {
   async #request(
     path: string,
     init: RequestInit,
-    options: { origin?: URL; timeoutMs?: number; raw?: boolean } = {},
+    options: { origin?: URL; timeoutMs?: number; raw?: boolean; signal?: AbortSignal } = {},
   ): Promise<ResponseInfo> {
     const startedAt = performance.now();
     const timeout = AbortSignal.timeout(options.timeoutMs ?? this.#timeout);
-    const signal = AbortSignal.any([this.#closed.signal, timeout]);
+    const signal = AbortSignal.any([
+      this.#closed.signal,
+      timeout,
+      ...(options.signal ? [options.signal] : []),
+    ]);
     let phase: "headers" | "body" = "headers";
     try {
       const url = new URL(path, options.origin ?? this.#base);
@@ -449,7 +453,7 @@ export class QqClient {
     operation: Parameters<typeof sdkRequest>[0],
     args: unknown[],
     init: RequestInit,
-    options: { origin?: URL; timeoutMs?: number } = {},
+    options: { origin?: URL; timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<ResponseInfo> {
     const body = init.body === undefined ? [] : [JSON.parse(String(init.body))];
     return await sdkRequest<ResponseInfo>(
@@ -704,6 +708,41 @@ export class QqClient {
       id: response.data.id,
       ...(typeof response.data.username === "string" ? { username: response.data.username } : {}),
       ...(typeof response.data.bot === "boolean" ? { bot: response.data.bot } : {}),
+    };
+  }
+
+  /** Read-only platform metadata for display, never identity or permission evidence. */
+  async groupInfo(
+    openId: string,
+    signal?: AbortSignal,
+  ): Promise<{ groupOpenId: string; groupName?: string }> {
+    if (!nonempty(openId) || openId.length > 512) requestError();
+    signal?.throwIfAborted();
+    const token = await this.#accessToken();
+    signal?.throwIfAborted();
+    const response = await this.#sdk("getGuildInfo", [encodeURIComponent(openId)], {
+      headers: {
+        Authorization: `QQBot ${token}`,
+        "X-Union-Appid": this.#credentials.appId,
+      },
+    }, { signal });
+    const code = codeOf(response);
+    if (response.httpStatus !== 200 || (code !== undefined && code !== 0)) {
+      const info = errorInfo(response, code);
+      if (info.category === "authentication") this.invalidateToken();
+      throw new QqRequestError(info);
+    }
+    // A mismatched response must not attach another group's name to this openid.
+    if (response.data.group_openid !== openId) {
+      throw new QqRequestError({ category: "invalid_response", httpStatus: response.httpStatus });
+    }
+    const name = response.data.group_name;
+    if (name !== undefined && (typeof name !== "string" || name.length > 512)) {
+      throw new QqRequestError({ category: "invalid_response", httpStatus: response.httpStatus });
+    }
+    return {
+      groupOpenId: openId,
+      ...(nonempty(name) ? { groupName: name } : {}),
     };
   }
 
