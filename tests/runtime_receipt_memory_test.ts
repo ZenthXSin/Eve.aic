@@ -7,7 +7,7 @@ import type { WebApi } from "../contracts/web.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
 
 async function fixture(web?: WebApi) {
-  const root = await Deno.makeTempDir({ dir: Deno.cwd(), prefix: "eve-receipt-memory-test-" });
+  const root = await Deno.makeTempDir({ prefix: "eve-receipt-memory-test-" });
   const options = {
     directory: root + "/data",
     workspace: root + "/workspace",
