@@ -17,21 +17,28 @@ try {
   let value;
   if (request.method === "readBytes") {
     const maximum = request.args.maxBytes ?? 20 * 1024 * 1024;
-    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 32 * 1024 * 1024) {
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 300 * 1024 * 1024) {
       throw new Error("附件读取大小无效");
     }
     const path = await files.path(request.args.path), file = await Deno.open(path);
     try {
       const stat = await file.stat();
       if (!stat.isFile || stat.size > maximum) throw new Error("附件不是普通文件或超过大小限制");
-      const bytes = new Uint8Array(maximum + 1);
+      // Allocate for the actual file, not the upload ceiling (300 MiB).
+      const bytes = new Uint8Array(stat.size + 1);
       let at = 0;
       while (at < bytes.length) {
         const size = await file.read(bytes.subarray(at));
         if (size === null) break;
         at += size;
       }
-      if (at > maximum) throw new Error("附件读取期间超过大小限制");
+      const after = await file.stat();
+      if (
+        at !== stat.size || after.size !== stat.size ||
+        after.mtime?.getTime() !== stat.mtime?.getTime()
+      ) {
+        throw new Error("附件读取期间文件改变，请重新读取");
+      }
       value = Buffer.from(bytes.subarray(0, at)).toString("base64");
     } finally {
       file.close();

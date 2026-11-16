@@ -7,6 +7,7 @@ const hash = (b: Uint8Array, alg = "md5") => createHash(alg).update(b).digest("h
 for (
   const mode of [
     "success",
+    "image",
     "string-size",
     "group",
     "invalid-size",
@@ -50,7 +51,7 @@ for (
         const body = await r.json();
         if (path.endsWith("upload_prepare")) {
           assert.deepEqual(body, {
-            file_type: 4,
+            file_type: mode === "image" ? 1 : 4,
             file_size: String(bytes.length),
             file_name: "test.zip",
             md5: hash(bytes),
@@ -95,7 +96,7 @@ for (
         if (path.endsWith("/files")) {
           merges++;
           assert.deepEqual(body, {
-            file_type: 4,
+            file_type: mode === "image" ? 1 : 4,
             srv_send_msg: false,
             file_name: "test.zip",
             upload_id: "resource",
@@ -122,24 +123,27 @@ for (
       const result = await client.sendText({
         destination: { kind: mode === "group" ? "group" : "user", openId: "target" },
         text: "file",
-        attachment: { path: "/test.zip", kind: "file" },
+        attachment: { path: "/test.zip", kind: mode === "image" ? "image" : "file" },
       });
       assert.equal(
         result.status,
-        ["success", "string-size", "group"].includes(mode)
+        ["success", "image", "string-size", "group"].includes(mode)
           ? "sent"
           : mode === "unknown"
           ? "unknown"
           : "failed",
       );
-      assert.equal(messages, ["success", "string-size", "group", "unknown"].includes(mode) ? 1 : 0);
+      assert.equal(
+        messages,
+        ["success", "image", "string-size", "group", "unknown"].includes(mode) ? 1 : 0,
+      );
       if (result.status === "failed") {
         assert.equal(result.attempted, false);
         assert.equal(result.error.failureStage, "upload");
         assert.equal(JSON.stringify(result).includes("secret"), false);
       }
       if (["duplicate", "short", "external", "invalid-size"].includes(mode)) assert.equal(puts, 0);
-      if (["success", "string-size", "group"].includes(mode)) {
+      if (["success", "image", "string-size", "group"].includes(mode)) {
         assert.deepEqual([puts, finishes, merges, messages], [2, 2, 1, 1]);
       }
     } finally {

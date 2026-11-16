@@ -16,6 +16,14 @@ export interface QqConnectionDiagnostic {
 }
 export type DiagnosticSink = (event: QqConnectionDiagnostic) => void;
 
+/** False only while DNS/TLS has not handed a socket to the HTTP writer. */
+export class QqTransportError extends Error {
+  constructor(readonly requestStarted: boolean) {
+    super("QQ HTTPS transport failed");
+    this.name = "QqTransportError";
+  }
+}
+
 /** Race TLS connections before any authentication or message bytes are sent. Never retry a POST. */
 export async function qqHttps(
   url: URL,
@@ -37,12 +45,13 @@ export async function qqHttps(
   const signal = init.signal;
   const sockets = new Set<TLSSocket>();
   let selected: TLSSocket | undefined;
+  let requestStarted = false;
   let closed = false;
   const abort = () => {
     closed = true;
     for (const socket of sockets) socket.destroy();
   };
-  signal?.throwIfAborted();
+  if (signal?.aborted) throw new QqTransportError(false);
   signal?.addEventListener("abort", abort, { once: true });
   const agent = new Agent({ keepAlive: false });
   agent.createConnection =
@@ -98,6 +107,9 @@ export async function qqHttps(
         selected = winner;
         for (const socket of sockets) if (socket !== winner) socket.destroy();
         log("connection_selected", { address: winner.remoteAddress });
+        // req.end may buffer before TLS completes. Once handed over, even a
+        // partial write is ambiguous; do not infer safety from "finish".
+        requestStarted = true;
         callback(null, winner);
       })().catch((error) =>
         callback(error instanceof Error ? error : new Error("QQ connection failed"))
@@ -148,7 +160,7 @@ export async function qqHttps(
         abort();
         signal?.removeEventListener("abort", abort);
         agent.destroy();
-        reject(error);
+        reject(new QqTransportError(requestStarted));
       });
       req.once("finish", () => log("request_written", { address: selected?.remoteAddress }));
       req.end(init.body === undefined || init.body === null ? undefined : init.body);
@@ -157,6 +169,6 @@ export async function qqHttps(
     abort();
     signal?.removeEventListener("abort", abort);
     agent.destroy();
-    throw error;
+    throw error instanceof QqTransportError ? error : new QqTransportError(requestStarted);
   }
 }

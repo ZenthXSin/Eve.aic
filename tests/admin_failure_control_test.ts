@@ -26,6 +26,8 @@ Deno.test("admin QQ failure resolution travels browser/CSRF/private bridges and 
       baseUrl: `http://127.0.0.1:${platform.addr.port}`,
     }),
     `${directory}/actions`,
+    "private",
+    { retainFailed: true }, // Recovery of the pre-v2 retained-failure ledger.
   );
   let qq: ReturnType<typeof startQqAdminServer> | undefined;
   let backend: Awaited<ReturnType<typeof startAdminControlServer>> | undefined;
