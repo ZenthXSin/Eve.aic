@@ -94,7 +94,7 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
     };\n` +
       `const kernel=new Kernel({dataDir:${
         JSON.stringify(directory + "/kernel")
-      },callTimeoutMs:15000});await kernel.register(${
+      },callTimeoutMs:30000});await kernel.register(${
         JSON.stringify(directory + "/phone")
       });await kernel.register(${
         JSON.stringify(directory + "/scripts-plugin")
@@ -171,7 +171,7 @@ Deno.test("脚本进程：SIGKILL后保留已完成动作及未完成未知，�
       const result = actions.status(job.actions[1].actionId);
       return Promise.resolve(result?.status === "finished");
     });
-    kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 15_000 });
+    kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 30_000 });
     await kernel.register(`${directory}/phone`);
     await kernel.register(`${directory}/scripts-plugin`);
     await kernel.start();

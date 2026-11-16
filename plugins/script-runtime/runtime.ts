@@ -278,7 +278,10 @@ export class ScriptRuntime {
       try {
         await Promise.race([
           live.done,
-          new Promise<void>((resolve) => timer = setTimeout(resolve, 5000)),
+          // Default covers typical 8–12s preparation; explicit sync retains its 5s contract.
+          new Promise<void>((resolve) =>
+            timer = setTimeout(resolve, request.mode === "sync" ? 5_000 : 15_000)
+          ),
         ]);
       } finally {
         clearTimeout(timer);

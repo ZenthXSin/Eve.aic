@@ -16,7 +16,7 @@ function deferred() {
   });
   return { promise, resolve };
 }
-async function fixture() {
+async function fixture(slowCheck = false) {
   const directory = await Deno.makeTempDir({ prefix: "eve-script-native-result-" });
   const key = "fixture_native_result_phone_01234567890123456789";
   const requested = deferred(), release = deferred();
@@ -53,6 +53,16 @@ async function fixture() {
     await release.promise;
     return Response.json({ ok: true, value: large });
   });
+  // Real type checking overlaps a seven-second preparation floor, independent of host load.
+  const denoBinary = slowCheck ? `${directory}/slow-deno` : Deno.execPath();
+  if (slowCheck) {
+    const executable = "'" + Deno.execPath().replaceAll("'", "'\\''") + "'";
+    await Deno.writeTextFile(
+      denoBinary,
+      `#!/bin/sh\n/bin/sleep 7 &\ndelay=$!\n${executable} "$@"\nresult=$?\nwait "$delay"\nexit "$result"\n`,
+      { mode: 0o700 },
+    );
+  }
   const configPath = `${directory}/config.json`;
   await Deno.writeTextFile(`${directory}/phone.key`, key);
   await Deno.writeTextFile(
@@ -64,7 +74,7 @@ async function fixture() {
       },
       scripts: {
         directory: `${directory}/scripts`,
-        denoBinary: Deno.execPath(),
+        denoBinary,
         cacheDirectory: `${directory}/cache`,
         defaultTimeoutMs: 60_000,
       },
@@ -74,7 +84,7 @@ async function fixture() {
   await composeScriptPlugin(`${directory}/script-plugin`, configPath);
   let kernel: Kernel;
   const start = async () => {
-    kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 15_000 });
+    kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 30_000 });
     await kernel.register(`${directory}/phone-plugin`);
     await kernel.register(`${directory}/script-plugin`);
     await kernel.start();
@@ -226,18 +236,22 @@ Deno.test("原生脚本返回值：异步手机大原件完成后可通过原生
   }
 });
 
-Deno.test("原生脚本：默认和sync最多等待5秒，原任务后台并行，迟到结果只执行一次", async () => {
+Deno.test("原生脚本：默认最多15秒且sync仍最多5秒，原任务后台并行，迟到结果只执行一次", async () => {
   for (const mode of [undefined, "sync"]) {
     const f = await fixture();
     try {
       const started = performance.now();
       const job = await f.execute(
-        "five-second-background",
+        "bounded-background",
         'return await tools.phone.file({handle:{conversationId:"qq:user:fixture",seq:3},index:1});',
         mode,
         false,
       );
-      assert.ok(performance.now() - started >= 4900, "先等待完整5秒");
+      const waitMs = mode === "sync" ? 5_000 : 15_000;
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed >= waitMs - 100, "不能提前结束声明的等待");
+      assert.ok(elapsed < waitMs + 2_000, "到期必须返回，不等实际工具结束");
+      console.log("bounded wait", JSON.stringify({ mode: mode ?? "default", elapsed }));
       assert.ok(["queued", "checking", "running"].includes(job.status));
       assert.equal(job.result, undefined);
       await f.waitForRequest();
@@ -258,7 +272,7 @@ Deno.test("原生脚本：默认和sync最多等待5秒，原任务后台并行�
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       const result = await f.execute(
-        "five-second-background",
+        "bounded-background",
         'return await tools.phone.file({handle:{conversationId:"qq:user:fixture",seq:3},index:1});',
         mode,
       );
@@ -269,5 +283,45 @@ Deno.test("原生脚本：默认和sync最多等待5秒，原任务后台并行�
     } finally {
       await f.close();
     }
+  }
+});
+
+Deno.test("原生脚本等待：默认覆盖超过5秒的真实检查准备并直接返回结果，async不等待准备", async () => {
+  const f = await fixture(true);
+  try {
+    // Prime Deno's real check cache so full-suite host load does not extend our 7s floor.
+    // Every request still runs the checker; both measured calls retain the preparation delay.
+    const code = "return 42;";
+    const prime = await f.execute("slow-preparation-prime", code, "async", false);
+    assert.equal((await settleScript(f.kernel(), prime)).status, "completed");
+    const started = performance.now();
+    const job = await f.execute(
+      "slow-preparation-default",
+      code,
+      undefined,
+      false,
+    );
+    assert.equal(job.status, "completed", "超过旧5秒等待的准备应直接带回结果，不补查原任务");
+    assert.ok(performance.now() - started >= 6900);
+    assert.ok(job.timing!.checkMs! >= 6900);
+    assert.ok(job.result);
+    assert.equal(JSON.parse(job.result.text), 42);
+    assert.equal(f.phoneCalls(), 0);
+    console.log("slow preparation default receipt", JSON.stringify(job.timing));
+
+    const asyncStarted = performance.now();
+    const pending = await f.execute(
+      "slow-preparation-async",
+      code,
+      "async",
+      false,
+    );
+    assert.ok(performance.now() - asyncStarted < 4900, "async不能等待七秒检查准备");
+    assert.ok(["queued", "checking", "running"].includes(pending.status));
+    assert.equal(pending.result, undefined);
+    assert.equal((await settleScript(f.kernel(), pending)).status, "completed");
+    assert.equal(f.phoneCalls(), 0);
+  } finally {
+    await f.close();
   }
 });

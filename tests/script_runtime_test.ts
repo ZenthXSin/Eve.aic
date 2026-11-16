@@ -78,7 +78,7 @@ async function fixture(handler?: (request: Request) => Promise<Response>) {
   );
   await composePhonePlugin(`${directory}/phone-plugin`, configPath);
   await composeScriptPlugin(`${directory}/scripts-plugin`, configPath);
-  let kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 15_000 });
+  let kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 30_000 });
   async function start() {
     await kernel.register(`${directory}/phone-plugin`);
     await kernel.register(`${directory}/scripts-plugin`);
@@ -94,7 +94,7 @@ async function fixture(handler?: (request: Request) => Promise<Response>) {
     kernel: () => kernel,
     restart: async () => {
       assert.deepEqual(await kernel.stop(), []);
-      kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 15_000 });
+      kernel = new Kernel({ dataDir: `${directory}/kernel`, callTimeoutMs: 30_000 });
       await start();
     },
     close: async () => {
