@@ -2,8 +2,8 @@ import { ChatModelError } from "./errors.ts";
 
 const encoder = new TextEncoder();
 
-function invalid(): never {
-  throw new ChatModelError("invalid_response");
+function invalid(detail?: ChatModelError["responseDetail"]): never {
+  throw new ChatModelError("invalid_response", undefined, undefined, detail);
 }
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -89,10 +89,20 @@ export class ChatStream {
     if (!object(chunk) || chunk.error !== undefined || !Array.isArray(chunk.choices)) invalid();
     if (chunk.usage !== undefined && chunk.usage !== null) this.#usage = chunk.usage;
     if (!chunk.choices.length) return; // include_usage sends a final choices: [] chunk.
-    if (chunk.choices.length !== 1 || this.#finish) invalid();
+    if (chunk.choices.length !== 1) invalid("stream_choice");
     const choice = chunk.choices[0];
-    if (!object(choice) || choice.index !== 0 || !object(choice.delta)) invalid();
+    if (!object(choice) || choice.index !== 0 || !object(choice.delta)) invalid("stream_choice");
     const delta = choice.delta;
+    if (this.#finish) {
+      // Chat gateways may retain an empty index-0 choice in the final usage
+      // chunk instead of choices: []. Only accounting may follow completion;
+      // a second finish, late output or tool fragments must still fail closed.
+      if (
+        !object(chunk.usage) || Object.keys(delta).length !== 0 ||
+        choice.finish_reason !== null && choice.finish_reason !== undefined
+      ) invalid("stream_after_finish");
+      return;
+    }
     if (delta.role !== undefined && delta.role !== "assistant") invalid();
     let advanced = false;
     for (const [key, target] of [["content", this.#content], ["refusal", this.#refusal]] as const) {
