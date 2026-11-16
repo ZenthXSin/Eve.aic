@@ -46,6 +46,11 @@ export type QqErrorCategory =
   | "pending"
   | "duplicate";
 
+export type QqGroupPermission = {
+  source: "qq_bot_state";
+  checkedAt: string;
+} & ({ state: "observed"; allowProactiveMsg: boolean } | { state: "unavailable" });
+
 export interface QqErrorInfo {
   category: QqErrorCategory;
   httpStatus?: number;
@@ -62,6 +67,8 @@ export interface QqErrorInfo {
   /** false proves HTTPS failed before an HTTP socket was handed to the writer. */
   requestStarted?: boolean;
   reason?: "active_permission_denied" | "attachment_read_failed" | "markdown_rejected";
+  /** Target-group observation, not a conclusion about the user's client switch. */
+  groupPermission?: QqGroupPermission;
 }
 
 export class QqRequestError extends Error {
@@ -292,6 +299,8 @@ export class QqClient {
   #closed = new AbortController();
   #attachmentReader?: (path: string) => Promise<Uint8Array>;
   #downloadedReader?: (path: string) => Promise<Uint8Array | undefined>;
+  #groupPermissions = new Map<string, { at: number; result: Promise<QqGroupPermission> }>();
+  #nextGroupPermissionQuery = 0;
 
   constructor(credentials: QqCredentials, options: QqClientOptions = {}) {
     if (!nonempty(credentials.appId) || !nonempty(credentials.appSecret)) requestError();
@@ -659,6 +668,47 @@ export class QqClient {
     };
   }
 
+  /** Only after a definite refusal: read the same bot/group, without resending or changing settings. */
+  #groupPermission(target: string, token: string): Promise<QqGroupPermission> {
+    const now = this.#now();
+    const cached = this.#groupPermissions.get(target);
+    if (cached && now - cached.at < 60_000) return cached.result;
+    const observation = { source: "qq_bot_state" as const, checkedAt: new Date(now).toISOString() };
+    // The API allows 30 QPM. A burst shares a one-minute observation; other groups
+    // never queue behind diagnostics or exceed the global query rate.
+    if (now < this.#nextGroupPermissionQuery) {
+      return Promise.resolve({ ...observation, state: "unavailable" });
+    }
+    this.#nextGroupPermissionQuery = now + 2_100;
+    const result = (async (): Promise<QqGroupPermission> => {
+      try {
+        const response = await this.#sdk("getGuildBotState", [target], {
+          headers: { Authorization: `QQBot ${token}` },
+        }, { timeoutMs: Math.min(2_000, this.#timeout) });
+        const code = codeOf(response.data);
+        if (
+          response.httpStatus === 200 && (code === undefined || code === 0) &&
+          typeof response.data.allow_proactive_msg === "boolean"
+        ) {
+          return {
+            ...observation,
+            state: "observed",
+            allowProactiveMsg: response.data.allow_proactive_msg,
+          };
+        }
+      } catch {
+        // Diagnostic failure cannot replace the original, definite send refusal.
+      }
+      return { ...observation, state: "unavailable" };
+    })();
+    this.#groupPermissions.delete(target);
+    if (this.#groupPermissions.size >= 16) {
+      this.#groupPermissions.delete(this.#groupPermissions.keys().next().value!);
+    }
+    this.#groupPermissions.set(target, { at: now, result });
+    return result;
+  }
+
   /** 一次调用只尝试主动发送一次；不自动重试、改正文或补写被动回复字段。 */
   async sendText(request: QqSendText, messageSequence?: number): Promise<QqSendResult> {
     request = structuredClone(request);
@@ -812,6 +862,12 @@ export class QqClient {
       failureStage: "message",
       ...(code === 40034105 ? { reason: "active_permission_denied" as const } : {}),
     };
+    if (
+      code === 40034105 && request.destination.kind === "group" &&
+      response.httpStatus >= 400 && response.httpStatus < 500
+    ) {
+      error.groupPermission = await this.#groupPermission(target, token);
+    }
     const detail = response.data.message ?? response.data.msg;
     // Only an explicit format refusal permits the persisted plain-text fallback.
     if (

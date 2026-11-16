@@ -143,6 +143,17 @@ function validResult(value: unknown): value is QqSendResult {
     r.error.elapsedMs !== undefined &&
     (!Number.isSafeInteger(r.error.elapsedMs) || r.error.elapsedMs < 0)
   ) return false;
+  if (r.error.groupPermission !== undefined) {
+    const permission = r.error.groupPermission;
+    if (
+      !permission || typeof permission !== "object" || permission.source !== "qq_bot_state" ||
+      typeof permission.checkedAt !== "string" ||
+      !Number.isFinite(Date.parse(permission.checkedAt)) ||
+      !(permission.state === "observed"
+        ? typeof permission.allowProactiveMsg === "boolean"
+        : permission.state === "unavailable" && !("allowProactiveMsg" in permission))
+    ) return false;
+  }
   if (
     r.error.retryAfterMs !== undefined &&
     (!Number.isSafeInteger(r.error.retryAfterMs) || r.error.retryAfterMs < 0 ||
