@@ -709,8 +709,8 @@ export class RuntimeEngine {
       const image = description ? args.image as unknown as ModelImage : undefined;
       const { _purpose: purpose, _agentConfig: agentConfig, ...modelArgs } = args;
       let overrides = agentConfig as unknown as ModelCallOptions | undefined;
-      if (overrides && (!id.startsWith("script_") && !id.startsWith("agent_"))) {
-        throw new KernelError("rejected", "子代理模型配置需要独立任务编号");
+      if (overrides && !this.agents.isModelRequest(id, agentConfig!)) {
+        throw new KernelError("rejected", "子代理模型配置需要已准入任务的独立请求和原配置");
       }
       if ((agentConfig as unknown as Partial<AgentConfig> | undefined)?.role === "general") {
         // Resolve the current shared client on every request. Do not freeze a

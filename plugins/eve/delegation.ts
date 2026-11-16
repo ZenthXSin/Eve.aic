@@ -6,7 +6,7 @@ import type { PluginContext } from "../../sdk/plugin.ts";
 export const DELEGATE_TOOL: ToolSpec = {
   name: "delegate_task",
   description:
-    "把工作交给子代理，直接返回已持久准入的jobId/agentId；无需写脚本，不等待工作完成。默认general跟随Eve当前模型与凭据，日常操作、巡检、资料整理、创作交付等用它；编码/调查/审查按role选择。默认使用对应常驻会话，同会话排队；独立任务要并行时newSession:true另开同类实例。已有任务追问用原agentId，不新开重复工作。交代目标、相关背景/路径、授权范围、验收与真实证据；回复会唤醒Eve，由她管理结果与下一步。",
+    "把工作交给子代理，直接返回已持久准入的jobId/agentId；无需写脚本，不等待工作完成。默认general跟随Eve当前模型与凭据，它能继续派coding/review/investigation并等完整交付后汇总；三类专用子代理不能再派工。日常操作、巡检、资料整理、创作交付等用general；专业任务也可直接按role选择。默认使用对应常驻会话，同会话排队；独立任务需并行时newSession:true另开同类实例。追问用原agentId。交代目标、背景/路径、授权范围、验收与真实证据；回复会唤醒Eve，由她管理结果与下一步。",
   parameters: {
     type: "object",
     properties: {
