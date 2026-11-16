@@ -18,7 +18,7 @@ export interface SendRecord {
   /** 新完成动作校验独立尝试账本；旧动作保持无此字段。 */
   attemptCount?: number;
   /** 仅此策略的新动作可持当前许可重入；旧动作不迁移、不重放。 */
-  policy?: { kind: "until_sent_v1"; sequence: number };
+  policy?: { kind: "until_sent_v1" | "until_sent_v2"; sequence: number };
 }
 
 export interface SendResolution {
@@ -128,6 +128,17 @@ function validResult(value: unknown): value is QqSendResult {
     !["timeout", "aborted", "network"].includes(r.error.transportReason)
   ) return false;
   if (r.error.phase !== undefined && !["headers", "body"].includes(r.error.phase)) return false;
+  if (r.error.requestStarted !== undefined && typeof r.error.requestStarted !== "boolean") {
+    return false;
+  }
+  if (
+    r.error.reason !== undefined &&
+    !["active_permission_denied", "attachment_read_failed", "markdown_rejected"].includes(
+      r.error.reason,
+    )
+  ) {
+    return false;
+  }
   if (
     r.error.elapsedMs !== undefined &&
     (!Number.isSafeInteger(r.error.elapsedMs) || r.error.elapsedMs < 0)
@@ -151,12 +162,21 @@ function legacyProtectedText(request: QqSendText): boolean {
 }
 function retryable(result: QqSendResult): boolean {
   if (
-    result.status === "failed" && ["authentication", "rate_limit"].includes(result.error.category)
+    result.status === "failed" &&
+    (["authentication", "rate_limit"].includes(result.error.category) ||
+      result.error.reason === "markdown_rejected")
   ) {
     return true;
   }
-  return result.status !== "sent" && result.error.category === "transport" &&
-    result.error.transportReason === "timeout" && !result.attempted;
+  if (result.status !== "failed" || result.attempted) return false;
+  return result.error.category === "transport" &&
+      ["timeout", "network"].includes(result.error.transportReason ?? "") ||
+    result.error.failureStage === "upload" && (result.error.httpStatus ?? 0) >= 500;
+}
+
+function releasesQueue(record: SendRecord): boolean {
+  return record.status === "finished" && (record.result?.status === "sent" ||
+    record.policy?.kind === "until_sent_v2" && record.result?.status === "failed");
 }
 /** Only validates immutable historical attempt chains; never authorizes a new send. */
 function legacyRetryable(request: QqSendText, result: QqSendResult): boolean {
@@ -184,7 +204,7 @@ function conversation(request: QqSendText): string {
   return JSON.stringify([request.destination.kind, request.destination.openId]);
 }
 
-/** 一个会话只允许队首先成功；许可暂停、未知和永久失败都保留屏障。 */
+/** 同会话串行。未知保留屏障；v2明确失败保留回执、放行后项，v1保持原语义。 */
 export class QqSendActions {
   #records = new Map<string, SendRecord>();
   // 首个异步哈希/落盘前同步预留，保证并发动作准入及会话顺序稳定。
@@ -221,12 +241,13 @@ export class QqSendActions {
   #lock?: Deno.FsFile;
   #failed = false;
   #closing = false;
+  #retainFailed: boolean;
 
   constructor(
     readonly client: QqClient,
     readonly directory: string,
     readonly sendScope: "all" | "private" = "private",
-    options: { retryDelaysMs?: readonly number[] } = {},
+    options: { retryDelaysMs?: readonly number[]; retainFailed?: boolean } = {},
   ) {
     if (!["all", "private"].includes(sendScope)) throw new QqActionError("request");
     const delays = options.retryDelaysMs ?? [250, 1000, 4000, 10_000, 30_000];
@@ -235,6 +256,8 @@ export class QqSendActions {
       delays.some((n) => !Number.isSafeInteger(n) || n < 0 || n > 60_000)
     ) throw new QqActionError("request");
     this.#retryDelays = [...delays];
+    this.#retainFailed = options.retainFailed ?? false;
+    if (typeof this.#retainFailed !== "boolean") throw new QqActionError("request");
   }
   get available(): boolean {
     return this.#lock !== undefined && !this.#failed && !this.#closing;
@@ -427,7 +450,7 @@ export class QqSendActions {
     const eligible = [...this.#records.values()].filter((record) => {
       if (
         !record.policy || record.policy.sequence <= after ||
-        this.#resolutions.has(record.actionId) || record.result?.status === "sent"
+        this.#resolutions.has(record.actionId) || releasesQueue(record)
       ) return false;
       if (
         args.conversationId !== undefined &&
@@ -668,14 +691,14 @@ export class QqSendActions {
         ) throw new QqActionError("corrupt");
         if (record.policy !== undefined) {
           if (
-            !record.policy || record.policy.kind !== "until_sent_v1" ||
+            !record.policy || !["until_sent_v1", "until_sent_v2"].includes(record.policy.kind) ||
             !Number.isSafeInteger(record.policy.sequence) || record.policy.sequence < 1 ||
             record.policy.sequence >= Number.MAX_SAFE_INTEGER ||
             sequences.has(record.policy.sequence)
           ) throw new QqActionError("corrupt");
           sequences.add(record.policy.sequence);
           this.#nextSequence = Math.max(this.#nextSequence, record.policy.sequence + 1);
-          if (record.status !== "finished" || record.result?.status !== "sent") {
+          if (!releasesQueue(record)) {
             this.#enqueue(record);
           }
         }
@@ -903,14 +926,29 @@ export class QqSendActions {
       };
       await this.#attemptFact(attempt, "started");
       attempts.push(attempt);
+      const plainFallback = started.policy?.kind === "until_sent_v2" &&
+        started.request.format === "markdown" && attempts.some((a) =>
+          a.result?.status === "failed" && a.result.error.reason === "markdown_rejected"
+        );
       const result: QqSendResult = JSON.parse(
-        JSON.stringify(await this.client.sendText(started.request)),
+        JSON.stringify(
+          await this.client.sendText(
+            plainFallback ? { ...started.request, format: "plain" } : started.request,
+            started.policy?.kind === "until_sent_v2"
+              ? started.policy.sequence * 2 + (plainFallback ? 1 : 0)
+              : undefined,
+          ),
+        ),
       );
       const finished = { ...attempt, finishedAt: new Date().toISOString(), result };
       await this.#attemptFact(finished, "result");
       attempts[n - 1] = finished;
-      if (aborted(result)) return undefined;
-      if (!retryable(result)) return settledResult(attempts);
+      if (aborted(result)) {
+        return undefined;
+      }
+      if (!retryable(result)) {
+        return settledResult(attempts);
+      }
       const baseDelay = this.#retryDelays[Math.min(n - 1, this.#retryDelays.length - 1)];
       if (
         !await this.#wait(
@@ -981,9 +1019,12 @@ export class QqSendActions {
     let policy = previous?.policy;
     if (!previous) {
       if (
-        !Number.isSafeInteger(this.#nextSequence) || this.#nextSequence >= Number.MAX_SAFE_INTEGER
+        !Number.isSafeInteger(this.#nextSequence) || this.#nextSequence > 1_073_741_823
       ) throw new QqActionError("storage");
-      policy = { kind: "until_sent_v1", sequence: this.#nextSequence++ };
+      policy = {
+        kind: this.#retainFailed ? "until_sent_v1" : "until_sent_v2",
+        sequence: this.#nextSequence++,
+      };
       this.#admissions.set(actionId, snapshot);
       this.#enqueue({ actionId, request: snapshot, policy });
     }
@@ -1036,7 +1077,9 @@ export class QqSendActions {
         result,
         attemptCount: this.#attempts.get(actionId)?.length ?? 0,
       });
-      if (result.status === "sent") {
+      if (
+        result.status === "sent" || policy?.kind === "until_sent_v2" && result.status === "failed"
+      ) {
         this.#queues.get(key)?.delete(actionId);
         this.#queueChanged();
       }

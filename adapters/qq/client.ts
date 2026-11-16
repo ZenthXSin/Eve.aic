@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { sdkRequest } from "./satori/api.ts";
-import { type DiagnosticSink, qqHttps } from "./transport.ts";
+import { type DiagnosticSink, qqHttps, QqTransportError } from "./transport.ts";
 import {
   QQ_API_ORIGIN,
   QQ_REQUEST_TIMEOUT_MS,
@@ -21,6 +21,8 @@ export interface QqClientOptions {
   /** 生产必须由组合层注入低权限文件读取器；缺省拒绝本机路径上传。 */
   attachmentReader?: (path: string) => Promise<Uint8Array>;
   diagnostics?: DiagnosticSink;
+  /** Injectable HTTPS implementation; production uses qqHttps. */
+  httpsTransport?: typeof qqHttps;
   /** 正式环境使用官方 HTTPS 地址；HTTP 只允许本机测试地址。 */
   baseUrl?: string;
   tokenBaseUrl?: string;
@@ -57,6 +59,9 @@ export interface QqErrorInfo {
   /** Platform-declared delay, bounded to one hour; never inferred from free-form messages. */
   retryAfterMs?: number;
   failureStage?: "auth" | "upload" | "message";
+  /** false proves HTTPS failed before an HTTP socket was handed to the writer. */
+  requestStarted?: boolean;
+  reason?: "active_permission_denied" | "attachment_read_failed" | "markdown_rejected";
 }
 
 export class QqRequestError extends Error {
@@ -279,6 +284,7 @@ export class QqClient {
   #tokenTimeout: number;
   #limit: number;
   #diagnostics?: DiagnosticSink;
+  #https: typeof qqHttps;
   #now: () => number;
   #token?: { value: string; expiresAt: number };
   #refresh?: Promise<string>;
@@ -317,6 +323,7 @@ export class QqClient {
       requestError();
     }
     this.#diagnostics = options.diagnostics;
+    this.#https = options.httpsTransport ?? qqHttps;
     this.#base = base;
     this.#tokenBase = tokenBase;
     this.#credentials = { ...credentials };
@@ -350,7 +357,7 @@ export class QqClient {
     try {
       const url = new URL(path, options.origin ?? this.#base);
       const send = url.protocol === "https:"
-        ? (init: RequestInit) => qqHttps(url, init, this.#diagnostics)
+        ? (init: RequestInit) => this.#https(url, init, this.#diagnostics)
         : (init: RequestInit) => fetch(url, init);
       const response = await send({
         ...init,
@@ -385,6 +392,7 @@ export class QqClient {
           : "network",
         phase,
         elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        ...(error instanceof QqTransportError ? { requestStarted: error.requestStarted } : {}),
       });
     }
   }
@@ -410,6 +418,7 @@ export class QqClient {
     target: string,
     privateChat: boolean,
     token: string,
+    fileType: 1 | 4,
   ): Promise<ResponseInfo> {
     const deadline = performance.now() + this.#uploadTimeout;
     const remaining = () => {
@@ -436,7 +445,7 @@ export class QqClient {
       return response;
     };
     const prepare = await post(privateChat ? "uploadPreparePrivate" : "uploadPrepareGuild", {
-      file_type: 4,
+      file_type: fileType,
       file_size: String(bytes.length),
       file_name: name,
       md5: hash(bytes),
@@ -500,7 +509,7 @@ export class QqClient {
       }, [200, 201, 202, 204]);
     }
     return await post(privateChat ? "sendFilePrivate" : "sendFileGuild", {
-      file_type: 4,
+      file_type: fileType,
       srv_send_msg: false,
       file_name: name,
       upload_id: uploadId,
@@ -651,9 +660,16 @@ export class QqClient {
   }
 
   /** 一次调用只尝试主动发送一次；不自动重试、改正文或补写被动回复字段。 */
-  async sendText(request: QqSendText): Promise<QqSendResult> {
+  async sendText(request: QqSendText, messageSequence?: number): Promise<QqSendResult> {
     request = structuredClone(request);
     const body = textBody(request);
+    if (messageSequence !== undefined) {
+      if (
+        !Number.isSafeInteger(messageSequence) || messageSequence < 1 ||
+        messageSequence > 2_147_483_646
+      ) requestError();
+      body.msg_seq = messageSequence;
+    }
     if (this.#scope === "private" && request.destination.kind !== "user") {
       return { status: "failed", attempted: false, error: { category: "scope" } };
     }
@@ -661,7 +677,11 @@ export class QqClient {
     try {
       token = await this.#accessToken();
     } catch (error) {
-      return { status: "failed", attempted: false, error: (error as QqRequestError).info };
+      return {
+        status: "failed",
+        attempted: false,
+        error: { ...(error as QqRequestError).info, failureStage: "auth" },
+      };
     }
     let response: ResponseInfo;
     const scope = request.destination.kind === "user" ? "c2c" : "group";
@@ -678,18 +698,19 @@ export class QqClient {
         return {
           status: "failed",
           attempted: false,
-          error: { category: "request", failureStage: "upload" },
+          error: { category: "request", failureStage: "upload", reason: "attachment_read_failed" },
         };
       }
       let upload: ResponseInfo;
       try {
-        upload = request.attachment.kind === "file" && bytes.length > 5 * 1024 * 1024
+        upload = bytes.length > 5 * 1024 * 1024
           ? await this.#uploadChunks(
             bytes,
             fileName(request.attachment.path),
             target,
             scope === "c2c",
             token,
+            request.attachment.kind === "image" ? 1 : 4,
           )
           : await this.#sdk(
             scope === "c2c" ? "sendFilePrivate" : "sendFileGuild",
@@ -775,7 +796,10 @@ export class QqClient {
         },
       );
     } catch (error) {
-      return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
+      const info = { ...(error as QqRequestError).info, failureStage: "message" as const };
+      return info.category === "transport" && info.requestStarted === false
+        ? { status: "failed", attempted: false, error: info }
+        : { status: "unknown", attempted: true, error: info };
     }
     let code: number | undefined;
     try {
@@ -783,10 +807,28 @@ export class QqClient {
     } catch (error) {
       return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
     }
-    const error: QqErrorInfo = { ...errorInfo(response, code), failureStage: "message" };
+    const error: QqErrorInfo = {
+      ...errorInfo(response, code),
+      failureStage: "message",
+      ...(code === 40034105 ? { reason: "active_permission_denied" as const } : {}),
+    };
+    const detail = response.data.message ?? response.data.msg;
+    // Only an explicit format refusal permits the persisted plain-text fallback.
+    if (
+      messageSequence !== undefined && request.format === "markdown" &&
+      error.category === "platform" && code !== 40034105 &&
+      [400, 403].includes(response.httpStatus) && typeof detail === "string" &&
+      /markdown|template/i.test(detail) &&
+      /invalid|unsupported|not support|permission|无权限|不支持|未开通|格式/i.test(detail)
+    ) {
+      error.reason = "markdown_rejected";
+    }
     if (error.category === "authentication") this.invalidateToken();
     // 异步审核没有送达回执；去重也不能替代查询原动作，尤其不能换序号再发送。
-    if ([304023, 304024].includes(code ?? -1) || [201, 202].includes(response.httpStatus)) {
+    if (
+      [304023, 304024].includes(code ?? -1) || response.httpStatus === 202 ||
+      (response.httpStatus === 201 && !nonempty(response.data.id))
+    ) {
       return { status: "unknown", attempted: true, error: { ...error, category: "pending" } };
     }
     if (code === 40054005) {
@@ -797,7 +839,7 @@ export class QqClient {
     }
     if (code !== undefined && code !== 0) return { status: "failed", attempted: true, error };
     if (response.httpStatus >= 400) return { status: "failed", attempted: true, error };
-    if (response.httpStatus !== 200 || !nonempty(response.data.id)) {
+    if (![200, 201].includes(response.httpStatus) || !nonempty(response.data.id)) {
       return {
         status: "unknown",
         attempted: true,

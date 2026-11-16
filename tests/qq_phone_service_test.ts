@@ -627,6 +627,7 @@ Deno.test("QQ 手机：旧回复句柄仍校验但统一主动，unknown也显�
     assert.deepEqual(f.received, [{
       markdown: { content: "嗯，我在" },
       msg_type: 2,
+      msg_seq: 2,
     }]);
     assert.deepEqual(await f.client.call("send", args), receipt);
     assert.equal(f.count(), 1);
@@ -933,6 +934,7 @@ Deno.test("QQ 引用视图：真实出站回执索引可被引用，引用展示
     assert.deepEqual(f.received, [{
       markdown: { content: "回复早先消息" },
       msg_type: 2,
+      msg_seq: 2,
       // Markdown沿用官方SDK：省略视觉引用；本机引用视图仍保留。
     }]);
   } finally {
@@ -990,7 +992,7 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
       if (path.startsWith("/v2/")) {
         paths.push(path);
         const body = await r.json();
-        assert.equal(body.msg_seq, undefined);
+        assert.ok(Number.isSafeInteger(body.msg_seq) && body.msg_seq > 0);
         assert.equal(body.msg_id, undefined);
         assert.equal(body.event_id, undefined);
         return Response.json({ id: `real-scope-send-${paths.length}` });
@@ -1147,7 +1149,7 @@ Deno.test("手机主动发送：旧sequence忽略，不同动作无被动字段�
     );
     assert.equal(f.count(), 3);
     for (const received of f.received as Record<string, unknown>[]) {
-      assert.equal(received.msg_seq, undefined);
+      assert.ok(Number.isSafeInteger(received.msg_seq) && Number(received.msg_seq) > 0);
       assert.equal(received.msg_id, undefined);
       assert.equal(received.event_id, undefined);
     }
@@ -1217,7 +1219,8 @@ Deno.test("手机主动发送：唤醒兼容旧回复句柄，附件上传与最
     assert.equal(f.count(), 5);
     for (const wire of f.received as Record<string, unknown>[]) {
       assert.equal(wire.msg_id, undefined);
-      assert.equal(wire.msg_seq, undefined);
+      if (wire.file_type !== undefined) assert.equal(wire.msg_seq, undefined);
+      else assert.ok(Number.isSafeInteger(wire.msg_seq) && Number(wire.msg_seq) > 0);
       assert.equal(wire.event_id, undefined);
     }
   } finally {

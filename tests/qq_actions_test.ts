@@ -43,6 +43,7 @@ Deno.test("QQ 发送动作：网络前started已落盘，同键并发只发送�
     assert.deepEqual(await r.json(), {
       markdown: { content: request.text },
       msg_type: 2,
+      msg_seq: 2,
     });
     const persisted = JSON.parse(await Deno.readTextFile(`${directory}/records/action-1.json`));
     assert.equal(persisted.status, "started");
@@ -445,8 +446,8 @@ Deno.test("QQ明确限流按序重试：固定主动请求、真实尝试账本�
       attemptCount: 2,
     });
     assert.deepEqual(bodies, [
-      { markdown: { content: request.text }, msg_type: 2 },
-      { markdown: { content: request.text }, msg_type: 2 },
+      { markdown: { content: request.text }, msg_type: 2, msg_seq: 2 },
+      { markdown: { content: request.text }, msg_type: 2, msg_seq: 2 },
     ]);
     const original = new Map<string, string>();
     for (
@@ -593,7 +594,7 @@ Deno.test("QQ上传超时尚未提交消息可重试，附件成功后才发送�
     }
     messages.push(body);
     assert.equal(body.msg_id, undefined);
-    assert.equal(body.msg_seq, undefined);
+    assert.ok(Number.isSafeInteger(body.msg_seq) && body.msg_seq > 0);
     assert.equal(body.event_id, undefined);
     return Response.json({ id: `sent-${messages.length}` });
   });
@@ -772,7 +773,7 @@ Deno.test("QQ同会话队首不限次重试直到成功再第二条，跨会话�
     });
     const queued = JSON.parse(await Deno.readTextFile(`${directory}/records/second.json`));
     assert.equal(queued.status, "started");
-    assert.equal(queued.policy.kind, "until_sent_v1");
+    assert.equal(queued.policy.kind, "until_sent_v2");
     assert.equal(queued.policy.sequence, 2);
     release.resolve();
     const results = await Promise.all([first, second, third]);
@@ -982,7 +983,7 @@ Deno.test("主动在途被kill后新许可也不重发，未知队首取消后�
     const body = await r.json();
     bodies.push(body);
     assert.equal(body.msg_id, undefined);
-    assert.equal(body.msg_seq, undefined);
+    assert.ok(Number.isSafeInteger(body.msg_seq) && body.msg_seq > 0);
     assert.equal(body.event_id, undefined);
     if (bodies.length === 1) {
       entered.resolve();

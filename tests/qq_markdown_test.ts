@@ -234,6 +234,7 @@ Deno.test("Restored Markdown keeps explicit plain admissions and old finished fo
     await a.send("explicit-plain", { ...request, format: "plain" });
     assert.deepEqual(f.bodies[0], {
       msg_type: 0,
+      msg_seq: 2,
       content: request.text,
       message_reference: { message_id: "ref" },
     });

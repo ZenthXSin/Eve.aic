@@ -26,7 +26,7 @@ async function fixture() {
       }
       const body = await request.json();
       assert.equal(body.msg_id, undefined);
-      assert.equal(body.msg_seq, undefined);
+      assert.ok(Number.isSafeInteger(body.msg_seq) && Number(body.msg_seq) > 0);
       texts.push(body.markdown?.content ?? body.content);
       return Response.json(unknown ? {} : { id: `sent-${texts.length}` });
     },

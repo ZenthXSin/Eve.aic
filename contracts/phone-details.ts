@@ -27,6 +27,8 @@ export interface PhoneActionReceipt {
     elapsedMs?: number;
     retryAfterMs?: number;
     failureStage?: "auth" | "upload" | "message";
+    requestStarted?: boolean;
+    reason?: "active_permission_denied" | "attachment_read_failed" | "markdown_rejected";
   };
 }
 

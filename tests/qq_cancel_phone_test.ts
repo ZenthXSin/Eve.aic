@@ -78,6 +78,8 @@ async function fixture(options: { pauseAfterCancelAdmission?: boolean } = {}) {
       baseUrl: `http://127.0.0.1:${platform.addr.port}`,
     }),
     `${directory}/actions`,
+    "private",
+    { retainFailed: true }, // Existing retained failures still need exact cancellation.
   );
   await actions.initialize();
   const timeline = new QqTimeline(`${directory}/timeline`);

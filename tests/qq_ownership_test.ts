@@ -636,7 +636,7 @@ Deno.test("QQ 无限顺序重试：真实 RPC 先超时，后台四次明确限�
     ]);
     for (const body of f.requests.slice(0, 5)) {
       assert.equal(body.msg_id, undefined);
-      assert.equal(body.msg_seq, undefined);
+      assert.ok(Number.isSafeInteger(body.msg_seq) && Number(body.msg_seq) > 0);
       assert.equal(body.event_id, undefined);
     }
     await waitFor(() => f.guard.status().activePermits === 0);
@@ -686,7 +686,7 @@ for (const mode of ["pause", "draining"] as const) {
       );
       assert.equal(saved.status, "started");
       assert.equal(saved.result, undefined);
-      assert.equal(saved.policy.kind, "until_sent_v1");
+      assert.equal(saved.policy.kind, "until_sent_v2");
     } finally {
       client.close();
       await f.close();

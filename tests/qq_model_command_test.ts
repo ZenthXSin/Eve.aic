@@ -114,7 +114,10 @@ async function fixture(configured = true) {
     baseUrl,
     sendScope: "all",
   });
-  const actions = new QqSendActions(qq, `${directory}/outbox`, "all", { retryDelaysMs: [1] });
+  const actions = new QqSendActions(qq, `${directory}/outbox`, "all", {
+    retainFailed: true,
+    retryDelaysMs: [1],
+  });
   await actions.initialize();
   const journal = new QqInboundJournal(`${directory}/inbound`);
   await journal.initialize();

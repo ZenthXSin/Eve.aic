@@ -28,10 +28,12 @@ function assertTransport(
   assert.equal(result.error.category, "transport");
   assert.equal(result.error.transportReason, reason);
   assert.equal(result.error.phase, phase);
+  assert.equal(result.error.failureStage, "message");
   assert.ok(Number.isSafeInteger(result.error.elapsedMs) && result.error.elapsedMs! >= 0);
   assert.deepEqual(Object.keys(result.error).sort(), [
     "category",
     "elapsedMs",
+    "failureStage",
     "phase",
     "transportReason",
   ]);

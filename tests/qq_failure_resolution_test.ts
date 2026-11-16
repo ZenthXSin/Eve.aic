@@ -79,7 +79,7 @@ Deno.test("QQ失败结束：精确摘要、并发幂等、原始回执与尝试�
   const directory = await Deno.makeTempDir({ prefix: "eve-resolution-exact-" });
   let reject = true;
   const local = platform(() => reject ? permanentFailure() : Response.json({ id: "next-sent" }));
-  let actions = new QqSendActions(local.client(), directory);
+  let actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
   const queueChanges: string[] = [];
   const notifiedResolutions: Promise<string>[] = [];
   actions.onQueueChange(() => {
@@ -144,7 +144,7 @@ Deno.test("QQ失败结束：精确摘要、并发幂等、原始回执与尝试�
       conflict,
     );
     await actions.close();
-    actions = new QqSendActions(local.client(), directory);
+    actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
     await actions.initialize();
     const deliveredEvents: string[] = [];
     actions.onQueueChange(() => deliveredEvents.push(actions.status("next")!.status));
@@ -182,7 +182,7 @@ Deno.test("QQ排队取消：只结束零尝试后项，保留队首与其余顺�
     contents.push((await r.json()).markdown.content);
     return reject ? permanentFailure() : Response.json({ id: "remaining-sent" });
   });
-  let actions = new QqSendActions(local.client(), directory);
+  let actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
   try {
     await actions.initialize();
     await actions.send("head", request);
@@ -215,7 +215,7 @@ Deno.test("QQ排队取消：只结束零尝试后项，保留队首与其余顺�
     await assert.rejects(Deno.stat(`${directory}/attempts/cancel-me`), Deno.errors.NotFound);
     assert.equal((await actions.listSendQueue()).items.length, 2);
     await actions.close();
-    actions = new QqSendActions(local.client(), directory);
+    actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
     await actions.initialize();
     assert.deepEqual(
       await actions.send("cancel-me", {
@@ -256,7 +256,7 @@ Deno.test("QQ取消保留未知事实：unknown队首可取消等待，活跃请
     }
     return Response.json({});
   });
-  const actions = new QqSendActions(local.client(), directory);
+  const actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
   let inflight: Promise<unknown> | undefined;
   try {
     await actions.initialize();
@@ -302,7 +302,7 @@ Deno.test("QQ取消保留未知事实：unknown队首可取消等待，活跃请
 Deno.test("QQ取消提交前校验许可，保留原件；持取消预留时同键send等待取消结果", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-resolution-checkpoint-" });
   const local = platform(permanentFailure);
-  const actions = new QqSendActions(local.client(), directory);
+  const actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
   const entered = deferred<void>();
   const release = deferred<void>();
   let pending: Promise<unknown> | undefined;
@@ -343,7 +343,7 @@ Deno.test("QQ取消校验磁盘事实：原始摘要过期拒绝，summary与att
   for (const tamper of ["whitespace", "summary", "attempt"] as const) {
     const directory = await Deno.makeTempDir({ prefix: `eve-resolution-${tamper}-` });
     const local = platform(permanentFailure);
-    const actions = new QqSendActions(local.client(), directory);
+    const actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
     try {
       await actions.initialize();
       await actions.send("head", request);
@@ -377,7 +377,7 @@ Deno.test("QQ取消校验磁盘事实：原始摘要过期拒绝，summary与att
 Deno.test("QQ恢复取消事实拒绝摘要分叉，完整失败回执仍保留", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-resolution-restore-" });
   const local = platform(permanentFailure);
-  const actions = new QqSendActions(local.client(), directory);
+  const actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
   let restart: QqSendActions | undefined;
   try {
     await actions.initialize();
@@ -389,7 +389,7 @@ Deno.test("QQ恢复取消事实拒绝摘要分叉，完整失败回执仍保留"
     const resolution = JSON.parse(await Deno.readTextFile(path));
     resolution.receiptDigest = "0".repeat(64);
     await Deno.writeTextFile(path, JSON.stringify(resolution));
-    restart = new QqSendActions(local.client(), directory);
+    restart = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
     await assert.rejects(restart.initialize(), corrupt);
     assert.equal(await Deno.readTextFile(`${directory}/records/head.json`), original);
     assert.equal(local.count(), 1);
@@ -414,7 +414,10 @@ Deno.test("QQ显式鉴权与限流失败按原请求重试，Retry-After加基�
     }
     return Response.json({ id: `sent-${bodies.length}` });
   });
-  let actions = new QqSendActions(local.client(), directory, "private", { retryDelaysMs: [20] });
+  let actions = new QqSendActions(local.client(), directory, "private", {
+    retainFailed: true,
+    retryDelaysMs: [20],
+  });
   let checkpoints = 0;
   try {
     await actions.initialize();
@@ -448,7 +451,7 @@ Deno.test("QQ显式鉴权与限流失败按原请求重试，Retry-After加基�
       1000,
     );
     await actions.close();
-    actions = new QqSendActions(local.client(), directory);
+    actions = new QqSendActions(local.client(), directory, "private", { retainFailed: true });
     await actions.initialize();
     assert.deepEqual(await actions.send("first", request), a);
     assert.equal(local.count(), 4);
@@ -477,7 +480,10 @@ Deno.test("QQ未知鉴权、限流和平台错误不自动重试，可取消等�
       attempted: true,
       error: { category, retryAfterMs: 0 },
     });
-    const actions = new QqSendActions(client, directory, "private", { retryDelaysMs: [0] });
+    const actions = new QqSendActions(client, directory, "private", {
+      retainFailed: true,
+      retryDelaysMs: [0],
+    });
     try {
       await actions.initialize();
       const result = await actions.send("unknown", request);
@@ -501,7 +507,10 @@ Deno.test("QQ长Retry-After等待不可取消，shutdown及时唤醒且不伪造
   const local = platform(() =>
     Response.json({ err_code: 100001 }, { status: 429, headers: { "retry-after": "3600" } })
   );
-  const actions = new QqSendActions(local.client(), directory, "private", { retryDelaysMs: [50] });
+  const actions = new QqSendActions(local.client(), directory, "private", {
+    retainFailed: true,
+    retryDelaysMs: [50],
+  });
   let send: Promise<unknown> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -559,7 +568,10 @@ Deno.test("QQ活跃队首重试期间可取消等待中的零尝试后项，并�
       headers: { "retry-after": contents.length === 1 ? "1" : "3600" },
     });
   });
-  const actions = new QqSendActions(local.client(), directory, "private", { retryDelaysMs: [5] });
+  const actions = new QqSendActions(local.client(), directory, "private", {
+    retainFailed: true,
+    retryDelaysMs: [5],
+  });
   let head: Promise<unknown> | undefined;
   let follower: Promise<unknown> | undefined;
   const timers: ReturnType<typeof setTimeout>[] = [];
@@ -644,7 +656,10 @@ Deno.test("QQ主动发送已尝试HTTP超时：未知队首阻塞且重启不重
     if (body.markdown.content === request.text) await release.promise;
     return Response.json({ id: "platform-may-have-delivered" });
   });
-  let actions = new QqSendActions(local.client(300), directory, "private", { retryDelaysMs: [0] });
+  let actions = new QqSendActions(local.client(300), directory, "private", {
+    retainFailed: true,
+    retryDelaysMs: [0],
+  });
   const follower = { ...request, text: "未知结束后的后项" };
   try {
     await actions.initialize();
@@ -666,7 +681,10 @@ Deno.test("QQ主动发送已尝试HTTP超时：未知队首阻塞且重启不重
     const records = await snapshot(`${directory}/records`);
     const attempts = await snapshot(`${directory}/attempts`);
     await actions.close();
-    actions = new QqSendActions(local.client(300), directory, "private", { retryDelaysMs: [0] });
+    actions = new QqSendActions(local.client(300), directory, "private", {
+      retainFailed: true,
+      retryDelaysMs: [0],
+    });
     await actions.initialize();
     assert.deepEqual(await actions.send("head", request), unknown);
     assert.equal(local.count(), 1);
