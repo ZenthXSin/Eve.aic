@@ -228,7 +228,7 @@ Deno.test("agents: tool loop preserves pairing, receipts, final one-message repl
     await f.close();
   }
 });
-Deno.test("agents: interrupted accepted job becomes one unknown reply after restart, never replays; tampered body fails closed", async () => {
+Deno.test("agents: interrupted accepted job resumes once after restart; completed jobs stay done and tampered body fails closed", async () => {
   const f = await fixture();
   try {
     const job = await f.api.send({ agentId: "agent_review", text: "recover" }, "agent_original");
@@ -251,13 +251,15 @@ Deno.test("agents: interrupted accepted job becomes one unknown reply after rest
     const recovered = new AgentService(interrupted, {
       complete() {
         models++;
-        return Promise.resolve(response("must not replay"));
+        return Promise.resolve(response("recovered reply"));
       },
       invoke: () => Promise.resolve(null),
     });
     await recovered.initialize();
-    assert.equal(models, 0);
-    assert.equal(recovered.status({ jobId: job.jobId }).status, "unknown");
+    const resumed = await recovered.send({ agentId: job.agentId, text: "recover" }, job.jobId);
+    assert.equal(models, 1);
+    assert.equal(resumed.status, "completed");
+    assert.equal(recovered.journal.events.filter((e) => e.kind === "accepted").length, 1);
     assert.equal(recovered.notifications().items.length, 1);
     await recovered.close();
     const again = new AgentService(interrupted, {
@@ -469,7 +471,7 @@ Deno.test("agents: restart recovers persisted final response before transcript o
         assert.equal(done.status, "completed");
         assert.equal((await restored.message({ seq: done.replySeq! })).text, "完整回复");
         assert.equal(restored.notifications().items.length, 1);
-        assert.equal(queried, 1);
+        assert.equal(queried, withStep ? 0 : 1);
       } finally {
         await restored.close();
       }

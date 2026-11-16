@@ -16,8 +16,19 @@ import type {
 } from "../../contracts/model.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
-import { type FactEvent, FactJournal } from "../../sdk/fact-journal.ts";
+import { FactJournal } from "../../sdk/fact-journal.ts";
 import { writeDurableJson } from "../../sdk/durable-json.ts";
+import {
+  applyAgentEvent,
+  assistantMessage,
+  type BlobRef,
+  createAgentState,
+  restoreAgents,
+  type Session,
+  type StoredJob,
+  type StoredMessage,
+  transcriptCursor,
+} from "./agent-restore.ts";
 
 const roles: Record<AgentRole, { name: string; prompt: string }> = {
   review: {
@@ -57,28 +68,6 @@ const tool: ToolSpec = {
     additionalProperties: false,
   },
 };
-interface BlobRef {
-  hash: string;
-}
-interface StoredMessage extends AgentMessagePreview {
-  body: BlobRef;
-}
-interface StoredJob extends AgentJob {
-  config: AgentConfig;
-  transcript: BlobRef[];
-  cancelled: boolean;
-}
-interface Session {
-  id: string;
-  config: AgentConfig;
-  closed: boolean;
-  readThrough: number;
-  messages: number[];
-  replies: number[];
-  jobs: string[];
-  unread: number;
-  pending: number;
-}
 export interface AgentHooks {
   result?(id: string): ModelResponse | undefined;
   complete(request: ModelRequest, options: ModelCallOptions, id: string): Promise<ModelResponse>;
@@ -107,11 +96,10 @@ function preview(text: string) {
 /** Metadata-only indexes, append-only originals, on-demand bodies, no idle model loop. */
 export class AgentService {
   readonly journal: FactJournal;
-  #sessions = new Map<string, Session>();
-  #jobs = new Map<string, StoredJob>();
-  #messages = new Map<number, StoredMessage>();
-  #notifications: number[] = [];
+  #state = createAgentState();
   #tails = new Map<string, Promise<unknown>>();
+  #work = new Map<string, Promise<void>>();
+  #initialized = false;
   #accepted = new Map<string, Set<() => void>>();
   #mutations: Promise<unknown> = Promise.resolve();
   #closing = false;
@@ -125,7 +113,7 @@ export class AgentService {
     this.journal = new FactJournal(directory);
   }
   get available() {
-    return this.journal.available;
+    return this.#initialized && this.journal.available;
   }
   async #serial<T>(operation: () => Promise<T>): Promise<T> {
     const work = this.#mutations.then(operation);
@@ -160,120 +148,59 @@ export class AgentService {
     }
   }
   #session(id: unknown) {
-    const session = typeof id === "string" ? this.#sessions.get(id) : undefined;
+    const session = typeof id === "string" ? this.#state.sessions.get(id) : undefined;
     if (!session) throw new KernelError("not_found", "子代理会话不存在");
     return session;
   }
   #job(id: unknown) {
-    const job = typeof id === "string" ? this.#jobs.get(id) : undefined;
+    const job = typeof id === "string" ? this.#state.jobs.get(id) : undefined;
     if (!job) throw new KernelError("not_found", "子代理任务不存在");
     return job;
   }
-  #apply(event: FactEvent) {
-    const d = event.data as Record<string, unknown>;
-    if (event.kind === "created") {
-      const config = d.config as AgentConfig, id = String(d.agentId);
-      if (this.#sessions.has(id)) throw new KernelError("corrupt", "子代理标识重复");
-      this.#sessions.set(id, {
-        id,
-        config,
-        closed: false,
-        readThrough: 0,
-        messages: [],
-        replies: [],
-        jobs: [],
-        unread: 0,
-        pending: 0,
-      });
-    } else {
-      const session = this.#session(d.agentId);
-      if (event.kind === "configured") session.config = d.config as AgentConfig;
-      else if (event.kind === "read") {
-        session.readThrough = Number(d.throughSeq);
-        let lo = 0, hi = session.replies.length;
-        while (lo < hi) {
-          const mid = (lo + hi) >>> 1;
-          if (session.replies[mid] <= session.readThrough) lo = mid + 1;
-          else hi = mid;
-        }
-        session.unread = session.replies.length - lo;
-      } else if (event.kind === "closed") session.closed = true;
-      else if (event.kind === "accepted") {
-        const job = d.job as StoredJob;
-        if (this.#jobs.has(job.jobId)) throw new KernelError("corrupt", "子代理任务重复");
-        job.requestSeq = event.seq;
-        this.#jobs.set(job.jobId, job);
-        session.jobs.push(job.jobId);
-        session.pending++;
-        const m = { ...(d.message as StoredMessage), seq: event.seq, at: event.at };
-        this.#messages.set(event.seq, m);
-        session.messages.push(event.seq);
-      } else if (event.kind === "started") this.#job(d.jobId).status = "running";
-      else if (event.kind === "step") this.#job(d.jobId).transcript.push(d.body as BlobRef);
-      else if (event.kind === "cancelled") this.#job(d.jobId).cancelled = true;
-      else if (event.kind === "reply") {
-        const job = this.#job(d.jobId),
-          message = { ...(d.message as StoredMessage), seq: event.seq, at: event.at };
-        if (job.replySeq) throw new KernelError("corrupt", "子代理回复重复");
-        job.status = message.status;
-        session.pending--;
-        session.replies.push(event.seq);
-        if (event.seq > session.readThrough) session.unread++;
-        job.replySeq = event.seq;
-        job.error = d.error as AgentJob["error"];
-        this.#messages.set(event.seq, message);
-        session.messages.push(event.seq);
-        this.#notifications.push(event.seq);
-      } else throw new KernelError("corrupt", "子代理事件类型无效");
-    }
-  }
   async #append(kind: string, data: unknown) {
     const event = await this.journal.append(kind, data as Json);
-    this.#apply(event);
+    applyAgentEvent(this.#state, event);
     return event;
   }
-  async initialize() {
+  async initialize(resume = true) {
     await Deno.mkdir(`${this.directory}/bodies`, { recursive: true, mode: 0o700 });
-    await this.journal.initialize();
-    for (const event of this.journal.events) this.#apply(event);
-    // Committed configurations and message/body references are verified before service admission.
-    for (const session of this.#sessions.values()) {
-      this.#config(session.config.role, { ...session.config });
-    }
-    for (const message of this.#messages.values()) await this.#read(message.body);
-    for (const job of this.#jobs.values()) {
-      for (const body of job.transcript) await this.#read(body);
-      if (!job.replySeq) {
-        const transcript = await Promise.all(
-          job.transcript.map((body) => this.#read<Message>(body)),
-        );
-        const last = transcript.at(-1);
-        const saved = this.hooks.result?.(
-          `${job.jobId}_model_${
-            transcript.filter((message) => message.role === "assistant").length + 1
-          }`,
-        );
-        if (last?.role === "assistant" && !last.toolCalls?.length) {
-          await this.#finish(job, job.cancelled ? "cancelled" : "completed", last.content);
-          continue;
-        }
-        if (saved && !saved.toolCalls.length) {
-          await this.#step(job, { role: "assistant", content: saved.content });
-          await this.#finish(job, job.cancelled ? "cancelled" : "completed", saved.content);
-          continue;
-        }
-        await this.#finish(job, "unknown", "执行服务中断，本次结果未确认；原消息不自动重发。", {
-          kind: "unknown",
-          message: "执行服务中断，原任务不重放",
-        });
-      }
-    }
+    await restoreAgents(this.journal, this.#state, {
+      validateConfig: (config) => {
+        this.#config(config.role, { ...config });
+      },
+      read: <T>(body: BlobRef) => this.#read<T>(body),
+      result: (id) => this.hooks.result?.(id),
+      step: (job, message) => this.#step(job, message),
+      finish: (job, status, text) => this.#finish(job, status, text),
+    });
     for (const role of Object.keys(roles) as AgentRole[]) {
       const id = `agent_${role}`;
-      if (!this.#sessions.has(id)) {
+      if (!this.#state.sessions.has(id)) {
         await this.#append("created", { agentId: id, config: this.#config(role, {}) });
       }
     }
+    this.#initialized = true;
+    if (resume) this.resume();
+  }
+  /** Defer execution until the host's action ledger is reconciled and dispatch is ready. */
+  resume() {
+    if (!this.available || this.#closing) return;
+    for (const job of this.#state.jobs.values()) {
+      if (!job.replySeq && !job.cancelled) this.#enqueue(job);
+    }
+  }
+  #enqueue(job: StoredJob): Promise<void> {
+    const existing = this.#work.get(job.jobId);
+    if (existing) return existing;
+    if (job.replySeq) return Promise.resolve();
+    const previous = this.#tails.get(job.agentId) ?? Promise.resolve();
+    const work = previous.then(() => this.#run(job));
+    this.#work.set(job.jobId, work);
+    const settled = work.catch(() => {}).finally(() => {
+      if (this.#work.get(job.jobId) === work) this.#work.delete(job.jobId);
+    });
+    this.#tails.set(job.agentId, settled);
+    return work;
   }
   #config(role: unknown, args: Record<string, unknown>, previous?: AgentConfig): AgentConfig {
     if (typeof role !== "string" || !Object.hasOwn(roles, role)) {
@@ -331,12 +258,12 @@ export class AgentService {
       state: session.closed ? "closed" : pending ? "working" : "idle",
       unread,
       pending,
-      ...(latest ? { latest: this.#preview(this.#messages.get(latest)!) } : {}),
+      ...(latest ? { latest: this.#preview(this.#state.messages.get(latest)!) } : {}),
     };
   }
   #preview(message: StoredMessage): AgentMessagePreview {
     const { body: _body, ...result } = message;
-    const job = this.#jobs.get(message.jobId);
+    const job = this.#state.jobs.get(message.jobId);
     return {
       ...result,
       ...(message.direction === "outgoing" && job ? { status: job.status } : {}),
@@ -345,7 +272,7 @@ export class AgentService {
   async create(args: Record<string, Json>, id: string) {
     return await this.#serial(async () => {
       const agentId = `agent_${await fingerprint(["agent-v1", id])}`;
-      if (!this.#sessions.has(agentId)) {
+      if (!this.#state.sessions.has(agentId)) {
         await this.#append("created", { agentId, config: this.#config(args.role, args) });
       }
       return this.#view(this.#session(agentId));
@@ -363,10 +290,10 @@ export class AgentService {
     });
   }
   list(args: Record<string, Json> = {}) {
-    const size = limit(args.limit), ids = [...this.#sessions.keys()].sort();
+    const size = limit(args.limit), ids = [...this.#state.sessions.keys()].sort();
     if (
       args.afterId !== undefined &&
-      (typeof args.afterId !== "string" || !this.#sessions.has(args.afterId))
+      (typeof args.afterId !== "string" || !this.#state.sessions.has(args.afterId))
     ) throw new KernelError("rejected", "会话列表游标无效");
     const start = args.afterId === undefined ? 0 : ids.indexOf(String(args.afterId)) + 1,
       page = ids.slice(start, start + size);
@@ -387,7 +314,7 @@ export class AgentService {
     };
   }
   async accepted(jobId: string, signal: AbortSignal): Promise<void> {
-    if (this.#jobs.has(jobId) || signal.aborted) return;
+    if (this.#state.jobs.has(jobId) || signal.aborted) return;
     await new Promise<void>((resolve) => {
       const finish = () => {
         signal.removeEventListener("abort", finish);
@@ -399,7 +326,7 @@ export class AgentService {
       this.#accepted.set(jobId, waiters);
       waiters.add(finish);
       signal.addEventListener("abort", finish, { once: true });
-      if (this.#jobs.has(jobId) || signal.aborted) finish();
+      if (this.#state.jobs.has(jobId) || signal.aborted) finish();
     });
   }
   async send(args: Record<string, Json>, id: string): Promise<AgentJob> {
@@ -410,7 +337,7 @@ export class AgentService {
       if (typeof args.text !== "string" || !args.text.trim()) {
         throw new KernelError("rejected", "子代理消息不可为空");
       }
-      const existing = this.#jobs.get(id);
+      const existing = this.#state.jobs.get(id);
       if (existing) return existing;
       const body = await this.#blob(args.text),
         job: StoredJob = {
@@ -437,9 +364,7 @@ export class AgentService {
       return this.#job(id);
     });
     // Register in the per-session chain before waking RPC admission waiters.
-    const previous = this.#tails.get(job.agentId) ?? Promise.resolve();
-    const work = previous.then(() => this.#run(job));
-    this.#tails.set(job.agentId, work.catch(() => {}));
+    const work = this.#enqueue(job);
     for (const done of [...this.#accepted.get(id) ?? []]) done();
     await work;
     return this.status({ jobId: id });
@@ -483,20 +408,23 @@ export class AgentService {
       if (!old.replySeq) throw new KernelError("corrupt", "同会话前件未完成");
       messages.push({
         role: "user",
-        content: await this.#read<string>(this.#messages.get(old.requestSeq)!.body),
+        content: await this.#read<string>(this.#state.messages.get(old.requestSeq)!.body),
       });
       if (old.status === "completed") {
         for (const body of old.transcript) messages.push(await this.#read<Message>(body));
       } else {messages.push({
           role: "assistant",
-          content: await this.#read<string>(this.#messages.get(old.replySeq)!.body),
+          content: await this.#read<string>(this.#state.messages.get(old.replySeq)!.body),
         });}
     }
     messages.push({
       role: "user",
-      content: await this.#read<string>(this.#messages.get(job.requestSeq)!.body),
+      content: await this.#read<string>(this.#state.messages.get(job.requestSeq)!.body),
     });
-    return messages;
+    const transcript: Message[] = [];
+    for (const body of job.transcript) transcript.push(await this.#read<Message>(body));
+    messages.push(...transcript);
+    return { messages, transcript };
   }
   async #run(job: StoredJob) {
     if (job.replySeq) return;
@@ -504,28 +432,32 @@ export class AgentService {
       if (job.cancelled) {
         return await this.#finish(job, "cancelled", "任务已取消，未开始后续工作。");
       }
-      await this.#append("started", { agentId: job.agentId, jobId: job.jobId });
-      const messages = await this.#context(job);
-      let step = 0;
+      if (job.status !== "running") {
+        await this.#append("started", { agentId: job.agentId, jobId: job.jobId });
+      }
+      const { messages, transcript } = await this.#context(job);
+      let { step, completed, assistant } = transcriptCursor(transcript);
       while (!job.cancelled) {
-        const response = await this.hooks.complete({ messages, tools: [tool] }, {
-          ...job.config,
-          sessionId: job.agentId,
-        }, `${job.jobId}_model_${++step}`);
-        const assistant: Message = {
-          role: "assistant",
-          content: response.content,
-          ...(response.toolCalls.length ? { toolCalls: response.toolCalls } : {}),
-        };
-        await this.#step(job, assistant);
-        messages.push(assistant);
-        if (!response.toolCalls.length) {
-          await this.#finish(job, job.cancelled ? "cancelled" : "completed", response.content);
+        if (!assistant) {
+          const id = `${job.jobId}_model_${++step}`;
+          const response = this.hooks.result?.(id) ??
+            await this.hooks.complete({ messages, tools: [tool] }, {
+              ...job.config,
+              sessionId: job.agentId,
+            }, id);
+          assistant = assistantMessage(response);
+          await this.#step(job, assistant);
+          messages.push(assistant);
+          completed = 0;
+        }
+        if (!assistant.toolCalls?.length) {
+          await this.#finish(job, job.cancelled ? "cancelled" : "completed", assistant.content);
           return;
         }
-        for (let i = 0; i < response.toolCalls.length; i++) {
+        // Durable receipts are authoritative: only execute the unrecorded suffix.
+        for (let i = completed; i < assistant.toolCalls.length; i++) {
           if (job.cancelled) break;
-          const call = response.toolCalls[i];
+          const call = assistant.toolCalls[i];
           let result: Json;
           try {
             if (call.name !== "use_tool" || !object(call.args)) {
@@ -553,6 +485,7 @@ export class AgentService {
           await this.#step(job, message);
           messages.push(message);
         }
+        assistant = undefined;
       }
       await this.#finish(job, "cancelled", "任务已取消，已执行动作与原始回执保留。");
     } catch (error) {
@@ -572,7 +505,7 @@ export class AgentService {
       : s.messages.indexOf(Number(args.beforeSeq));
     const start = Math.max(0, end - size), page = s.messages.slice(start, end);
     return {
-      messages: page.map((seq) => this.#preview(this.#messages.get(seq)!)),
+      messages: page.map((seq) => this.#preview(this.#state.messages.get(seq)!)),
       ...(start > 0 ? { older: { beforeSeq: page[0] } } : {}),
     };
   }
@@ -584,10 +517,10 @@ export class AgentService {
     });
   }
   async message(args: Record<string, Json>) {
-    if (!positive(args.seq) || !this.#messages.has(args.seq)) {
+    if (!positive(args.seq) || !this.#state.messages.has(args.seq)) {
       throw new KernelError("not_found", "消息不存在");
     }
-    const message = this.#messages.get(args.seq)!,
+    const message = this.#state.messages.get(args.seq)!,
       text = await this.#read<string>(message.body),
       startChar = args.startChar ?? 0;
     if (
@@ -621,14 +554,14 @@ export class AgentService {
       throw new KernelError("rejected", "搜索文字不可为空");
     }
     const ids = args.agentId === undefined
-      ? [...this.#messages.keys()]
+      ? [...this.#state.messages.keys()]
       : this.#session(args.agentId).messages;
     const end = args.beforeSeq === undefined ? ids.length : ids.indexOf(Number(args.beforeSeq));
     if (end < 0) throw new KernelError("rejected", "搜索游标无效");
     const messages: AgentMessagePreview[] = [], size = limit(args.limit);
     let index = end - 1, scanned = 0;
     for (; index >= 0 && messages.length < size && scanned++ < 100; index--) {
-      const m = this.#messages.get(ids[index])!;
+      const m = this.#state.messages.get(ids[index])!;
       if ((await this.#read<string>(m.body)).includes(args.query)) messages.push(this.#preview(m));
     }
     return {
@@ -642,20 +575,20 @@ export class AgentService {
       !Number.isSafeInteger(after) || Number(after) < 0 ||
       Number(after) > this.journal.events.length
     ) throw new KernelError("rejected", "通知游标无效");
-    let lo = 0, hi = this.#notifications.length;
+    let lo = 0, hi = this.#state.notifications.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.#notifications[mid] <= Number(after)) lo = mid + 1;
+      if (this.#state.notifications[mid] <= Number(after)) lo = mid + 1;
       else hi = mid;
     }
-    const page = this.#notifications.slice(lo, lo + 100),
-      more = lo + page.length < this.#notifications.length;
+    const page = this.#state.notifications.slice(lo, lo + 100),
+      more = lo + page.length < this.#state.notifications.length;
     return {
       items: page.filter((seq) => {
-        const m = this.#messages.get(seq)!;
+        const m = this.#state.messages.get(seq)!;
         return seq > this.#session(m.agentId).readThrough;
-      }).map((seq) => this.#preview(this.#messages.get(seq)!)),
-      throughSeq: more ? page.at(-1)! : this.#notifications.at(-1) ?? 0,
+      }).map((seq) => this.#preview(this.#state.messages.get(seq)!)),
+      throughSeq: more ? page.at(-1)! : this.#state.notifications.at(-1) ?? 0,
       hasMore: more,
     };
   }
@@ -709,15 +642,13 @@ export class AgentService {
     return result as unknown as Json;
   }
   async cancelAll() {
-    for (const job of this.#jobs.values()) {
+    for (const job of this.#state.jobs.values()) {
       if (!job.replySeq) await this.cancel({ jobId: job.jobId });
     }
   }
   async close() {
     this.#closing = true;
-    for (const job of this.#jobs.values()) {
-      if (!job.replySeq) await this.cancel({ jobId: job.jobId });
-    }
+    if (this.#initialized) await this.cancelAll();
     await Promise.allSettled([...this.#tails.values()]);
     await this.#mutations;
     await this.journal.close();
