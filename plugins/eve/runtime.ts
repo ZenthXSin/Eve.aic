@@ -16,6 +16,7 @@ import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type ErrorKind, type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
 import { CONTEXT_TOOLS, inspectContext, previewCompression } from "./context-tools.ts";
+import { contextMaintenanceState } from "./context-maintenance.ts";
 import { recallQuery } from "./recall-query.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 import { type ConsciousEvent, ConsciousJournal } from "./journal.ts";
@@ -1011,6 +1012,11 @@ export class EveRuntime {
     }
     const day = this.#sharedBudget?.day ?? accountingDay(this.config.timeZone);
     const usage = this.#sharedBudget ?? budget(this.journal.events, day);
+    const maintenance = contextMaintenanceState(
+      this.journal.events,
+      estimated,
+      this.config.sourceCommit,
+    );
     let reservation = new TextEncoder().encode(JSON.stringify({ messages, tools })).length +
       messages.length * 32 + this.config.maxOutputTokens;
     const state = {
@@ -1023,9 +1029,12 @@ export class EveRuntime {
       contextTargetTokens: 150_000,
       contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
       contextComposition: contextComposition(messages),
-      contextReminder: estimated >= 120_000
-        ? "上下文输入目标低于150k；已达到120k估算提醒线，可自主整理时间线、摘要或工具结果，原件保留"
-        : null,
+      contextReminder: maintenance.reminder,
+      contextMaintenance: {
+        level: maintenance.level,
+        providerInput: maintenance.providerInput,
+        retainTargetTokens: maintenance.retainTargetTokens,
+      },
       dailyBudget: this.config.dailyTokenBudget,
       knownNoncachedTokens: usage.knownNoncachedTokens,
       unknownReservedTokens: usage.unknownReservedTokens,
@@ -1050,13 +1059,23 @@ export class EveRuntime {
     const band = Math.floor(estimated / 25_000);
     const last = lastActiveEvent(this.journal.events, "perception");
     if (
-      !last || (last.data as { contextBand: number }).contextBand !== band ||
+      maintenance.due || !last || (last.data as { contextBand: number }).contextBand !== band ||
       (last.data as { day: string }).day !== day ||
       (last.data as { remainingBand: number }).remainingBand !==
         Math.floor(state.safeRemaining / 10_000_000) ||
       (last.data as { dailyBudget?: number }).dailyBudget !== this.config.dailyTokenBudget ||
       (last.data as { reminder?: string | null }).reminder !== state.contextReminder
     ) {
+      const inspection = maintenance.reminder
+        ? inspectContext(
+          this.journal.events,
+          this.#prompt,
+          tools,
+          { limit: 1 },
+          this.contextCounter,
+          (messages) => this.#present(messages),
+        )
+        : undefined;
       await this.journal.append("perception", {
         contextBand: band,
         day,
@@ -1065,6 +1084,19 @@ export class EveRuntime {
         dailyBudget: this.config.dailyTokenBudget,
         counting: this.contextCounter?.description ?? "字符与图像估算，未验证为当前模型精确分词",
         reminder: state.contextReminder,
+        contextMaintenance: inspection
+          ? {
+            level: maintenance.level,
+            estimatedTokens: maintenance.estimatedTokens,
+            providerInput: maintenance.providerInput,
+            observedTokens: maintenance.observedTokens,
+            compressedThroughSeq: maintenance.compressedThroughSeq,
+            totalCandidates: inspection.totalCandidates,
+            recommendation: inspection.recommendation,
+            inspect: { tool: "inspect_context", args: {} },
+            repeat: "仍未整理时，每4次模型回复或15分钟的下一次活动轮提醒；不另开模型请求",
+          }
+          : null,
       });
       messages = this.#render();
     }

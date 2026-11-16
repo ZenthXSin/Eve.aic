@@ -210,6 +210,12 @@ export function presentContext(
             task: {
               jobId: script.jobId,
               status: script.status,
+              ...(script.status === "failed"
+                ? {
+                  recovery:
+                    "脚本任务失败，本次读取完成不等于任务成功。具体错误见receipt.output.error；参数rejected先查契约并修正，不能据此判定整条链路不可用。脚本可能已执行部分动作，先查原动作回执，再继续未完成部分或委派；重复read_script不会修复同一个已失败任务。",
+                }
+                : {}),
               ...(script.status === "completed" ? {} : {
                 inspect: {
                   tool: "read_script",

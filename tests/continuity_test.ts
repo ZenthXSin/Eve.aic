@@ -341,6 +341,47 @@ Deno.test("完整轮次缓存：生活状态只在变化时追加，跨工具、
   }
 });
 
+Deno.test("休息收尾：后续工具失败和新私信使旧审查失效，重启后重新核对再休息", async () => {
+  const f = await fixture([response(), response("act"), response(), response(), response()]);
+  try {
+    await f.eve.pulse();
+    const original = pendingRestReview(f.eve.journal.events)!;
+    await f.eve.pulse();
+    assert.equal(pendingRestReview(f.eve.journal.events), undefined);
+    await f.eve.pulse();
+    const callId = (f.eve.journal.events.at(-1)!.data as { callId: string }).callId;
+    await f.eve.journal.append("tool_result", {
+      callId,
+      result: {
+        status: "completed",
+        output: JSON.stringify({
+          jobId: "failed-job",
+          status: "failed",
+          actions: 1,
+          error: { kind: "rejected", message: "limit范围1..32" },
+        }),
+      },
+    });
+    await f.restart();
+    await f.eve.pulse();
+    const renewed = pendingRestReview(f.eve.journal.events)!;
+    assert.ok(renewed.seq > original.seq);
+    assert.equal(f.eve.journal.events.some((e) => e.kind === "rest"), false);
+    assert.ok(JSON.stringify(f.messages[2]).includes("failed-job"));
+    assert.ok(JSON.stringify(f.messages[2]).includes("limit范围1..32"));
+    f.wake();
+    await f.eve.pulse();
+    const afterMessage = pendingRestReview(f.eve.journal.events)!;
+    assert.ok(afterMessage.seq > renewed.seq);
+    await f.eve.pulse();
+    const rest = f.eve.journal.events.findLast((e) => e.kind === "rest")!;
+    assert.equal((rest.data as { reviewSeq: number }).reviewSeq, afterMessage.seq);
+    assert.equal(f.messages.length, 5, "有效审查只多走一轮，不无限检查或重放动作");
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test("原生脚本读取接线：工具表可用，结果直接进入下一轮结构化上下文，重启不重放", async () => {
   const f = await fixture([
     response("read_script", { jobId: "old-job" }),

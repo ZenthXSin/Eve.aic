@@ -266,7 +266,7 @@ export interface PhoneApi {
   burstStatus(args: { actionId: string }): Promise<PhoneBurstStatus | null>;
   waitForMessages(args: PhoneWaitForMessages): Promise<PhoneMessagesWaitResult>;
   action(args: { actionId: string }): Promise<PhoneActionReceipt | null>;
-  /** 队列分页不发送任何消息。发送中的请求不可取消；只有canCancel且有receiptDigest可提交取消。 */
+  /** 队列分页不发送任何消息。limit默认8，范围1..32；afterSequence为非负整数，下一页直接传next。发送中的请求不可取消；只有canCancel且有receiptDigest可提交取消。 */
   listSendQueue(
     args?: { conversationId?: string; afterSequence?: number; limit?: number },
   ): Promise<{

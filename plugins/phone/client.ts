@@ -11,7 +11,7 @@ import { fingerprint } from "../../kernel/calls.ts";
 
 export class PhoneRpcError extends KernelError {
   readonly attachment?: PhoneAttachmentFailure;
-  constructor(readonly category: string, diagnostic?: unknown) {
+  constructor(readonly category: string, diagnostic?: unknown, method?: string) {
     const attachment = phoneAttachmentFailure(diagnostic);
     super(
       category === "unknown"
@@ -35,6 +35,8 @@ export class PhoneRpcError extends KernelError {
             attachment.httpStatus === undefined ? "" : ` (HTTP ${attachment.httpStatus})`
           }`
           : ""
+      }${method ? `；操作：${method}` : ""}${
+        category === "request" ? "；请求参数被拒绝，请核对当前类型契约，不代表手机连接不可用" : ""
       }`,
     );
     this.attachment = attachment;
@@ -61,6 +63,24 @@ export class PhoneRpcClient {
   }
 
   async call(method: PhoneMethod | "health", args: Json = {}): Promise<Json> {
+    if (method === "listSendQueue") {
+      if (
+        !args || typeof args !== "object" || Array.isArray(args) ||
+        Object.keys(args).some((key) =>
+          !["conversationId", "afterSequence", "limit"].includes(key)
+        ) ||
+        args.limit !== undefined &&
+          (!Number.isSafeInteger(args.limit) || Number(args.limit) < 1 ||
+            Number(args.limit) > 32) ||
+        args.afterSequence !== undefined &&
+          (!Number.isSafeInteger(args.afterSequence) || Number(args.afterSequence) < 0)
+      ) {
+        throw new KernelError(
+          "rejected",
+          "phone.listSendQueue参数无效：limit默认8，范围1..32；afterSequence须为非负整数；只接受conversationId、afterSequence、limit。未派发请求，修正后可继续；下一页直接传返回的next。",
+        );
+      }
+    }
     const captured = structuredClone(args);
     const proof = method === "health" ? undefined : await this.ownershipProof?.();
     const actionId = method === "cancelSend"
@@ -136,7 +156,7 @@ export class PhoneRpcClient {
       const result: PhoneRpcResponse = JSON.parse(new TextDecoder().decode(joined));
       if (result?.ok === true && Object.hasOwn(result, "value")) return result.value;
       if (result?.ok === false && typeof result.error?.category === "string") {
-        throw new PhoneRpcError(result.error.category, result.error.attachment);
+        throw new PhoneRpcError(result.error.category, result.error.attachment, method);
       }
       throw new PhoneRpcError("invalid_response");
     } catch (error) {
