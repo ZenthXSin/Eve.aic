@@ -8,6 +8,7 @@ import { EveRuntime } from "../plugins/eve/runtime.ts";
 Deno.test("原生派工：默认通用、独立会话和追问用稳定原动作，不执行工作脚本", async () => {
   const admissions = new Map<string, Json>();
   const ctx = {
+    // deno-lint-ignore require-await -- PluginContext mocks preserve its async contract.
     async call(namespace: string, method: string, args: Record<string, Json>) {
       assert.equal(namespace, "agents");
       const id = String(args._actionId);
@@ -44,6 +45,7 @@ Deno.test("原生派工接线：准入回执直接进入接续状态，重启不
   await Deno.writeTextFile(`${directory}/prompt`, "单条意识流");
   let models = 0, admitted = 0;
   const ctx = {
+    // deno-lint-ignore require-await -- PluginContext mocks preserve its async contract.
     async call(namespace: string, method: string, args: Record<string, Json>) {
       if (namespace === "model") {
         models++;

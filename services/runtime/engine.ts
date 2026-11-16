@@ -256,7 +256,7 @@ export class RuntimeEngine {
         await this.budget.response(data.id, data.response);
       }
       // Reconcile agent originals first, so a completed reply also restores its outer receipt.
-      await this.agents.initialize();
+      await this.agents.initialize(false);
       for (const [id, location] of this.#requests) {
         if (typeof location === "number") {
           const r = this.#request(id)!;
@@ -302,6 +302,7 @@ export class RuntimeEngine {
       }
       this.#recoveryStage = "ready";
       this.#ready = true;
+      this.agents.resume();
     } catch (error) {
       this.#recoveryStage = "failed";
       await this.close().catch(() => {});

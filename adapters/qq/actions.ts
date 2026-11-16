@@ -114,15 +114,17 @@ function validResult(value: unknown): value is QqSendResult {
       "authentication",
       "rate_limit",
       "platform",
+      "not_found",
       "transport",
       "invalid_response",
       "pending",
       "duplicate",
     ].includes(r.error.category)
   ) return false;
-  for (const field of [r.error.httpStatus, r.error.code]) {
+  for (const field of [r.error.httpStatus, r.error.code, r.error.errCode]) {
     if (field !== undefined && (!Number.isSafeInteger(field) || field < 0)) return false;
   }
+  if (r.error.message !== undefined && typeof r.error.message !== "string") return false;
   if (
     r.error.transportReason !== undefined &&
     !["timeout", "aborted", "network"].includes(r.error.transportReason)
