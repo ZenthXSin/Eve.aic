@@ -1098,7 +1098,7 @@ export class EveRuntime {
                   query,
                   limit: 3,
                   _actionId: `recall_${anchor}`,
-                }) as {
+                }, { timeoutMs: 1500 }) as {
                   items: Json[];
                   related?: Json[];
                   guidance?: string;
@@ -1106,7 +1106,7 @@ export class EveRuntime {
               } catch (error) {
                 if (
                   !(error instanceof KernelError &&
-                    ["unavailable", "not_found"].includes(error.kind))
+                    ["unavailable", "not_found", "timeout", "rejected"].includes(error.kind))
                 ) {
                   throw error;
                 }

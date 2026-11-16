@@ -106,6 +106,18 @@ class SearchTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.index.search({"query": "feline", "collections": invalid})
 
+    def test_long_recall_query_is_chunked_before_embedding(self):
+        self.note(1, 1, "猫需要梳毛")
+        self.drain()
+        class BoundedEncoder(Encoder):
+            def embed(self, text, purpose):
+                if purpose == "query" and len(text) > 80:
+                    raise ValueError("Query exceeds embedding model capacity")
+                return super().embed(text, purpose)
+        self.index.encoder = BoundedEncoder()
+        result = self.index.search({"query": "feline " + "背景材料" * 300, "collections": ["notes"], "mode": "semantic"})
+        self.assertEqual(result["items"][0]["source"]["collection"], "notes")
+
     def test_agent_accepted_reads_job_id_from_message(self):
         folder = self.backend / "agents/events"
         bodies = self.backend / "agents/bodies"
