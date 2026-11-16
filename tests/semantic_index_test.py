@@ -93,6 +93,19 @@ class SearchTest(unittest.TestCase):
         self.assertTrue(result["items"][0]["untrusted"])
         self.assertFalse(self.index.search({"query": "feline", "collection": "records", "afterSeq": 2})["items"])
 
+    def test_recall_filters_multiple_collections_before_scoring(self):
+        self.note(1, 1, "猫需要梳毛")
+        memory = self.backend / "memory/events"
+        memory.mkdir(parents=True)
+        (memory / "0000000000000001.json").write_text(json.dumps({"seq": 1, "kind": "formation", "at": "2026-11-15", "data": {"id": "memory1", "text": "猫喜欢纸箱", "sources": []}}, ensure_ascii=False))
+        (self.backend / "consciousness/events/0000000000000001.json").write_text(json.dumps({"seq": 1, "kind": "thought", "at": "2026-11-15", "data": {"text": "猫的工具日志"}}, ensure_ascii=False))
+        self.drain()
+        result = self.index.search({"query": "feline", "collections": ["notes", "memory"], "mode": "semantic"})
+        self.assertEqual({hit["source"]["collection"] for hit in result["items"]}, {"notes", "memory"})
+        for invalid in [[], ["invalid"], ["notes", "notes"], "notes", [True]]:
+            with self.assertRaises(ValueError):
+                self.index.search({"query": "feline", "collections": invalid})
+
     def test_agent_accepted_reads_job_id_from_message(self):
         folder = self.backend / "agents/events"
         bodies = self.backend / "agents/bodies"

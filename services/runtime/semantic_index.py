@@ -324,6 +324,12 @@ class Index:
         if collection != "all":
             where += " AND d.collection=?"
             values.append(collection)
+        if "collections" in args:
+            selected = args["collections"]
+            if not isinstance(selected, list) or not 1 <= len(selected) <= len(COLLECTIONS) or any(not isinstance(c, str) or c not in COLLECTIONS for c in selected) or len(set(selected)) != len(selected):
+                raise ValueError("Invalid collection filters")
+            where += " AND d.collection IN (" + ",".join("?" for _ in selected) + ")"
+            values.extend(selected)
         for field in ["afterSeq", "beforeSeq"]:
             if field in args:
                 if type(args[field]) is not int or args[field] < 0:

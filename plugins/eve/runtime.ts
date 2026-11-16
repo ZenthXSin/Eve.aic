@@ -6,7 +6,19 @@ import {
   pendingRestReview,
   REST_TOOL,
   restArgs,
+  validateFocusEvidence,
 } from "./continuity.ts";
+import {
+  assessOutreach,
+  CONVERSATION_TOOL,
+  conversationArgs,
+  OUTREACH_TOOL,
+  outreachArgs,
+  outreachEntries,
+  type OutreachEntry,
+  updateConversation,
+} from "./social.ts";
+import type { HistoryScreen, MessageScreen, PhoneActionReceipt } from "../../contracts/phone.ts";
 import { MODEL_RPC_TIMEOUT_MS } from "../../sdk/model-timeouts.ts";
 import type { Message, ModelResponse, ToolSpec } from "../../contracts/model.ts";
 import type { NoteApi } from "../../contracts/notes.ts";
@@ -626,7 +638,28 @@ export class EveRuntime {
           if (args.expectedSeq !== (previous?.seq ?? 0)) {
             throw new KernelError("rejected", "近期重心已变化，请基于当前上下文中的版本修改");
           }
-          focus = await this.journal.append("focus", { callId: call.id, ...args });
+          validateFocusEvidence(args.items, this.journal.events);
+          const oldItems = (previous?.data as unknown as { items: typeof args.items })?.items ?? [];
+          for (const item of args.items) {
+            const feedback = item.feedback;
+            const old = oldItems.find((p) => p.id === item.id)?.feedback;
+            if (feedback && JSON.stringify(feedback) !== JSON.stringify(old)) {
+              const message = await this.ctx.call("phone", "message", {
+                handle: feedback.message,
+              }) as unknown as MessageScreen;
+              if (
+                message.direction !== "incoming" ||
+                message.handle.conversationId !== feedback.message.conversationId ||
+                message.handle.seq !== feedback.message.seq
+              ) {
+                throw new KernelError("rejected", "反馈来源必须是真实入站消息");
+              }
+            }
+          }
+          focus = await this.journal.append(
+            "focus",
+            { callId: call.id, ...args } as unknown as Json,
+          );
         }
         result = {
           status: "completed",
@@ -639,6 +672,115 @@ export class EveRuntime {
       } catch (error) {
         if (!(error instanceof KernelError && error.kind === "rejected")) throw error;
         result = { status: "failed", error: toWireError(error) as unknown as Json };
+      }
+      await this.#saveToolResult(call.id, result);
+      return;
+    }
+    if (
+      this.config.restReviewEnabled &&
+      [CONVERSATION_TOOL.name, OUTREACH_TOOL.name].includes(call.name)
+    ) {
+      try {
+        const applied = lastActiveEvent(
+          this.journal.events,
+          call.name === CONVERSATION_TOOL.name ? "conversation_state" : "outreach_result",
+          (e) => (e.data as { callId?: string }).callId === call.id,
+        );
+        let output: Json;
+        if (applied) {
+          output = {
+            ...(applied.data as Record<string, Json>).receipt as Record<string, Json>,
+            record: applied.seq,
+          };
+        } else if (call.name === CONVERSATION_TOOL.name) {
+          const args = conversationArgs(call.args);
+          const history = await this.ctx.call("phone", "history", {
+            conversationId: args.conversationId,
+          }) as unknown as HistoryScreen;
+          args.conversationId = history.messages[0]?.handle.conversationId ?? args.conversationId;
+          const items = updateConversation(this.journal.events, args, history);
+          const receipt = {
+            status: "recorded",
+            conversationId: args.conversationId,
+            mode: args.mode,
+            throughSeq: args.throughSeq,
+          };
+          const saved = await this.journal.append(
+            "conversation_state",
+            { callId: call.id, items, receipt } as unknown as Json,
+          );
+          output = { ...receipt, record: saved.seq };
+        } else {
+          const args = outreachArgs(call.args);
+          let started = lastActiveEvent(
+            this.journal.events,
+            "outreach_start",
+            (e) => (e.data as { callId?: string }).callId === call.id,
+          );
+          if (!started) {
+            const history = await this.ctx.call("phone", "history", {
+              conversationId: args.conversationId,
+            }) as unknown as HistoryScreen;
+            args.conversationId = history.messages[0]?.handle.conversationId ?? args.conversationId;
+            const gate = assessOutreach(
+              this.journal.events,
+              args,
+              history,
+              Date.now(),
+              this.config.timeZone ?? "Asia/Hong_Kong",
+            );
+            if (gate.status !== "ready") {
+              await this.#saveToolResult(call.id, {
+                status: "completed",
+                output: JSON.stringify(gate),
+              });
+              return;
+            }
+            const entry = {
+              actionId: `${call.id}_outreach`,
+              conversationId: args.conversationId,
+              throughSeq: args.throughSeq,
+              focusId: args.focusId,
+              angle: args.angle,
+              at: new Date().toISOString(),
+            };
+            // Reserve before the external effect. Recovery uses this exact action,
+            // not another opportunity or newly generated message.
+            started = await this.journal.append(
+              "outreach_start",
+              {
+                callId: call.id,
+                entry,
+                items: [...outreachEntries(this.journal.events), entry].slice(-16),
+              } as unknown as Json,
+            );
+          }
+          const entry = (started.data as unknown as { entry: OutreachEntry }).entry;
+          let receipt = await this.ctx.call("phone", "action", {
+            actionId: entry.actionId,
+          }) as unknown as PhoneActionReceipt | null;
+          if (!receipt) {
+            receipt = await this.ctx.call("phone", "send", {
+              actionId: entry.actionId,
+              conversationId: entry.conversationId,
+              text: args.text,
+            }) as unknown as PhoneActionReceipt;
+          }
+          const reported = { status: "attempted", conversationId: entry.conversationId, receipt };
+          const saved = await this.journal.append(
+            "outreach_result",
+            { callId: call.id, receipt: reported } as unknown as Json,
+          );
+          output = { ...reported, record: saved.seq } as unknown as Json;
+        }
+        result = { status: "completed", output: JSON.stringify(output) };
+      } catch (error) {
+        if (error instanceof KernelError && error.kind === "storage") throw error;
+        const wire = toWireError(error);
+        result = {
+          status: ["unknown", "timeout"].includes(wire.kind) ? "unknown" : "failed",
+          error: wire as unknown as Json,
+        };
       }
       await this.#saveToolResult(call.id, result);
       return;
@@ -855,7 +997,9 @@ export class EveRuntime {
       WRITE_THOUGHT_TOOL,
       READ_SCRIPT_TOOL,
       ...CONTEXT_TOOLS,
-      ...(this.config.restReviewEnabled ? [FOCUS_TOOL, REST_TOOL] : []),
+      ...(this.config.restReviewEnabled
+        ? [FOCUS_TOOL, REST_TOOL, CONVERSATION_TOOL, OUTREACH_TOOL]
+        : []),
     ];
     if (provided.some((tool) => native.some((item) => item.name === tool.name))) {
       throw new KernelError("rejected", "意识流原生工具不能由外部覆盖");
@@ -948,7 +1092,7 @@ export class EveRuntime {
               e.kind === "notice" && (e.data as { source?: string }).source === "memory"
             );
             if (query && (lastRecall?.data as { anchor?: number } | undefined)?.anchor !== anchor) {
-              let recalled: { items: Json[] };
+              let recalled: { items: Json[]; related?: Json[]; guidance?: string };
               try {
                 recalled = await this.ctx.call("memory", "recall", {
                   query,
@@ -956,6 +1100,8 @@ export class EveRuntime {
                   _actionId: `recall_${anchor}`,
                 }) as {
                   items: Json[];
+                  related?: Json[];
+                  guidance?: string;
                 };
               } catch (error) {
                 if (
@@ -970,6 +1116,8 @@ export class EveRuntime {
                 source: "memory",
                 anchor,
                 items: recalled.items,
+                ...(recalled.related?.length ? { related: recalled.related } : {}),
+                ...(recalled.guidance ? { guidance: recalled.guidance } : {}),
               });
             }
           }

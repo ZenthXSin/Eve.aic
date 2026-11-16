@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { Message, ModelResponse } from "../contracts/model.ts";
+import type { HistoryScreen, PhoneActionReceipt, PhoneSend } from "../contracts/phone.ts";
 import type { PluginContext } from "../sdk/plugin.ts";
 import { type Json, KernelError } from "../kernel/protocol.ts";
 import { EveRuntime } from "../plugins/eve/runtime.ts";
@@ -22,11 +23,31 @@ const response = (name?: string, args: Json = {}): ModelResponse => ({
   content: name ? "" : "今天先放着，醒来再看资料",
   toolCalls: name ? [{ id: crypto.randomUUID(), name, args }] : [],
 });
-async function fixture(responses: ModelResponse[]) {
+const socialHistory: HistoryScreen = {
+  snapshotThroughSeq: 20,
+  readThroughSeq: 20,
+  messages: [{
+    handle: { conversationId: "qq:user:friend", seq: 20 },
+    direction: "incoming",
+    sender: {
+      platformUserId: "friend",
+      displayName: { text: "朋友", characters: 2, truncated: false },
+    },
+    time: { status: "known", at: "2026-11-16T00:00:00Z" },
+    body: { text: "晚安", characters: 2, truncated: false },
+    attachments: [],
+    attachmentCount: 0,
+  }],
+};
+async function fixture(
+  responses: ModelResponse[],
+  phone: { history?: HistoryScreen; receipt?: PhoneActionReceipt } = {},
+) {
   const directory = await Deno.makeTempDir({ prefix: "eve-continuity-" });
   const promptFile = `${directory}/prompt.md`;
   await Deno.writeTextFile(promptFile, "稳定身份");
   const messages: Message[][] = [];
+  const sends: PhoneSend[] = [];
   let phoneSeq = 0;
   const mindEvents: Json[] = [];
   let completed = false;
@@ -74,6 +95,15 @@ async function fixture(responses: ModelResponse[]) {
         });
       }
       if (namespace === "phone") {
+        if (method === "history") return Promise.resolve(phone.history);
+        if (method === "action") return Promise.resolve(phone.receipt ?? null);
+        if (method === "send") {
+          sends.push(args as unknown as PhoneSend);
+          return Promise.resolve({
+            actionId: (args as { actionId: string }).actionId,
+            state: "sent",
+          });
+        }
         return Promise.resolve({
           items: phoneSeq > Number((args as { afterSeq: number }).afterSeq)
             ? [{ text: "新的私信" }]
@@ -103,6 +133,7 @@ async function fixture(responses: ModelResponse[]) {
       return eve;
     },
     messages,
+    sends,
     requestRest(wakeAt: string) {
       mindEvents.push({
         seq: mindEvents.length + 1,
@@ -406,6 +437,90 @@ Deno.test("原生脚本读取接线：工具表可用，结果直接进入下一
     await f.restart();
     await f.eve.pulse();
     assert.equal(f.eve.journal.events.filter((e) => e.kind === "tool_result").length, count);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("自然收尾接线：不额外请求模型或发告别，跨重启压缩接续，新私信照常唤醒", async () => {
+  const f = await fixture([
+    response("set_conversation", {
+      expectedSeq: 0,
+      conversationId: "qq:user:friend",
+      throughSeq: 20,
+      mode: "close",
+      summary: "聊完星星",
+      nextOpening: "有新观测再接",
+      pending: [],
+    }),
+    response("rest", decision),
+    response("act"),
+  ], { history: socialHistory });
+  try {
+    await f.eve.pulse();
+    await f.eve.pulse();
+    const saved = f.eve.journal.events.find((e) => e.kind === "conversation_state")!;
+    assert.ok(saved);
+    await f.eve.pulse();
+    assert.ok(JSON.stringify(f.messages[1]).includes("有新观测再接"));
+    await f.eve.pulse();
+    await f.eve.pulse();
+    assert.equal(f.messages.length, 2);
+    assert.equal(f.sends.length, 0);
+    await f.eve.journal.append("compression", { throughSeq: saved.seq, summary: "旧经历" });
+    await f.restart();
+    f.wake();
+    await f.eve.pulse();
+    assert.equal(f.messages.length, 3, "close不能屏蔽新私信");
+    assert.ok(JSON.stringify(f.messages[2]).includes("有新观测再接"));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("主动搭话恢复：中断后的原actionId已有unknown，不重新发送，不重复占机会", async () => {
+  const args = {
+    conversationId: "qq:user:friend",
+    throughSeq: 20,
+    focusId: "learn",
+    angle: "新观测",
+    text: "昨天那个有结果了",
+  };
+  const phone: { history: HistoryScreen; receipt?: PhoneActionReceipt } = {
+    history: socialHistory,
+  };
+  const f = await fixture(
+    [response("start_conversation", args), response("rest", decision)],
+    phone,
+  );
+  try {
+    await f.eve.pulse();
+    const e = f.eve.journal.events.find((event) => event.kind === "model_response")!;
+    const callId = `eve_${e.seq}_0`, actionId = `${callId}_outreach`;
+    const entry = {
+      actionId,
+      conversationId: args.conversationId,
+      throughSeq: 20,
+      focusId: "learn",
+      angle: args.angle,
+      at: new Date().toISOString(),
+    };
+    await f.eve.journal.append("outreach_start", { callId, entry, items: [entry] });
+    // Original platform action already exists, even though the Eve receipt was lost.
+    phone.receipt = { actionId, state: "unknown" };
+    await f.restart();
+    await f.eve.pulse();
+    assert.equal(f.sends.length, 0);
+    const result = f.eve.journal.events.find((event) => event.kind === "outreach_result")!;
+    assert.equal(
+      (result.data as unknown as { receipt: { receipt: PhoneActionReceipt } }).receipt.receipt
+        .state,
+      "unknown",
+    );
+    assert.equal(f.eve.journal.events.filter((event) => event.kind === "outreach_start").length, 1);
+    await f.restart();
+    await f.eve.pulse();
+    assert.equal(f.sends.length, 0, "持久回执后不重发");
   } finally {
     await f.close();
   }
