@@ -1,5 +1,5 @@
 /** 子代理是独立持久会话，不进入 QQ 平台；整条消息保存，不自动拆分。 */
-export type AgentRole = "review" | "coding" | "investigation";
+export type AgentRole = "review" | "coding" | "investigation" | "general";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export interface AgentConfig {
   role: AgentRole;
@@ -8,6 +8,8 @@ export interface AgentConfig {
   model?: string;
   reasoningEffort: ReasoningEffort;
   instructions: string;
+  /** 通用子代理实际请求跟随 Eve 当前连接、模型和思考强度，不建立私有配置。 */
+  modelSource?: "eve";
   /** 上游单次生成上限，不是消息字数上限，不自动拆成多条。 */
   maxOutputTokens?: number;
 }
@@ -39,7 +41,7 @@ export interface AgentJob {
   error?: { kind: string; message: string };
 }
 export interface AgentApi {
-  /** 创建任意多个同类/不同类实例；默认思考强度 high。 */
+  /** 创建任意多个同类/不同类实例；专用角色默认 high，general 跟随 Eve。 */
   create(
     args: {
       role: AgentRole;

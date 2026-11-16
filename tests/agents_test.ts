@@ -37,7 +37,7 @@ async function fixture(hooks: Partial<AgentHooks> = {}) {
     },
   };
 }
-Deno.test("agents: three high defaults, duplicate roles, isolated configuration and persistent conversations", async () => {
+Deno.test("agents: four high defaults, duplicate roles, isolated configuration and persistent conversations", async () => {
   const calls: { request: ModelRequest; options: ModelCallOptions; id: string }[] = [];
   const f = await fixture({
     complete(request, options, id) {
@@ -47,8 +47,13 @@ Deno.test("agents: three high defaults, duplicate roles, isolated configuration 
   });
   try {
     const defaults = f.api.list().items;
-    assert.equal(defaults.length, 3);
-    assert.deepEqual(defaults.map((x) => x.config.reasoningEffort), ["high", "high", "high"]);
+    assert.equal(defaults.length, 4);
+    assert.deepEqual(defaults.map((x) => x.config.reasoningEffort), [
+      "high",
+      "high",
+      "high",
+      "high",
+    ]);
     const first = await f.api.create({
       role: "coding",
       name: "编码甲",
@@ -97,7 +102,7 @@ Deno.test("agents: three high defaults, duplicate roles, isolated configuration 
     });
     await restored.initialize();
     try {
-      assert.equal(restored.list().items.length, 5);
+      assert.equal(restored.list().items.length, 6);
       assert.equal(
         restored.list().items.find((x) => x.agentId === second.agentId)!.config.reasoningEffort,
         "medium",

@@ -35,6 +35,11 @@ const roles: Record<AgentRole, { name: string; prompt: string }> = {
     prompt:
       "你是 Eve 的调查子代理。调查事实、日志、实现和公开资料，区分证据、推断与未知，给出来源和可执行结论。默认只调查，修改前须由 Eve 明确交代。",
   },
+  general: {
+    name: "通用子代理",
+    prompt:
+      "你是 Eve 的通用执行子代理。承接她派发的日常工作、资料整理、服务器巡检、操作与验证、创作交付和其他不限编码的任务。Eve 负责交流、决策与管理，你负责把授权范围内的工作推进到真实结果，遇到阻碍及时给出具体证据和下一步。先读已有约定与原件，保留原任务和动作句柄，不重复未知副作用。需要 Eve 决定时明确告诉她，不自行扩大任务范围。",
+  },
 };
 const efforts = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const allowed: Record<string, readonly string[]> = {
@@ -277,7 +282,7 @@ export class AgentService {
   }
   #config(role: unknown, args: Record<string, unknown>, previous?: AgentConfig): AgentConfig {
     if (typeof role !== "string" || !Object.hasOwn(roles, role)) {
-      throw new KernelError("rejected", "子代理类型须为review/coding/investigation");
+      throw new KernelError("rejected", "子代理类型须为review/coding/investigation/general");
     }
     const type = role as AgentRole;
     const config: AgentConfig = {
@@ -288,6 +293,13 @@ export class AgentService {
       ...this.defaults[type],
       ...previous,
     };
+    if (type === "general") {
+      if (args.model !== undefined && args.model !== null) {
+        throw new KernelError("rejected", "通用子代理跟随Eve当前模型，不单独指定模型");
+      }
+      config.modelSource = "eve";
+      delete config.model;
+    }
     if (args.name !== undefined) {
       if (typeof args.name !== "string" || !args.name.trim()) {
         throw new KernelError("rejected", "子代理名称不可为空");

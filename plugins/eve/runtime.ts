@@ -1,5 +1,6 @@
 import { READ_SCRIPT_TOOL, readScript } from "./script-reader.ts";
 import { defaultRestWake, eveCommandCompletions, selfActivityWindow } from "./activity.ts";
+import { DELEGATE_TOOL, delegateTask } from "./delegation.ts";
 import {
   continuityMessage,
   FOCUS_TOOL,
@@ -637,6 +638,23 @@ export class EveRuntime {
       });
     }
     let result: Json;
+    if (call.name === DELEGATE_TOOL.name && this.config.agentsEnabled) {
+      try {
+        result = {
+          status: "completed",
+          output: JSON.stringify(await delegateTask(this.ctx, call.args, call.id)),
+        };
+      } catch (error) {
+        const wire = toWireError(error);
+        if (wire.kind === "storage") throw error;
+        result = {
+          status: ["unknown", "timeout"].includes(wire.kind) ? "unknown" : "failed",
+          error: wire as unknown as Json,
+        };
+      }
+      await this.#saveToolResult(call.id, result);
+      return;
+    }
     if (call.name === FOCUS_TOOL.name && this.config.restReviewEnabled) {
       try {
         let focus = activeEvents(this.journal.events).find((e) =>
@@ -1007,6 +1025,7 @@ export class EveRuntime {
       WRITE_THOUGHT_TOOL,
       READ_SCRIPT_TOOL,
       ...CONTEXT_TOOLS,
+      ...(this.config.agentsEnabled ? [DELEGATE_TOOL] : []),
       ...(this.config.restReviewEnabled
         ? [FOCUS_TOOL, REST_TOOL, CONVERSATION_TOOL, OUTREACH_TOOL]
         : []),

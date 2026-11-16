@@ -494,7 +494,7 @@ export class RuntimeEngine {
     // Capture before the first await: an admitted request keeps its original client and provenance.
     const role = (args._agentConfig as unknown as Partial<AgentConfig> | undefined)?.role;
     const agentModel = namespace === "model" && method === "complete" &&
-        args._purpose === "isolated" && role &&
+        args._purpose === "isolated" && role && role !== "general" &&
         Object.hasOwn(this.options.agentModels ?? {}, role)
       ? this.options.agentModels![role]
       : undefined;
@@ -707,9 +707,19 @@ export class RuntimeEngine {
       }
       const image = description ? args.image as unknown as ModelImage : undefined;
       const { _purpose: purpose, _agentConfig: agentConfig, ...modelArgs } = args;
-      const overrides = agentConfig as unknown as ModelCallOptions | undefined;
+      let overrides = agentConfig as unknown as ModelCallOptions | undefined;
       if (overrides && (!id.startsWith("script_") && !id.startsWith("agent_"))) {
         throw new KernelError("rejected", "子代理模型配置需要独立任务编号");
+      }
+      if ((agentConfig as unknown as Partial<AgentConfig> | undefined)?.role === "general") {
+        // Resolve the current shared client on every request. Do not freeze a
+        // model/key/effort into the persistent general session or expose credentials.
+        overrides = {
+          sessionId: overrides?.sessionId,
+          ...(overrides?.maxOutputTokens === undefined
+            ? {}
+            : { maxOutputTokens: overrides.maxOutputTokens }),
+        };
       }
       const outputTokens = overrides?.maxOutputTokens ?? selected?.maxOutputTokens ??
         this.options.maxOutputTokens;
@@ -731,7 +741,13 @@ export class RuntimeEngine {
           }
           : {}),
         ...(overrides
-          ? { agentSession: overrides.sessionId, reasoningEffort: overrides.reasoningEffort }
+          ? {
+            ...(overrides.sessionId ? { agentSession: overrides.sessionId } : {}),
+            ...(overrides.reasoningEffort ? { reasoningEffort: overrides.reasoningEffort } : {}),
+            ...((agentConfig as unknown as Partial<AgentConfig>)?.role === "general"
+              ? { modelSource: "eve" }
+              : {}),
+          }
           : {}),
       } as unknown as Json);
       this.#responseIndex.set(id, savedResponse.seq);

@@ -3,6 +3,7 @@ import { readAgentModels } from "../services/runtime/agent-models.ts";
 import { RuntimeEngine } from "../services/runtime/engine.ts";
 import { ChatModelClient, type ChatModelOptions } from "../plugins/model-chat/client.ts";
 import { writeDurableJson } from "../sdk/durable-json.ts";
+import { KernelError } from "../kernel/protocol.ts";
 
 Deno.test("agent role profiles isolate credentials, inherit transport and preserve per-session choices", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-agent-models-" });
@@ -132,6 +133,107 @@ Deno.test("agent role profiles isolate credentials, inherit transport and preser
     }
   } finally {
     await engine?.close();
+    await server.shutdown();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("general agent follows Eve selection, credential and effort without a private profile", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-general-model-" });
+  const calls: { key: string | null; model: string; effort: string; cache: string }[] = [];
+  const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (req) => {
+    const body = await req.json();
+    calls.push({
+      key: req.headers.get("authorization"),
+      model: body.model,
+      effort: body.reasoning_effort,
+      cache: body.prompt_cache_key,
+    });
+    return Response.json({
+      choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+    });
+  });
+  const base: ChatModelOptions = {
+    baseUrl: `http://127.0.0.1:${server.addr.port}`,
+    protocol: "chat",
+    model: "eve-first",
+    apiKey: "eve-key-one",
+    reasoningEffort: "high",
+    maxOutputTokens: 8192,
+    timeoutMs: 10000,
+    sessionId: "eve",
+  };
+  const first = new ChatModelClient(base);
+  const second = new ChatModelClient({
+    ...base,
+    model: "eve-second",
+    apiKey: "eve-key-two",
+    reasoningEffort: "medium",
+  });
+  let selection = { client: first, modelName: "eve-first", maxOutputTokens: 8192, revision: 1 };
+  let engine: RuntimeEngine | undefined;
+  try {
+    await writeDurableJson(`${directory}/settings`, {
+      dailyTokenBudget: 1000000,
+      paused: false,
+      timeZone: "UTC",
+    });
+    engine = new RuntimeEngine({
+      directory: `${directory}/data`,
+      workspace: `${directory}/workspace`,
+      settingsFile: `${directory}/settings`,
+      model: first,
+      maxOutputTokens: 8192,
+      modelSelection: {
+        snapshot: () => selection,
+        current: () => ({ model: selection.modelName, revision: selection.revision }),
+      },
+    });
+    await engine.initialize();
+    const agent = engine.agents.list().items.find((a) => a.agentId === "agent_general")!;
+    assert.equal(agent.config.modelSource, "eve");
+    assert.equal(agent.config.model, undefined);
+    await assert.rejects(
+      engine.agents.configure({ agentId: "agent_general", model: "private-model" }),
+      KernelError,
+    );
+    await engine.dispatch("agents", "send", {
+      agentId: "agent_general",
+      text: "整理资料",
+    }, "agent_general_first");
+    selection = { client: second, modelName: "eve-second", maxOutputTokens: 8192, revision: 2 };
+    await engine.dispatch("agents", "send", {
+      agentId: "agent_general",
+      text: "继续下一步",
+    }, "agent_general_second");
+    const extra = await engine.agents.create({ role: "general" }, "extra_general");
+    assert.equal(extra.config.modelSource, "eve");
+    assert.equal(extra.config.model, undefined);
+    assert.deepEqual(calls.map(({ cache: _cache, ...call }) => call), [
+      { key: "Bearer eve-key-one", model: "eve-first", effort: "high" },
+      { key: "Bearer eve-key-two", model: "eve-second", effort: "medium" },
+    ]);
+    assert.equal(calls[0].cache, calls[1].cache, "same agent retains its stable cache identity");
+    assert.ok(
+      engine.modelResponses.events.every((e) =>
+        (e.data as { credentialProfile: string }).credentialProfile === "shared"
+      ),
+    );
+    assert.equal(JSON.stringify(engine.agents.journal.events).includes("eve-key"), false);
+    assert.equal(JSON.stringify(engine.transactions.events).includes("eve-key"), false);
+    const options = await readAgentModels(undefined, base);
+    assert.deepEqual(options, {});
+    await assert.rejects(
+      readAgentModels({
+        general: { model: "private", apiKeyFile: "/unused" },
+      }, base),
+      /私有模型配置无效/,
+    );
+  } finally {
+    await engine?.close();
+    first.close();
+    second.close();
     await server.shutdown();
     await Deno.remove(directory, { recursive: true });
   }
