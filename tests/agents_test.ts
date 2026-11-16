@@ -37,7 +37,7 @@ async function fixture(hooks: Partial<AgentHooks> = {}) {
     },
   };
 }
-Deno.test("agents: three high defaults, duplicate roles, isolated configuration and persistent conversations", async () => {
+Deno.test("agents: four high defaults, duplicate roles, isolated configuration and persistent conversations", async () => {
   const calls: { request: ModelRequest; options: ModelCallOptions; id: string }[] = [];
   const f = await fixture({
     complete(request, options, id) {
@@ -47,8 +47,13 @@ Deno.test("agents: three high defaults, duplicate roles, isolated configuration 
   });
   try {
     const defaults = f.api.list().items;
-    assert.equal(defaults.length, 3);
-    assert.deepEqual(defaults.map((x) => x.config.reasoningEffort), ["high", "high", "high"]);
+    assert.equal(defaults.length, 4);
+    assert.deepEqual(defaults.map((x) => x.config.reasoningEffort), [
+      "high",
+      "high",
+      "high",
+      "high",
+    ]);
     const first = await f.api.create({
       role: "coding",
       name: "编码甲",
@@ -97,7 +102,7 @@ Deno.test("agents: three high defaults, duplicate roles, isolated configuration 
     });
     await restored.initialize();
     try {
-      assert.equal(restored.list().items.length, 5);
+      assert.equal(restored.list().items.length, 6);
       assert.equal(
         restored.list().items.find((x) => x.agentId === second.agentId)!.config.reasoningEffort,
         "medium",
@@ -228,7 +233,7 @@ Deno.test("agents: tool loop preserves pairing, receipts, final one-message repl
     await f.close();
   }
 });
-Deno.test("agents: interrupted accepted job becomes one unknown reply after restart, never replays; tampered body fails closed", async () => {
+Deno.test("agents: interrupted accepted job resumes once after restart; completed jobs stay done and tampered body fails closed", async () => {
   const f = await fixture();
   try {
     const job = await f.api.send({ agentId: "agent_review", text: "recover" }, "agent_original");
@@ -251,13 +256,15 @@ Deno.test("agents: interrupted accepted job becomes one unknown reply after rest
     const recovered = new AgentService(interrupted, {
       complete() {
         models++;
-        return Promise.resolve(response("must not replay"));
+        return Promise.resolve(response("recovered reply"));
       },
       invoke: () => Promise.resolve(null),
     });
     await recovered.initialize();
-    assert.equal(models, 0);
-    assert.equal(recovered.status({ jobId: job.jobId }).status, "unknown");
+    const resumed = await recovered.send({ agentId: job.agentId, text: "recover" }, job.jobId);
+    assert.equal(models, 1);
+    assert.equal(resumed.status, "completed");
+    assert.equal(recovered.journal.events.filter((e) => e.kind === "accepted").length, 1);
     assert.equal(recovered.notifications().items.length, 1);
     await recovered.close();
     const again = new AgentService(interrupted, {
@@ -469,7 +476,7 @@ Deno.test("agents: restart recovers persisted final response before transcript o
         assert.equal(done.status, "completed");
         assert.equal((await restored.message({ seq: done.replySeq! })).text, "完整回复");
         assert.equal(restored.notifications().items.length, 1);
-        assert.equal(queried, 1);
+        assert.equal(queried, withStep ? 0 : 1);
       } finally {
         await restored.close();
       }

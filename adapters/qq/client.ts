@@ -41,6 +41,7 @@ export type QqErrorCategory =
   | "authentication"
   | "rate_limit"
   | "platform"
+  | "not_found"
   | "transport"
   | "invalid_response"
   | "pending"
@@ -54,8 +55,13 @@ export type QqGroupPermission = {
 export interface QqErrorInfo {
   category: QqErrorCategory;
   httpStatus?: number;
+  /** Legacy platform code, retained independently of err_code. */
   code?: number;
+  /** Preferred classification code from the platform's err_code field. */
+  errCode?: number;
   traceId?: string;
+  /** Platform message verbatim, except locally known credentials are redacted. Not for logs. */
+  message?: string;
   /** 仅记录受控分类，不携带 fetch 原始异常、URL、凭据或请求正文。 */
   transportReason?: "timeout" | "aborted" | "network";
   /** headers 包括建连及等待响应头；不据此猜测请求是否已经送达。 */
@@ -74,7 +80,8 @@ export interface QqErrorInfo {
 export class QqRequestError extends Error {
   constructor(readonly info: QqErrorInfo) {
     // 不把服务端任意正文、URL、凭据或 fetch 错误原文写进日志。
-    super(`QQ 请求未完成：${info.category}${info.code === undefined ? "" : ` (${info.code})`}`);
+    const code = info.errCode ?? info.code;
+    super(`QQ 请求未完成：${info.category}${code === undefined ? "" : ` (${code})`}`);
     this.name = "QqRequestError";
   }
 }
@@ -129,21 +136,39 @@ function requestError(): never {
   throw new QqRequestError({ category: "request" });
 }
 
-function codeOf(data: Record<string, unknown>): number | undefined {
-  // 新文档用 err_code，旧接口/访问凭证用 code。不能把错误字段类型不对当成成功。
-  let code: number | undefined;
+function parsedCode(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function responseDetails(response: ResponseInfo) {
+  const message = typeof response.data.message === "string"
+    ? response.data.message
+    : typeof response.data.msg === "string"
+    ? response.data.msg
+    : undefined;
+  return {
+    httpStatus: response.httpStatus,
+    code: parsedCode(response.data.code),
+    errCode: parsedCode(response.data.err_code),
+    traceId: response.traceId,
+    ...(message === undefined ? {} : { message }),
+    ...(response.retryAfterMs === undefined ? {} : { retryAfterMs: response.retryAfterMs }),
+  };
+}
+
+function codeOf(response: ResponseInfo): number | undefined {
+  // code and err_code use different namespaces; equality is not a validity condition.
+  const { code, errCode } = responseDetails(response);
   for (const key of ["err_code", "code"]) {
-    if (!(key in data)) continue;
-    const value = data[key];
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-      throw new QqRequestError({ category: "invalid_response" });
+    if (key in response.data && parsedCode(response.data[key]) === undefined) {
+      // Invalid success metadata must not permit a send. A known HTTP rejection
+      // remains a rejection even when its error payload uses an unexpected type.
+      if (response.httpStatus < 400) {
+        throw new QqRequestError({ category: "invalid_response", ...responseDetails(response) });
+      }
     }
-    if (code !== undefined && value !== code) {
-      throw new QqRequestError({ category: "invalid_response" });
-    }
-    code = value;
   }
-  return code;
+  return errCode ?? code;
 }
 
 function traceOf(data: Record<string, unknown>, header: string | null): string | undefined {
@@ -159,13 +184,13 @@ function errorInfo(response: ResponseInfo, code?: number): QqErrorInfo {
     ? "rate_limit"
     : response.httpStatus === 401 || code === 100016 || code === 11243
     ? "authentication"
+    : response.httpStatus >= 400 && response.httpStatus < 500 &&
+        (code === 11255 || code === 40011028)
+    ? "not_found"
     : "platform";
   return {
     category,
-    httpStatus: response.httpStatus,
-    code,
-    traceId: response.traceId,
-    ...(response.retryAfterMs === undefined ? {} : { retryAfterMs: response.retryAfterMs }),
+    ...responseDetails(response),
   };
 }
 
@@ -209,16 +234,20 @@ async function readObject(response: Response, limit: number): Promise<Record<str
     bytes.set(chunk, offset);
     offset += chunk.length;
   }
-  let parsed: unknown;
+  let text: string;
   try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     throw new QqRequestError({ category: "invalid_response", httpStatus: response.status });
   }
-  if (!object(parsed)) {
-    throw new QqRequestError({ category: "invalid_response", httpStatus: response.status });
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (object(parsed)) return parsed;
+  } catch {
+    // Gateways may serve plain text or HTML for a definite HTTP rejection.
   }
-  return parsed;
+  if (response.status >= 400) return { message: text };
+  throw new QqRequestError({ category: "invalid_response", httpStatus: response.status });
 }
 
 function textBody(request: QqSendText): Record<string, unknown> {
@@ -386,6 +415,16 @@ export class QqClient {
         if (!(error instanceof QqRequestError) || response.status < 400) throw error;
         data = {};
       }
+      // Preserve platform explanations in receipts, never echo our known credentials.
+      // Error.message stays a controlled summary even when the response is arbitrary text.
+      for (const key of ["message", "msg"]) {
+        if (typeof data[key] !== "string") continue;
+        for (const secret of [this.#credentials.appSecret, this.#token?.value, data.access_token]) {
+          if (typeof secret === "string" && secret) {
+            data[key] = (data[key] as string).split(secret).join("[redacted]");
+          }
+        }
+      }
       return {
         httpStatus: response.status,
         data,
@@ -447,7 +486,7 @@ export class QqClient {
         headers: { Authorization: `QQBot ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify(data),
       }, { timeoutMs: remaining() });
-      const code = codeOf(response.data);
+      const code = codeOf(response);
       if (!statuses.includes(response.httpStatus) || (code !== undefined && code !== 0)) {
         throw new QqRequestError(errorInfo(response, code));
       }
@@ -535,7 +574,7 @@ export class QqClient {
         clientSecret: this.#credentials.appSecret,
       }),
     }, { origin: this.#tokenBase, timeoutMs: this.#tokenTimeout });
-    const code = codeOf(response.data);
+    const code = codeOf(response);
     if (response.httpStatus !== 200 || (code !== undefined && code !== 0)) {
       throw new QqRequestError({ ...errorInfo(response, code), failureStage: "auth" });
     }
@@ -579,7 +618,7 @@ export class QqClient {
     const response = await this.#sdk("getGateway", [], {
       headers: { Authorization: `QQBot ${token}` },
     });
-    const code = codeOf(response.data);
+    const code = codeOf(response);
     if (response.httpStatus !== 200 || (code !== undefined && code !== 0)) {
       throw new QqRequestError(errorInfo(response, code));
     }
@@ -654,7 +693,7 @@ export class QqClient {
     const response = await this.#sdk("getMe", [], {
       headers: { Authorization: `QQBot ${token}` },
     });
-    const code = codeOf(response.data);
+    const code = codeOf(response);
     if (response.httpStatus !== 200 || (code !== undefined && code !== 0)) {
       throw new QqRequestError(errorInfo(response, code));
     }
@@ -685,7 +724,7 @@ export class QqClient {
         const response = await this.#sdk("getGuildBotState", [target], {
           headers: { Authorization: `QQBot ${token}` },
         }, { timeoutMs: Math.min(2_000, this.#timeout) });
-        const code = codeOf(response.data);
+        const code = codeOf(response);
         if (
           response.httpStatus === 200 && (code === undefined || code === 0) &&
           typeof response.data.allow_proactive_msg === "boolean"
@@ -798,7 +837,7 @@ export class QqClient {
       }
       let code: number | undefined;
       try {
-        code = codeOf(upload.data);
+        code = codeOf(upload);
       } catch (error) {
         return {
           status: "failed",
@@ -853,7 +892,7 @@ export class QqClient {
     }
     let code: number | undefined;
     try {
-      code = codeOf(response.data);
+      code = codeOf(response);
     } catch (error) {
       return { status: "unknown", attempted: true, error: (error as QqRequestError).info };
     }

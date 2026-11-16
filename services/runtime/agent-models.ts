@@ -6,7 +6,8 @@ export type AgentModels = Partial<
   Record<AgentRole, ModelSnapshot & { reasoningEffort: ReasoningEffort }>
 >;
 
-/** Private role credentials stay in the host configuration, never in agent messages or receipts. */
+/** Private specialist credentials stay on the host. General always follows Eve,
+ * so it deliberately has no entry in this private profile format. */
 export async function readAgentModels(
   value: unknown,
   inherited: ChatModelOptions,
