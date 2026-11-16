@@ -15,6 +15,8 @@ export interface AgentConfig {
 }
 export interface AgentView {
   agentId: string;
+  /** 由该子代理创建的帮手；省略表示 Eve 的直接帮手。 */
+  parentAgentId?: string;
   config: AgentConfig;
   state: "idle" | "working" | "closed";
   unread: number;
@@ -25,6 +27,8 @@ export interface AgentMessagePreview {
   seq: number;
   agentId: string;
   jobId: string;
+  parentJobId?: string;
+  rootJobId?: string;
   direction: "incoming" | "outgoing";
   at: string;
   preview: string;
@@ -35,6 +39,10 @@ export interface AgentMessagePreview {
 export interface AgentJob {
   jobId: string;
   agentId: string;
+  /** 上级任务与最初 Eve 委托，重启后仍保留完整任务链。 */
+  parentJobId?: string;
+  rootJobId?: string;
+  childJobIds?: string[];
   status: AgentMessagePreview["status"];
   requestSeq: number;
   replySeq?: number;

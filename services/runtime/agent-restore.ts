@@ -2,6 +2,7 @@ import type { AgentConfig, AgentJob, AgentMessagePreview } from "../../contracts
 import type { Message, ModelResponse } from "../../contracts/model.ts";
 import { KernelError } from "../../kernel/protocol.ts";
 import type { FactEvent, FactJournal } from "../../sdk/fact-journal.ts";
+import { agentDeliveries } from "./agent-delegation.ts";
 
 export interface BlobRef {
   hash: string;
@@ -16,6 +17,7 @@ export interface StoredJob extends AgentJob {
 }
 export interface Session {
   id: string;
+  parentAgentId?: string;
   config: AgentConfig;
   closed: boolean;
   readThrough: number;
@@ -41,8 +43,15 @@ export function applyAgentEvent(state: AgentState, event: FactEvent) {
   if (event.kind === "created") {
     const config = d.config as AgentConfig, id = String(d.agentId);
     if (state.sessions.has(id)) throw new KernelError("corrupt", "子代理标识重复");
+    if (
+      d.parentAgentId !== undefined && (
+        typeof d.parentAgentId !== "string" ||
+        state.sessions.get(d.parentAgentId)?.config.role !== "general" || config.role === "general"
+      )
+    ) throw new KernelError("corrupt", "子代理会话派工层级无效");
     state.sessions.set(id, {
       id,
+      ...(d.parentAgentId === undefined ? {} : { parentAgentId: String(d.parentAgentId) }),
       config,
       closed: false,
       readThrough: 0,
@@ -78,6 +87,15 @@ export function applyAgentEvent(state: AgentState, event: FactEvent) {
     const accepted = structuredClone(d.job) as StoredJob;
     if (state.jobs.has(accepted.jobId)) throw new KernelError("corrupt", "子代理任务重复");
     if (accepted.agentId !== session.id) throw new KernelError("corrupt", "子代理任务会话不符");
+    if (accepted.parentJobId) {
+      const parent = state.jobs.get(accepted.parentJobId);
+      if (
+        !parent || parent.config.role !== "general" || parent.replySeq ||
+        session.parentAgentId !== parent.agentId || accepted.config.role === "general" ||
+        accepted.rootJobId !== (parent.rootJobId ?? parent.jobId)
+      ) throw new KernelError("corrupt", "子代理派工层级或归属无效");
+      (parent.childJobIds ??= []).push(accepted.jobId);
+    }
     accepted.requestSeq = event.seq;
     state.jobs.set(accepted.jobId, accepted);
     session.jobs.push(accepted.jobId);
@@ -100,7 +118,8 @@ export function applyAgentEvent(state: AgentState, event: FactEvent) {
     replied.error = d.error as AgentJob["error"];
     state.messages.set(event.seq, message);
     session.messages.push(event.seq);
-    state.notifications.push(event.seq);
+    // Specialized deliveries go to their general coordinator, not Eve's inbox.
+    if (!replied.parentJobId) state.notifications.push(event.seq);
   } else throw new KernelError("corrupt", "子代理事件类型无效");
 }
 
@@ -119,6 +138,12 @@ export function transcriptCursor(transcript: Message[]) {
       assistant = message;
       completed = 0;
       step++;
+    } else if (
+      message.role === "user" && agentDeliveries(message) && assistant &&
+      (!assistant.toolCalls?.length || completed === assistant.toolCalls.length)
+    ) {
+      assistant = undefined;
+      completed = 0;
     } else if (
       message.role === "tool" && assistant?.toolCalls?.[completed] &&
       message.toolCallId === assistant.toolCalls[completed].id
@@ -143,6 +168,7 @@ interface RestoreHooks {
   result?(id: string): ModelResponse | undefined;
   step(job: StoredJob, message: Message): Promise<void>;
   finish(job: StoredJob, status: StoredJob["status"], text: string): Promise<void>;
+  canFinish?(job: StoredJob, transcript: Message[]): boolean;
 }
 
 /** Validate all originals before changing the journal or admitting resumed work.
@@ -179,12 +205,16 @@ export async function restoreAgents(
           : "任务已取消，未开始后续工作。",
       );
     } else if (cursor.assistant && !cursor.assistant.toolCalls?.length) {
-      await hooks.finish(job, "completed", cursor.assistant.content);
+      if (hooks.canFinish?.(job, transcript) !== false) {
+        await hooks.finish(job, "completed", cursor.assistant.content);
+      }
     } else if (!cursor.assistant || cursor.completed === cursor.assistant.toolCalls?.length) {
       const saved = hooks.result?.(`${job.jobId}_model_${cursor.step + 1}`);
       if (saved && !saved.toolCalls.length) {
         await hooks.step(job, assistantMessage(saved));
-        await hooks.finish(job, "completed", saved.content);
+        if (hooks.canFinish?.(job, [...transcript, assistantMessage(saved)]) !== false) {
+          await hooks.finish(job, "completed", saved.content);
+        }
       }
     }
   }
