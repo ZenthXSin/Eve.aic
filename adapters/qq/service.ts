@@ -2,6 +2,7 @@ import { QQ_THIRD_PARTY_SDK } from "./satori/api.ts";
 import { type QqModelCommandOptions, QqModelCommands } from "./model-command.ts";
 import { QqSendActions } from "./actions.ts";
 import { QqClient } from "./client.ts";
+import { QqGroupNames } from "./contacts.ts";
 import { QqPhone } from "./phone.ts";
 import { QqReceiver, type QqReceiverStatus } from "./receiver.ts";
 import { startPhoneRpc } from "./rpc.ts";
@@ -118,6 +119,7 @@ export async function startQqPhoneAdapter(
       device,
       downloads,
       true,
+      new QqGroupNames((openId, signal) => client.groupInfo(openId, signal)),
     );
     prefetch.start();
     if (options.captureActivationBoundary) await ensurePhoneActivationBoundary(phone, directory);

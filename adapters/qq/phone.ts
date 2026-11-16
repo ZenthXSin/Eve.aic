@@ -24,7 +24,7 @@ import { fingerprint } from "../../kernel/calls.ts";
 import type { Json } from "../../kernel/protocol.ts";
 
 import { admitBurst, readBurst, waitForQuiet } from "./phone-social.ts";
-import { contactIndex, messageMentions } from "./contacts.ts";
+import { contactIndex, messageMentions, QqGroupNames } from "./contacts.ts";
 
 const SCREEN = { pageSize: 8, previewCharacters: 160, attachmentPageSize: 4 };
 const NOTICE = { ...SCREEN, previewCharacters: 80 };
@@ -130,6 +130,7 @@ export class QqPhone {
     readonly device?: QqPhoneDevice,
     readonly downloads?: QqPhoneDownloads,
     readonly autoDownloadAttachments = false,
+    readonly groupNames?: QqGroupNames,
   ) {}
 
   async #snapshot(options: { storedNotifications?: boolean; notificationAfterSeq?: number } = {}) {
@@ -206,7 +207,9 @@ export class QqPhone {
     const rows = await this.timeline.snapshot(sources);
     for (const row of rows) {
       const settings = this.device?.get(row.message.conversationId);
-      const platformName = contacts.conversations.get(row.message.conversationId);
+      const id = row.message.conversationId;
+      const platformName = contacts.conversations.get(id) ??
+        (id.startsWith("qq:group:") ? this.groupNames?.peek(id.slice(9)) : undefined);
       if (platformName || settings?.remark || settings?.alias) {
         row.message.conversation = {
           ...(platformName ? { platformName } : {}),
@@ -272,6 +275,32 @@ export class QqPhone {
     return rows;
   }
 
+  /** Only fetch for groups on the requested page/screen, not every historical group. */
+  async #platformNames(messages: PhoneMessage[]) {
+    if (!this.groupNames) return;
+    const groups = new Map<string, PhoneMessage[]>();
+    for (const message of messages) {
+      if (!message.conversationId.startsWith("qq:group:")) continue;
+      const openId = message.conversationId.slice(9);
+      const group = groups.get(openId) ?? [];
+      group.push(message);
+      groups.set(openId, group);
+    }
+    await Promise.all([...groups].map(async ([openId, group]) => {
+      // Envelope names remain platform facts; never overwrite local alias/remark.
+      if (this.#contacts.conversations.has(`qq:group:${openId}`)) return;
+      const name = await this.groupNames!.get(openId);
+      for (const message of group) {
+        const { platformName: _oldName, ...local } = message.conversation ?? {};
+        message.conversation = {
+          ...local,
+          ...(name === undefined ? {} : { platformName: name }),
+        };
+        if (!Object.keys(message.conversation).length) delete message.conversation;
+      }
+    }));
+  }
+
   /** 下载只取平台真实附件，复用同一个显式下载通道与并发去重。 */
   async prefetchAttachments(record: InboundRecord) {
     if (!this.downloads) return;
@@ -327,6 +356,7 @@ export class QqPhone {
       Number(pinned(b.conversationId)) - Number(pinned(a.conversationId)) || b.seq - a.seq
     );
     const page = eligible.slice(0, SCREEN.pageSize);
+    await this.#platformNames(page);
     const pending = new Map<string, number>();
     for (const row of rows) {
       const id = row.message.conversationId;
@@ -399,6 +429,10 @@ export class QqPhone {
     // open 不接受历史游标，防止将向前翻页误作打开最新一屏。
     if (Object.hasOwn(args, "cursor")) throw new QqPhoneError("request");
     const rows = await this.#snapshot();
+    await this.#platformNames(
+      rows.filter((row) => row.message.conversationId === args.conversationId)
+        .slice(-SCREEN.pageSize).map((row) => row.message),
+    );
     const screen = historyScreen(
       rows.map((row) => row.message),
       args.conversationId,
@@ -434,6 +468,13 @@ export class QqPhone {
     if (args.cursor && args.cursor.snapshotThroughSeq > (rows.at(-1)?.message.seq ?? 0)) {
       throw new QqPhoneError("request");
     }
+    await this.#platformNames(
+      rows.filter((row) =>
+        row.message.conversationId === args.conversationId &&
+        (!args.cursor || row.message.seq <= args.cursor.snapshotThroughSeq &&
+            row.message.seq < args.cursor.beforeSeq)
+      ).slice(-SCREEN.pageSize).map((row) => row.message),
+    );
     return historyScreen(
       rows.map((row) => row.message),
       args.conversationId,
@@ -443,7 +484,7 @@ export class QqPhone {
     );
   }
 
-  async #message(handle: { conversationId: string; seq: number }) {
+  async #message(handle: { conversationId: string; seq: number }, display = false) {
     handle = {
       ...handle,
       conversationId: this.device?.resolve(handle?.conversationId) ?? handle?.conversationId,
@@ -454,6 +495,7 @@ export class QqPhone {
       message.seq === handle.seq && message.conversationId === handle.conversationId
     );
     if (!found) throw new QqPhoneError("not_found");
+    if (display) await this.#platformNames([found.message]);
     return found.message;
   }
 
@@ -462,7 +504,7 @@ export class QqPhone {
     attachmentOffset?: number;
   }) {
     return messageScreen(
-      await this.#message(args.handle),
+      await this.#message(args.handle, true),
       SCREEN,
       this.now(),
       args.attachmentOffset,
@@ -498,6 +540,7 @@ export class QqPhone {
         message.conversation?.platformName?.includes(args.query))
     );
     const page = eligible.slice(-SCREEN.pageSize);
+    await this.#platformNames(page);
     return {
       messages: page.map((message) => messageScreen(message, SCREEN, this.now())),
       snapshotThroughSeq: through,
@@ -520,6 +563,7 @@ export class QqPhone {
       row.message.seq > (this.reading.get(row.message.conversationId)?.notificationThroughSeq ?? 0)
     );
     const page = eligible.slice(0, SCREEN.pageSize);
+    await this.#platformNames(page.map((row) => row.message));
     return {
       items: page.map((row) => messageScreen(row.message, NOTICE, this.now())),
       // 队列尚有未展示通知时，只确认本页末尾；不因快照末尾有更多通知就跳过。

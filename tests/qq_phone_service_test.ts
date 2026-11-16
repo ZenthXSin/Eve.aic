@@ -974,6 +974,7 @@ Deno.test("QQ组合配置沿用缺省private，接受all并拒绝无效scope", a
 Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持原回执不重发", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-phone-group-scope-" });
   const paths: string[] = [];
+  let groupQueries = 0;
   const sockets = new Set<WebSocket>();
   const platform = Deno.serve(
     { hostname: "127.0.0.1", port: 0, onListen() {} },
@@ -988,6 +989,13 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
           url: `ws://127.0.0.1:${platform.addr.port}/websocket`,
           session_start_limit: { remaining: 100 },
         });
+      }
+      if (path === "/v2/groups/scope-group/info") {
+        groupQueries++;
+        assert.equal(r.method, "GET");
+        assert.equal(r.headers.get("Authorization"), "QQBot fixture-token");
+        assert.equal(r.headers.get("X-Union-Appid"), "fixture");
+        return Response.json({ group_openid: "scope-group", group_name: "真实范围测试群" });
       }
       if (path.startsWith("/v2/")) {
         paths.push(path);
@@ -1054,6 +1062,21 @@ Deno.test("真实QQ适配器范围贯穿健康、群REST和私信，重启保持
       const health = await rpc!.call("health") as { available: boolean; replyScope: string };
       assert.equal(health.available, true);
       assert.equal(health.replyScope, scope);
+      const queriesBefore = groupQueries;
+      const list = await rpc!.call("conversations") as {
+        items: {
+          conversationId: string;
+          platformName?: string;
+          latest: { conversation?: { platformName?: string } };
+        }[];
+      };
+      const groupItem = list.items.find((item) => item.conversationId === "qq:group:scope-group")!;
+      assert.equal(groupItem.platformName, "真实范围测试群");
+      assert.equal(groupItem.latest.conversation?.platformName, "真实范围测试群");
+      await rpc!.call("history", { conversationId: "qq:group:scope-group" });
+      await rpc!.call("conversations");
+      assert.equal(groupQueries, queriesBefore + 1);
+
       const group = {
         actionId: "scope-group-action",
         conversationId: "qq:group:scope-group",

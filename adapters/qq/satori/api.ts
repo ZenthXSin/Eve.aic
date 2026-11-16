@@ -17,6 +17,7 @@ export async function sdkRequest<T>(
     | "getMe"
     | "getGateway"
     | "getGuildBotState"
+    | "getGuildInfo"
     | "sendPrivateMessage"
     | "sendMessage"
     | "sendFilePrivate"
