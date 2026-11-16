@@ -1,4 +1,4 @@
-import type { MemorySource, MemoryView } from "../../contracts/memory.ts";
+import type { MemorySource, MemoryView, SearchHit } from "../../contracts/memory.ts";
 import { fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
@@ -189,20 +189,31 @@ export class MemoryStore {
     ) throw new KernelError("rejected", "记忆检索参数无效");
     const candidates = this.#views().filter((m) => m.level < 4 && !m.quarantined);
     let retrieval: "semantic" | "lexical" = this.embed || this.searchIndex ? "semantic" : "lexical";
-    if (!candidates.length) return { items: [], retrieval, guidance: RECALL_GUIDANCE };
+    if (!candidates.length && !this.searchIndex) {
+      return {
+        items: [],
+        related: [] as (SearchHit & { historical: true })[],
+        retrieval,
+        guidance: RECALL_GUIDANCE,
+      };
+    }
     const indexed = new Map<string, number>();
+    let relatedHits: SearchHit[] = [];
     let indexAvailable = false;
     let index: Awaited<ReturnType<SemanticSearch["search"]>>["index"] | undefined;
     if (this.searchIndex) {
       try {
         const found = await this.searchIndex.search({
           query: args.query.slice(-2048),
-          collection: "memory",
+          collections: ["memory", "notes", "chat"],
           mode: "hybrid",
           limit: 40,
         });
         indexAvailable = true;
         index = found.index;
+        relatedHits = found.items.filter((hit) =>
+          ["notes", "chat"].includes(hit.source.collection)
+        );
         for (const hit of found.items) {
           if (
             hit.source.collection === "memory" && hit.source.id &&
@@ -221,7 +232,9 @@ export class MemoryStore {
         if (!this.embed) retrieval = "lexical";
       }
     }
-    const query = this.embed && !indexAvailable ? await this.embed(args.query, "query") : undefined,
+    const query = candidates.length && this.embed && !indexAvailable
+        ? await this.embed(args.query, "query")
+        : undefined,
       scored = [];
     // Existing asynchronous index handles semantic candidates; new/unindexed
     // formations still participate through their original lexical text.
@@ -276,6 +289,28 @@ export class MemoryStore {
           .length
       ).slice(0, limit),
     );
+    const related = relatedHits.filter((hit) =>
+      !this.quarantine.excluded(
+        hit.source.contextRecordSeq,
+        ...(hit.source.sources ?? []).map((source) => source.recordSeq),
+      ).length
+    ).map((hit) => {
+      const text = `${hit.title}\n${hit.excerpt}`.toLocaleLowerCase();
+      const lexical = terms.length
+        ? terms.filter((term) => text.includes(term)).length / terms.length
+        : 0;
+      const recency = Number.isFinite(Date.parse(hit.at))
+        ? Math.exp(-Math.max(0, this.now() - Date.parse(hit.at)) / (60 * 86400000))
+        : 0;
+      const excerpt = Array.from(hit.excerpt).slice(0, 280).join("");
+      return {
+        ...hit,
+        excerpt,
+        excerptTruncated: excerpt !== hit.excerpt,
+        historical: true as const,
+        rankingScore: 0.65 * (hit.semanticScore ?? 0) + 0.15 * lexical + 0.1 * recency,
+      };
+    }).sort((a, b) => b.rankingScore - a.rankingScore || b.score - a.score).slice(0, 2);
     if (items.length) {
       await this.journal.append("recalled", {
         ids: items.map((m) => m.id),
@@ -284,6 +319,7 @@ export class MemoryStore {
     }
     return {
       items,
+      related,
       retrieval,
       ...(index ? { index } : {}),
       guidance: RECALL_GUIDANCE,

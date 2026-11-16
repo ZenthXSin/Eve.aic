@@ -185,13 +185,24 @@ Deno.test("自动回忆接索引：复用本机向量服务，未索引和服务
   const records = new FactJournal(`${directory}/records`);
   let indexedId = "", unavailable = false, searches = 0;
   const searchIndex = {
-    search(args: { collection: string; query: string }) {
+    search(args: { collections: string[]; query: string }) {
       searches++;
-      assert.equal(args.collection, "memory");
+      assert.deepEqual(args.collections, ["memory", "notes", "chat"]);
       assert.ok(args.query.length <= 2048);
       if (unavailable) throw new KernelError("unavailable", "索引重启中");
       return Promise.resolve({
-        items: [{ source: { collection: "memory", id: indexedId }, semanticScore: 0.8 }],
+        items: [
+          { source: { collection: "memory", id: indexedId }, semanticScore: 0.8 },
+          {
+            source: { collection: "notes", id: "note1", seq: 1 },
+            title: "相关便签",
+            excerpt: "旧便签内容".repeat(100),
+            at: new Date().toISOString(),
+            score: 0.03,
+            semanticScore: 0.75,
+            untrusted: true,
+          },
+        ],
       });
     },
   } as unknown as SemanticSearch;
@@ -211,6 +222,9 @@ Deno.test("自动回忆接索引：复用本机向量服务，未索引和服务
     assert.equal(indexed.retrieval, "semantic");
     assert.equal(indexed.items[0].id, semantic.id);
     assert.equal(indexed.items[0].ranking.semantic, 0.8);
+    assert.equal(indexed.related[0].source.collection, "notes");
+    assert.equal(indexed.related[0].historical, true);
+    assert.ok(indexed.related[0].excerpt.length <= 280);
     const fresh = await memory.remember({
       text: "今天修了文件发送。",
       entities: ["文件发送"],
@@ -222,6 +236,7 @@ Deno.test("自动回忆接索引：复用本机向量服务，未索引和服务
     const fallback = await memory.recall({ query: "文件发送" });
     assert.equal(fallback.retrieval, "lexical");
     assert.equal(fallback.items[0].id, fresh.id);
+    assert.deepEqual(fallback.related, []);
     assert.equal(searches, 3, "每次召回只有一次现有索引查询");
   } finally {
     await memory.close();

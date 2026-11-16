@@ -40,6 +40,8 @@ export interface MemoryApi {
     /** 已配置向量模型时结合语义与词法排序，否则用词法召回。 */
     retrieval: "lexical" | "semantic";
     guidance?: string;
+    /** 少量相关便签或 Eve 参与过的聊天线索；按 source 展开原件。 */
+    related?: (SearchHit & { historical: true })[];
     /** 本机异步索引进度；新记忆未入索引时仍用词法兜底。 */
     index?: SearchStatus;
   }>;
@@ -74,6 +76,8 @@ export type SearchCollection = "notes" | "chat" | "agents" | "records" | "memory
 export interface SearchQuery {
   query: string;
   collection?: SearchCollection | "all";
+  /** 只扫描这些集合；可用于同时召回便签、互动聊天和记忆，避免扫描意识工具日志。 */
+  collections?: SearchCollection[];
   mode?: "hybrid" | "semantic" | "literal";
   limit?: number;
   afterSeq?: number;

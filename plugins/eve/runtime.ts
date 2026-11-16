@@ -1092,7 +1092,7 @@ export class EveRuntime {
               e.kind === "notice" && (e.data as { source?: string }).source === "memory"
             );
             if (query && (lastRecall?.data as { anchor?: number } | undefined)?.anchor !== anchor) {
-              let recalled: { items: Json[]; guidance?: string };
+              let recalled: { items: Json[]; related?: Json[]; guidance?: string };
               try {
                 recalled = await this.ctx.call("memory", "recall", {
                   query,
@@ -1100,6 +1100,7 @@ export class EveRuntime {
                   _actionId: `recall_${anchor}`,
                 }) as {
                   items: Json[];
+                  related?: Json[];
                   guidance?: string;
                 };
               } catch (error) {
@@ -1115,6 +1116,7 @@ export class EveRuntime {
                 source: "memory",
                 anchor,
                 items: recalled.items,
+                ...(recalled.related?.length ? { related: recalled.related } : {}),
                 ...(recalled.guidance ? { guidance: recalled.guidance } : {}),
               });
             }
