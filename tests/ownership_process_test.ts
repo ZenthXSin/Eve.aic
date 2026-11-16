@@ -42,8 +42,12 @@ function process(entry: string, config: string) {
       await waitFor(async () => {
         if (stdout.includes(`"${marker}"`)) return true;
         if (terminal) {
-          await errors;
-          throw new Error(`实际子进程在就绪前退出：${stderr}`);
+          const [result] = await Promise.all([status, output, errors]);
+          throw new Error(
+            `实际子进程在就绪前退出：${
+              JSON.stringify({ entry, marker, ...result, stdout, stderr })
+            }`,
+          );
         }
         return false;
       });

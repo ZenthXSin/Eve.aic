@@ -6,7 +6,8 @@ import { OwnershipFence } from "../../../sdk/ownership-fence.ts";
 
 if (import.meta.main) {
   const config = JSON.parse(await Deno.readTextFile(Deno.args[0]));
-  const client = new OwnershipRpcClient(config.url, config.exitKey, 1000);
+  // RPC 预算 5 秒，容纳高负载延迟并为父进程 ready() 的 10 秒上限留足余量。
+  const client = new OwnershipRpcClient(config.url, config.exitKey, 5000);
   const fence = new OwnershipFence(config.fence, "phone", new OwnershipExitClient(client));
   await fence.initialize();
   try {
