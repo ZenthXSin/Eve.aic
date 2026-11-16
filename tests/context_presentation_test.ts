@@ -52,6 +52,12 @@ Deno.test("结构化回执：调用完成与后台任务分离，unknown和扩�
       status,
     );
   }
+  const failed = project({
+    status: "completed",
+    output: JSON.stringify({ jobId: "failed", status: "failed", error: { kind: "rejected" } }),
+  }, "read_script");
+  assert.match(failed.task.recovery, /参数rejected先查契约并修正/);
+  assert.equal(failed.receipt.output.error.kind, "rejected");
 });
 Deno.test("结构化回执：只解码完整脚本结果页，嵌套正文JSON保持原文", () => {
   const value = {

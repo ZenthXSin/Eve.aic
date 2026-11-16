@@ -2,6 +2,11 @@ import type { Message, ToolSpec } from "../../contracts/model.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import {
+  CONTEXT_RETAIN_TARGET_TOKENS,
+  CONTEXT_SUMMARY_RESERVE_TOKENS,
+  CONTEXT_TARGET_TOKENS,
+} from "./context-maintenance.ts";
+import {
   activeEvents,
   blocks,
   type ContextCounter,
@@ -14,7 +19,7 @@ export const CONTEXT_TOOLS: ToolSpec[] = [
   {
     name: "inspect_context",
     description:
-      "查看当前上下文用量估算、最近一次上游真实用量，以及可直接用于compress_context的完整消息/工具回执边界。分页用nextAfterSeq；不写入压缩。候选removedMessageTokens为移出的消息估算，未扣除新摘要。",
+      "查看当前上下文用量估算、最近一次上游真实用量，以及可直接用于compress_context的完整消息/工具回执边界。recommendation给出优先保留最近8个完整片段、目标约100k的建议边界；可按任务改选。分页用nextAfterSeq；不写入压缩。候选removedMessageTokens为移出的消息估算，未扣除新摘要。",
     parameters: {
       type: "object",
       properties: {
@@ -74,7 +79,7 @@ export function contextUsage(
     estimatedTokens: contextEstimate(project(render(events, prompt)), tools, counter),
     measurement: counter?.description ?? "本地估算，包含身份、消息及工具定义；非上游精确token",
     compressedThroughSeq: compressionThrough(events),
-    targetTokens: 150000,
+    targetTokens: CONTEXT_TARGET_TOKENS,
     latestProviderUsage: latest
       ? {
         responseSeq: latest.seq,
@@ -107,15 +112,45 @@ export function inspectContext(
     removed += estimate(block.messages);
     return { throughSeq: block.throughSeq, removedMessageTokens: removed };
   });
+  const recommendation = recommendCompression(all, usage.estimatedTokens);
   const remaining = all.filter((block) => block.throughSeq > Number(after));
   const candidates = remaining.slice(0, Number(limit));
   return {
     ...usage,
     candidates,
+    recommendation,
     totalCandidates: all.length,
     hasMore: remaining.length > candidates.length,
     nextAfterSeq: remaining.length > candidates.length ? candidates.at(-1)!.throughSeq : null,
     preview: "compress_context({throughSeq,summary,dryRun:true})返回包含实际摘要的前后估算",
+  };
+}
+
+export function recommendCompression(
+  candidates: { throughSeq: number; removedMessageTokens: number }[],
+  estimatedTokens: number,
+) {
+  const needed = Math.max(
+    8_000,
+    estimatedTokens - CONTEXT_RETAIN_TARGET_TOKENS + CONTEXT_SUMMARY_RESERVE_TOKENS,
+  );
+  // Prefer retaining eight recent complete blocks; a few very large blocks may
+  // need summarizing too. The caller still chooses the scope and writes its own summary.
+  const eligible = candidates.slice(0, Math.max(1, candidates.length - 8));
+  const fallback = candidates.slice(0, Math.max(1, candidates.length - 1));
+  const candidate = eligible.find((item) => item.removedMessageTokens >= needed) ??
+    fallback.find((item) => item.removedMessageTokens >= needed) ??
+    eligible.findLast((item) => item.removedMessageTokens >= 8_000) ??
+    fallback.findLast((item) => item.removedMessageTokens >= 8_000) ?? null;
+  return {
+    candidate,
+    retainTargetTokens: CONTEXT_RETAIN_TARGET_TOKENS,
+    summaryReserveTokens: CONTEXT_SUMMARY_RESERVE_TOKENS,
+    retainedRecentBlocks: candidate
+      ? candidates.length - candidates.findIndex((item) => item === candidate) - 1
+      : candidates.length,
+    scope:
+      "建议边界是完整片段；节约量仅为消息估算，实际摘要与投影可能影响结果。保留当前目标、承诺、失败与unknown动作编号、子代理任务、下一步及原件位置；承接旧摘要，不逐条抄日志。以compress_context的applied/compressionSeq和after核实生效，再看下一次inputTokens。",
   };
 }
 export function previewCompression(

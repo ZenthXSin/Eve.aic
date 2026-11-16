@@ -4,7 +4,7 @@ import type { Json } from "../kernel/protocol.ts";
 import type { PluginContext } from "../sdk/plugin.ts";
 import { EveRuntime } from "../plugins/eve/runtime.ts";
 
-async function fixture() {
+async function fixture(dailyTokenBudget = 200_000_000) {
   const directory = await Deno.makeTempDir({ prefix: "eve-projection-runtime-" });
   await Deno.writeTextFile(`${directory}/prompt`, "稳定身份");
   const requests: Message[][] = [];
@@ -30,7 +30,7 @@ async function fixture() {
     maxOutputTokens: 10,
     pollMs: 1000,
     defaultSleepMs: 0,
-    dailyTokenBudget: 200_000_000,
+    dailyTokenBudget,
   };
   const counter = {
     description: "test character count",
@@ -187,6 +187,36 @@ Deno.test("投影runtime：可节约8k但未到高水位不换边界，显式raw
     assert.ok(retained?.content.includes("原".repeat(10_000)));
     await f.runtime.pulse();
     assert.equal(epochs(f.runtime).length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("整理提醒runtime：附可用边界，每四轮重复，重启与普通轮次保持缓存前缀", async () => {
+  const f = await fixture(195_000_000);
+  const reminders = () =>
+    f.runtime.journal.events.filter((e) =>
+      e.kind === "perception" && !!(e.data as { contextMaintenance?: Json }).contextMaintenance
+    );
+  try {
+    for (let i = 0; i < 8; i++) await tool(f.runtime, 17_000);
+    await f.runtime.pulse();
+    assert.equal(reminders().length, 1);
+    const data = reminders()[0].data as {
+      contextMaintenance: { recommendation: { candidate: { throughSeq: number } } };
+    };
+    assert.ok(data.contextMaintenance.recommendation.candidate.throughSeq > 0);
+    await f.runtime.pulse();
+    await f.restart();
+    await f.runtime.pulse();
+    await f.runtime.pulse();
+    assert.equal(reminders().length, 1);
+    await f.runtime.pulse();
+    assert.equal(reminders().length, 2);
+    for (let i = 1; i < f.requests.length; i++) {
+      assert.deepEqual(f.requests[i].slice(0, f.requests[i - 1].length), f.requests[i - 1]);
+    }
+    assert.equal(epochs(f.runtime).length, 1, "提醒追加不改写投影边界");
   } finally {
     await f.close();
   }

@@ -64,7 +64,7 @@ export function focusArgs(args: Json) {
 export const REST_TOOL: ToolSpec = {
   name: "rest",
   description:
-    "睡前收尾并安排休息。先结合近期重心、答应的事、未读通知、真实任务回执决定是否还有想做的事；可以带着未完成事项休息。用简短判断填写原因、未完成事项与醒后下一步，不展开内部推演。此工具须为本轮唯一工具；无需再调用mind.rest，也不发送QQ消息。决定持久保存，处理完已到达的新通知后才休息；新消息和任务完成仍可唤醒。",
+    "睡前收尾并安排休息。先核对近期重心、承诺、未读通知、真实任务回执及上下文整理提醒。工具失败先读具体错误，参数拒绝不等于链路不可用；能修正或改走其他路径就继续，确实受阻再记录阻碍。可以带着未完成事项休息，用简短判断填写原因、未完成事项与醒后下一步。此工具须为本轮唯一工具；无需再调用mind.rest，也不发送QQ消息。决定持久保存，处理完已到达的新通知后才休息；新消息和任务完成仍可唤醒。",
   parameters: {
     type: "object",
     properties: {
@@ -104,10 +104,53 @@ export function restArgs(args: Json) {
   return args as { reason: string; unfinished: string[]; resume: string; wakeAt?: string };
 }
 export function pendingRestReview(events: ConsciousEvent[]) {
-  const boundary = activeEvents(events).findLast((e) =>
-    e.kind === "rest" || e.kind === "rest_review"
-  );
-  return boundary?.kind === "rest_review" ? boundary : undefined;
+  const active = activeEvents(events);
+  for (let i = active.length - 1; i >= 0; i--) {
+    const event = active[i];
+    if (event.kind === "rest_review") return event;
+    // A review only covers the decision immediately following it. New actions,
+    // failures or external events require a fresh decision, including after restart.
+    if (
+      ["rest", "wake", "tool_start", "tool_result", "model_failure", "compression", "retain"]
+        .includes(event.kind) ||
+      event.kind === "model_response" &&
+        (event.data as unknown as { response: { toolCalls: unknown[] } }).response.toolCalls
+          .length ||
+      event.kind === "notice" && (() => {
+          const data = event.data as { source?: string; items?: Json[] };
+          return data.source !== "memory" &&
+            (data.source === "reminder" || !!data.items?.length ||
+              ["image", "image_description"].includes(data.source ?? ""));
+        })() ||
+      event.kind === "perception" &&
+        !!(event.data as { contextMaintenance?: Json }).contextMaintenance
+    ) return undefined;
+  }
+}
+function recentToolFailures(events: ConsciousEvent[], afterSeq: number) {
+  const failures: Json[] = [];
+  const active = activeEvents(events);
+  for (let i = active.length - 1; i >= 0 && failures.length < 3; i--) {
+    const event = active[i];
+    if (event.seq <= afterSeq) break;
+    if (event.kind !== "tool_result") continue;
+    const data = event.data as { callId: string; result: Record<string, Json> };
+    let task: Record<string, Json> | undefined;
+    try {
+      const value = typeof data.result?.output === "string" ? JSON.parse(data.result.output) : null;
+      if (typeof value?.jobId === "string" && typeof value.status === "string") task = value;
+    } catch { /* Only decode documented script summaries, not arbitrary nested data. */ }
+    const status = task?.status ?? data.result?.status;
+    if (!["failed", "unknown"].includes(String(status))) continue;
+    failures.push({
+      record: event.seq,
+      callId: data.callId,
+      status,
+      ...(task ? { jobId: task.jobId } : {}),
+      error: task?.error ?? data.result?.error ?? null,
+    } as Json);
+  }
+  return failures.reverse();
 }
 export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { status: string }>) {
   const review = pendingRestReview(events);
@@ -132,6 +175,9 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
         pendingJobs: pending.map(([jobId, job]) => ({ jobId, status: job.status })),
         unknownJobCount: unknown.length,
         recentUnknownJobs: unknown.slice(-5).map(([jobId]) => jobId),
+        recentToolFailures: recentToolFailures(events, rest?.seq ?? 0),
+        failureRecovery:
+          "调用完成不等于任务成功；以task.status和具体error为准。参数拒绝先查契约并修正，不把单个失败当成整条链路坏了。失败脚本可能已经执行部分动作，先查原jobId/actionId回执；unknown不可重放。仍可完成的部分继续或委派，确实受阻才记录原因、下一步与合理唤醒时间。",
         resting:
           "准备休息时优先以rest作为本轮唯一工具，简短留下原因、未完成事项和醒后下一步；需要先行动就调用其他工具，不必每轮汇报或改写重心。",
         previousRest: rest
@@ -143,7 +189,7 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
               record: review.seq,
               request: review.data,
               guidance:
-                "刚才准备休息。现在核对近期重心、对人的承诺、未读通知和任务回执：继续就行动，搁置就记清原因与下一步。仍想休息可调用rest一次收尾，或用简短文字留下决定；不会因有待办强迫你继续，也不会无休止追加检查。",
+                "刚才准备休息。核对近期重心、承诺、待回应的人、任务失败的恢复办法及最新contextMaintenance提醒；该整理时先压缩并核实applied回执。继续就行动，确实受阻或想休息就记清原因与下一步，用rest收尾或简短文字留下决定；新动作或新通知会使这次检查失效，不复用旧检查，也不无休止追加检查。",
             },
           }
           : {}),
