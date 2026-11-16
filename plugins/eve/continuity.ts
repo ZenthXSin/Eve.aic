@@ -166,7 +166,7 @@ export function validateFocusEvidence(items: FocusItem[], events: ConsciousEvent
 export const REST_TOOL: ToolSpec = {
   name: "rest",
   description:
-    "睡前收尾并安排休息。先核对近期重心、承诺、未读通知、真实任务回执及上下文整理提醒。工具失败先读具体错误，参数拒绝不等于链路不可用；能修正或改走其他路径就继续，确实受阻再记录阻碍。可以带着未完成事项休息，用简短判断填写原因、未完成事项与醒后下一步。此工具须为本轮唯一工具；无需再调用mind.rest，也不发送QQ消息。决定持久保存，处理完已到达的新通知后才休息；新消息和任务完成仍可唤醒。",
+    "收尾并安排休息。先看可推进的重心、自己的兴趣、工具改进、承诺与上下文整理提醒。没人发消息、某项等人或子代理在跑，不代表自己没事可做；可推进就先行动或委派。工具失败先读具体回执并恢复。确实需要休息时留下具体原因、未完事项与醒后可执行的一步；省略wakeAt最多默认休息10分钟，可明确安排更长时间。此工具须为本轮唯一工具；无需mind.rest，不发送QQ。决定持久保存，新消息和任务完成仍可唤醒。",
   parameters: {
     type: "object",
     properties: {
@@ -177,7 +177,7 @@ export const REST_TOOL: ToolSpec = {
         maxItems: 20,
       },
       resume: { type: "string", minLength: 1, maxLength: 2000 },
-      wakeAt: { type: "string", description: "可选ISO时间；省略沿用默认休息时长" },
+      wakeAt: { type: "string", description: "可选未来ISO时间；省略默认最多10分钟后再看" },
     },
     required: ["reason", "unfinished", "resume"],
     additionalProperties: false,
@@ -281,8 +281,10 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
         recentToolFailures: recentToolFailures(events, rest?.seq ?? 0),
         failureRecovery:
           "调用完成不等于任务成功；以task.status和具体error为准。参数拒绝先查契约并修正，不把单个失败当成整条链路坏了。失败脚本可能已经执行部分动作，先查原jobId/actionId回执；unknown不可重放。仍可完成的部分继续或委派，确实受阻才记录原因、下一步与合理唤醒时间。",
+        ownActivity:
+          "空闲先推进一件真实重心、便签里的兴趣或工具痛点。等别人答复、子代理工作或巡检时间未到，只阻塞对应事项，自己仍可探索或安排独立改进。自主改进选一项最常碰到的实际问题，写清复现与验收，长实现交给编码子代理；交付后审查、提交升级并核对实际生效。用现有重心和便签保存进展及原任务句柄，不另建重复清单，不重复轮询同一结果。",
         resting:
-          "准备休息时优先以rest作为本轮唯一工具，简短留下原因、未完成事项和醒后下一步；需要先行动就调用其他工具，不必每轮汇报或改写重心。",
+          "能推进就先调用相应工具。确实需要休息时以rest作为唯一工具，留下原因、未完成事项和醒后可执行的一步；省略wakeAt最多10分钟后再看。没新消息不是单独的休息理由，不必每轮汇报或改写重心。",
         previousRest: rest
           ? { record: rest.seq, at: rest.at, ...rest.data as Record<string, Json> }
           : null,
@@ -292,7 +294,7 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
               record: review.seq,
               request: review.data,
               guidance:
-                "刚才准备休息。核对近期重心、承诺、待回应的人、任务失败的恢复办法及最新contextMaintenance提醒；该整理时先压缩并核实applied回执。继续就行动，确实受阻或想休息就记清原因与下一步，用rest收尾或简短文字留下决定；新动作或新通知会使这次检查失效，不复用旧检查，也不无休止追加检查。",
+                "刚才没有继续动作。先从重心、兴趣便签或工具痛点里找一件可推进的事；别因为一项等人或后台结果就把整个人停下。该整理时压缩并核实applied。继续就直接行动或委派，确实需要休息就记清原因与下一步；这次只核对一次，不无休止检查。",
             },
           }
           : {}),

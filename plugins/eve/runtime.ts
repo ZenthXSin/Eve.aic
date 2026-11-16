@@ -1,4 +1,5 @@
 import { READ_SCRIPT_TOOL, readScript } from "./script-reader.ts";
+import { defaultRestWake, eveCommandCompletions, selfActivityWindow } from "./activity.ts";
 import {
   continuityMessage,
   FOCUS_TOOL,
@@ -88,7 +89,8 @@ export class EveRuntime {
         this.#selfIdeas = self.ideas;
         this.#selfMessages.push({
           role: "user",
-          content: "独处时翻到自己写的几条原话，可以挑一件，也可以不理：\n" +
+          content:
+            "独处时翻到自己写的几条原话。接着可推进的重心；若它们都在等人或后台结果，挑一件自己感兴趣的去查、去试，工具改进也可以。无需为选题另外汇报：\n" +
             self.ideas.map((idea) => `便签 ${idea.noteId} v${idea.revision}：\n${idea.text}`).join(
               "\n\n",
             ),
@@ -502,13 +504,17 @@ export class EveRuntime {
     if (this.config.remoteRecords) {
       const page = completed as unknown as { items: Json[]; throughSeq: number };
       if (page.throughSeq > this.#commandThrough) {
+        const items = eveCommandCompletions(page.items);
         await this.journal.append("notice", {
           source: "commands",
           throughSeq: page.throughSeq,
-          items: page.items,
+          items,
+          ...(items.length < page.items.length
+            ? { delegated: page.items.length - items.length }
+            : {}),
         });
         this.#commandThrough = page.throughSeq;
-        if (page.items.length) {
+        if (items.length) {
           fresh = true;
           this.#commandFresh = true;
           this.#wake = 0;
@@ -532,7 +538,11 @@ export class EveRuntime {
           event.args !== null && typeof event.args === "object" && !Array.isArray(event.args) &&
             typeof event.args.wakeAt === "string"
             ? Date.parse(event.args.wakeAt)
-            : Date.now() + this.config.defaultSleepMs;
+            : defaultRestWake(
+              Date.now(),
+              this.config.defaultSleepMs,
+              !!this.config.restReviewEnabled,
+            );
       } else if (event.kind === "compress") {
         const args = event.args as { throughSeq: number; summary: string };
         const complete = blocks(this.journal.events);
@@ -1032,7 +1042,7 @@ export class EveRuntime {
         if (receipt) {
           this.#wake = data.wakeAt && Date.parse(data.wakeAt) > Date.now()
             ? Date.parse(data.wakeAt)
-            : Date.now() + this.config.defaultSleepMs;
+            : defaultRestWake(Date.now(), this.config.defaultSleepMs, true);
           await this.journal.append("rest", {
             ...decision.data as Record<string, Json>,
             wakeAt: this.#wake,
@@ -1067,14 +1077,6 @@ export class EveRuntime {
     const tools = await this.#tools();
     const toolsListMs = performance.now() - toolsStarted;
     if (this.config.remoteRecords && this.#sharedBudget?.paused) return;
-    const lastResponse = activeEvents(this.journal.events).findLast((e) =>
-      e.kind === "model_response"
-    );
-    const hasActions = lastResponse &&
-      (lastResponse.data as unknown as { response: ModelResponse }).response.toolCalls.length > 0;
-    const pendingJobs = [...this.#observedJobs.values()].some((j) =>
-      !["completed", "failed", "cancelled", "unknown"].includes(j.status)
-    );
     let recallMs = 0, selfContextMs = 0;
     // Both reads follow notices/tools; self notes do not depend on recall's journal append.
     // Settle both before any retry, so a late read cannot mutate the next round.
@@ -1128,7 +1130,7 @@ export class EveRuntime {
       (async () => {
         const started = performance.now();
         try {
-          await this.#selfContext(!fresh && !hasActions && !pendingJobs);
+          await this.#selfContext(selfActivityWindow(this.journal.events, fresh));
         } finally {
           selfContextMs = performance.now() - started;
         }
@@ -1361,21 +1363,24 @@ export class EveRuntime {
       const review = pendingRestReview(this.journal.events);
       if (this.config.restReviewEnabled && !review) {
         await this.journal.append("rest_review", {
-          wakeAt: Date.now() + this.config.defaultSleepMs,
+          wakeAt: defaultRestWake(Date.now(), this.config.defaultSleepMs, true),
           responseSeq: this.journal.events.at(-1)!.seq,
-          reason: "本步没有继续动作，睡前核对一次未完成事项与自己的打算",
+          reason:
+            "本步没有继续动作，核对可推进的重心、自己的兴趣与工具改进；等待一项不妨碍推进另一项",
         });
         this.#wake = 0;
         this.#continueImmediately = true;
       } else {
         const requested = (review?.data as { wakeAt?: number } | undefined)?.wakeAt;
-        this.#wake = requested && requested > Date.now()
-          ? requested
-          : Date.now() + this.config.defaultSleepMs;
+        this.#wake = requested && requested > Date.now() ? requested : defaultRestWake(
+          Date.now(),
+          this.config.defaultSleepMs,
+          !!this.config.restReviewEnabled,
+        );
         await this.journal.append("rest", {
           wakeAt: this.#wake,
           sourceCommit: this.config.sourceCommit,
-          reason: "本步没有继续动作；默认长唤醒，Eve可改",
+          reason: "本步没有继续动作；稍后再看自己的兴趣与改进事项，Eve可明确安排唤醒",
           ...(this.config.restReviewEnabled
             ? { summary: response.content, reviewSeq: review!.seq }
             : {}),
