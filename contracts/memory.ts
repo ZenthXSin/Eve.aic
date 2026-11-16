@@ -24,9 +24,24 @@ export interface MemoryApi {
   recall(
     args: { query: string; limit?: number },
   ): Promise<{
-    items: (MemoryView & { score: number })[];
-    /** 语义模型接入 TODO；当前未配置模型时使用词法召回。 */
+    items: (MemoryView & {
+      /** 原始相关度；rankingScore用于排序，不是事实可信度。 */
+      score: number;
+      rankingScore?: number;
+      ranking?: {
+        relevance: number;
+        lexical: number;
+        importance: number;
+        recency: number;
+        semantic?: number;
+      };
+      historical?: true;
+    })[];
+    /** 已配置向量模型时结合语义与词法排序，否则用词法召回。 */
     retrieval: "lexical" | "semantic";
+    guidance?: string;
+    /** 本机异步索引进度；新记忆未入索引时仍用词法兜底。 */
+    index?: SearchStatus;
   }>;
   used(args: { ids: string[] }): Promise<{ reinforced: string[] }>;
   list(

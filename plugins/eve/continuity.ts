@@ -2,11 +2,29 @@ import type { ToolSpec } from "../../contracts/model.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import { activeEvents, lastActiveEvent } from "./view.ts";
+import { socialContext } from "./social.ts";
+
+export interface FocusItem {
+  id: string;
+  title: string;
+  state: string;
+  reason: string;
+  next: string;
+  origin?: "self" | "owner" | "shared";
+  confidence?: number;
+  evidence?: number[];
+  expiresAt?: string;
+  feedback?: {
+    kind: "welcome" | "declined" | "redirected" | "uncertain";
+    note: string;
+    message: { conversationId: string; seq: number };
+  };
+}
 
 export const FOCUS_TOOL: ToolSpec = {
   name: "set_focus",
   description:
-    "维护自己的近期重心，整体替换并持久保存；当前版本和原话每轮可见，跨休息、重启和压缩接续。由你选择少量在意的事，写明原因、状态与下一步；不等同于必须完成的系统任务。可搁置、完成、放弃或清空，不自动编任务。expectedSeq使用上下文里的focus.record，首次为0。无须每轮更新。",
+    "维护少量近期重心，整体替换并持久保存；跨休息、重启和压缩接续。可选origin区分自己的兴趣、主人委托与共同话题；evidence引用真实意识记录编号，confidence表达把握，expiresAt表示过期。feedback只记明确针对这一项的反馈及真实入站消息句柄，不把别处一句‘好’或沉默算作赞同；重复旧依据不能提高把握。可搁置、完成、放弃或清空，不自动编任务。expectedSeq用focus.record，首次0，无变化不更新。",
   parameters: {
     type: "object",
     properties: {
@@ -22,6 +40,32 @@ export const FOCUS_TOOL: ToolSpec = {
             state: { type: "string", enum: ["active", "parked", "done", "dropped"] },
             reason: { type: "string", minLength: 1, maxLength: 1000 },
             next: { type: "string", minLength: 1, maxLength: 1000 },
+            origin: { type: "string", enum: ["self", "owner", "shared"] },
+            confidence: { type: "number", minimum: 0, maximum: 1 },
+            evidence: {
+              type: "array",
+              maxItems: 8,
+              items: { type: "integer", minimum: 1 },
+            },
+            expiresAt: { type: "string", description: "可选ISO过期时间" },
+            feedback: {
+              type: "object",
+              properties: {
+                kind: { type: "string", enum: ["welcome", "declined", "redirected", "uncertain"] },
+                note: { type: "string", minLength: 1, maxLength: 500 },
+                message: {
+                  type: "object",
+                  properties: {
+                    conversationId: { type: "string", minLength: 1, maxLength: 256 },
+                    seq: { type: "integer", minimum: 1 },
+                  },
+                  required: ["conversationId", "seq"],
+                  additionalProperties: false,
+                },
+              },
+              required: ["kind", "note", "message"],
+              additionalProperties: false,
+            },
           },
           required: ["id", "title", "state", "reason", "next"],
           additionalProperties: false,
@@ -45,7 +89,20 @@ export function focusArgs(args: Json) {
   for (const item of args.items) {
     if (
       !item || typeof item !== "object" || Array.isArray(item) ||
-      Object.keys(item).some((k) => !["id", "title", "state", "reason", "next"].includes(k)) ||
+      Object.keys(item).some((k) =>
+        ![
+          "id",
+          "title",
+          "state",
+          "reason",
+          "next",
+          "origin",
+          "confidence",
+          "evidence",
+          "expiresAt",
+          "feedback",
+        ].includes(k)
+      ) ||
       !["active", "parked", "done", "dropped"].includes(String(item.state)) ||
       !Object.entries({ id: 64, title: 300, reason: 1000, next: 1000 }).every(([k, n]) =>
         typeof item[k] === "string" && !!(item[k] as string).trim() &&
@@ -55,11 +112,56 @@ export function focusArgs(args: Json) {
       throw new KernelError("rejected", "每项重心需要唯一id、标题、状态、原因和下一步");
     }
     ids.add(String(item.id));
+    if (
+      item.origin !== undefined && !["self", "owner", "shared"].includes(String(item.origin)) ||
+      item.confidence !== undefined &&
+        (typeof item.confidence !== "number" || !Number.isFinite(item.confidence) ||
+          item.confidence < 0 || item.confidence > 1) ||
+      item.evidence !== undefined && (!Array.isArray(item.evidence) || item.evidence.length > 8 ||
+          !item.evidence.every((seq) => Number.isSafeInteger(seq) && Number(seq) > 0) ||
+          new Set(item.evidence).size !== item.evidence.length) ||
+      item.expiresAt !== undefined &&
+        (typeof item.expiresAt !== "string" || !Number.isFinite(Date.parse(item.expiresAt)))
+    ) throw new KernelError("rejected", "重心的来源、把握、依据或过期时间无效");
+    if (item.feedback !== undefined) {
+      const f = item.feedback;
+      if (
+        !f || typeof f !== "object" || Array.isArray(f) ||
+        Object.keys(f).some((k) => !["kind", "note", "message"].includes(k)) ||
+        !["welcome", "declined", "redirected", "uncertain"].includes(String(f.kind)) ||
+        typeof f.note !== "string" || !f.note.trim() || f.note.length > 500 ||
+        !f.message || typeof f.message !== "object" || Array.isArray(f.message) ||
+        Object.keys(f.message).some((k) => !["conversationId", "seq"].includes(k)) ||
+        typeof f.message.conversationId !== "string" || !f.message.conversationId.trim() ||
+        f.message.conversationId.length > 256 || !Number.isSafeInteger(f.message.seq) ||
+        Number(f.message.seq) < 1
+      ) throw new KernelError("rejected", "反馈需要明确判断、简短说明及真实消息句柄");
+    }
   }
-  return args as {
-    expectedSeq: number;
-    items: { id: string; title: string; state: string; reason: string; next: string }[];
-  };
+  return args as unknown as { expectedSeq: number; items: FocusItem[] };
+}
+
+export function validateFocusEvidence(items: FocusItem[], events: ConsciousEvent[]) {
+  const previous =
+    (lastActiveEvent(events, "focus")?.data as unknown as { items: FocusItem[] })?.items ?? [];
+  for (const item of items) {
+    for (const seq of item.evidence ?? []) {
+      if (!lastActiveEvent(events, events[seq - 1]?.kind ?? "", (e) => e.seq === seq)) {
+        throw new KernelError("rejected", "重心依据需要未被回滚的真实意识记录编号");
+      }
+    }
+    const old = previous.find((p) => p.id === item.id);
+    const newEvidence = item.evidence?.some((seq) => !old?.evidence?.includes(seq));
+    const newFeedback = item.feedback && (!old?.feedback ||
+      item.feedback.message.conversationId !== old.feedback.message.conversationId ||
+      item.feedback.message.seq !== old.feedback.message.seq);
+    if (
+      old?.confidence !== undefined && (item.confidence ?? old.confidence) > old.confidence &&
+      !newEvidence && !newFeedback
+    ) {
+      throw new KernelError("rejected", "重复旧依据不能提高把握；有新经历或明确新反馈再调整");
+    }
+  }
 }
 export const REST_TOOL: ToolSpec = {
   name: "rest",
@@ -169,11 +271,12 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
             record: focus?.seq ?? 0,
             items: (focus?.data as { items?: Json } | undefined)?.items ?? [],
             guidance:
-              "这是自己维护的近期重心，可用set_focus改变状态和下一步；没有时不编造，也不要求填满。",
+              "自己维护的近期重心，不要求填满。自己的兴趣与别人委托分开；新反馈只调整被明确提到的那一项，旧依据不重复强化。过期、没人接或失去兴趣可搁置，完成或放弃后不反复重提。",
           };
         })(),
         pendingJobs: pending.map(([jobId, job]) => ({ jobId, status: job.status })),
         unknownJobCount: unknown.length,
+        ...socialContext(events),
         recentUnknownJobs: unknown.slice(-5).map(([jobId]) => jobId),
         recentToolFailures: recentToolFailures(events, rest?.seq ?? 0),
         failureRecovery:

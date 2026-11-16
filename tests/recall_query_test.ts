@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { recallQuery } from "../plugins/eve/recall-query.ts";
 import { MemoryStore } from "../services/runtime/memory.ts";
 import { FactJournal } from "../sdk/fact-journal.ts";
-import type { Json } from "../kernel/protocol.ts";
+import { type Json, KernelError } from "../kernel/protocol.ts";
+import type { SemanticSearch } from "../services/runtime/search.ts";
 
 Deno.test("自动回忆正文：QQ句柄及状态不提供检索词，真正正文与工具嵌套输出仍召回对应事实", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-recall-body-" });
@@ -122,4 +123,109 @@ Deno.test("自动回忆正文：跳过旧memory、模型工具代码和原图，
     data: { response: { content: "花".repeat(50_000) } },
   }]);
   assert.equal(huge.length, 16_000);
+});
+
+Deno.test("混合回忆：语义与词法排序，真正使用才增加重要性，召回保留历史标记及原件", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-memory-ranking-" });
+  const records = new FactJournal(`${directory}/records`);
+  const embed = (text: string) =>
+    Promise.resolve(
+      text === "缓存"
+        ? [1, 0]
+        : text.includes("无关")
+        ? [0.2, Math.sqrt(0.96)]
+        : [0.9, Math.sqrt(0.19)],
+    );
+  let memory = new MemoryStore(`${directory}/memory`, records, embed);
+  try {
+    await records.initialize();
+    await memory.initialize();
+    const source = await records.append("activation", { fixture: true });
+    const sources = [{
+      recordSeq: source.seq,
+      digest: source.digest,
+      kind: "experienced" as const,
+    }];
+    const lexical = await memory.remember({ text: "缓存需要保持前缀稳定。", sources }, "lexical");
+    const semantic = await memory.remember(
+      { text: "这是一段意思相近的旧材料。", sources },
+      "semantic",
+    );
+    await memory.remember({ text: "无关材料。", sources }, "irrelevant");
+    const first = await memory.recall({ query: "缓存", limit: 8 });
+    assert.equal(first.items[0].id, lexical.id);
+    assert.equal(first.items.length, 2, "时间和重要性不能让无关材料越过相关度门槛");
+    assert.equal(first.items[0].historical, true);
+    assert.equal(first.items[0].ranking.importance, 0);
+    assert.ok(first.guidance?.includes("不是当前事实"));
+    first.items[0].sources[0].recordSeq = 99;
+    assert.equal(
+      memory.get({ id: lexical.id }).sources[0].recordSeq,
+      source.seq,
+      "召回视图不能改写原件",
+    );
+    const repeated = await memory.recall({ query: "缓存", limit: 8 });
+    assert.equal(repeated.items[0].ranking.importance, 0, "重复召回不冒充实际使用");
+    await memory.used({ ids: [semantic.id] });
+    await memory.close();
+    memory = new MemoryStore(`${directory}/memory`, records, embed);
+    await memory.initialize();
+    const replayed = await memory.recall({ query: "缓存", limit: 8 });
+    assert.ok(replayed.items.find((m) => m.id === semantic.id)!.ranking.importance > 0);
+    assert.equal(replayed.items[0].id, lexical.id);
+  } finally {
+    await memory.close();
+    await records.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("自动回忆接索引：复用本机向量服务，未索引和服务中断都有词法兜底", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-memory-index-" });
+  const records = new FactJournal(`${directory}/records`);
+  let indexedId = "", unavailable = false, searches = 0;
+  const searchIndex = {
+    search(args: { collection: string; query: string }) {
+      searches++;
+      assert.equal(args.collection, "memory");
+      assert.ok(args.query.length <= 2048);
+      if (unavailable) throw new KernelError("unavailable", "索引重启中");
+      return Promise.resolve({
+        items: [{ source: { collection: "memory", id: indexedId }, semanticScore: 0.8 }],
+      });
+    },
+  } as unknown as SemanticSearch;
+  const memory = new MemoryStore(`${directory}/memory`, records, undefined, Date.now, searchIndex);
+  try {
+    await records.initialize();
+    await memory.initialize();
+    const source = await records.append("activation", {});
+    const sources = [{
+      recordSeq: source.seq,
+      digest: source.digest,
+      kind: "experienced" as const,
+    }];
+    const semantic = await memory.remember({ text: "前缀的稳定性值得留意。", sources }, "indexed");
+    indexedId = semantic.id;
+    const indexed = await memory.recall({ query: "命中率" });
+    assert.equal(indexed.retrieval, "semantic");
+    assert.equal(indexed.items[0].id, semantic.id);
+    assert.equal(indexed.items[0].ranking.semantic, 0.8);
+    const fresh = await memory.remember({
+      text: "今天修了文件发送。",
+      entities: ["文件发送"],
+      sources,
+    }, "unindexed");
+    const mixed = await memory.recall({ query: "文件发送", limit: 8 });
+    assert.ok(mixed.items.some((m) => m.id === fresh.id));
+    unavailable = true;
+    const fallback = await memory.recall({ query: "文件发送" });
+    assert.equal(fallback.retrieval, "lexical");
+    assert.equal(fallback.items[0].id, fresh.id);
+    assert.equal(searches, 3, "每次召回只有一次现有索引查询");
+  } finally {
+    await memory.close();
+    await records.close();
+    await Deno.remove(directory, { recursive: true });
+  }
 });

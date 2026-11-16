@@ -113,7 +113,13 @@ export class RuntimeEngine {
       options.semantic ? (text) => options.semantic!.count(text) : undefined,
       options.searchIndex,
     );
-    this.memory = new MemoryStore(`${directory}/memory`, this.records, embed);
+    this.memory = new MemoryStore(
+      `${directory}/memory`,
+      this.records,
+      embed,
+      Date.now,
+      options.searchIndex,
+    );
     this.files = unrestricted
       ? new FileTools(options.workspace, ["/"])
       : options.commandIdentity
