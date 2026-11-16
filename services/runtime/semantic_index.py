@@ -345,7 +345,7 @@ class Index:
         rankings, scores = [], {}
         with self.db() as db:
             if mode != "literal":
-                vector = self.encoder.embed(query, "query")
+                vector = self.encoder.embed(self.encoder.chunk(query), "query")
                 top = []
                 cursor = db.execute("SELECT c.id,c.vector FROM chunks c JOIN docs d ON d.id=c.doc_id WHERE " + where, values)
                 while rows := cursor.fetchmany(256):
