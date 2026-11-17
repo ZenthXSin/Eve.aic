@@ -52,6 +52,29 @@ Deno.test("整理提醒：实测输入触线，四轮或15分钟重复；整理�
   }
 });
 
+Deno.test("整理提醒：120k只准备一次，不每四轮催压缩；150k才要求整理", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-context-watch-" });
+  const journal = new ConsciousJournal(directory);
+  try {
+    await journal.initialize();
+    const state = contextMaintenanceState(journal.events, 125_000);
+    assert.equal(state.compressionDue, false);
+    assert.equal(state.due, true);
+    assert.ok(state.reminder?.includes("不因预提醒或睡前就压缩"));
+    await journal.append("perception", { contextMaintenance: state });
+    for (let i = 0; i < 5; i++) {
+      await journal.append("model_response", { response: { content: "接着聊", toolCalls: [] } });
+    }
+    assert.equal(contextMaintenanceState(journal.events, 140_000).due, false);
+    const urgent = contextMaintenanceState(journal.events, 150_000);
+    assert.equal(urgent.compressionDue, true);
+    assert.equal(urgent.due, true);
+  } finally {
+    await journal.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
 Deno.test("整理建议：完整边界优先满足100k目标，保留最近片段，不切未完成工具批次", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-context-boundaries-" });
   const journal = new ConsciousJournal(directory);

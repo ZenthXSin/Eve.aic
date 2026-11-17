@@ -6,6 +6,8 @@ export const CONTEXT_TARGET_TOKENS = 150_000;
 export const CONTEXT_REMINDER_TOKENS = 120_000;
 export const CONTEXT_RETAIN_TARGET_TOKENS = 100_000;
 export const CONTEXT_SUMMARY_RESERVE_TOKENS = 4_000;
+export const CONTEXT_PROJECTION_EMERGENCY_TOKENS = 180_000;
+export const CONTEXT_PROJECTION_MIN_SAVING_TOKENS = 30_000;
 
 /** A reported input only describes the view actually sent, not a later compression or release. */
 export function currentProviderInput(events: ConsciousEvent[], sourceCommit?: string) {
@@ -69,8 +71,8 @@ export function contextMaintenanceState(
   const reminder = level === "normal"
     ? null
     : level === "urgent"
-    ? "上下文已达到150k整理线：先完成眼前必要回复，再优先整理；目标约100k，为后续任务留余量。不要把提醒只写成待办后继续堆积。"
-    : "上下文已达到120k预提醒线：在当前任务阶段结束、下一次大读取前或睡前整理，目标约100k；原件保留。";
+    ? "上下文已达到150k整理线：先完成眼前必要回复，再一次整理到约100k，保留最新往来、自己已说的话、承诺和子代理任务；宿主在同次整理中固定历史投影，随后复用缓存。"
+    : "上下文已达到120k预提醒线：先保留稳定请求前缀，继续当前阶段；只准备摘要要点，不因预提醒或睡前就压缩。约150k时再一次整理到约100k；原件保留。";
   return {
     level,
     estimatedTokens,
@@ -79,10 +81,11 @@ export function contextMaintenanceState(
     compressedThroughSeq,
     targetTokens: CONTEXT_TARGET_TOKENS,
     retainTargetTokens: CONTEXT_RETAIN_TARGET_TOKENS,
+    compressionDue: level === "urgent",
     reminder,
     due: level !== "normal" &&
       (!previous || previous.level !== level ||
-        previous.compressedThroughSeq !== compressedThroughSeq || turns >= 4 ||
-        now - Date.parse(last!.at) >= 15 * 60_000),
+        previous.compressedThroughSeq !== compressedThroughSeq || level === "urgent" &&
+          (turns >= 4 || now - Date.parse(last!.at) >= 15 * 60_000)),
   };
 }
