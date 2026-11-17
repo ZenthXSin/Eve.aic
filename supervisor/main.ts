@@ -297,7 +297,8 @@ export async function startSupervisor(configPath: string) {
           value: await upgrades.invoke(data, request.headers.get("authorization")),
         });
       }
-      if (request.headers.get("authorization") !== `Bearer ${key}`) {
+      const requiredKey = data.method === "requestUpgrade" ? adminKey : key;
+      if (request.headers.get("authorization") !== `Bearer ${requiredKey}`) {
         return new Response(null, { status: 403 });
       }
       if (data.method === "status") return Response.json({ ok: true, value: controller.state });
