@@ -21,7 +21,7 @@ export const CONTEXT_TOOLS: ToolSpec[] = [
   {
     name: "inspect_context",
     description:
-      "查看当前上下文用量估算、最近一次上游真实用量，以及可直接用于compress_context的完整消息/工具回执边界。recommendation给出保留最近片段、目标约100k的建议边界；recommendedNow为false时保留稳定缓存，不因查询到候选就压缩，通常150k再整理。分页用nextAfterSeq；不写入压缩。候选removedMessageTokens为移出的消息估算，未扣除新摘要。",
+      "查看当前上下文用量估算、最近一次上游真实用量，以及可直接用于compress_context的完整消息/工具回执边界。recommendation给出保留最近片段、目标约100k的建议边界；recommendedNow为false时保留稳定缓存，不因查询到候选就压缩，通常270k再整理。分页用nextAfterSeq；不写入压缩。候选removedMessageTokens为移出的消息估算，未扣除新摘要。",
     parameters: {
       type: "object",
       properties: {
@@ -34,7 +34,7 @@ export const CONTEXT_TOOLS: ToolSpec[] = [
   {
     name: "compress_context",
     description:
-      "按inspect_context给出的throughSeq和自己写的summary立即压缩上下文。通常150k时一次整理到约100k；120k预提醒先准备，不反复压缩。summary承接旧摘要、重要事实、最新往来和自己已说的话、承诺及未完成事项。压缩会重建历史缓存，宿主同步固定投影，随后继续复用。返回已生效的持久记录和前后用量估算；原件保留。当前未完成工具批次不能移出。真实压后inputTokens要等下一次模型请求。",
+      "按inspect_context给出的throughSeq和自己写的summary立即压缩上下文。通常270k时一次整理到约100k；200k预提醒先准备，不反复压缩。summary承接旧摘要、重要事实、最新往来和自己已说的话、承诺及未完成事项。压缩会重建历史缓存，宿主同步固定投影，随后继续复用。返回已生效的持久记录和前后用量估算；原件保留。当前未完成工具批次不能移出。真实压后inputTokens要等下一次模型请求。",
     parameters: {
       type: "object",
       properties: {
@@ -152,7 +152,7 @@ export function recommendCompression(
       ? candidates.length - candidates.findIndex((item) => item === candidate) - 1
       : candidates.length,
     scope:
-      "建议边界是完整片段，不代表现在必须压缩；通常150k时一次整理到约100k。保留当前目标、最新往来和自己已发出的回复、承诺、失败与unknown动作编号、子代理任务、下一步及原件位置；承接旧摘要，不逐条抄日志。以compress_context的applied/compressionSeq和after核实生效，再看下一次inputTokens。",
+      "建议边界是完整片段，不代表现在必须压缩；通常270k时一次整理到约100k。保留当前目标、最新往来和自己已发出的回复、承诺、失败与unknown动作编号、子代理任务、下一步及原件位置；承接旧摘要，不逐条抄日志。以compress_context的applied/compressionSeq和after核实生效，再看下一次inputTokens。",
   };
 }
 export function previewCompression(

@@ -33,6 +33,7 @@ import { CONTEXT_TOOLS, inspectContext, previewCompression } from "./context-too
 import {
   CONTEXT_PROJECTION_EMERGENCY_TOKENS,
   CONTEXT_PROJECTION_MIN_SAVING_TOKENS,
+  CONTEXT_TARGET_TOKENS,
   contextMaintenanceState,
 } from "./context-maintenance.ts";
 import { recallQuery } from "./recall-query.ts";
@@ -185,8 +186,9 @@ export class EveRuntime {
   #rememberCompletions(items: Json) {
     if (!Array.isArray(items)) return;
     for (const item of items) {
-      if (item && typeof item === "object" && !Array.isArray(item) && item.job) {
-        this.#rememberJobSummary(item.job);
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        // Script completions wrap job; agent replies carry jobId/status directly.
+        this.#rememberJobSummary(item.job ?? item);
       }
     }
   }
@@ -263,7 +265,10 @@ export class EveRuntime {
           ["image", "image_description"].includes(String(data.source)) &&
           typeof data.actionId === "string"
         ) this.#imageActions.add(data.actionId);
-        if (data.source === "agents") this.#agentThrough = Number(data.throughSeq);
+        if (data.source === "agents") {
+          this.#agentThrough = Number(data.throughSeq);
+          this.#rememberCompletions(data.items);
+        }
         if (data.source === "phone") this.#phoneThrough = Number(data.throughSeq);
         if (data.source === "scripts") {
           this.#scriptThrough = Number(data.throughSeq);
@@ -477,6 +482,7 @@ export class EveRuntime {
           items: page.items,
         });
         this.#agentThrough = page.throughSeq;
+        this.#rememberCompletions(page.items);
         if (page.items.length) {
           fresh = true;
           this.#agentFresh = true;
@@ -997,7 +1003,7 @@ export class EveRuntime {
     const messages = this.#render();
     const estimated = contextEstimate(messages, tools, this.contextCounter);
     // 压缩已经改变摘要前缀，趁第一次后续请求尚未发出时一起固定投影，
-    // 避免随后再次支付缓存重建。正常轮次只追加；180k才允许应急投影。
+    // 避免随后再次支付缓存重建。正常轮次只追加；300k才允许应急投影。
     if (previous && !afterCompression && estimated < CONTEXT_PROJECTION_EMERGENCY_TOKENS) {
       return messages;
     }
@@ -1212,7 +1218,7 @@ export class EveRuntime {
         "字符与图像估算，未验证为当前模型精确分词",
       sourceCommit: this.config.sourceCommit,
       contextEstimatedTokens: estimated,
-      contextTargetTokens: 150_000,
+      contextTargetTokens: CONTEXT_TARGET_TOKENS,
       contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
       contextComposition: contextComposition(messages),
       contextReminder: maintenance.reminder,
@@ -1283,8 +1289,8 @@ export class EveRuntime {
             recommendation: inspection.recommendation,
             inspect: { tool: "inspect_context", args: {} },
             repeat: maintenance.compressionDue
-              ? "150k仍未整理时，每4次模型回复或15分钟的下一次活动轮提醒；不另开模型请求"
-              : "120k仅预提醒；保留前缀，不重复催压缩，150k再整理",
+              ? "270k仍未整理时，每4次模型回复或15分钟的下一次活动轮提醒；不另开模型请求"
+              : "200k仅预提醒；保留前缀，不重复催压缩，270k再整理",
           }
           : null,
       });
@@ -1448,7 +1454,7 @@ export class EveRuntime {
         budget(this.journal.events, accountingDay(this.config.timeZone)),
       lastError: this.#lastError ?? null,
       contextBlocked: this.#contextBlocked,
-      contextTargetTokens: 150_000,
+      contextTargetTokens: CONTEXT_TARGET_TOKENS,
       contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
       contextComposition: this.#contextComposition ?? null,
       modelBlocked: this.#modelBlocked,

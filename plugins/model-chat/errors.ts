@@ -9,7 +9,17 @@ export class ChatModelError extends Error {
       | "invalid_response",
     readonly httpStatus?: number,
     readonly timeoutPhase?: "connect" | "first_token" | "idle" | "total",
-    readonly responseDetail?: "stream_choice" | "stream_after_finish",
+    readonly responseDetail?:
+      | "stream_choice"
+      | "stream_after_finish"
+      | "response_choice"
+      | "response_message"
+      | "tool_call"
+      | "tool_arguments"
+      | "empty_response"
+      | "json_syntax"
+      | "json_envelope"
+      | "json_call",
   ) {
     // 服务端正文、URL 和 fetch 原文可能含凭据，不写入错误消息或 cause。
     super(

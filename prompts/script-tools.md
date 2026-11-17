@@ -148,7 +148,7 @@ interface CoreTools {
 history/search/notifications/settings、waitForMessages、download/image/file、sendBurst/burstStatus、listSendQueue/cancelSend。phone-details：送达与分段回执。
 agents：上述常用项，以及 create/configure/history/search/notifications/close。
 mind：上述常用项，以及 watch/compress。整理上下文优先用原生 inspect_context 给出的完整边界与
-compress_context，直接返回生效和前后用量；120k 准备，150k 一次整理到约100k。 notes：上述常用项，以及
+compress_context，直接返回生效和前后用量；200k 准备，270k 一次整理到约100k。 notes：上述常用项，以及
 list/versions。“关于我”最多2000本地token，基于旧版本编辑传 expectedRevision。
 memory：上述常用项，以及 remember/used/list/get。records：上述常用项，以及
 page/indexStatus。召回是历史线索，按 source 展开核实。

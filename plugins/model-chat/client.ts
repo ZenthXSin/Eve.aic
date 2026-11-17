@@ -44,8 +44,11 @@ function positive(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
 }
 
-function fail(category: ChatModelError["category"]): never {
-  throw new ChatModelError(category);
+function fail(
+  category: ChatModelError["category"],
+  detail?: ChatModelError["responseDetail"],
+): never {
+  throw new ChatModelError(category, undefined, undefined, detail);
 }
 
 function imageBytes(value: unknown): { image: ModelImage; bytes: Uint8Array<ArrayBuffer> } {
@@ -112,12 +115,12 @@ async function requestBody(
       function: { name: tool.name, description: tool.description, parameters: tool.parameters },
     };
   });
-  const pending = new Set<string>();
+  const pending = new Map<string, string>();
   const seenIds = new Set<string>();
   let imageCount = 0;
   let imageSize = 0;
   const imageChecks: { sha256: string; bytes: Uint8Array<ArrayBuffer> }[] = [];
-  const messages = request.messages.map((message) => {
+  const messages = request.messages.map((message, messageIndex) => {
     if (
       !record(message) || !["system", "user", "assistant", "tool"].includes(message.role) ||
       typeof message.content !== "string"
@@ -136,25 +139,39 @@ async function requestBody(
       });
     }
     if (message.role === "tool") {
-      if (typeof message.toolCallId !== "string" || !pending.delete(message.toolCallId)) {
+      const wireId = typeof message.toolCallId === "string"
+        ? pending.get(message.toolCallId)
+        : undefined;
+      if (!wireId) {
         fail("request");
       }
-      return { role: "tool", content: message.content, tool_call_id: message.toolCallId };
+      pending.delete(message.toolCallId!);
+      return { role: "tool", content: message.content, tool_call_id: wireId };
     }
     if (pending.size > 0) fail("request");
     const calls = message.toolCalls ?? [];
     if (!Array.isArray(calls) || (calls.length > 0 && message.role !== "assistant")) {
       fail("request");
     }
-    const wireCalls = calls.map((call) => {
+    const wireCalls = calls.map((call, callIndex) => {
       if (
-        !record(call) || typeof call.id !== "string" || !call.id || seenIds.has(call.id) ||
+        !record(call) || typeof call.id !== "string" || !call.id || pending.has(call.id) ||
         typeof call.name !== "string" || !record(call.args)
       ) fail("request");
-      seenIds.add(call.id);
-      pending.add(call.id);
+      // Compatible Chat providers reuse short IDs such as call_1 across turns.
+      // Pair against the current assistant first, then disambiguate only on the
+      // wire. Durable originals and the unchanged history prefix stay intact.
+      let wireId = call.id, collision = 0;
+      while (seenIds.has(wireId)) {
+        if (config.protocol === "responses") fail("request");
+        wireId = "call_" + createHash("sha256")
+          .update(JSON.stringify([messageIndex, callIndex, call.id, collision++]))
+          .digest("hex").slice(0, 32);
+      }
+      seenIds.add(wireId);
+      pending.set(call.id, wireId);
       return {
-        id: call.id,
+        id: wireId,
         type: "function",
         function: { name: call.name, arguments: JSON.stringify(call.args) },
       };
@@ -228,22 +245,22 @@ function usageView(raw: unknown): ModelResponse["usage"] {
 
 function modelResponse(raw: unknown, request: ModelRequest): ModelResponse {
   if (!record(raw) || !Array.isArray(raw.choices) || raw.choices.length !== 1) {
-    fail("invalid_response");
+    fail("invalid_response", "response_choice");
   }
   const choice = raw.choices[0];
   if (
     !record(choice) || !["stop", "tool_calls"].includes(String(choice.finish_reason)) ||
     !record(choice.message) || choice.message.role !== "assistant"
-  ) fail("invalid_response");
+  ) fail("invalid_response", "response_message");
   const message = choice.message;
   if (
     message.content !== null && message.content !== undefined && typeof message.content !== "string"
-  ) fail("invalid_response");
+  ) fail("invalid_response", "response_message");
   // 有些 Chat 兼容上游在纯工具响应中省略 content；仍须完整验证工具，空终答继续拒绝。
   const content = (message.content as string | null | undefined) ??
     (typeof message.refusal === "string" ? message.refusal : "");
   const rawCalls = message.tool_calls ?? [];
-  if (!Array.isArray(rawCalls)) fail("invalid_response");
+  if (!Array.isArray(rawCalls)) fail("invalid_response", "tool_call");
   const tools = new Set(request.tools.map((tool) => tool.name));
   const ids = new Set<string>();
   const toolCalls: ToolCall[] = rawCalls.map((call) => {
@@ -251,21 +268,21 @@ function modelResponse(raw: unknown, request: ModelRequest): ModelResponse {
       !record(call) || call.type !== "function" || typeof call.id !== "string" || !call.id ||
       ids.has(call.id) || !record(call.function) || typeof call.function.name !== "string" ||
       !tools.has(call.function.name) || typeof call.function.arguments !== "string"
-    ) fail("invalid_response");
+    ) fail("invalid_response", "tool_call");
     let args: unknown;
     try {
       args = JSON.parse(call.function.arguments);
     } catch {
-      fail("invalid_response");
+      fail("invalid_response", "tool_arguments");
     }
-    if (!record(args)) fail("invalid_response");
+    if (!record(args)) fail("invalid_response", "tool_arguments");
     ids.add(call.id);
     return { id: call.id, name: call.function.name, args: args as ToolCall["args"] };
   });
   if (
     (toolCalls.length === 0 && content.trim() === "") ||
     (choice.finish_reason === "tool_calls" && toolCalls.length === 0)
-  ) fail("invalid_response");
+  ) fail("invalid_response", "empty_response");
   const usage = usageView(raw.usage);
   return { content, toolCalls, ...(usage === undefined ? {} : { usage }) };
 }
