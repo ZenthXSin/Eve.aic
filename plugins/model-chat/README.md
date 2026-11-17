@@ -52,3 +52,10 @@ data receipts without modifying stored messages. Unknown tools, duplicate IDs, m
 extra envelope fields, incomplete streams and empty results are rejected. Reasoning text is never
 interpreted as an action. Each completion still makes one upstream request; there is no automatic
 retry or silent protocol fallback.
+
+The isolated agent service may correct a definitively completed JSON-format rejection once per step
+(at most two steps per job), with a new durable request ID and separate budget reservation. When
+available, it persists the rejected assistant content as private diagnostic data and includes it in
+the correction request; reasoning and simulated receipts are never accepted as results. Correction
+requests ask for one action at a time to reduce nesting mistakes, while normal steps retain
+multiple-tool support. Existing executed tools and their receipts are preserved on restart.
