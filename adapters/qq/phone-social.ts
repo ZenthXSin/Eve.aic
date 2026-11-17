@@ -29,7 +29,7 @@ function validateBurst(args: PhoneSendBurst) {
         !/^[a-zA-Z0-9_-]{1,128}$/.test(args.resumeActionId))) ||
     typeof args.conversationId !== "string" ||
     !/^qq:(user|group):.{1,512}$/.test(args.conversationId) ||
-    !Array.isArray(args.messages) || args.messages.length < 1 || args.messages.length > 4 ||
+    !Array.isArray(args.messages) || args.messages.length < 1 ||
     args.messages.some((text) => typeof text !== "string" || !text.trim()) ||
     (args.splitLongText !== undefined && typeof args.splitLongText !== "boolean") ||
     new TextEncoder().encode(JSON.stringify(args.messages)).length > 262_144
@@ -43,11 +43,11 @@ export function burstSegments(args: PhoneSendBurst): string[] {
     segments = args.splitLongText
       ? args.messages.flatMap((text) => splitForQQ(text))
       : [...args.messages];
-  } catch {
-    throw new KernelError("rejected", "分条文字超过四条；请自行整理，原文未截断也未发送");
-  }
-  if (segments.length > 4) {
-    throw new KernelError("rejected", "分条文字超过四条；请自行整理，原文未截断也未发送");
+  } catch (error) {
+    throw new KernelError(
+      "rejected",
+      error instanceof Error ? error.message : "分条文字无法切分，原文未截断也未发送",
+    );
   }
   return segments;
 }
@@ -67,12 +67,12 @@ export async function readBurst(
     const parent = await Deno.lstat(folder);
     if (!parent.isDirectory || parent.isSymlink) throw new QqActionError("corrupt");
     const stat = await Deno.lstat(path);
-    if (!stat.isFile || stat.isSymlink || stat.size > 1_048_576) throw new QqActionError("corrupt");
+    if (!stat.isFile || stat.isSymlink) throw new QqActionError("corrupt");
     const stored = JSON.parse(await Deno.readTextFile(path)) as BurstManifest;
     if (
       !stored || stored.schema !== 1 || stored.actionId !== actionId ||
       !Array.isArray(stored.messages) || !Array.isArray(stored.segments) ||
-      stored.segments.length < 1 || stored.segments.length > 4 ||
+      stored.segments.length < 1 ||
       stored.segments.some((text) => typeof text !== "string" || !text.trim()) ||
       !Array.isArray(stored.childActionIds) ||
       canonical(stored.childActionIds) !==

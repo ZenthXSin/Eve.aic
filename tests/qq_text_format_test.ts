@@ -56,13 +56,17 @@ Deno.test("QQ splitting prefers semantic boundaries, preserves full input and ke
   assert.deepEqual(splitForQQ(" \n "), []);
 });
 
-Deno.test("QQ splitting rejects overflow and code instead of truncation or hidden oversized final messages", () => {
-  const input = "字".repeat(121);
-  assert.throws(() => splitForQQ(input), /超过 4 条.*未截断/);
-  assert.equal(input.length, 121);
+Deno.test("QQ splitting has no default part limit, preserves long text, and honors only explicit bounds", () => {
+  const input = "字".repeat(1000);
+  const parts = splitForQQ(input);
+  assert.equal(parts.length, 34);
+  assert.equal(parts.join(""), input);
+  assert(parts.every((part) => part.length <= 30));
+  assert.throws(() => splitForQQ(input, { maxParts: 4 }), /超过 4 条.*未截断/);
+  assert.deepEqual(splitForQQ(input, { maxParts: 34 }), parts);
   assert.throws(() => splitForQQ("```js\nconst x = 1;\n```"), /代码块/);
   assert.throws(() => splitForQQ("你好", { maxCharacters: 0 }), /参数无效/);
-  assert.throws(() => splitForQQ("你好", { maxParts: 33 }), /参数无效/);
+  assert.throws(() => splitForQQ("你好", { maxParts: 0 }), /参数无效/);
 });
 
 Deno.test("QQ splitting keeps URLs intact and is deterministic before action admission", () => {

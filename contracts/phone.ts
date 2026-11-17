@@ -148,12 +148,12 @@ export interface PhoneSend {
   wakeup?: boolean;
 }
 
-/** 显式一次发一至四条文字；不自动拆分代码、附件或普通send。 */
+/** 显式按原顺序发送分条文字，条数不限；不自动拆分代码、附件或普通send。 */
 export interface PhoneSendBurst {
   actionId: string;
   conversationId: string;
   messages: string[];
-  /** 显式选择按约30字切分；总共超过四条会拒绝，绝不截断。默认false。 */
+  /** 显式选择按约30字切分，条数不限，绝不截断。默认false。 */
   splitLongText?: boolean;
   /** 新脚本继续原父请求：仅允许已存在父编号且全部原参数一致；不会重发已结束子条。 */
   resumeActionId?: string;
