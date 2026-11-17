@@ -198,7 +198,7 @@ export async function startSupervisor(configPath: string) {
         instanceIdentities: c.instanceIdentities!,
       },
       controller,
-      key,
+      adminKey,
     )
     : undefined;
   if (upgrades) await upgrades.initialize();
