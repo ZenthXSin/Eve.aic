@@ -550,10 +550,20 @@ export function contextComposition(messages: Message[]) {
     else if (message.role === "user") {
       category = "timelineAndNotices";
       try {
-        const value = JSON.parse(message.content);
+        const encoded = JSON.parse(message.content);
+        const value = encoded?.schema === "eve.host_notice.v1" ? encoded.data : encoded;
         const source = value?.kind === "notice" ? value.data?.source : undefined;
         if (
-          ["phone", "scripts", "commands", "memory", "image", "image_description"].includes(source)
+          [
+            "phone",
+            "agents",
+            "scripts",
+            "commands",
+            "memory",
+            "image",
+            "image_description",
+            "reminder",
+          ].includes(source)
         ) {
           category = `notice:${source}`;
         }

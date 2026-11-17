@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EveRuntime } from "../plugins/eve/runtime.ts";
 import type { PluginContext } from "../sdk/plugin.ts";
 import type { Json } from "../kernel/protocol.ts";
+import type { Message } from "../contracts/model.ts";
 
 Deno.test("agent reply wakes resting Eve like a private message and persists its notification cursor", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-agent-wake-" });
@@ -85,6 +86,91 @@ Deno.test("agent reply wakes resting Eve like a private message and persists its
       e.kind === "notice" && (e.data as { source?: string }).source === "agents"
     );
     assert.equal(notices.length, 1);
+  } finally {
+    await runtime.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("agent completions retire queued continuity jobs live and after restart without reviving late receipts", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-agent-continuity-" });
+  await Deno.writeTextFile(`${directory}/prompt`, "test");
+  let incoming: Json[] = [], seq = 0;
+  const requests: Message[][] = [];
+  const ctx = {
+    call(contract: string, method: string, args: { messages?: Message[] }) {
+      const address = `${contract}.${method}`;
+      if (address === "agents.notifications") {
+        const items = incoming;
+        incoming = [];
+        return { items, throughSeq: seq };
+      }
+      if (address === "tools.list") return [];
+      if (address === "model.complete") {
+        requests.push(args.messages!);
+        return { content: "继续", toolCalls: [] };
+      }
+      if (["phone.notifications", "scripts.completions", "mind.poll"].includes(address)) {
+        return { items: [], throughSeq: 0 };
+      }
+      if (address === "mind.update") return {};
+      throw new Error(address);
+    },
+  } as unknown as PluginContext;
+  const config = {
+    directory: `${directory}/journal`,
+    promptFile: `${directory}/prompt`,
+    sourceCommit: "a".repeat(40),
+    modelTimeoutMs: 1000,
+    maxOutputTokens: 10,
+    pollMs: 60000,
+    defaultSleepMs: 0,
+    dailyTokenBudget: 2000000,
+    agentsEnabled: true,
+    restReviewEnabled: true,
+  };
+  let runtime = new EveRuntime(ctx, config);
+  const queue = async (id: string) => {
+    await runtime.journal.append("tool_result", {
+      callId: `call_${id}`,
+      result: {
+        output: JSON.stringify({ jobId: id, status: "queued" }),
+      },
+    });
+  };
+  const continuity = () => {
+    const message = requests.at(-1)!.findLast((m) => m.content.startsWith("当前生活接续"))!;
+    return JSON.parse(message.content.slice(message.content.indexOf("\n") + 1));
+  };
+  try {
+    await runtime.initialize();
+    await queue("eve_live_task");
+    await runtime.close();
+    runtime = new EveRuntime(ctx, config);
+    await runtime.initialize();
+    await runtime.pulse();
+    assert.deepEqual(continuity().pendingJobs, [{ jobId: "eve_live_task", status: "queued" }]);
+    incoming = [{
+      seq: ++seq,
+      jobId: "eve_live_task",
+      agentId: "agent_general",
+      status: "completed",
+    }];
+    await runtime.pulse();
+    assert.deepEqual(continuity().pendingJobs, []);
+    await queue("eve_restore_task");
+    await runtime.journal.append("notice", {
+      source: "agents",
+      throughSeq: ++seq,
+      items: [{ jobId: "eve_restore_task", status: "failed" }],
+    });
+    await queue("eve_restore_task");
+    await runtime.close();
+    runtime = new EveRuntime(ctx, config);
+    await runtime.initialize();
+    await runtime.pulse();
+    assert.deepEqual(continuity().pendingJobs, []);
+    assert.equal(runtime.status().agentThroughSeq, seq);
   } finally {
     await runtime.close();
     await Deno.remove(directory, { recursive: true });

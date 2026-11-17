@@ -2,11 +2,11 @@ import type { ModelResponse } from "../../contracts/model.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import { activeEvents, lastActiveEvent } from "./view.ts";
 
-export const CONTEXT_TARGET_TOKENS = 150_000;
-export const CONTEXT_REMINDER_TOKENS = 120_000;
+export const CONTEXT_TARGET_TOKENS = 270_000;
+export const CONTEXT_REMINDER_TOKENS = 200_000;
 export const CONTEXT_RETAIN_TARGET_TOKENS = 100_000;
 export const CONTEXT_SUMMARY_RESERVE_TOKENS = 4_000;
-export const CONTEXT_PROJECTION_EMERGENCY_TOKENS = 180_000;
+export const CONTEXT_PROJECTION_EMERGENCY_TOKENS = CONTEXT_TARGET_TOKENS + 30_000;
 export const CONTEXT_PROJECTION_MIN_SAVING_TOKENS = 30_000;
 
 /** A reported input only describes the view actually sent, not a later compression or release. */
@@ -71,8 +71,8 @@ export function contextMaintenanceState(
   const reminder = level === "normal"
     ? null
     : level === "urgent"
-    ? "上下文已达到150k整理线：先完成眼前必要回复，再一次整理到约100k，保留最新往来、自己已说的话、承诺和子代理任务；宿主在同次整理中固定历史投影，随后复用缓存。"
-    : "上下文已达到120k预提醒线：先保留稳定请求前缀，继续当前阶段；只准备摘要要点，不因预提醒或睡前就压缩。约150k时再一次整理到约100k；原件保留。";
+    ? "上下文已达到270k整理线：先完成眼前必要回复，再一次整理到约100k，保留最新往来、自己已说的话、承诺和子代理任务；宿主在同次整理中固定历史投影，随后复用缓存。"
+    : "上下文已达到200k预提醒线：先保留稳定请求前缀，继续当前阶段；只准备摘要要点，不因预提醒或睡前就压缩。约270k时再一次整理到约100k；原件保留。";
   return {
     level,
     estimatedTokens,

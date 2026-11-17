@@ -58,8 +58,8 @@ export function jsonToolRequest(body: Record<string, unknown>): Record<string, u
   return { ...rest, messages: wire, response_format: { type: "json_object" } };
 }
 
-function invalid(): never {
-  throw new ChatModelError("invalid_response");
+function invalid(detail: ChatModelError["responseDetail"] = "json_envelope"): never {
+  throw new ChatModelError("invalid_response", undefined, undefined, detail);
 }
 
 function completedEnvelope(content: string): { value: unknown; preface: string } {
@@ -74,11 +74,11 @@ function completedEnvelope(content: string): { value: unknown; preface: string }
     if (
       start < 1 || !preface.trim() || /[{}\[\]`]/.test(preface) ||
       !/\n[ \t]*$/.test(preface)
-    ) invalid();
+    ) invalid("json_syntax");
     try {
       return { value: JSON.parse(content.slice(start)), preface: preface.trim() };
     } catch {
-      invalid();
+      invalid("json_syntax");
     }
   }
 }
@@ -103,7 +103,7 @@ export function jsonToolResponse(raw: unknown): unknown {
       !object(call) || Object.keys(call).some((key) => !["id", "name", "args"].includes(key)) ||
       typeof call.id !== "string" || !call.id || call.id.length > 256 ||
       typeof call.name !== "string" || !object(call.args)
-    ) invalid();
+    ) invalid("json_call");
     return {
       id: call.id,
       type: "function",

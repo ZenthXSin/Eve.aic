@@ -563,7 +563,7 @@ Deno.test("admin charts exclude unknown cache usage and distinguish the average 
   );
   assert.equal(document.getElementById("inputAverage").textContent, "200,000");
   assert.equal(document.getElementById("cacheHit").textContent, "90.0%");
-  assert.match(document.getElementById("usageInsight").textContent, /高于 150k 目标 50,000/);
+  assert.match(document.getElementById("usageInsight").textContent, /低于 270k 压缩参考线 70,000/);
   assert.match(document.getElementById("usageInsight").textContent, /覆盖 1\/3/);
   assert.match(document.getElementById("usageRange").textContent, /1 次响应未提供可用用量/);
   assert.equal(document.getElementById("usageTable").children.length, 3);

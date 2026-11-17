@@ -21,43 +21,43 @@ Deno.test("整理提醒：实测输入触线，四轮或15分钟重复；整理�
   };
   try {
     await journal.initialize();
-    await model(160_000);
+    await model(280_000);
     let state = contextMaintenanceState(journal.events, 100_000, commit);
     assert.equal(state.level, "urgent");
     assert.equal(state.due, true);
     const perception = await journal.append("perception", { contextMaintenance: state });
     assert.equal(contextMaintenanceState(journal.events, 100_000, commit).due, false);
-    for (let i = 0; i < 3; i++) await model(160_000);
+    for (let i = 0; i < 3; i++) await model(280_000);
     assert.equal(contextMaintenanceState(journal.events, 100_000, commit).due, false);
     assert.equal(
       contextMaintenanceState(journal.events, 100_000, commit, Date.parse(perception.at) + 900_000)
         .due,
       true,
     );
-    await model(160_000);
+    await model(280_000);
     assert.equal(contextMaintenanceState(journal.events, 100_000, commit).due, true);
     await journal.append("compression", { throughSeq: 1, summary: "承接" });
     state = contextMaintenanceState(journal.events, 95_000, commit);
     assert.equal(state.providerInput?.currentView, false);
     assert.equal(state.level, "normal");
     assert.equal(state.due, false);
-    await model(125_000);
+    await model(205_000);
     assert.equal(contextMaintenanceState(journal.events, 100_000, commit).level, "due");
     assert.equal(contextMaintenanceState(journal.events, 100_000, "new-release").level, "normal");
     await model(0);
-    assert.equal(contextMaintenanceState(journal.events, 120_000, commit).level, "due");
+    assert.equal(contextMaintenanceState(journal.events, 200_000, commit).level, "due");
   } finally {
     await journal.close();
     await Deno.remove(directory, { recursive: true });
   }
 });
 
-Deno.test("整理提醒：120k只准备一次，不每四轮催压缩；150k才要求整理", async () => {
+Deno.test("整理提醒：200k只准备一次，不每四轮催压缩；270k才要求整理", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-context-watch-" });
   const journal = new ConsciousJournal(directory);
   try {
     await journal.initialize();
-    const state = contextMaintenanceState(journal.events, 125_000);
+    const state = contextMaintenanceState(journal.events, 205_000);
     assert.equal(state.compressionDue, false);
     assert.equal(state.due, true);
     assert.ok(state.reminder?.includes("不因预提醒或睡前就压缩"));
@@ -65,8 +65,8 @@ Deno.test("整理提醒：120k只准备一次，不每四轮催压缩；150k才�
     for (let i = 0; i < 5; i++) {
       await journal.append("model_response", { response: { content: "接着聊", toolCalls: [] } });
     }
-    assert.equal(contextMaintenanceState(journal.events, 140_000).due, false);
-    const urgent = contextMaintenanceState(journal.events, 150_000);
+    assert.equal(contextMaintenanceState(journal.events, 260_000).due, false);
+    const urgent = contextMaintenanceState(journal.events, 270_000);
     assert.equal(urgent.compressionDue, true);
     assert.equal(urgent.due, true);
   } finally {

@@ -3,6 +3,7 @@ import { type Json, KernelError } from "../kernel/protocol.ts";
 import type { ConsciousEvent } from "../plugins/eve/journal.ts";
 import { appendPreviewEvent, contextComposition, estimate, render } from "../plugins/eve/view.ts";
 import { previewCompression } from "../plugins/eve/context-tools.ts";
+import { presentContext } from "../sdk/context-presentation.ts";
 
 function event(seq: number, kind: string, data: Json): ConsciousEvent {
   return { seq, kind, data, at: "2026-11-12T00:00:00Z", digest: "fixture" } as ConsciousEvent;
@@ -136,6 +137,7 @@ Deno.test("上下文组成：仅返回分类计数和明确估算，不泄露正
   assert.equal(composition.estimatedMessageTokens, estimate(messages));
   assert.equal(composition.parts.identityAndContracts.messages, 1);
   assert.equal(composition.parts["notice:phone"].messages, 1);
+  assert.equal(contextComposition(presentContext(messages)).parts["notice:phone"].messages, 1);
   assert.ok(!JSON.stringify(composition).includes("秘密正文"));
   assert.ok(!JSON.stringify(composition).includes("private-id"));
 });

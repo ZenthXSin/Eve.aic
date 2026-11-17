@@ -9,6 +9,7 @@ import { OwnershipAuthority } from "../guardian/ownership.ts";
 import { OwnershipFence } from "../sdk/ownership-fence.ts";
 import type { AgentJob } from "../contracts/agents.ts";
 import { KernelError } from "../kernel/protocol.ts";
+import { ChatModelClient } from "../plugins/model-chat/client.ts";
 
 function deferred<T = void>() {
   let resolve!: (v: T | PromiseLike<T>) => void;
@@ -116,6 +117,79 @@ Deno.test("agents: four high defaults, duplicate roles, isolated configuration a
     await f.close();
   }
 });
+Deno.test("agents: JSON provider reused IDs survive multiple tool steps, followups and restart", async () => {
+  let calls = 0, invoked = 0;
+  const local = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (incoming) => {
+    const body = await incoming.json();
+    const ids: string[] = [], receipts: string[] = [];
+    for (const message of body.messages) {
+      if (message.role === "assistant") {
+        ids.push(...JSON.parse(message.content).toolCalls.map((c: { id: string }) => c.id));
+      } else if (message.content.startsWith("工具执行回执")) {
+        receipts.push(
+          JSON.parse(message.content.slice(message.content.indexOf("\n") + 1)).toolCallId,
+        );
+      }
+    }
+    assert.equal(new Set(ids).size, ids.length);
+    assert.deepEqual(receipts, ids);
+    const envelope = ++calls % 3 === 0 ? { content: "完整结果", toolCalls: [] } : {
+      content: "",
+      toolCalls: [{
+        id: "call_1",
+        name: "use_tool",
+        args: { namespace: "files", method: "list", args: {} },
+      }],
+    };
+    return Response.json({
+      choices: [{
+        finish_reason: "stop",
+        message: { role: "assistant", content: JSON.stringify(envelope) },
+      }],
+    });
+  });
+  const client = new ChatModelClient({
+    baseUrl: `http://127.0.0.1:${local.addr.port}`,
+    model: "compat-model",
+    apiKey: "fixture-secret",
+    sessionId: "agent-test",
+    maxOutputTokens: 8192,
+    timeoutMs: 1000,
+    jsonToolModels: ["compat-model"],
+  });
+  const hooks: AgentHooks = {
+    complete: (request, config) => client.complete(request, config),
+    invoke: () => {
+      invoked++;
+      return Promise.resolve({ files: [] });
+    },
+  };
+  const f = await fixture(hooks);
+  let restored: AgentService | undefined;
+  try {
+    for (const id of ["agent_reused_first", "agent_reused_followup"]) {
+      const job = await f.api.send({ agentId: "agent_general", text: "读取后继续" }, id);
+      assert.equal(job.status, "completed");
+    }
+    await f.api.close();
+    restored = new AgentService(f.directory, hooks);
+    await restored.initialize();
+    const job = await restored.send(
+      { agentId: "agent_general", text: "重启后的追问" },
+      "agent_reused_restored",
+    );
+    assert.equal(job.status, "completed");
+    assert.equal(calls, 9);
+    assert.equal(invoked, 6, "restoring history never replays completed tools");
+    assert.equal(restored.history({ agentId: "agent_general" }).messages.length, 6);
+  } finally {
+    await restored?.close();
+    await f.close();
+    client.close();
+    await local.shutdown();
+  }
+});
+
 Deno.test("agents: same instance is FIFO, different instances parallel; queued config is captured and cancellation does not execute", async () => {
   const gate = deferred(), parallel = deferred(), began = deferred();
   let calls = 0;

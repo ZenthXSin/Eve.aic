@@ -351,6 +351,66 @@ Deno.test("模型传输：拒绝坏 JSON、未完成响应、未知工具与不�
   }
 });
 
+Deno.test("Chat history: reused IDs pair per assistant, remain stable and do not change originals", async () => {
+  const history: ModelRequest = {
+    ...request,
+    messages: [...request.messages],
+  };
+  for (let i = 0; i < 3; i++) {
+    history.messages.push(
+      { role: "assistant", content: "", toolCalls: [{ id: "call_1", name: "echo", args: {} }] },
+      { role: "tool", toolCallId: "call_1", content: `receipt ${i}` },
+    );
+  }
+  const original = structuredClone(history), bodies: Record<string, unknown>[][] = [];
+  const local = server(async (incoming) => {
+    const body = await incoming.json();
+    bodies.push(body.messages);
+    const ids = body.messages.filter((m: { tool_calls?: unknown }) => m.tool_calls)
+      .map((m: { tool_calls: { id: string }[] }) => m.tool_calls[0].id);
+    const receipts = body.messages.filter((m: { role: string }) => m.role === "tool")
+      .map((m: { tool_call_id: string }) => m.tool_call_id);
+    assert.equal(ids[0], "call_1");
+    assert.equal(new Set(ids).size, ids.length);
+    assert.deepEqual(receipts, ids);
+    return Response.json(completion());
+  });
+  const client = new ChatModelClient({ ...options, baseUrl: local.url });
+  try {
+    await client.complete(history);
+    assert.deepEqual(history, original);
+    history.messages.push({ role: "user", content: "followup" });
+    await client.complete(history);
+    assert.deepEqual(bodies[1].slice(0, bodies[0].length), bodies[0]);
+    for (
+      const messages of [
+        [{
+          role: "assistant",
+          content: "",
+          toolCalls: [
+            { id: "same", name: "echo", args: {} },
+            { id: "same", name: "echo", args: {} },
+          ],
+        }],
+        [...original.messages, { role: "tool", content: "extra receipt", toolCallId: "call_1" }],
+        [
+          { role: "assistant", content: "", toolCalls: [{ id: "call_1", name: "echo", args: {} }] },
+          { role: "user", content: "missing receipt" },
+        ],
+      ]
+    ) {
+      await assert.rejects(
+        client.complete({ ...request, messages } as ModelRequest),
+        (e) => e instanceof ChatModelError && e.category === "request",
+      );
+    }
+    assert.equal(bodies.length, 2, "malformed pairing never reaches the upstream");
+  } finally {
+    client.close();
+    await local.close();
+  }
+});
+
 Deno.test("模型传输：HTTP 拒绝、响应过大与超时不泄露错误正文、不自动重试", async () => {
   let status = 401;
   let attempts = 0;

@@ -80,9 +80,9 @@ const overviewMarkup = `<section id="overview" class="view" hidden>
 </div>
 <div class="grid-two">
 <section class="panel usage-panel"><div class="panel-title"><div><h2>每次请求的输入量</h2><p class="hint" id="usageRange">读取最近的真实请求用量…</p></div></div>
-<div class="usage-summary"><div class="usage-stat"><strong id="inputAverage">—</strong><span>平均输入 token</span></div><div class="usage-stat"><strong id="cacheHit">—</strong><span>缓存命中率（按 token 加权）</span></div><div class="usage-stat"><strong>150k</strong><span>平均输入目标，非硬上限</span></div></div>
+<div class="usage-summary"><div class="usage-stat"><strong id="inputAverage">—</strong><span>平均输入 token</span></div><div class="usage-stat"><strong id="cacheHit">—</strong><span>缓存命中率（按 token 加权）</span></div><div class="usage-stat"><strong>270k</strong><span>压缩参考线，200k 预提醒</span></div></div>
 <p id="usageInsight" class="chart-insight">正在分析已报告的请求用量。</p>
-<div class="chart-legend"><span><i class="dot"></i>已缓存</span><span><i class="dot remaining"></i>未缓存</span><span><i class="dot unknown"></i>缓存未报告</span><span>┄ 150k 目标</span></div>
+<div class="chart-legend"><span><i class="dot"></i>已缓存</span><span><i class="dot remaining"></i>未缓存</span><span><i class="dot unknown"></i>缓存未报告</span><span>┄ 270k 压缩参考线</span></div>
 <div class="chart-scroll"><svg id="usageChart" class="usage-chart" viewBox="0 0 900 230" role="img" aria-labelledby="usageChartTitle"><title id="usageChartTitle">最近真实请求输入与缓存分布</title></svg></div>
 <p id="chartReadout" class="chart-readout" aria-live="polite">点按柱形查看单次请求。</p><p id="usageEmpty" class="chart-empty" hidden></p>
 <details><summary>以表格查看</summary><div class="chart-table"><table class="chart-data"><thead><tr><th>完成时间</th><th>请求</th><th>输入 token</th><th>缓存 token</th></tr></thead><tbody id="usageTable"></tbody></table></div></details>
