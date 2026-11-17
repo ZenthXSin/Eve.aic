@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { Kernel } from "../kernel/kernel.ts";
 import { KernelError } from "../kernel/protocol.ts";
 import { StopDiagnostics, stopErrorKind } from "../runtime/stop-diagnostics.ts";
-import { eveStopDeadlineMs, instanceStopControlDeadlineMs } from "../sdk/lifecycle-timeouts.ts";
+import {
+  eveStopDeadlineMs,
+  instanceStartControlDeadlineMs,
+  instanceStopControlDeadlineMs,
+} from "../sdk/lifecycle-timeouts.ts";
 
 Deno.test("停止诊断：真实worker超时与真实storage保持分类，兼容字符串汇总", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-stop-diagnostic-" });
@@ -106,4 +110,12 @@ Deno.test("停止期限：长模型期限保留完整收尾窗口，控制端不
   assert.ok(eveStopDeadlineMs(240_000) > 240_000);
   assert.ok(instanceStopControlDeadlineMs(240_000) > eveStopDeadlineMs(240_000));
   assert.throws(() => eveStopDeadlineMs(2_147_483_647), KernelError);
+});
+
+Deno.test("启动期限：涵盖脚本与意识依次恢复，配置更长时仍留加载窗口，拒绝计时器溢出", () => {
+  assert.ok(instanceStartControlDeadlineMs() > 300_000 + 300_000);
+  assert.ok(instanceStartControlDeadlineMs(600_000) > 300_000 + 600_000);
+  for (const invalid of [0, -1, 1.5, NaN, 2_147_483_647]) {
+    assert.throws(() => instanceStartControlDeadlineMs(invalid), KernelError);
+  }
 });
