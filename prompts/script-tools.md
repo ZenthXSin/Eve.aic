@@ -9,6 +9,11 @@ QQ，同一内容不重复记录。 脚本默认最多等待15秒（含准备）
 await tools.scripts.contracts({name:"phone"})，有 nextChar
 就续页。已有契约无需每轮重读，执行能力与权限不因省略而改变。不猜参数；脚本类型检查始终使用完整原件。
 
+扩展接口也保存在便签：先 return await
+tools.notes.get({id:"工具契约目录"})，再按目录中的短名读取所需类别。
+文档标明源码版本，当前完整签名可用 scripts.contracts
+核对；改接口时同步更新对应便签。不要一次读回整套文档。
+
 ```ts
 type ContractName =
   | "phone"
