@@ -3,7 +3,10 @@ import { KernelError } from "../kernel/protocol.ts";
 import type { SourceArtifact } from "./source.ts";
 
 /** Read candidate files as data only. Never import or run candidate composition code as root. */
-async function generatedPrompt(source: SourceArtifact): Promise<string> {
+async function generatedPrompt(
+  source: SourceArtifact,
+  options: { legacyAutoWaitV2?: boolean } = {},
+): Promise<string> {
   const read = async (path: string) => {
     const member = source.files.find((file) => file.path === path);
     if (!member) throw new KernelError("corrupt", "固定源码缺少生成提示所需原件");
@@ -28,7 +31,7 @@ async function generatedPrompt(source: SourceArtifact): Promise<string> {
   }
   return `${qq}\n\n${
     mechanics === undefined ? "" : `${mechanics}\n\n`
-  }${await renderScriptContracts(read)}`;
+  }${await renderScriptContracts(read, options)}`;
 }
 
 /** Preserve the complete identity/custom prefix; ambiguous legacy prompts require explicit repair. */
@@ -37,8 +40,14 @@ export async function refreshUpgradePrompt(
   active: SourceArtifact,
   candidate: SourceArtifact,
 ): Promise<string> {
-  const oldGenerated = `\n\n${await generatedPrompt(active)}`;
-  const boundary = prompt.indexOf(oldGenerated);
+  let oldGenerated = `\n\n${await generatedPrompt(active)}`;
+  let boundary = prompt.indexOf(oldGenerated);
+  // The old control service did not recognize auto-wait v2 in newer pinned
+  // source. Reproduce its exact output too, still requiring a unique full suffix.
+  if (boundary < 0) {
+    oldGenerated = `\n\n${await generatedPrompt(active, { legacyAutoWaitV2: true })}`;
+    boundary = prompt.indexOf(oldGenerated);
+  }
   if (
     boundary < 0 || boundary !== prompt.lastIndexOf(oldGenerated) ||
     boundary + oldGenerated.length !== prompt.length || !prompt.slice(0, boundary).trim()

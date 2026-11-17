@@ -95,6 +95,72 @@ const legacyPreamble =
   "upgrades.request 只提交完整 Git commit，独立监督校验并由旧 Eve 明确确认；回执 actionId 用于 upgrades.status，不以 submitted 冒充升级完成。\n" +
   "以下为当前契约原件；PhoneApi.send/sendFile 在 ScriptApi 中省去 actionId，由宿主提供。ScriptHostApi 供宿主领取任务/通知，不是 tools 内的额外对象。\n\n";
 
+Deno.test("升级提示：全量契约迁移至按需目录，后续升级保留完整定制与校验", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-upgrade-compact-prompt-" });
+  try {
+    const old = await fixture(`${directory}/old`, "old", true, true);
+    const next = await fixture(`${directory}/next`, "next", true, true);
+    const later = await fixture(`${directory}/later`, "later", true, true);
+    for (const source of [next, later]) {
+      const contents = {
+        "contracts/script.ts": "export const COMPACT_TOOL_PROMPT_VERSION = 1;\n",
+        "prompts/script-tools.md": `compact tools ${source.directory.split("/").at(-1)}\n`,
+      };
+      for (const [path, text] of Object.entries(contents)) {
+        await Deno.writeTextFile(`${source.directory}/${path}`, text);
+        source.files = source.files.filter((file) => file.path !== path);
+        source.files.push({
+          path,
+          executable: false,
+          sha256: [
+            ...new Uint8Array(
+              await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+            ),
+          ].map((byte) => byte.toString(16).padStart(2, "0")).join(""),
+        });
+      }
+    }
+    const prefix = "完整定制人格\r\n  原始空白  \n";
+    const prompt = `${prefix}\n\n${await Deno.readTextFile(
+      `${old.directory}/prompts/qq-social.md`,
+    )}\n\n${await Deno.readTextFile(
+      `${old.directory}/prompts/qq-mechanics.md`,
+    )}\n\n${await renderScriptContracts((path) => Deno.readTextFile(`${old.directory}/${path}`))}`;
+    const compact = await refreshUpgradePrompt(prompt, old, next);
+    assert.ok(compact.startsWith(`${prefix}\n\n`));
+    assert.ok(compact.endsWith("compact tools next\n"));
+    assert.equal(compact.includes("接口来源：contracts/"), false);
+    const scriptFile = old.files.find((file) => file.path === "contracts/script.ts")!;
+    const oldScript = await Deno.readTextFile(`${old.directory}/${scriptFile.path}`) +
+      "export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 2;\n";
+    await Deno.writeTextFile(`${old.directory}/${scriptFile.path}`, oldScript);
+    scriptFile.sha256 = [
+      ...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(oldScript))),
+    ].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const canonical = await renderScriptContracts((path) =>
+      Deno.readTextFile(`${old.directory}/${path}`)
+    );
+    const legacy = await renderScriptContracts(
+      (path) => Deno.readTextFile(`${old.directory}/${path}`),
+      { legacyAutoWaitV2: true },
+    );
+    assert.ok(canonical.includes("默认最多等待15秒"));
+    assert.ok(legacy.includes("脚本默认异步返回持久任务编号"));
+    assert.ok(legacy.includes("mode:sync 等待完成后"));
+    const oldControlPrompt = prompt.slice(0, prompt.indexOf("原生工具有 execute_script")) + legacy;
+    assert.equal(await refreshUpgradePrompt(oldControlPrompt, old, next), compact);
+    const refreshed = await refreshUpgradePrompt(compact, next, later);
+    assert.ok(refreshed.startsWith(`${prefix}\n\n`));
+    assert.ok(refreshed.endsWith("compact tools later\n"));
+    await Deno.writeTextFile(`${later.directory}/prompts/script-tools.md`, "tampered");
+    await assert.rejects(() => refreshUpgradePrompt(compact, next, later), /摘要变化/);
+    later.files = later.files.filter((file) => file.path !== "prompts/script-tools.md");
+    await assert.rejects(() => refreshUpgradePrompt(compact, next, later), /缺少/);
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
 Deno.test("升级提示：610版固定生成说明可刷新到新能力，并保留当前人格原文", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-upgrade-legacy-prompt-" });
   try {

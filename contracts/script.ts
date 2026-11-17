@@ -24,7 +24,21 @@ export const WEB_CAPABILITY_VERSION = 1;
 export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 2;
 export const AGENT_CAPABILITY_VERSION = 1;
 export const GENERAL_AGENT_CAPABILITY_VERSION = 1;
-export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 1;
+export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 2;
+export const COMPACT_TOOL_PROMPT_VERSION = 1;
+export type ScriptContractName =
+  | "phone"
+  | "phone-details"
+  | "agents"
+  | "mind"
+  | "notes"
+  | "files"
+  | "commands"
+  | "memory"
+  | "records"
+  | "web"
+  | "upgrades"
+  | "scripts";
 /** 原生随记工具 write_thought 的参数，不属于脚本 tools 对象中的接口。 */
 export interface NativeThoughtArguments {
   thought: string;
@@ -87,7 +101,7 @@ export interface ScriptApi {
   scripts: {
     /** 按需读取完整类型原件；按Unicode码点分页，不改变执行能力。 */
     contracts(
-      args: { name: "phone-details" | "agents"; startChar?: number; limit?: number },
+      args: { name: ScriptContractName; startChar?: number; limit?: number },
     ): Promise<{ text: string; characters: number; nextChar?: number }>;
     status(args: { jobId: string }): Promise<ScriptSummary>;
     cancel(args: { jobId: string }): Promise<ScriptSummary>;

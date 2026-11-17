@@ -33,6 +33,20 @@ export interface ScriptConfig {
   defaultTimeoutMs: number;
 }
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
+const CONTRACT_FILES: Record<string, string> = {
+  phone: "phone",
+  "phone-details": "phone-details",
+  agents: "agents",
+  mind: "mind",
+  notes: "notes",
+  files: "workspace",
+  commands: "workspace",
+  memory: "memory",
+  records: "memory",
+  web: "web",
+  upgrades: "upgrades",
+  scripts: "script",
+};
 const ERROR_KINDS = new Set([
   "remote",
   "timeout",
@@ -418,12 +432,15 @@ export class ScriptRuntime {
 
   async contracts(args: { name: string; startChar?: number; limit?: number }) {
     if (
-      !args || !["phone-details", "agents"].includes(args.name) ||
+      !args || typeof args.name !== "string" || !Object.hasOwn(CONTRACT_FILES, args.name) ||
       Object.keys(args).some((k) => !["name", "startChar", "limit"].includes(k))
     ) throw new KernelError("rejected", "契约名称无效");
-    const text = await Deno.readTextFile(
-      new URL(`../../contracts/${args.name}.ts`, import.meta.url),
-    );
+    const text =
+      (args.name === "phone"
+        ? "脚本 tools.phone.send/sendFile/sendBurst 省去 actionId，由宿主生成；ScriptApi 签名优先于 PhoneApi。\n"
+        : "") + await Deno.readTextFile(
+          new URL(`../../contracts/${CONTRACT_FILES[args.name]}.ts`, import.meta.url),
+        );
     const start = args.startChar ?? 0, limit = args.limit ?? 4096;
     if (
       !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(limit) || limit < 1 ||

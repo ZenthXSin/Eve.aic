@@ -287,18 +287,16 @@ Deno.test("脚本：宿主发起前账本保存失败阻止发送，健康不可
     );
     assert.equal(f.count(), 0);
     const description = await renderScriptContracts();
-    assert.equal(
-      description.includes(
-        await Deno.readTextFile(new URL("../contracts/script.ts", import.meta.url)),
-      ),
-      true,
-    );
-    assert.equal(
-      description.includes(
-        await Deno.readTextFile(new URL("../contracts/phone.ts", import.meta.url)),
-      ),
-      true,
-    );
+    assert.ok(description.includes("interface CoreTools"));
+    for (const [name, file] of [["scripts", "script"], ["phone", "phone"]]) {
+      const original = await Deno.readTextFile(new URL(`../contracts/${file}.ts`, import.meta.url));
+      assert.equal(description.includes(original), false);
+      const contract = await f.kernel().call<{ text: string }>("scripts", "contracts", {
+        name,
+        limit: 8192,
+      });
+      assert.ok(contract.text.includes(original.slice(0, 30)));
+    }
   } finally {
     await f.close();
   }
@@ -636,11 +634,40 @@ Deno.test("脚本：详细契约可按需读取并分页，未知名称拒绝，
     };
     assert.equal(Array.from(page.text).length, 40);
     assert.equal(page.nextChar, 40);
+    for (
+      const [name, file] of Object.entries({
+        phone: "phone",
+        "phone-details": "phone-details",
+        agents: "agents",
+        mind: "mind",
+        notes: "notes",
+        files: "workspace",
+        commands: "workspace",
+        memory: "memory",
+        records: "memory",
+        web: "web",
+        upgrades: "upgrades",
+        scripts: "script",
+      })
+    ) {
+      const result = await f.kernel().call<{ text: string; characters: number }>(
+        "scripts",
+        "contracts",
+        { name, limit: 8192 },
+      );
+      const original = await Deno.readTextFile(new URL(`../contracts/${file}.ts`, import.meta.url));
+      assert.ok(result.text.includes(original.slice(0, 30)));
+      assert.ok(result.characters >= Array.from(original).length);
+    }
+    for (const name of ["__proto__", "constructor", "model"]) {
+      await assert.rejects(() => f.kernel().call("scripts", "contracts", { name }));
+    }
     await assert.rejects(() =>
       f.kernel().call("scripts", "contracts", { name: "../../etc/passwd" })
     );
     const prompt = await renderScriptContracts();
-    assert.ok(prompt.includes('name:"agents"'));
+    assert.ok(prompt.includes('name:"phone"'));
+    assert.ok(prompt.includes('| "agents"'));
     assert.equal(prompt.includes("export interface AgentView"), false);
     assert.equal(prompt.includes("export interface PhoneActionReceipt"), false);
   } finally {
