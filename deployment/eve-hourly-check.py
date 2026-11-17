@@ -33,6 +33,44 @@ def rpc(config, method, args=None, channel='private'):
         client.close()
 
 
+def inspect_owner_history(fetch, now, report):
+    cursor = None
+    unknown_age = False
+    for page_index in range(4):
+        page = fetch(cursor)
+        rows = sorted(page['messages'], key=lambda row: row['handle']['seq'], reverse=True)
+        for index, row in enumerate(rows):
+            direction = row['direction']
+            stamp = row['time'].get('at')
+            delivery = (row.get('delivery') or {}).get('state')
+            if page_index == 0 and index == 0:
+                report.update(owner_last_direction=direction, owner_last_at=stamp)
+                if direction == 'outgoing':
+                    report['owner_last_delivery'] = delivery
+            if direction == 'outgoing' and delivery == 'sent':
+                report['owner_last_confirmed_send_seq'] = row['handle']['seq']
+                break
+            if direction == 'incoming':
+                if stamp is None:
+                    unknown_age = True
+                elif (now - datetime.fromisoformat(stamp.replace('Z', '+00:00'))).total_seconds() >= 1800:
+                    report['owner_unanswered_seq'] = row['handle']['seq']
+                    report['issues'].append('owner_dm_no_later_outgoing_30m')
+                    return
+        else:
+            older = page.get('older')
+            if older:
+                if cursor and older['beforeSeq'] >= cursor['beforeSeq']:
+                    raise ValueError('invalid history cursor')
+                cursor = older
+                continue
+        break
+    else:
+        report['issues'].append('owner_dm_history_inconclusive')
+    if unknown_age:
+        report['issues'].append('owner_dm_age_unknown')
+
+
 def main():
     now = datetime.now(timezone.utc)
     report = {'at': now.isoformat(), 'issues': []}
@@ -75,13 +113,12 @@ def main():
 
     def inspect_history():
         owner = read('/etc/eve-rebuild/qq.json')['qq']['modelControl']['ownerPlatformUserId']
-        rows = page('qqHistory', {'conversationId': 'qq:user:' + owner})['messages']
-        latest = max(rows, key=lambda row: row['handle']['seq'], default=None)
-        if latest:
-            stamp = latest['time'].get('at')
-            report.update(owner_last_direction=latest['direction'], owner_last_at=stamp)
-            if latest['direction'] == 'incoming' and stamp and (now - datetime.fromisoformat(stamp.replace('Z', '+00:00'))).total_seconds() >= 1800:
-                issues.append('owner_dm_no_later_outgoing_30m')
+        def fetch(cursor):
+            args = {'conversationId': 'qq:user:' + owner}
+            if cursor:
+                args['cursor'] = cursor
+            return page('qqHistory', args)
+        inspect_owner_history(fetch, now, report)
 
     def inspect_queue():
         heads = page('qqFailures', {'limit': 32})
