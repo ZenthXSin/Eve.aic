@@ -1,7 +1,25 @@
 /** 接口说明直接取契约源码，类型检查也导入同一文件，不另写一份签名。 */
 export async function renderScriptContracts(
   readSource?: (path: string) => Promise<string>,
+  options: { legacyAutoWaitV2?: boolean } = {},
 ): Promise<string> {
+  const scriptPath = "contracts/script.ts";
+  const scriptSource =
+    await (readSource
+      ? readSource(scriptPath)
+      : Deno.readTextFile(new URL("../contracts/script.ts", import.meta.url)));
+  // Read pinned documentation as data. Keep the legacy renderer byte-exact so
+  // upgrades can identify the old generated suffix without touching identity.
+  if (/^export const COMPACT_TOOL_PROMPT_VERSION = 1;\r?$/m.test(scriptSource)) {
+    const path = "prompts/script-tools.md";
+    const compact = await (readSource
+      ? readSource(path)
+      : Deno.readTextFile(new URL("../prompts/script-tools.md", import.meta.url)));
+    if (!compact.trim()) {
+      throw new Error("精简工具提示原件为空");
+    }
+    return compact;
+  }
   const files = [
     new URL("../contracts/phone.ts", import.meta.url),
     new URL("../contracts/model.ts", import.meta.url),
@@ -23,7 +41,9 @@ export async function renderScriptContracts(
   let directReplacement = false;
   for (const file of files) {
     const path = `contracts/${file.pathname.split("/").at(-1)}`;
-    const source = await (readSource ? readSource(path) : Deno.readTextFile(file));
+    const source = path === scriptPath
+      ? scriptSource
+      : await (readSource ? readSource(path) : Deno.readTextFile(file));
     // 旧源码没有该声明，必须逐字复原旧前言来识别现役提示生成区。
     // 源码仅作为已固定的数据读取；绝不 import 候选生成器或执行标记表达式。
     if (path === "contracts/phone.ts") sendBurst = /^\s*sendBurst\(/m.test(source);
@@ -31,7 +51,8 @@ export async function renderScriptContracts(
       contractLookup = /^export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       agents = /^export const AGENT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       generalAgent = /^export const GENERAL_AGENT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
-      autoWait = /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 2;\r?$/m.test(source)
+      autoWait = !options.legacyAutoWaitV2 &&
+          /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 2;\r?$/m.test(source)
         ? 2
         : /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 1;\r?$/m.test(source)
         ? 1
