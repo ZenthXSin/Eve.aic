@@ -14,6 +14,12 @@ export interface StoredJob extends AgentJob {
   config: AgentConfig;
   transcript: BlobRef[];
   cancelled: boolean;
+  formatRetries?: Record<number, number>;
+}
+
+export function agentModelRequestId(job: StoredJob, step: number): string {
+  const base = `${job.jobId}_model_${step}`;
+  return job.formatRetries?.[step] ? `${base}_format_${job.formatRetries[step]}` : base;
 }
 export interface Session {
   id: string;
@@ -105,7 +111,16 @@ export function applyAgentEvent(state: AgentState, event: FactEvent) {
     session.messages.push(event.seq);
   } else if (event.kind === "started") job().status = "running";
   else if (event.kind === "step") job().transcript.push(d.body as BlobRef);
-  else if (event.kind === "cancelled") job().cancelled = true;
+  else if (event.kind === "format_retry") {
+    const current = job(), step = Number(d.step);
+    if (
+      current.status !== "running" || current.replySeq || !Number.isSafeInteger(step) || step < 1 ||
+      d.attempt !== 1 || current.formatRetries?.[step] ||
+      Object.keys(current.formatRetries ?? {}).length >= 2 ||
+      !["json_syntax", "json_envelope"].includes(String(d.detail))
+    ) throw new KernelError("corrupt", "子代理格式纠正记录无效");
+    (current.formatRetries ??= {})[step] = 1;
+  } else if (event.kind === "cancelled") job().cancelled = true;
   else if (event.kind === "reply") {
     const replied = job(),
       message = { ...(d.message as StoredMessage), seq: event.seq, at: event.at };
@@ -209,7 +224,7 @@ export async function restoreAgents(
         await hooks.finish(job, "completed", cursor.assistant.content);
       }
     } else if (!cursor.assistant || cursor.completed === cursor.assistant.toolCalls?.length) {
-      const saved = hooks.result?.(`${job.jobId}_model_${cursor.step + 1}`);
+      const saved = hooks.result?.(agentModelRequestId(job, cursor.step + 1));
       if (saved && !saved.toolCalls.length) {
         await hooks.step(job, assistantMessage(saved));
         if (hooks.canFinish?.(job, [...transcript, assistantMessage(saved)]) !== false) {

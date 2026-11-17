@@ -239,3 +239,24 @@ Deno.test("JSON tools: per-call options cannot enable the compatibility protocol
     await local.close();
   }
 });
+
+Deno.test("JSON tools: malformed completed output remains available only as private diagnostic data", async () => {
+  const content = '{"content":"private-body","toolCalls":';
+  const local = fixture(() => Response.json(completion(content)));
+  try {
+    await assert.rejects(local.client.complete(request), (error) => {
+      assert.ok(error instanceof ChatModelError);
+      assert.equal(error.responseDetail, "json_syntax");
+      assert.equal(
+        (error.responseBody as ReturnType<typeof completion>).choices[0].message.content,
+        content,
+      );
+      assert.ok(!error.message.includes("private-body"));
+      assert.ok(!error.message.includes("fixture-secret"));
+      return true;
+    });
+  } finally {
+    local.client.close();
+    await local.close();
+  }
+});

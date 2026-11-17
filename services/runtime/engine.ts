@@ -25,6 +25,8 @@ import type { LocalSemantic } from "./embedding.ts";
 import { describedImage, imageDescriptionRequest, imageProvenance } from "./vision.ts";
 import type { ModelSelection, ModelSelectionResult, ModelSnapshot } from "./model-selection.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
+import { ChatModelError } from "../../plugins/model-chat/errors.ts";
+import { writeDurableJson } from "../../sdk/durable-json.ts";
 
 interface RequestRecord {
   id: string;
@@ -730,7 +732,25 @@ export class RuntimeEngine {
       const amount = new TextEncoder().encode(JSON.stringify(request)).length +
         request.messages.length * 64 + outputTokens;
       await this.budget.reserve(id, amount);
-      const response = await (selected?.client ?? this.options.model).complete(request, overrides);
+      let response: ModelResponse;
+      try {
+        response = await (selected?.client ?? this.options.model).complete(request, overrides);
+      } catch (error) {
+        if (error instanceof ChatModelError && error.responseBody !== undefined) {
+          const directory = `${this.options.directory}/model-invalid`;
+          await Deno.mkdir(directory, { recursive: true, mode: 0o700 });
+          await writeDurableJson(`${directory}/${await fingerprint(id)}.json`, {
+            id,
+            at: new Date().toISOString(),
+            category: error.category,
+            detail: error.responseDetail ?? null,
+            credentialProfile,
+            modelName: selected?.modelName ?? null,
+            response: error.responseBody,
+          } as Json);
+        }
+        throw error;
+      }
       const savedResponse = await this.modelResponses.append("response", {
         id,
         response,

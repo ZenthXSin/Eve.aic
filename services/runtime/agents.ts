@@ -19,6 +19,7 @@ import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
 import { writeDurableJson } from "../../sdk/durable-json.ts";
 import {
+  agentModelRequestId,
   applyAgentEvent,
   assistantMessage,
   type BlobRef,
@@ -68,7 +69,7 @@ const allowed: Record<string, readonly string[]> = {
 const tool: ToolSpec = {
   name: "use_tool",
   description:
-    "调用项目工具。files: read({path,offsetBytes?,limitBytes?,encoding?}), list({path?,afterName?}), search({path,query,afterLine?}), write({path,text,expectedSha256:'absent'或旧摘要}), replace({path,oldText,newText,expectedSha256}); commands: start({cmd,cwd?,waitMs?}), poll({sessionId,stdoutOffsetBytes?,stderrOffsetBytes?,limitBytes?,waitMs?}), write({sessionId,text?,closeStdin?}), cancel({sessionId}); web: search({query}), fetch({url,startChar?,limit?,expectedSha256?})。文件路径相对共享工作空间；读取返回摘要供修改前件校验。",
+    '参数严格为{namespace,method,args}，业务参数放在内层args中。例如{"namespace":"commands","method":"start","args":{"cmd":"pwd","waitMs":1000}}，不要把cmd放在namespace同层。files: read({path,offsetBytes?,limitBytes?,encoding?}), list({path?,afterName?}), search({path,query,afterLine?}), write({path,text,expectedSha256:\'absent\'或旧摘要}), replace({path,oldText,newText,expectedSha256}); commands: start({cmd,cwd?,waitMs?}), poll({sessionId,stdoutOffsetBytes?,stderrOffsetBytes?,limitBytes?,waitMs?}), write({sessionId,text?,closeStdin?}), cancel({sessionId}); web: search({query}), fetch({url,startChar?,limit?,expectedSha256?})。文件路径相对共享工作空间；读取返回摘要供修改前件校验。',
   parameters: {
     type: "object",
     properties: {
@@ -78,6 +79,7 @@ const tool: ToolSpec = {
     },
     required: ["namespace", "method", "args"],
     additionalProperties: false,
+    examples: [{ namespace: "commands", method: "start", args: { cmd: "pwd", waitMs: 1000 } }],
   },
 };
 export interface AgentHooks {
@@ -611,24 +613,56 @@ export class AgentService {
       let { step, completed, assistant } = transcriptCursor(transcript);
       while (!job.cancelled) {
         if (!assistant) {
-          const id = `${job.jobId}_model_${++step}`;
-          let response = this.hooks.result?.(id);
-          if (!response) {
-            this.#modelRequests.set(id, job);
-            try {
-              response = await this.hooks.complete({
-                messages,
-                tools: job.config.role === "general"
-                  ? [tool, AGENT_DELEGATE_TOOL, AGENT_WAIT_TOOL]
-                  : [tool],
-              }, {
-                ...job.config,
-                sessionId: job.agentId,
-              }, id);
-            } finally {
-              this.#modelRequests.delete(id);
+          step++;
+          let response: ModelResponse | undefined;
+          while (!response && !job.cancelled) {
+            const id = agentModelRequestId(job, step);
+            response = this.hooks.result?.(id);
+            if (!response) {
+              this.#modelRequests.set(id, job);
+              try {
+                response = await this.hooks.complete({
+                  messages: job.formatRetries?.[step]
+                    ? [...messages, {
+                      role: "system",
+                      content:
+                        '刚才模型输出未通过JSON格式校验，没有执行其中任何工具。这次只纠正输出格式：输出完整JSON对象{"content":"文字","toolCalls":[]}；实际调用必须填入toolCalls，字符串中的换行和引号按JSON转义。use_tool的args严格为{namespace,method,args:{业务参数}}。依据已有真实回执继续，已完成动作不要重做；不要添加JSON外的说明或Markdown。',
+                    }]
+                    : messages,
+                  tools: job.config.role === "general"
+                    ? [tool, AGENT_DELEGATE_TOOL, AGENT_WAIT_TOOL]
+                    : [tool],
+                }, {
+                  ...job.config,
+                  sessionId: job.agentId,
+                }, id);
+              } catch (error) {
+                const wire = toWireError(error);
+                const detail = wire.kind === "remote"
+                  ? /模型请求未完成：invalid_response \(response: (json_syntax|json_envelope)\)$/
+                    .exec(
+                      wire.message,
+                    )?.[1]
+                  : undefined;
+                if (
+                  !detail || job.cancelled || job.formatRetries?.[step] ||
+                  Object.keys(job.formatRetries ?? {}).length >= 2
+                ) throw error;
+                // Only a definitively rejected, completed response can be corrected.
+                // Persist the new request ID before paying; prior tool receipts stay authoritative.
+                await this.#append("format_retry", {
+                  agentId: job.agentId,
+                  jobId: job.jobId,
+                  step,
+                  attempt: 1,
+                  detail,
+                });
+              } finally {
+                this.#modelRequests.delete(id);
+              }
             }
           }
+          if (!response) break;
           assistant = assistantMessage(response);
           await record(assistant);
           completed = 0;
@@ -663,7 +697,12 @@ export class AgentService {
               if (
                 typeof namespace !== "string" || typeof method !== "string" ||
                 !allowed[namespace]?.includes(method) || !object(args)
-              ) throw new KernelError("rejected", "子代理工具参数无效");
+              ) {
+                throw new KernelError(
+                  "rejected",
+                  '子代理工具参数应为{namespace,method,args:{业务参数}}；例如{"namespace":"commands","method":"start","args":{"cmd":"pwd"}}，不要把cmd放在外层',
+                );
+              }
               result = await this.hooks.invoke(
                 namespace,
                 method,
