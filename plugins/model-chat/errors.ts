@@ -16,6 +16,7 @@ export class ChatModelError extends Error {
       | "response_message"
       | "tool_call"
       | "tool_arguments"
+      | "tool_protocol"
       | "empty_response"
       | "json_syntax"
       | "json_envelope"
