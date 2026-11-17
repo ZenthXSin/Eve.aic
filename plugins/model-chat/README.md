@@ -59,3 +59,15 @@ available, it persists the rejected assistant content as private diagnostic data
 the correction request; reasoning and simulated receipts are never accepted as results. Correction
 requests ask for one action at a time to reduce nesting mistakes, while normal steps retain
 multiple-tool support. Existing executed tools and their receipts are preserved on restart.
+
+Prefer the standard Chat `tools`/`tool_calls` fields whenever the current upstream supports them. Do
+not enable JSON compatibility based only on a model family or an old gateway failure: verify the
+actual streaming response first. JSON compatibility removes wire-level tool definitions and puts an
+envelope contract into assistant content, which some upstreams do not enforce even with
+`response_format`; repeated DSML/JSON mixtures are a reason to recheck the native Chat path. This
+does not require changing models, keys, reasoning effort, Chat streaming, durable history, or the
+cache session. After a transport change, the changed wire prefix warms its cache again.
+
+On the native path, stranded DSML control tokens or a content JSON envelope containing pending
+actions are rejected as `tool_protocol`, rather than saved as a completed task. They are never
+executed from prose. Fenced documentation examples and normal final answers remain ordinary text.

@@ -351,6 +351,49 @@ Deno.test("模型传输：拒绝坏 JSON、未完成响应、未知工具与不�
   }
 });
 
+Deno.test("native Chat: stranded provider markup never completes a tool task or executes from prose", async () => {
+  let content = "";
+  let calls = 0;
+  const local = server(() => {
+    calls++;
+    return Response.json(completion(content));
+  });
+  const client = new ChatModelClient({ ...options, baseUrl: local.url });
+  try {
+    const rejected = [
+      '<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="echo">\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>',
+      '准备行动。\n<｜｜DSML｜｜ invoke name="echo">{"text":"hello"}</｜｜DSML｜｜ invoke>',
+      '{"content":"准备","toolCalls":[]}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>',
+      JSON.stringify({
+        content: "准备",
+        toolCalls: [{ id: "call_text", name: "echo", args: { text: "hello" } }],
+      }),
+    ];
+    for (content of rejected) {
+      await assert.rejects(client.complete(request), (error) => {
+        assert.ok(error instanceof ChatModelError);
+        assert.equal(error.responseDetail, "tool_protocol");
+        assert.ok(error.responseBody);
+        assert.ok(!error.message.includes(content));
+        return true;
+      });
+    }
+    assert.equal(calls, rejected.length, "no protocol fallback or repeated paid request");
+    for (
+      content of [
+        "已完成，依据真实回执汇总。",
+        '代码中的 DSML 是格式标记。\n```xml\n<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="echo">\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>\n```',
+        '~~~xml\n<｜｜DSML｜｜ invoke name="echo">示例</｜｜DSML｜｜ invoke>\n~~~',
+      ]
+    ) {
+      assert.equal((await client.complete(request)).content, content);
+    }
+  } finally {
+    client.close();
+    await local.close();
+  }
+});
+
 Deno.test("Chat history: reused IDs pair per assistant, remain stable and do not change originals", async () => {
   const history: ModelRequest = {
     ...request,

@@ -69,7 +69,7 @@ const allowed: Record<string, readonly string[]> = {
 const tool: ToolSpec = {
   name: "use_tool",
   description:
-    '参数严格为{namespace,method,args}，业务参数放在内层args中。例如{"namespace":"commands","method":"start","args":{"cmd":"pwd","waitMs":1000}}，不要把cmd放在namespace同层。files: read({path,offsetBytes?,limitBytes?,encoding?}), list({path?,afterName?}), search({path,query,afterLine?}), write({path,text,expectedSha256:\'absent\'或旧摘要}), replace({path,oldText,newText,expectedSha256}); commands: start({cmd,cwd?,waitMs?}), poll({sessionId,stdoutOffsetBytes?,stderrOffsetBytes?,limitBytes?,waitMs?}), write({sessionId,text?,closeStdin?}), cancel({sessionId}); web: search({query}), fetch({url,startChar?,limit?,expectedSha256?})。文件路径相对共享工作空间；读取返回摘要供修改前件校验。',
+    '参数严格为{namespace,method,args}，业务参数放在内层args中。例如{"namespace":"commands","method":"start","args":{"cmd":"pwd","waitMs":1000}}，不要把cmd放在namespace同层。files: read({path,offsetBytes?,limitBytes?,encoding?}), list({path?,afterName?}), search({path,query,afterLine?}), write({path,text,expectedSha256:\'absent\'或旧摘要}), replace({path,oldText,newText,expectedSha256}); commands: start({cmd,cwd?,waitMs?}), poll({sessionId,stdoutOffsetBytes?,stderrOffsetBytes?,limitBytes?,waitMs?}), write({sessionId,text?,closeStdin?}), cancel({sessionId}); web: search({query}), fetch({url,startChar?,limit?,expectedSha256?})。commands的waitMs须为0至10000的整数，长命令返回sessionId后用poll续读，不把等待值设成总耗时。文件路径相对共享工作空间；读取返回摘要供修改前件校验。',
   parameters: {
     type: "object",
     properties: {

@@ -243,6 +243,34 @@ function usageView(raw: unknown): ModelResponse["usage"] {
   return usage;
 }
 
+/** Provider control tokens in assistant prose are not native tool calls or a final answer. */
+function strandedToolOutput(content: string): boolean {
+  let fence: string | undefined;
+  for (const line of content.split("\n")) {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker) {
+      if (!fence) fence = marker;
+      else if (marker[0] === fence[0] && marker.length >= fence.length) fence = undefined;
+      continue;
+    }
+    if (!fence && /<\/?[|｜]{2}DSML[|｜]{2}\s+(?:calls|invoke|parameter)\b/.test(line)) {
+      return true;
+    }
+  }
+  // A complete compatibility envelope with pending actions must not be mistaken
+  // for a native final answer. Never extract or execute its action descriptions.
+  if (content.trimStart().startsWith("{")) {
+    try {
+      const value = JSON.parse(content);
+      return record(value) && typeof value.content === "string" &&
+        Array.isArray(value.toolCalls) && value.toolCalls.length > 0;
+    } catch {
+      // Ordinary prose and incomplete examples do not become executable calls.
+    }
+  }
+  return false;
+}
+
 function modelResponse(raw: unknown, request: ModelRequest): ModelResponse {
   if (!record(raw) || !Array.isArray(raw.choices) || raw.choices.length !== 1) {
     fail("invalid_response", "response_choice");
@@ -262,6 +290,9 @@ function modelResponse(raw: unknown, request: ModelRequest): ModelResponse {
   const rawCalls = message.tool_calls ?? [];
   if (!Array.isArray(rawCalls)) fail("invalid_response", "tool_call");
   const tools = new Set(request.tools.map((tool) => tool.name));
+  if (tools.size > 0 && rawCalls.length === 0 && strandedToolOutput(content)) {
+    fail("invalid_response", "tool_protocol");
+  }
   const ids = new Set<string>();
   const toolCalls: ToolCall[] = rawCalls.map((call) => {
     if (
