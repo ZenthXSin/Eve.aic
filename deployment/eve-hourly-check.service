@@ -1,0 +1,16 @@
+[Unit]
+Description=Read-only Eve and QQ health check
+After=eve-rebuild-supervisor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -IB /usr/local/lib/eve-rebuild/eve-hourly-check.py
+TimeoutStartSec=3min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+UMask=0077
