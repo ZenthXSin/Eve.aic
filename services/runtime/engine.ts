@@ -144,6 +144,30 @@ export class RuntimeEngine {
       `${directory}/agents`,
       {
         result: (id) => this.#modelResult(id) as unknown as ModelResponse | undefined,
+        rejectedContent: async (id) => {
+          const path = `${directory}/model-invalid/${await fingerprint(id)}.json`;
+          let saved;
+          try {
+            const stat = await Deno.lstat(path);
+            if (!stat.isFile || stat.isSymlink) {
+              throw new KernelError("corrupt", "模型格式诊断原件无效");
+            }
+            saved = JSON.parse(await Deno.readTextFile(path));
+          } catch (error) {
+            if (error instanceof Deno.errors.NotFound) return undefined;
+            throw error;
+          }
+          if (saved.id !== id || saved.category !== "invalid_response") {
+            throw new KernelError("corrupt", "模型格式诊断请求不匹配");
+          }
+          const choice = saved.response?.choices?.[0];
+          const content = choice?.message?.content;
+          // Never use reasoning, an unfinished stream, or a truncated excerpt as a repair source.
+          return choice?.finish_reason === "stop" && choice?.message?.role === "assistant" &&
+              typeof content === "string" && content.length <= 16_384
+            ? content
+            : undefined;
+        },
         complete: async (request, config, id) =>
           await this.dispatch(
             "model",

@@ -43,6 +43,10 @@ Deno.test("agents: format correction uses a new paid request and preserves execu
   const requests: string[] = [];
   let invoked = 0;
   const f = await fixture({
+    rejectedContent(id) {
+      assert.equal(id, "agent_format_model_2");
+      return Promise.resolve("<DSML>private rejected output</DSML>");
+    },
     complete(request, _options, id) {
       requests.push(id);
       if (id === "agent_format_model_1") {
@@ -64,6 +68,8 @@ Deno.test("agents: format correction uses a new paid request and preserves execu
       assert.equal(id, "agent_format_model_2_format_1");
       assert.equal(request.messages.at(-1)!.role, "system");
       assert.ok(request.messages.at(-1)!.content.includes("已完成动作不要重做"));
+      assert.ok(request.messages.at(-2)!.content.includes("private rejected output"));
+      assert.ok(request.messages.at(-1)!.content.includes("只提交一个实际工具调用"));
       assert.equal(request.messages.filter((m) => m.role === "tool").length, 1);
       return Promise.resolve(response("来自实际回执的完整回复"));
     },
@@ -97,10 +103,16 @@ Deno.test("agents: format correction uses a new paid request and preserves execu
     const restored = new AgentService(dest, {
       result(id) {
         assert.equal(id, "agent_format_model_2_format_1");
-        return response("来自实际回执的完整回复");
+        return undefined;
       },
-      complete() {
-        throw new Error("must not pay again");
+      rejectedContent() {
+        throw new Error("must restore saved repair source without rereading rejected request");
+      },
+      complete(request, _options, id) {
+        assert.equal(id, "agent_format_model_2_format_1");
+        assert.ok(request.messages.at(-2)!.content.includes("private rejected output"));
+        assert.equal(request.messages.filter((m) => m.role === "tool").length, 1);
+        return Promise.resolve(response("来自实际回执的完整回复"));
       },
       invoke() {
         throw new Error("must not replay tool");
@@ -108,7 +120,8 @@ Deno.test("agents: format correction uses a new paid request and preserves execu
     });
     await restored.initialize();
     try {
-      assert.equal(restored.status({ jobId: job.jobId }).status, "completed");
+      const resumed = await restored.send({ agentId: job.agentId, text: "只读" }, job.jobId);
+      assert.equal(resumed.status, "completed");
       assert.equal(restored.notifications().items.length, 1);
     } finally {
       await restored.close();
@@ -149,8 +162,21 @@ Deno.test("agents: format correction is bounded and unknown or HTTP outcomes are
 Deno.test("agents: format correction accounts separate requests and saves invalid originals privately", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-agent-format-live-" });
   let calls = 0;
-  const local = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, () => {
+  const local = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (incoming) => {
     calls++;
+    const body = await incoming.json();
+    if (calls === 3) {
+      assert.ok(
+        body.messages.some((m: { content: string }) =>
+          m.content.includes("rejectedOutput") && m.content.includes("private invalid body")
+        ),
+      );
+      assert.ok(
+        body.messages.some((m: { content: string }) =>
+          m.content.includes("只提交一个实际工具调用")
+        ),
+      );
+    }
     const content = calls === 1
       ? JSON.stringify({
         content: "",

@@ -7,6 +7,9 @@ function object(value: unknown): value is Record<string, unknown> {
 /** Explicit compatibility for providers that drop native tool calls. Never parse reasoning. */
 export function jsonToolRequest(body: Record<string, unknown>): Record<string, unknown> {
   const { tools, messages, ...rest } = body;
+  const hasUseTool = (tools as { function: { name: string } }[] | undefined)?.some((tool) =>
+    tool.function.name === "use_tool"
+  );
   const wire = (messages as Record<string, unknown>[]).map((message) => {
     if (message.role === "assistant") {
       return {
@@ -53,7 +56,24 @@ export function jsonToolRequest(body: Record<string, unknown>): Record<string, u
     content:
       "本轮最终输出必须严格为一个JSON对象，第一字符是{，最后字符是}，只允许content和toolCalls两个字段。" +
       "所有想说的正文放进content；实际行动放进toolCalls。" +
-      "不要输出JSON之外的文字、前导说明、Markdown或代码围栏。",
+      "不要输出JSON之外的文字、前导说明、Markdown、代码围栏或DSML。" +
+      "这不是原生工具调用连接，不输出XML或invoke/parameter标记。" +
+      "只输出这一轮，调用后等待真实回执，禁止模拟工具结果。" +
+      "嵌套示例（只说明格式，不要求执行）：\n" +
+      JSON.stringify(
+        hasUseTool
+          ? {
+            content: "读取文件。",
+            toolCalls: [{
+              id: "example_1",
+              name: "use_tool",
+              args: { namespace: "files", method: "read", args: { path: "AGENT.md" } },
+            }],
+          }
+          : { content: "本轮回复。", toolCalls: [] },
+        null,
+        2,
+      ),
   });
   return { ...rest, messages: wire, response_format: { type: "json_object" } };
 }

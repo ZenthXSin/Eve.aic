@@ -15,6 +15,7 @@ export interface StoredJob extends AgentJob {
   transcript: BlobRef[];
   cancelled: boolean;
   formatRetries?: Record<number, number>;
+  formatSources?: Record<number, BlobRef>;
 }
 
 export function agentModelRequestId(job: StoredJob, step: number): string {
@@ -119,6 +120,13 @@ export function applyAgentEvent(state: AgentState, event: FactEvent) {
       Object.keys(current.formatRetries ?? {}).length >= 2 ||
       !["json_syntax", "json_envelope"].includes(String(d.detail))
     ) throw new KernelError("corrupt", "子代理格式纠正记录无效");
+    if (d.body !== undefined) {
+      const body = d.body as BlobRef;
+      if (!/^[a-f0-9]{64}$/.test(body?.hash)) {
+        throw new KernelError("corrupt", "子代理格式纠正原件无效");
+      }
+      (current.formatSources ??= {})[step] = body;
+    }
     (current.formatRetries ??= {})[step] = 1;
   } else if (event.kind === "cancelled") job().cancelled = true;
   else if (event.kind === "reply") {
