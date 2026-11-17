@@ -149,12 +149,12 @@ export interface QqSplitOptions {
  * Long URLs and fenced code are rejected instead of corrupting them into chat fragments.
  */
 export function splitForQQ(text: string, options: QqSplitOptions = {}): string[] {
-  const maximum = options.maxCharacters ?? 30, maxParts = options.maxParts ?? 4;
+  const maximum = options.maxCharacters ?? 30, maxParts = options.maxParts;
   if (
     !Number.isSafeInteger(maximum) || maximum < 1 || maximum > 10_000 ||
-    !Number.isSafeInteger(maxParts) || maxParts < 1 || maxParts > 32
+    (maxParts !== undefined && (!Number.isSafeInteger(maxParts) || maxParts < 1))
   ) {
-    throw new RangeError("QQ 分条参数无效：每条 1–10000 字，1–32 条。");
+    throw new RangeError("QQ 分条参数无效：每条 1–10000 字；显式 maxParts 须为正整数。");
   }
   if (!text.trim()) return [];
   if (/^ {0,3}(`{3,}|~{3,})/m.test(text)) {
@@ -165,7 +165,7 @@ export function splitForQQ(text: string, options: QqSplitOptions = {}): string[]
   const parts: string[] = [];
   let start = 0;
   while (start < segments.length) {
-    if (parts.length === maxParts) {
+    if (maxParts !== undefined && parts.length === maxParts) {
       throw new RangeError(
         `QQ 普通聊天超过 ${maxParts} 条，请先精简或明确作为长文发送；原文未截断。`,
       );

@@ -133,7 +133,9 @@ export class PhoneRpcClient {
           const next = await reader.read();
           if (next.done) break;
           size += next.value.length;
-          const limit = method === "image"
+          const limit = ["sendBurst", "burstStatus"].includes(method)
+            ? Infinity
+            : method === "image"
             ? 16_777_216
             : ["file", "settings"].includes(method)
             ? 1_048_576

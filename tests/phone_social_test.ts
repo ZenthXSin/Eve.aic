@@ -4,7 +4,7 @@ import { QqClient } from "../adapters/qq/client.ts";
 import { type QqDispatch, qqMessage } from "../adapters/qq/inbound.ts";
 import { QqInboundJournal } from "../adapters/qq/journal.ts";
 import { QqPhone } from "../adapters/qq/phone.ts";
-import { admitBurst, burstSegments, waitForQuiet } from "../adapters/qq/phone-social.ts";
+import { admitBurst, burstSegments, readBurst, waitForQuiet } from "../adapters/qq/phone-social.ts";
 import { QqPhoneReading } from "../adapters/qq/reading.ts";
 import { startPhoneRpc } from "../adapters/qq/rpc.ts";
 import { QqTimeline } from "../adapters/qq/timeline.ts";
@@ -101,7 +101,7 @@ Deno.test("手机分条：真实RPC顺序发送、父子编号冻结、重启重
     const args = {
       actionId: "burst-one",
       conversationId: CONVERSATION,
-      messages: ["先说一个意思", "再补一句", "最后一句"],
+      messages: ["先说一个意思", "再补一句", "第三句", "第四句", "最后一句"],
     };
     const [result, concurrent] = await Promise.all([
       f.remote().call("sendBurst", args),
@@ -110,14 +110,14 @@ Deno.test("手机分条：真实RPC顺序发送、父子编号冻结、重启重
     assert.deepEqual(result, concurrent);
     assert.deepEqual(await f.remote().call("burstStatus", { actionId: args.actionId }), result);
     assert.equal(result.complete, true);
-    assert.deepEqual(result.items.map((item) => item.index), [1, 2, 3]);
+    assert.deepEqual(result.items.map((item) => item.index), [1, 2, 3, 4, 5]);
     assert.deepEqual(f.texts, args.messages);
-    assert.equal(new Set(result.items.map((item) => item.actionId)).size, 3);
+    assert.equal(new Set(result.items.map((item) => item.actionId)).size, 5);
     assert.ok(
       result.items.every((item) => item.receipt.state === "sent" && item.actionId.length <= 128),
     );
     const children = f.actions().records().sort((a, b) => a.policy!.sequence - b.policy!.sequence);
-    assert.deepEqual(children.map((item) => item.policy!.sequence), [1, 2, 3]);
+    assert.deepEqual(children.map((item) => item.policy!.sequence), [1, 2, 3, 4, 5]);
     assert.deepEqual(children.map((item) => item.request.text), args.messages);
     for await (const item of Deno.readDir(`${f.directory}/actions/bursts`)) {
       assert.match(item.name, /^[a-f0-9]{64}\.json$/);
@@ -179,14 +179,10 @@ Deno.test("手机分条：未知队首阻挡其后子动作，取消保留未知
   }
 });
 
-Deno.test("手机分条：超四条先拒绝不发送，显式30字切分冻结原文与segments，代码不暗拆", async () => {
+Deno.test("手机分条：显式30字切分不限制条数，冻结原文与segments，代码不暗拆", async () => {
   const f = await fixture();
   try {
     const base = { actionId: "split", conversationId: CONVERSATION };
-    await assert.rejects(f.phone().sendBurst({ ...base, messages: ["1", "2", "3", "4", "5"] }));
-    await assert.rejects(
-      f.phone().sendBurst({ ...base, messages: ["甲".repeat(121)], splitLongText: true }),
-    );
     await assert.rejects(
       f.phone().sendBurst({
         ...base,
@@ -195,15 +191,42 @@ Deno.test("手机分条：超四条先拒绝不发送，显式30字切分冻结�
       }),
     );
     assert.deepEqual(f.texts, []);
-    const text = "甲".repeat(65);
+    const text = "甲".repeat(121);
     const split = await f.phone().sendBurst({ ...base, messages: [text], splitLongText: true });
-    assert.equal(split.items.length, 3);
+    assert.equal(split.items.length, 5);
     assert.equal(f.texts.join(""), text);
     assert.ok(f.texts.every((text) => Array.from(text).length <= 30));
     assert.equal(
       burstSegments({ ...base, messages: ["```ts\nhello\n```"] })[0],
       "```ts\nhello\n```",
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("手机分条：大量分段的完整父原件超过旧大小仍可恢复且子编号不变", async () => {
+  const f = await fixture();
+  const directory = `${f.directory}/actions`;
+  try {
+    const args = {
+      actionId: "large-burst",
+      conversationId: CONVERSATION,
+      messages: Array.from({ length: 10000 }, (_, i) => `message-${String(i).padStart(5, "0")}`),
+    };
+    const original = await admitBurst(directory, args);
+    const files = [];
+    for await (const file of Deno.readDir(`${directory}/bursts`)) files.push(file.name);
+    assert.equal(files.length, 1);
+    assert((await Deno.stat(`${directory}/bursts/${files[0]}`)).size > 1_048_576);
+    assert.deepEqual(await readBurst(directory, args.actionId), original);
+    assert.deepEqual(await admitBurst(directory, args), original);
+    const status = await f.remote().call("burstStatus", { actionId: args.actionId }) as unknown as {
+      items: { receipt: unknown }[];
+    };
+    assert.equal(status.items.length, args.messages.length);
+    assert(status.items.every((item) => item.receipt === null));
+    assert.deepEqual(f.texts, []);
   } finally {
     await f.close();
   }
