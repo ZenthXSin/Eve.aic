@@ -20,6 +20,8 @@ export class ChatModelError extends Error {
       | "json_syntax"
       | "json_envelope"
       | "json_call",
+    /** Completed provider output for the private diagnostic sink; never included in the message. */
+    readonly responseBody?: unknown,
   ) {
     // 服务端正文、URL 和 fetch 原文可能含凭据，不写入错误消息或 cause。
     super(

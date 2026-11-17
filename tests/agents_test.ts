@@ -38,6 +38,190 @@ async function fixture(hooks: Partial<AgentHooks> = {}) {
     },
   };
 }
+
+Deno.test("agents: format correction uses a new paid request and preserves executed tools across restart", async () => {
+  const requests: string[] = [];
+  let invoked = 0;
+  const f = await fixture({
+    complete(request, _options, id) {
+      requests.push(id);
+      if (id === "agent_format_model_1") {
+        return Promise.resolve({
+          content: "",
+          toolCalls: [{
+            id: "call_1",
+            name: "use_tool",
+            args: { namespace: "files", method: "list", args: {} },
+          }],
+        });
+      }
+      if (id === "agent_format_model_2") {
+        throw new KernelError(
+          "remote",
+          "ChatModelError: 模型请求未完成：invalid_response (response: json_syntax)",
+        );
+      }
+      assert.equal(id, "agent_format_model_2_format_1");
+      assert.equal(request.messages.at(-1)!.role, "system");
+      assert.ok(request.messages.at(-1)!.content.includes("已完成动作不要重做"));
+      assert.equal(request.messages.filter((m) => m.role === "tool").length, 1);
+      return Promise.resolve(response("来自实际回执的完整回复"));
+    },
+    invoke() {
+      invoked++;
+      return Promise.resolve({ items: ["actual"] });
+    },
+  });
+  try {
+    const job = await f.api.send({ agentId: "agent_general", text: "只读" }, "agent_format");
+    assert.equal(job.status, "completed");
+    assert.equal(invoked, 1);
+    assert.deepEqual(requests, [
+      "agent_format_model_1",
+      "agent_format_model_2",
+      "agent_format_model_2_format_1",
+    ]);
+    const repair = f.api.journal.events.find((e) => e.kind === "format_retry")!;
+    await f.api.close();
+    const dest = `${f.directory}/interrupted`;
+    await Deno.mkdir(`${dest}/events`, { recursive: true });
+    await Deno.mkdir(`${dest}/bodies`);
+    for await (const file of Deno.readDir(`${f.directory}/bodies`)) {
+      await Deno.copyFile(`${f.directory}/bodies/${file.name}`, `${dest}/bodies/${file.name}`);
+    }
+    for (const event of f.api.journal.events) {
+      if (event.seq > repair.seq) break;
+      const name = `${String(event.seq).padStart(16, "0")}.json`;
+      await Deno.copyFile(`${f.directory}/events/${name}`, `${dest}/events/${name}`);
+    }
+    const restored = new AgentService(dest, {
+      result(id) {
+        assert.equal(id, "agent_format_model_2_format_1");
+        return response("来自实际回执的完整回复");
+      },
+      complete() {
+        throw new Error("must not pay again");
+      },
+      invoke() {
+        throw new Error("must not replay tool");
+      },
+    });
+    await restored.initialize();
+    try {
+      assert.equal(restored.status({ jobId: job.jobId }).status, "completed");
+      assert.equal(restored.notifications().items.length, 1);
+    } finally {
+      await restored.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("agents: format correction is bounded and unknown or HTTP outcomes are never retried", async () => {
+  for (
+    const error of [
+      new KernelError("remote", "模型请求未完成：invalid_response (response: json_envelope)"),
+      new KernelError("unknown", "模型连接中断"),
+      new KernelError("remote", "模型请求未完成：http (503)"),
+    ]
+  ) {
+    let calls = 0;
+    const f = await fixture({
+      complete() {
+        calls++;
+        throw error;
+      },
+      invoke() {
+        throw new Error("invalid responses must not execute tools");
+      },
+    });
+    try {
+      const job = await f.api.send({ agentId: "agent_general", text: "只读" }, "agent_bounded");
+      assert.equal(job.status, "failed");
+      assert.equal(calls, error.message.includes("json_envelope") ? 2 : 1);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+Deno.test("agents: format correction accounts separate requests and saves invalid originals privately", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-agent-format-live-" });
+  let calls = 0;
+  const local = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, () => {
+    calls++;
+    const content = calls === 1
+      ? JSON.stringify({
+        content: "",
+        toolCalls: [{
+          id: "call_1",
+          name: "use_tool",
+          args: { namespace: "files", method: "list", args: { path: "." } },
+        }],
+      })
+      : calls === 2
+      ? '{"content":"private invalid body","toolCalls":'
+      : JSON.stringify({ content: "已依据工具回执完成", toolCalls: [] });
+    return Response.json({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content } }],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 110,
+        prompt_tokens_details: { cached_tokens: 80 },
+      },
+    });
+  });
+  const client = new ChatModelClient({
+    baseUrl: `http://127.0.0.1:${local.addr.port}`,
+    model: "compat",
+    apiKey: "fixture",
+    sessionId: "fixture",
+    maxOutputTokens: 256,
+    timeoutMs: 1000,
+    jsonToolModels: ["compat"],
+  });
+  const engine = new RuntimeEngine({
+    directory: `${directory}/runtime`,
+    workspace: directory,
+    settingsFile: `${directory}/settings.json`,
+    model: client,
+    modelName: "compat",
+    maxOutputTokens: 256,
+  });
+  try {
+    await writeDurableJson(`${directory}/settings.json`, {
+      dailyTokenBudget: 1_000_000,
+      paused: false,
+      timeZone: "UTC",
+    });
+    await engine.initialize();
+    const job = await engine.dispatch(
+      "agents",
+      "send",
+      { agentId: "agent_general", text: "列目录" },
+      "agent_format_live",
+    ) as unknown as AgentJob;
+    assert.equal(job.status, "completed");
+    assert.equal(calls, 3);
+    const files = [...Deno.readDirSync(`${directory}/runtime/model-invalid`)];
+    assert.equal(files.length, 1);
+    const path = `${directory}/runtime/model-invalid/${files[0].name}`;
+    const saved = JSON.parse(await Deno.readTextFile(path));
+    assert.equal(saved.id, "agent_format_live_model_2");
+    assert.equal(saved.detail, "json_syntax");
+    assert.ok(saved.response.choices[0].message.content.includes("private invalid body"));
+    assert.equal((await Deno.stat(path)).mode! & 0o077, 0);
+    const budget = await engine.budget.status();
+    assert.equal(budget.knownNoncachedTokens, 60);
+    assert.ok(budget.unknownReservedTokens > 0, "invalid first completion retains its reservation");
+  } finally {
+    await engine.close();
+    await local.shutdown();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
 Deno.test("agents: four high defaults, duplicate roles, isolated configuration and persistent conversations", async () => {
   const calls: { request: ModelRequest; options: ModelCallOptions; id: string }[] = [];
   const f = await fixture({

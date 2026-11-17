@@ -399,6 +399,7 @@ export class ChatModelClient {
     const totalTimer = setTimeout(() => expire("total"), this.#config.maxDurationMs!);
     const signal = AbortSignal.any([this.#closed.signal, controller.signal]);
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let completedRaw: unknown;
     try {
       arm("connect", this.#config.connectTimeoutMs!);
       const response = await fetch(this.#endpoint, {
@@ -463,6 +464,7 @@ export class ChatModelClient {
         const raw = config.protocol === "responses"
           ? responsesResult(stream.result())
           : stream.result();
+        completedRaw = raw;
         return {
           ...modelResponse(jsonTools ? jsonToolResponse(raw) : raw, snapshot),
           ...(config.protocol === "responses"
@@ -486,10 +488,22 @@ export class ChatModelClient {
           modelOutput: (decoded as { output: NonNullable<ModelResponse["modelOutput"]> }).output,
         };
       }
+      completedRaw = decoded;
       return modelResponse(jsonTools ? jsonToolResponse(decoded) : decoded, snapshot);
     } catch (error) {
       if (timeoutPhase) throw new ChatModelError("transport", undefined, timeoutPhase);
-      if (error instanceof ChatModelError) throw error;
+      if (error instanceof ChatModelError) {
+        if (error.category === "invalid_response" && completedRaw !== undefined) {
+          throw new ChatModelError(
+            error.category,
+            error.httpStatus,
+            error.timeoutPhase,
+            error.responseDetail,
+            completedRaw,
+          );
+        }
+        throw error;
+      }
       throw new ChatModelError("transport");
     } finally {
       clearTimeout(timer);
