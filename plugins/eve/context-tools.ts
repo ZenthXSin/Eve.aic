@@ -7,19 +7,21 @@ import {
   CONTEXT_TARGET_TOKENS,
 } from "./context-maintenance.ts";
 import {
-  activeEvents,
+  appendPreviewEvent,
   blocks,
   type ContextCounter,
   contextEstimate,
   estimate,
+  lastActiveEvent,
   render,
+  selectedEvents,
 } from "./view.ts";
 
 export const CONTEXT_TOOLS: ToolSpec[] = [
   {
     name: "inspect_context",
     description:
-      "查看当前上下文用量估算、最近一次上游真实用量，以及可直接用于compress_context的完整消息/工具回执边界。recommendation给出优先保留最近8个完整片段、目标约100k的建议边界；可按任务改选。分页用nextAfterSeq；不写入压缩。候选removedMessageTokens为移出的消息估算，未扣除新摘要。",
+      "查看当前上下文用量估算、最近一次上游真实用量，以及可直接用于compress_context的完整消息/工具回执边界。recommendation给出保留最近片段、目标约100k的建议边界；recommendedNow为false时保留稳定缓存，不因查询到候选就压缩，通常150k再整理。分页用nextAfterSeq；不写入压缩。候选removedMessageTokens为移出的消息估算，未扣除新摘要。",
     parameters: {
       type: "object",
       properties: {
@@ -32,7 +34,7 @@ export const CONTEXT_TOOLS: ToolSpec[] = [
   {
     name: "compress_context",
     description:
-      "按inspect_context给出的throughSeq和自己写的summary立即压缩上下文。summary需承接旧摘要、重要事实和未完成事项。返回已生效的持久记录和前后用量估算，不是入队通知；原件保留。当前未完成工具批次不能移出。真实压后inputTokens要等下一次模型请求。",
+      "按inspect_context给出的throughSeq和自己写的summary立即压缩上下文。通常150k时一次整理到约100k；120k预提醒先准备，不反复压缩。summary承接旧摘要、重要事实、最新往来和自己已说的话、承诺及未完成事项。压缩会重建历史缓存，宿主同步固定投影，随后继续复用。返回已生效的持久记录和前后用量估算；原件保留。当前未完成工具批次不能移出。真实压后inputTokens要等下一次模型请求。",
     parameters: {
       type: "object",
       properties: {
@@ -57,10 +59,8 @@ export function contextArgs(args: Json, keys: string[]): Record<string, Json> {
 }
 export function compressionThrough(events: ConsciousEvent[]): number {
   let through = 0;
-  for (const event of activeEvents(events)) {
-    if (event.kind === "compression") {
-      through = Math.max(through, (event.data as { throughSeq: number }).throughSeq);
-    }
+  for (const event of selectedEvents(events, "compression")) {
+    through = Math.max(through, (event.data as { throughSeq: number }).throughSeq);
   }
   return through;
 }
@@ -71,9 +71,10 @@ export function contextUsage(
   counter?: ContextCounter,
   project: (messages: Message[]) => Message[] = (messages) => messages,
 ) {
-  const latest = activeEvents(events).findLast((event) =>
-    event.kind === "model_response" &&
-    !!(event.data as { response?: { usage?: Json } }).response?.usage
+  const latest = lastActiveEvent(
+    events,
+    "model_response",
+    (event) => !!(event.data as { response?: { usage?: Json } }).response?.usage,
   );
   return {
     estimatedTokens: contextEstimate(project(render(events, prompt)), tools, counter),
@@ -144,13 +145,14 @@ export function recommendCompression(
     fallback.findLast((item) => item.removedMessageTokens >= 8_000) ?? null;
   return {
     candidate,
+    recommendedNow: estimatedTokens >= CONTEXT_TARGET_TOKENS,
     retainTargetTokens: CONTEXT_RETAIN_TARGET_TOKENS,
     summaryReserveTokens: CONTEXT_SUMMARY_RESERVE_TOKENS,
     retainedRecentBlocks: candidate
       ? candidates.length - candidates.findIndex((item) => item === candidate) - 1
       : candidates.length,
     scope:
-      "建议边界是完整片段；节约量仅为消息估算，实际摘要与投影可能影响结果。保留当前目标、承诺、失败与unknown动作编号、子代理任务、下一步及原件位置；承接旧摘要，不逐条抄日志。以compress_context的applied/compressionSeq和after核实生效，再看下一次inputTokens。",
+      "建议边界是完整片段，不代表现在必须压缩；通常150k时一次整理到约100k。保留当前目标、最新往来和自己已发出的回复、承诺、失败与unknown动作编号、子代理任务、下一步及原件位置；承接旧摘要，不逐条抄日志。以compress_context的applied/compressionSeq和after核实生效，再看下一次inputTokens。",
   };
 }
 export function previewCompression(
@@ -173,9 +175,10 @@ export function previewCompression(
     );
   }
   const throughSeq = Number(value.throughSeq);
+  const compressedThroughSeq = compressionThrough(events);
   if (
-    throughSeq <= compressionThrough(events) ||
-    !blocks(events).some((block) => block.throughSeq === throughSeq)
+    throughSeq <= compressedThroughSeq ||
+    !blocks(events, compressedThroughSeq).some((block) => block.throughSeq === throughSeq)
   ) {
     throw new KernelError(
       "rejected",
@@ -193,7 +196,7 @@ export function previewCompression(
     digest: "preview",
     data: { throughSeq, summary: value.summary, source: "eve" },
   };
-  const after = contextUsage([...events, preview], prompt, tools, counter, project);
+  const after = contextUsage(appendPreviewEvent(events, preview), prompt, tools, counter, project);
   return {
     throughSeq,
     summary: value.summary,

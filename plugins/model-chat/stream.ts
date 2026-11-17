@@ -8,6 +8,16 @@ function invalid(detail?: ChatModelError["responseDetail"]): never {
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+function mergeUsage(previous: unknown, next: unknown): unknown {
+  if (!object(previous) || !object(next)) return next;
+  const merged = { ...previous, ...next };
+  for (const key of ["prompt_tokens_details", "completion_tokens_details"]) {
+    if (object(previous[key]) && object(next[key])) {
+      merged[key] = { ...previous[key], ...next[key] };
+    }
+  }
+  return merged;
+}
 interface Call {
   id: string;
   type: string;
@@ -87,7 +97,11 @@ export class ChatStream {
       invalid();
     }
     if (!object(chunk) || chunk.error !== undefined || !Array.isArray(chunk.choices)) invalid();
-    if (chunk.usage !== undefined && chunk.usage !== null) this.#usage = chunk.usage;
+    // Some gateways emit several accounting chunks. Later totals can be more
+    // complete while omitting cache details reported earlier; retain both.
+    if (chunk.usage !== undefined && chunk.usage !== null) {
+      this.#usage = mergeUsage(this.#usage, chunk.usage);
+    }
     if (!chunk.choices.length) return; // include_usage sends a final choices: [] chunk.
     if (chunk.choices.length !== 1) invalid("stream_choice");
     const choice = chunk.choices[0];

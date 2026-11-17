@@ -115,7 +115,7 @@ Deno.test("投影runtime：普通追加与重启复用边界，模型已见前�
   }
 });
 
-Deno.test("投影runtime：120k高水位且节约8k才换epoch，预演不污染日志", async () => {
+Deno.test("投影runtime：120k预提醒保持前缀，180k且节约30k才应急换epoch", async () => {
   const f = await fixture();
   try {
     for (let i = 0; i < 8; i++) await tool(f.runtime, 17_000);
@@ -124,14 +124,18 @@ Deno.test("投影runtime：120k高水位且节约8k才换epoch，预演不污染
     assert.equal(epochs(f.runtime).length, 1);
     await tool(f.runtime, 17_000);
     await f.runtime.pulse();
+    assert.equal(epochs(f.runtime).length, 1);
+    assert.deepEqual(f.requests.at(-1)!.slice(0, f.requests[0].length), f.requests[0]);
+    for (let i = 0; i < 3; i++) await tool(f.runtime, 17_000);
+    await f.runtime.pulse();
     assert.equal(epochs(f.runtime).length, 2);
     const data = epochs(f.runtime)[1].data as {
       throughSeq: number;
       estimatedBefore: number;
       estimatedAfter: number;
     };
-    assert.ok(data.estimatedBefore >= 120_000);
-    assert.ok(data.estimatedBefore - data.estimatedAfter >= 8_000);
+    assert.ok(data.estimatedBefore >= 180_000);
+    assert.ok(data.estimatedBefore - data.estimatedAfter >= 30_000);
     assert.ok(data.throughSeq < epochs(f.runtime)[1].seq);
     await f.runtime.pulse();
     assert.equal(epochs(f.runtime).length, 2);
@@ -144,10 +148,10 @@ Deno.test("投影runtime：120k高水位且节约8k才换epoch，预演不污染
 Deno.test("投影runtime：回滚移除未确认epoch，恢复旧边界而不采纳候选投影", async () => {
   const f = await fixture();
   try {
-    for (let i = 0; i < 8; i++) await tool(f.runtime, 17_000);
+    for (let i = 0; i < 8; i++) await tool(f.runtime, 23_000);
     await f.runtime.pulse();
     const acceptedThrough = f.runtime.journal.events.at(-1)!.seq;
-    await tool(f.runtime, 17_000);
+    for (let i = 0; i < 2; i++) await tool(f.runtime, 23_000);
     await f.runtime.pulse();
     assert.equal(epochs(f.runtime).length, 2);
     const rejectedThrough = f.runtime.journal.events.at(-1)!.seq;
@@ -178,7 +182,7 @@ Deno.test("投影runtime：可节约8k但未到高水位不换边界，显式raw
       toolIndex: 0,
       mode: "raw",
     });
-    for (let i = 0; i < 6; i++) await tool(f.runtime, 10_000);
+    for (let i = 0; i < 10; i++) await tool(f.runtime, 10_000);
     await f.runtime.pulse();
     assert.equal(epochs(f.runtime).length, 2);
     const retained = f.requests.at(-1)!.find((m) =>
@@ -192,14 +196,14 @@ Deno.test("投影runtime：可节约8k但未到高水位不换边界，显式raw
   }
 });
 
-Deno.test("整理提醒runtime：附可用边界，每四轮重复，重启与普通轮次保持缓存前缀", async () => {
+Deno.test("整理提醒runtime：150k附可用边界并每四轮重复，普通轮次保持缓存前缀", async () => {
   const f = await fixture(195_000_000);
   const reminders = () =>
     f.runtime.journal.events.filter((e) =>
       e.kind === "perception" && !!(e.data as { contextMaintenance?: Json }).contextMaintenance
     );
   try {
-    for (let i = 0; i < 8; i++) await tool(f.runtime, 17_000);
+    for (let i = 0; i < 8; i++) await tool(f.runtime, 19_000);
     await f.runtime.pulse();
     assert.equal(reminders().length, 1);
     const data = reminders()[0].data as {
@@ -217,6 +221,60 @@ Deno.test("整理提醒runtime：附可用边界，每四轮重复，重启与�
       assert.deepEqual(f.requests[i].slice(0, f.requests[i - 1].length), f.requests[i - 1]);
     }
     assert.equal(epochs(f.runtime).length, 1, "提醒追加不改写投影边界");
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("投影runtime：应急时只节约一小批回执不重建缓存", async () => {
+  const f = await fixture();
+  try {
+    for (let i = 0; i < 8; i++) await tool(f.runtime, 20_000);
+    await f.runtime.pulse();
+    const first = f.requests[0];
+    await tool(f.runtime, 20_000);
+    await f.runtime.pulse();
+    assert.equal(epochs(f.runtime).length, 1);
+    assert.deepEqual(f.requests.at(-1)!.slice(0, first.length), first);
+    await tool(f.runtime, 20_000);
+    await f.runtime.pulse();
+    assert.equal(epochs(f.runtime).length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("投影runtime：压缩和投影共用第一次后续请求，追加与重启不再重投影", async () => {
+  const f = await fixture();
+  try {
+    const receipts = [];
+    for (let i = 0; i < 8; i++) receipts.push(await tool(f.runtime, 14_000));
+    await f.runtime.pulse();
+    for (let i = 0; i < 4; i++) await tool(f.runtime, 14_000);
+    await f.runtime.pulse();
+    assert.equal(epochs(f.runtime).length, 1);
+    const compression = await f.runtime.journal.append("compression", {
+      throughSeq: receipts[3].seq,
+      summary: "最新往来、自己已说的话与未完成任务",
+      source: "eve",
+    });
+    await f.runtime.pulse();
+    const projection = epochs(f.runtime).at(-1)!;
+    assert.equal(epochs(f.runtime).length, 2);
+    assert.equal((projection.data as { reason: string }).reason, "compression_fixed_projection");
+    assert.equal((projection.data as { compressionSeq: number }).compressionSeq, compression.seq);
+    const start = f.runtime.journal.events.findLast((e) => e.kind === "model_start")!;
+    assert.ok(compression.seq < projection.seq && projection.seq < start.seq);
+    const firstAfterCompression = f.requests.at(-1)!;
+    await tool(f.runtime, 1_000);
+    await f.runtime.pulse();
+    await f.restart();
+    await f.runtime.pulse();
+    assert.equal(epochs(f.runtime).length, 2);
+    assert.deepEqual(
+      f.requests.at(-1)!.slice(0, firstAfterCompression.length),
+      firstAfterCompression,
+    );
   } finally {
     await f.close();
   }

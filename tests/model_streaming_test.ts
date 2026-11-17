@@ -186,6 +186,59 @@ Deno.test("stream: gateway usage with an empty trailing choice preserves complet
   }
 });
 
+Deno.test("stream: later partial accounting retains cache details and updates reported totals", async () => {
+  let initial: Record<string, unknown> = {}, final: Record<string, unknown> = {};
+  const accounting = (usage: unknown) => `data: ${JSON.stringify({ choices: [], usage })}\r\n\r\n`;
+  const local = fixture(() =>
+    stream([
+      accounting(initial),
+      event({ content: "完成" }, "stop"),
+      accounting(final),
+      done,
+    ])
+  );
+  const client = local.client();
+  try {
+    for (
+      const [earlyCache, lateCache, expectedCache] of [
+        [80, undefined, 80],
+        [0, undefined, 0],
+        [80, 0, 0],
+        [undefined, undefined, undefined],
+      ]
+    ) {
+      initial = {
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 110,
+        ...(earlyCache === undefined
+          ? {}
+          : { prompt_tokens_details: { cached_tokens: earlyCache } }),
+      };
+      final = {
+        completion_tokens: 20,
+        total_tokens: 120,
+        prompt_tokens_details: {
+          audio_tokens: 0,
+          ...(lateCache === undefined ? {} : { cached_tokens: lateCache }),
+        },
+      };
+      const result = await client.complete(request);
+      assert.equal(result.content, "完成");
+      assert.deepEqual(result.usage, {
+        status: expectedCache === undefined ? "partial" : "reported",
+        inputTokens: 100,
+        outputTokens: 20,
+        totalTokens: 120,
+        ...(expectedCache === undefined ? {} : { cachedInputTokens: expectedCache }),
+      });
+    }
+  } finally {
+    client.close();
+    await local.close();
+  }
+});
+
 Deno.test("stream: truncated/error/invalid streams never return partial content or tools", async () => {
   const bad = [
     event({ content: "partial" }),

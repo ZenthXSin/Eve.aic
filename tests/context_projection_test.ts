@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { type Json, KernelError } from "../kernel/protocol.ts";
 import type { ConsciousEvent } from "../plugins/eve/journal.ts";
-import { contextComposition, estimate, render } from "../plugins/eve/view.ts";
+import { appendPreviewEvent, contextComposition, estimate, render } from "../plugins/eve/view.ts";
+import { previewCompression } from "../plugins/eve/context-tools.ts";
 
 function event(seq: number, kind: string, data: Json): ConsciousEvent {
   return { seq, kind, data, at: "2026-11-12T00:00:00Z", digest: "fixture" } as ConsciousEvent;
@@ -287,6 +288,41 @@ Deno.test("轮次准备：预建索引后长压缩历史不再逐条读取，新
   assert.deepEqual(next.slice(-3).map((message) => message.role), ["assistant", "tool", "user"]);
   assert.ok(next.at(-1)!.content.includes("新消息"));
   assert.deepEqual(next, render(structuredClone(source), "身份"));
+});
+
+Deno.test("整理预演：复用热索引，不读取压掉的18000条正文，原事件与缓存前缀不变", () => {
+  const source = Array.from(
+    { length: 18_000 },
+    (_, i) => event(i + 1, "notice", { source: "phone", items: [{ text: `旧消息${i}` }] }),
+  );
+  source.push(event(source.length + 1, "context_projection", { throughSeq: source.length }));
+  source.push(event(source.length + 1, "compression", { throughSeq: 18_000, summary: "旧经历" }));
+  source.push(event(source.length + 1, "notice", { source: "phone", items: [{ text: "新问题" }] }));
+  let reads = 0;
+  const events = new Proxy(source, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) reads++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const before = render(events, "身份");
+  const length = events.length;
+  const preview = event(length + 1, "context_projection", { throughSeq: length });
+  reads = 0;
+  const projected = render(appendPreviewEvent(events, preview), "身份");
+  assert.ok(reads < 60, `投影预演不应展开旧正文，实际读取${reads}次`);
+  assert.deepEqual(projected, render([...source, preview], "身份"));
+  reads = 0;
+  const compressed = previewCompression(events, "身份", [], {
+    throughSeq: length,
+    summary: "最新问题与已说的话",
+    dryRun: true,
+  });
+  assert.ok(reads < 100, `压缩预演不应展开旧正文，实际读取${reads}次`);
+  assert.ok(compressed.after.estimatedTokens > 0);
+  assert.equal(events.length, length);
+  assert.deepEqual(render(events, "身份"), before);
+  assert.throws(() => appendPreviewEvent(events, preview).push(preview), /只读/);
 });
 
 Deno.test("轮次准备：热索引正确处理保留策略、连续压缩及回滚并与冷启动一致", () => {

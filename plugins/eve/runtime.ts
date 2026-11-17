@@ -30,7 +30,11 @@ import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type ErrorKind, type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
 import { CONTEXT_TOOLS, inspectContext, previewCompression } from "./context-tools.ts";
-import { contextMaintenanceState } from "./context-maintenance.ts";
+import {
+  CONTEXT_PROJECTION_EMERGENCY_TOKENS,
+  CONTEXT_PROJECTION_MIN_SAVING_TOKENS,
+  contextMaintenanceState,
+} from "./context-maintenance.ts";
 import { recallQuery } from "./recall-query.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 import { type ConsciousEvent, ConsciousJournal } from "./journal.ts";
@@ -39,6 +43,7 @@ import { thoughtForCall, withoutThought, WRITE_THOUGHT_TOOL } from "./thoughts.t
 import {
   accountingDay,
   activeEvents,
+  appendPreviewEvent,
   blocks,
   budget,
   contextComposition,
@@ -987,11 +992,15 @@ export class EveRuntime {
   async #projectContext(tools: ToolSpec[]) {
     const events = this.journal.events;
     const previous = lastActiveEvent(events, "context_projection");
+    const compression = lastActiveEvent(events, "compression");
+    const afterCompression = !!previous && (compression?.seq ?? 0) > previous.seq;
     const messages = this.#render();
     const estimated = contextEstimate(messages, tools, this.contextCounter);
-    // 固定 epoch 只在首次迁移或值得支付一次缓存失效时前移。retain/压缩
-    // 自己的事实仍立即生效，但不因此每一轮滑动最近八批或记忆来源。
-    if (previous && estimated < 120_000) return messages;
+    // 压缩已经改变摘要前缀，趁第一次后续请求尚未发出时一起固定投影，
+    // 避免随后再次支付缓存重建。正常轮次只追加；180k才允许应急投影。
+    if (previous && !afterCompression && estimated < CONTEXT_PROJECTION_EMERGENCY_TOKENS) {
+      return messages;
+    }
     const throughSeq = events.at(-1)?.seq ?? 0;
     if (previous && (previous.data as { throughSeq: number }).throughSeq === throughSeq) {
       return messages;
@@ -1007,15 +1016,23 @@ export class EveRuntime {
     };
     // 完整原件构造临时视图，不写回、追加或修改任何原事件。预演不使用
     // 已投影的 messages 作输入，避免把节选误当原件再压缩。
-    const projected = this.#present(render([...events, preview], this.#prompt));
+    const projected = this.#present(render(appendPreviewEvent(events, preview), this.#prompt));
     const projectedTokens = contextEstimate(projected, tools, this.contextCounter);
-    if (previous && estimated - projectedTokens < 8_000) return messages;
+    if (
+      previous && !afterCompression &&
+      estimated - projectedTokens < CONTEXT_PROJECTION_MIN_SAVING_TOKENS
+    ) return messages;
     // 单条持久事实先提交，随后重启/回滚都从活动日志重建同一边界。
     await this.journal.append("context_projection", {
       throughSeq,
-      reason: previous ? "context_high_watermark" : "initial_fixed_projection",
+      reason: afterCompression
+        ? "compression_fixed_projection"
+        : previous
+        ? "context_emergency_watermark"
+        : "initial_fixed_projection",
       estimatedBefore: estimated,
       estimatedAfter: projectedTokens,
+      ...(afterCompression ? { compressionSeq: compression!.seq } : {}),
     });
     return this.#render();
   }
@@ -1201,6 +1218,7 @@ export class EveRuntime {
       contextReminder: maintenance.reminder,
       contextMaintenance: {
         level: maintenance.level,
+        compressionDue: maintenance.compressionDue,
         providerInput: maintenance.providerInput,
         retainTargetTokens: maintenance.retainTargetTokens,
       },
@@ -1256,6 +1274,7 @@ export class EveRuntime {
         contextMaintenance: inspection
           ? {
             level: maintenance.level,
+            compressionDue: maintenance.compressionDue,
             estimatedTokens: maintenance.estimatedTokens,
             providerInput: maintenance.providerInput,
             observedTokens: maintenance.observedTokens,
@@ -1263,7 +1282,9 @@ export class EveRuntime {
             totalCandidates: inspection.totalCandidates,
             recommendation: inspection.recommendation,
             inspect: { tool: "inspect_context", args: {} },
-            repeat: "仍未整理时，每4次模型回复或15分钟的下一次活动轮提醒；不另开模型请求",
+            repeat: maintenance.compressionDue
+              ? "150k仍未整理时，每4次模型回复或15分钟的下一次活动轮提醒；不另开模型请求"
+              : "120k仅预提醒；保留前缀，不重复催压缩，150k再整理",
           }
           : null,
       });

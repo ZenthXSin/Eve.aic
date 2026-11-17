@@ -15,6 +15,41 @@ interface ActiveIndex {
 }
 const activeIndexes = new WeakMap<ConsciousEvent[], ActiveIndex>();
 const activeSources = new WeakMap<ConsciousEvent[], ConsciousEvent[]>();
+const previewSources = new WeakMap<
+  ConsciousEvent[],
+  { source: ConsciousEvent[]; length: number }
+>();
+/** Snapshot positions, not historical bodies. A preview must not expand a lazy journal into RAM. */
+export function appendPreviewEvent(
+  events: ConsciousEvent[],
+  event: ConsciousEvent,
+): ConsciousEvent[] {
+  const source = activeSources.get(events) ?? events;
+  const length = source.length;
+  const preview = new Proxy([] as ConsciousEvent[], {
+    get(target, key, receiver) {
+      if (key === "length") return length + 1;
+      if (typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key)) {
+        const index = Number(key);
+        return index < length ? source[index] : index === length ? event : undefined;
+      }
+      return Reflect.get(target, key, receiver);
+    },
+    has(target, key) {
+      return typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key)
+        ? Number(key) <= length
+        : Reflect.has(target, key);
+    },
+    set() {
+      throw new Error("预演意识记录视图只读");
+    },
+    deleteProperty() {
+      throw new Error("预演意识记录视图只读");
+    },
+  });
+  previewSources.set(preview, { source, length });
+  return preview;
+}
 /** 未确认版本的原件仍在，但不作为恢复后 Eve 已接受的经历或未完成决定。
  * 仅缓存数字索引，原件仍由 journal 惰性读取，避免回滚后又全量常驻正文。 */
 export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
@@ -29,6 +64,16 @@ export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
       kinds: new Map(),
       view: [],
     } as ActiveIndex;
+    const preview = previewSources.get(events);
+    if (preview && preview.source.length === preview.length) {
+      activeEvents(preview.source);
+      const parent = activeIndexes.get(preview.source)!;
+      current.scanned = parent.scanned;
+      current.revision = parent.revision;
+      current.ranges = [...parent.ranges];
+      current.indices = [...parent.indices];
+      current.kinds = new Map([...parent.kinds].map(([kind, positions]) => [kind, [...positions]]));
+    }
     current.view = new Proxy([] as ConsciousEvent[], {
       get(target, key, receiver) {
         if (key === "length") return current.indices.length;
@@ -107,7 +152,7 @@ function afterPosition(positions: number[], afterSeq: number) {
   }
   return low;
 }
-function* selectedEvents(events: ConsciousEvent[], kind?: string, afterSeq = 0) {
+export function* selectedEvents(events: ConsciousEvent[], kind?: string, afterSeq = 0) {
   const { source, positions } = selectedPositions(events, kind);
   for (let i = afterPosition(positions, afterSeq); i < positions.length; i++) {
     yield source[positions[i]];
