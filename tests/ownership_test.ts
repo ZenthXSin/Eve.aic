@@ -243,6 +243,54 @@ Deno.test("begin 回执丢失并取消失败：重启取消原编号，迟到请
   }
 });
 
+Deno.test("QQ 在同一进程核对两笔中断许可后解除排空，不执行或重放业务", async () => {
+  const fixtureState = await fixture();
+  let disconnected = true;
+  const lost = () => new KernelError("unknown", "lost receipt");
+  const fence = new OwnershipFence(`${fixtureState.directory}/fence`, "phone", {
+    begin: async (request) => {
+      const permit = await fixtureState.authority.begin(request);
+      if (request.actionId === "request_lost" && disconnected) throw lost();
+      return permit;
+    },
+    cancel: (permit, hash) => disconnected
+      ? Promise.reject(lost())
+      : fixtureState.authority.cancel(permit, hash),
+    finish: (id, outcome, hash) => disconnected
+      ? Promise.reject(lost())
+      : fixtureState.authority.finish(id, outcome, hash),
+  });
+  await fence.initialize();
+  const entered = deferred<void>(), release = deferred<void>();
+  let executed = 0;
+  try {
+    const finished = fence.run(fixtureState.proof, "finish_lost", null, async () => {
+      executed++;
+      entered.resolve();
+      await release.promise;
+      return null;
+    });
+    await entered.promise;
+    await rejects(() => fence.run(fixtureState.proof, "request_lost", null, () => {
+      executed++;
+      return Promise.resolve(null);
+    }), "unknown");
+    release.resolve();
+    await rejects(() => finished, "unknown");
+    assert.equal(fence.available, false);
+    assert.equal(fixtureState.authority.status().activePermits, 2);
+    disconnected = false;
+    assert.deepEqual(await fence.reconcile(), { remaining: 0 });
+    assert.equal(fence.available, true);
+    assert.equal(fixtureState.authority.status().activePermits, 0);
+    assert.equal(executed, 1);
+  } finally {
+    release.resolve();
+    await fence.close();
+    await fixtureState.close();
+  }
+});
+
 Deno.test("执行回执已存但 finish 回执未知：重启只结算，不重新执行", async () => {
   const f = await fixture();
   const lost: OwnershipExit = {
