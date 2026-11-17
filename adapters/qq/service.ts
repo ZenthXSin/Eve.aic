@@ -136,6 +136,11 @@ export async function startQqPhoneAdapter(
       }),
       fence,
     );
+    const reconcileTimer = fence && setInterval(() => {
+      if (!fence.available) {
+        void fence.reconcile().catch(() => console.warn("QQ 出口回执尚未核对，将再次尝试"));
+      }
+    }, 30_000);
     let closing: Promise<void> | undefined;
     return {
       url: rpc.url,
@@ -144,6 +149,7 @@ export async function startQqPhoneAdapter(
       stopped: receive,
       close: () => {
         closing ??= (async () => {
+          clearInterval(reconcileTimer);
           modelCommands?.requestStop();
           actions.requestStop();
           controller.abort();
