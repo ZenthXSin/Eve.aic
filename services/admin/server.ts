@@ -1,4 +1,5 @@
 import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
+import { qqDestination } from "../../contracts/qq-conversation.ts";
 import {
   ADMIN_READS,
   type AdminBackend,
@@ -6,7 +7,11 @@ import {
   type AdminQuery,
   validateFailedResolution,
 } from "./contracts.ts";
-import { panelHtml } from "./view.ts";
+import { studioAsset } from "./studio-assets.ts";
+import { studioRead, type StudioRequest, validateStudio } from "./studio-protocol.ts";
+import { collectStudioOverview } from "./studio-metrics.ts";
+import { studioSettingsFailure, validateStudioUpdate } from "./studio-settings.ts";
+import { studioChatRoutes } from "./studio-chat.ts";
 import { LiveReader } from "./live.ts";
 import {
   boundLiveSnapshot,
@@ -75,9 +80,7 @@ export function validateQuery(body: Record<string, Json>): AdminQuery {
     const allowed = resource === "qqHistory" ? ["conversationId", "cursor"] : ["cursor"];
     if (
       Object.keys(args).some((key) => !allowed.includes(key)) ||
-      resource === "qqHistory" &&
-        (typeof args.conversationId !== "string" ||
-          !/^qq:(user|group):.{1,512}$/.test(args.conversationId))
+      resource === "qqHistory" && !qqDestination(args.conversationId)
     ) {
       throw new KernelError("rejected", "QQ 只读查询参数无效");
     }
@@ -190,7 +193,12 @@ export async function startAdminServer(
     throw new KernelError("rejected", "管理端口无效");
   }
   const tokenHash = await digest(options.token), now = options.now ?? Date.now;
+  const studio = (input: StudioRequest) => {
+    if (!backend.studio) throw new KernelError("unavailable", "监督服务尚未接入此工作室功能");
+    return backend.studio(input);
+  };
   const live = new LiveReader(backend);
+  const chatRoutes = studioChatRoutes(studio);
   const workspace = new WorkspaceReader(backend, now);
   const sessions = new Map<string, { csrf: string; expires: number }>();
   const sockets = new Map<WebSocket, { sessionId: string; expires: number }>();
@@ -287,18 +295,9 @@ export async function startAdminServer(
         (request.headers.has("origin") && request.headers.get("origin") !== origin) ||
         ["cross-site", "same-site"].includes(request.headers.get("sec-fetch-site") ?? "")
       ) return response({ ok: false, error: { message: "拒绝跨站管理请求" } }, 403);
-      if (request.method === "GET" && path === "/") {
-        const nonce = crypto.randomUUID();
-        return new Response(panelHtml(nonce), {
-          headers: {
-            ...secureHeaders,
-            "content-type": "text/html; charset=utf-8",
-            "content-security-policy":
-              `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self' ${
-                origin.replace(/^http/, "ws")
-              }; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`,
-          },
-        });
+      if (path === "/" || path.startsWith("/studio/")) {
+        return await studioAsset(request, path) ??
+          new Response(null, { status: 404, headers: secureHeaders });
       }
       try {
         for (const [id, session] of sessions) if (session.expires <= now()) sessions.delete(id);
@@ -342,11 +341,27 @@ export async function startAdminServer(
           .find((item) => item.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1);
         const session = cookie ? sessions.get(cookie) : undefined;
         if (!session) return response({ ok: false, error: { message: "请先登录" } }, 401);
+        if (path === "/api/chat" || path === "/api/chat/send") {
+          const result = await chatRoutes(request, session, origin);
+          if (!result) throw new KernelError("unavailable", "会话接口不可用");
+          const value = await result.json();
+          return response(
+            result.ok ? { ok: true, value } : { ok: false, error: value.error },
+            result.status,
+          );
+        }
+        if (request.method === "GET" && path === "/api/overview" && !url.search) {
+          return response({ ok: true, value: await collectStudioOverview(backend) });
+        }
         if (request.method === "GET" && path === "/api/session") {
           return response({ ok: true, value: { csrf: session.csrf, expires: session.expires } });
         }
         if (request.method === "GET" && path === "/api/status") {
           return response({ ok: true, value: await backend.status() });
+        }
+        if (request.method === "GET") {
+          const read = studioRead(url);
+          if (read) return response({ ok: true, value: await studio(read) });
         }
         if (request.method === "GET" && path === "/api/live") {
           return response({ ok: true, value: await snapshot() });
@@ -393,6 +408,13 @@ export async function startAdminServer(
           });
         }
         const body = await readAdminBody(request);
+        if (path === "/api/settings" && !url.search) {
+          const update = validateStudioUpdate(body);
+          return response({
+            ok: true,
+            value: await studio({ action: "settingsUpdate", ...update }),
+          });
+        }
         if (path === "/api/query") {
           return response({
             ok: true,
@@ -407,6 +429,10 @@ export async function startAdminServer(
         }
         return response({ ok: false, error: { message: "没有该管理入口" } }, 404);
       } catch (error) {
+        if (path === "/api/settings") {
+          const result = studioSettingsFailure(error);
+          return response({ ok: false, error: result.error }, result.status);
+        }
         return response(
           { ok: false, error: toWireError(error) },
           error instanceof KernelError && error.kind === "rejected" ? 400 : 503,
@@ -446,7 +472,10 @@ export async function startAdminControlServer(backend: AdminBackend, key: string
       const body = await readAdminBody(request);
       let value: Json;
       if (body.method === "status") value = await backend.status();
-      else if (body.method === "query" || body.method === "control") {
+      else if (body.method === "studio") {
+        if (!backend.studio) throw new KernelError("unavailable", "监督服务尚未接入工作室");
+        value = await backend.studio(validateStudio(body.request));
+      } else if (body.method === "query" || body.method === "control") {
         if (!body.request || typeof body.request !== "object" || Array.isArray(body.request)) {
           throw new KernelError("rejected", "需要管理操作参数");
         }

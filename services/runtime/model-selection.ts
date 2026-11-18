@@ -1,3 +1,4 @@
+import type { ModelSelectionResult } from "../../contracts/model-selection.ts";
 import type { ModelCallOptions, ModelRequest, ModelResponse } from "../../contracts/model.ts";
 import { type Json, KernelError, type WireError } from "../../kernel/protocol.ts";
 import { ChatModelClient, type ChatModelOptions } from "../../plugins/model-chat/client.ts";
@@ -12,12 +13,7 @@ export interface ModelSnapshot {
     close(): void;
   };
 }
-export interface ModelSelectionResult {
-  actionId: string;
-  model: string;
-  revision: number;
-  changed: boolean;
-}
+export type { ModelSelectionResult } from "../../contracts/model-selection.ts";
 interface SelectionRequest {
   actionId: string;
   model: string;

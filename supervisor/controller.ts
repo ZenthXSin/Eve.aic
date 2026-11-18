@@ -375,7 +375,9 @@ export class Supervisor {
     return credential;
   }
   async #status(instance: InstanceSpec, active = false) {
-    const status = await this.options.driver.call<InstanceStatus>(instance, "status");
+    const status = await this.options.driver.call<InstanceStatus>(instance, "status", {
+      brief: true,
+    });
     const channelError = (status.eve as Record<string, Json> | undefined)?.lastError;
     if (active && typeof channelError === "string") {
       const previous = this.#channelFailures.get(instance.id);

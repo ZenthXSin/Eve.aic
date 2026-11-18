@@ -64,6 +64,7 @@ export class MemoryStore {
     return Array.isArray(sources) && sources.length > 0 && sources.length <= 32 &&
       sources.every((s) =>
         s && Number.isSafeInteger(s.recordSeq) && s.recordSeq > 0 &&
+        typeof s.digest === "string" && /^[a-f0-9]{64}$/.test(s.digest) &&
         this.records.events[s.recordSeq - 1]?.digest === s.digest &&
         ["experienced", "heard", "imagined"].includes(s.kind)
       );

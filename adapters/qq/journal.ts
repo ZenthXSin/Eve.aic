@@ -1,7 +1,7 @@
 // 独立适配器的只追加入站日志。先完整持久化，再允许网关提交消费水位。
 import {
   type InboundQqMessage,
-  type QqDispatch,
+  type QqInboundEvent,
   qqMessage,
   type QqProjectionVersion,
 } from "./inbound.ts";
@@ -14,7 +14,7 @@ export interface InboundRecord {
   receivedAt: string;
   identity: string;
   message: InboundQqMessage;
-  raw: QqDispatch;
+  raw: QqInboundEvent;
 }
 
 export class QqJournalError extends Error {
@@ -71,6 +71,7 @@ export async function writeAtomic(path: string, data: unknown): Promise<void> {
 /** 一个进程持有日志目录；正式部署还须独立守护/所有权令牌约束多进程写入。 */
 export class QqInboundJournal {
   #records = new Map<string, InboundRecord>();
+  #ordered: InboundRecord[] = [];
   // 仅在内存关联新版平台索引；原始 identity 仍用于落盘与手机 source fingerprint。
   #currentIdentities = new Map<string, InboundRecord[]>();
   #seq = 0;
@@ -115,6 +116,7 @@ export class QqInboundJournal {
           throw new QqJournalError("corrupt");
         }
         this.#records.set(record.identity, record);
+        this.#ordered.push(record);
         await this.#indexCurrentIdentity(record);
         this.#seq = record.seq;
       }
@@ -143,7 +145,7 @@ export class QqInboundJournal {
 
   async append(
     message: InboundQqMessage,
-    raw: QqDispatch,
+    raw: QqInboundEvent,
   ): Promise<{ record: InboundRecord; fresh: boolean }> {
     // 在调用时复制输入，排队期间调用方修改不能改变已经开始保存的事实。
     const snapshot = structuredClone({ message, raw });
@@ -193,6 +195,7 @@ export class QqInboundJournal {
       }
       this.#seq = record.seq;
       this.#records.set(identity, record);
+      this.#ordered.push(record);
       await this.#indexCurrentIdentity(record);
       return { record: structuredClone(record), fresh: true };
     });
@@ -200,8 +203,22 @@ export class QqInboundJournal {
     return await operation;
   }
 
-  records(): InboundRecord[] {
+  records(afterSeq = 0): InboundRecord[] {
     if (!this.#initialized || this.#failed) throw new QqJournalError("storage");
-    return structuredClone([...this.#records.values()]);
+    return this.#ordered.slice(afterSeq).map((record) => structuredClone(record));
+  }
+
+  record(seq: number): InboundRecord | undefined {
+    if (!this.#initialized || this.#failed) throw new QqJournalError("storage");
+    const record = this.#ordered[seq - 1];
+    return record && structuredClone(record);
+  }
+
+  latest(conversationId: string) {
+    if (!this.#initialized || this.#failed) throw new QqJournalError("storage");
+    const record = this.#ordered.findLast((entry) =>
+      entry.message.message.conversationId === conversationId
+    );
+    return record && { seq: record.seq, receivedAt: record.receivedAt };
   }
 }

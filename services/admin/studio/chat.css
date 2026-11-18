@@ -1,0 +1,273 @@
+.eve-chat {
+  --ech-paper: #fff;
+  --ech-ink: #192e2c;
+  --ech-muted: #4f6561;
+  --ech-rule: #becdc8;
+  --ech-tint: #f0f6f3;
+  --ech-mine: #e3f2e9;
+  --ech-accent: #17644f;
+  --ech-on: #fff;
+  --ech-error: #a22d28;
+  box-sizing: border-box;
+  width: min(100%, 59rem);
+  margin-inline: auto;
+  padding: clamp(.8rem, 3vw, 2.2rem);
+  color: var(--ech-ink);
+  font: 1rem/1.6 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  overflow-wrap: anywhere;
+}
+.eve-chat *,
+.eve-chat *::before,
+.eve-chat *::after {
+  box-sizing: border-box;
+}
+.eve-chat [hidden] {
+  display: none !important;
+}
+.eve-chat :is(h1, h2, p, ol) {
+  margin: 0;
+}
+.eve-chat h1 {
+  font-size: clamp(1.6rem, 4vw, 2.35rem);
+  line-height: 1.2;
+}
+.eve-chat h2,
+.eve-chat .ech-bar label {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+.eve-chat .ech-head,
+.eve-chat .ech-bar,
+.eve-chat .ech-bottom,
+.eve-chat .ech-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: .5rem .8rem;
+}
+.eve-chat .ech-head {
+  margin-block-end: 1.1rem;
+}
+.eve-chat .ech-kicker {
+  color: var(--ech-accent);
+  font-weight: 700;
+  font-size: .8rem;
+  letter-spacing: .08em;
+  margin-block-end: .35rem;
+}
+.eve-chat .ech-intro,
+.eve-chat .ech-count,
+.eve-chat .ech-hint,
+.eve-chat .ech-feedback {
+  color: var(--ech-muted);
+}
+.eve-chat .ech-intro {
+  margin-block-start: .5rem;
+}
+.eve-chat .ech-about {
+  margin-block: 0 .9rem;
+  color: var(--ech-muted);
+}
+.eve-chat .ech-about summary {
+  width: fit-content;
+  min-height: 44px;
+  padding-block: .55rem;
+  color: var(--ech-accent);
+  font-weight: 650;
+  cursor: pointer;
+}
+.eve-chat .ech-about p {
+  max-width: 50rem;
+  padding: .25rem 0 .5rem;
+}
+.eve-chat .ech-turn {
+  margin-block-start: .5rem;
+  padding: .5rem .7rem;
+  background: var(--ech-tint);
+  border-inline-start: .25rem solid var(--ech-accent);
+  border-radius: .25rem;
+}
+.eve-chat .ech-count,
+.eve-chat .ech-badge,
+.eve-chat .ech-hint,
+.eve-chat .ech-feedback,
+.eve-chat .ech-error {
+  font-size: .9rem;
+}
+.eve-chat .ech-count,
+.eve-chat time {
+  font-variant-numeric: tabular-nums;
+}
+.eve-chat .ech-card,
+.eve-chat .ech-recovery {
+  min-width: 0;
+  background: var(--ech-paper);
+  padding: clamp(.8rem, 2.5vw, 1.4rem);
+  border: 1px solid var(--ech-rule);
+  border-radius: 1rem;
+}
+.eve-chat .ech-compose,
+.eve-chat .ech-recovery {
+  margin-top: .85rem;
+}
+.eve-chat .ech-badge {
+  border-radius: .4rem;
+  padding: .1rem .5rem;
+  color: var(--ech-muted);
+  background: var(--ech-tint);
+}
+.eve-chat .ech-badge[data-tone="ok"],
+.eve-chat .ech-feedback[data-tone="success"] {
+  color: var(--ech-accent);
+}
+.eve-chat .ech-badge[data-tone="error"],
+.eve-chat .ech-error,
+.eve-chat .ech-feedback[data-tone="error"] {
+  color: var(--ech-error);
+}
+.eve-chat .ech-pager {
+  text-align: center;
+}
+.eve-chat .ech-pager .ech-btn {
+  margin-top: .5rem;
+}
+.eve-chat .ech-viewport {
+  min-height: 7rem;
+  max-height: min(55vh, 32rem);
+  margin-block-start: .7rem;
+  overflow: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  padding: .25rem .3rem;
+  border-top: 1px solid var(--ech-rule);
+}
+.eve-chat .ech-log {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: .6rem;
+}
+.eve-chat .ech-entry {
+  min-width: 0;
+  width: fit-content;
+  max-width: 86%;
+  padding: .55rem .85rem;
+  justify-self: start;
+  background: var(--ech-tint);
+  border-radius: .15rem .8rem .8rem;
+}
+.eve-chat .ech-user {
+  justify-self: end;
+  background: var(--ech-mine);
+  border-radius: .8rem .15rem .8rem .8rem;
+}
+.eve-chat .ech-meta {
+  display: flex;
+  gap: .15rem .6rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+  font-size: .78rem;
+  color: var(--ech-muted);
+}
+.eve-chat .ech-meta strong {
+  color: var(--ech-ink);
+  font-size: .88rem;
+}
+.eve-chat .ech-state {
+  font-weight: 600;
+}
+.eve-chat .ech-text {
+  margin-block-start: .15rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
+.eve-chat .ech-empty {
+  text-align: center;
+  color: var(--ech-muted);
+  padding: 2rem .3rem;
+}
+.eve-chat .ech-hint:not(:empty),
+.eve-chat .ech-feedback:not(:empty) {
+  margin-block-start: .5rem;
+}
+.eve-chat .ech-recovery {
+  background: var(--ech-tint);
+  border-inline-start: .3rem solid var(--ech-accent);
+}
+.eve-chat .ech-actions {
+  justify-content: flex-start;
+  margin-top: .5rem;
+}
+.eve-chat textarea {
+  display: block;
+  width: 100%;
+  min-height: 5rem;
+  margin: .5rem 0;
+  border: 1px solid var(--ech-muted);
+  border-radius: .55rem;
+  padding: .65rem .85rem;
+  color: var(--ech-ink);
+  background: var(--ech-paper);
+  font: inherit;
+  resize: vertical;
+}
+.eve-chat textarea[aria-invalid="true"] {
+  border-color: var(--ech-error);
+}
+.eve-chat .ech-btn {
+  min-height: 44px;
+  border: 1px solid var(--ech-muted);
+  border-radius: .55rem;
+  padding: .45rem .9rem;
+  color: var(--ech-ink);
+  background: var(--ech-paper);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.eve-chat .ech-btn:not(:disabled):hover {
+  text-decoration: underline;
+  text-underline-offset: .18em;
+}
+.eve-chat .ech-btn:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+.eve-chat .ech-primary {
+  background: var(--ech-accent);
+  border-color: var(--ech-accent);
+  color: var(--ech-on);
+}
+.eve-chat :focus-visible {
+  outline: 3px solid var(--ech-accent);
+  outline-offset: 3px;
+}
+@media (max-width: 36rem) {
+  .eve-chat .ech-entry {
+    max-width: 94%;
+  }
+  .eve-chat .ech-bottom {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .eve-chat .ech-viewport {
+    max-height: 43vh;
+    max-height: 43svh;
+  }
+}
+@media (prefers-color-scheme: dark) {
+  .eve-chat {
+    color-scheme: dark;
+    --ech-paper: #192825;
+    --ech-ink: #e1f0eb;
+    --ech-muted: #b3c8c0;
+    --ech-rule: #465e55;
+    --ech-tint: #20322c;
+    --ech-mine: #214535;
+    --ech-accent: #8fdabb;
+    --ech-on: #142b20;
+    --ech-error: #ffb1a9;
+  }
+}

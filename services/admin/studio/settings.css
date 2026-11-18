@@ -1,0 +1,249 @@
+.eve-settings {
+  --est-paper: #fff;
+  --est-ink: #192e2c;
+  --est-muted: #4f6561;
+  --est-rule: #becdc8;
+  --est-tint: #f0f6f3;
+  --est-accent: #17644f;
+  --est-on: #fff;
+  --est-error: #a22d28;
+  box-sizing: border-box;
+  width: min(100%, 68rem);
+  margin-inline: auto;
+  padding: clamp(.8rem, 3vw, 2.2rem);
+  color: var(--est-ink);
+  font: 1rem/1.6 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  overflow-wrap: anywhere;
+}
+.eve-settings *,
+.eve-settings *::before,
+.eve-settings *::after {
+  box-sizing: border-box;
+}
+.eve-settings [hidden] {
+  display: none !important;
+}
+.eve-settings :is(h1, h2, p, dl, dd) {
+  margin: 0;
+}
+.eve-settings h1 {
+  font-size: clamp(1.6rem, 4vw, 2.35rem);
+  line-height: 1.2;
+}
+.eve-settings h2 {
+  font-size: 1.15rem;
+}
+.eve-settings .est-head,
+.eve-settings .est-actions {
+  display: flex;
+  gap: .75rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.eve-settings .est-head {
+  justify-content: space-between;
+  margin-block-end: 1.25rem;
+}
+.eve-settings .est-kicker {
+  color: var(--est-accent);
+  font-weight: 700;
+  font-size: .8rem;
+  letter-spacing: .08em;
+  margin-block-end: .35rem;
+}
+.eve-settings .est-intro,
+.eve-settings .est-hint,
+.eve-settings .est-feedback,
+.eve-settings dt {
+  color: var(--est-muted);
+}
+.eve-settings .est-intro {
+  margin-block-start: .5rem;
+}
+.eve-settings .est-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(13rem, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+.eve-settings .est-card {
+  min-width: 0;
+  background: var(--est-paper);
+  padding: clamp(1rem, 3vw, 1.6rem);
+  border: 1px solid var(--est-rule);
+  border-radius: 1rem;
+}
+.eve-settings .est-summary {
+  background: var(--est-tint);
+}
+.eve-settings .est-summary dl {
+  margin-block-start: 1rem;
+}
+.eve-settings .est-summary dl > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: .7rem;
+  padding-block: .55rem;
+  border-top: 1px solid var(--est-rule);
+}
+.eve-settings dd {
+  font-weight: 650;
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+.eve-settings fieldset {
+  border: 0;
+  min-inline-size: 0;
+  padding: 0;
+  margin: 1.5rem 0 0;
+}
+.eve-settings legend {
+  font-size: .92rem;
+  font-weight: 700;
+  color: var(--est-accent);
+  border-bottom: 2px solid var(--est-accent);
+  padding: 0 0 .2rem;
+}
+.eve-settings .est-field {
+  padding-block: .95rem;
+}
+.eve-settings .est-field + .est-field,
+.eve-settings .est-actions {
+  border-block-start: 1px solid var(--est-rule);
+}
+.eve-settings label,
+.eve-settings .est-label > span {
+  font-weight: 650;
+}
+.eve-settings .est-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem .65rem;
+}
+.eve-settings .est-label:has(input[type="checkbox"]) label {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+.eve-settings .est-badge {
+  color: var(--est-muted);
+  background: var(--est-tint);
+  padding: .05rem .4rem;
+  border-radius: .35rem;
+}
+.eve-settings .est-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--est-muted);
+  white-space: pre-wrap;
+}
+.eve-settings .est-summary .est-hint {
+  margin-top: 1rem;
+}
+.eve-settings .est-source {
+  padding: .65rem 0;
+}
+.eve-settings .est-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem .65rem;
+  align-items: center;
+  margin-top: .75rem;
+}
+.eve-settings .est-tools input[type="search"] {
+  flex: 1 1 11rem;
+  min-width: 0;
+}
+.eve-settings .est-hint,
+.eve-settings .est-error,
+.eve-settings .est-feedback {
+  font-size: .92rem;
+}
+.eve-settings .est-hint {
+  margin-block: .15rem .5rem;
+}
+.eve-settings :is(input:not([type="checkbox"]), select, textarea) {
+  display: block;
+  width: min(100%, 28rem);
+  min-height: 44px;
+  margin-block: .35rem;
+  border: 1px solid var(--est-muted);
+  border-radius: .5rem;
+  padding: .55rem .75rem;
+  color: var(--est-ink);
+  background: var(--est-paper);
+  font: inherit;
+}
+.eve-settings textarea {
+  resize: vertical;
+}
+.eve-settings [aria-invalid="true"] {
+  border-color: var(--est-error);
+}
+.eve-settings .est-error,
+.eve-settings .est-feedback[data-tone="error"] {
+  color: var(--est-error);
+}
+.eve-settings input[type="checkbox"] {
+  inline-size: 1.25rem;
+  block-size: 1.25rem;
+  margin: 0;
+  accent-color: var(--est-accent);
+}
+.eve-settings .est-actions {
+  padding-block-start: 1rem;
+}
+.eve-settings .est-btn {
+  min-height: 44px;
+  border: 1px solid var(--est-muted);
+  padding: .5rem 1rem;
+  border-radius: .55rem;
+  color: var(--est-ink);
+  background: var(--est-paper);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.eve-settings .est-primary {
+  background: var(--est-accent);
+  border-color: var(--est-accent);
+  color: var(--est-on);
+}
+.eve-settings .est-btn:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+.eve-settings .est-btn:not(:disabled):hover {
+  text-decoration: underline;
+  text-underline-offset: .18em;
+}
+.eve-settings :focus-visible {
+  outline: 3px solid var(--est-accent);
+  outline-offset: 3px;
+}
+.eve-settings .est-feedback {
+  margin-top: .75rem;
+}
+.eve-settings .est-feedback[data-tone="success"] {
+  color: var(--est-accent);
+}
+@media (max-width: 44rem) {
+  .eve-settings .est-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (prefers-color-scheme: dark) {
+  .eve-settings {
+    color-scheme: dark;
+    --est-paper: #192825;
+    --est-ink: #e1f0eb;
+    --est-muted: #b3c8c0;
+    --est-rule: #465e55;
+    --est-tint: #20322c;
+    --est-accent: #8fdabb;
+    --est-on: #142b20;
+    --est-error: #ffb1a9;
+  }
+}

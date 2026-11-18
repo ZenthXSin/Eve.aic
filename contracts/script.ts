@@ -29,6 +29,7 @@ export const COMPACT_TOOL_PROMPT_VERSION = 1;
 export type ScriptContractName =
   | "phone"
   | "phone-details"
+  | "phone-platform"
   | "agents"
   | "mind"
   | "notes"

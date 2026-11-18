@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EVE Studio · 管理工作台</title>
+    <link rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23283f35'/%3E%3Cpath fill='%23fcf5df' d='m4 8 11 4v15L4 23zm13 4 11-6v15l-11 6z'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/studio/base.css">
+    <script type="module" src="/studio/app.js"></script>
+  </head>
+  <body>
+    <svg class="shell-symbols" aria-hidden="true" focusable="false"
+      xmlns="http://www.w3.org/2000/svg">
+      <symbol id="mark-folio" viewBox="0 0 32 32">
+        <path d="M4 7.5 15 11v16L4 23.5zM17 11l11-6v16l-11 6z" />
+        <path d="M8 4.5 15.8 7 24 2.5v2.7l-8.2 4.4L8 7.1z" />
+      </symbol>
+      <symbol id="mark-overview" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <path d="M10 4v16m0-9h11" />
+      </symbol>
+      <symbol id="mark-chat" viewBox="0 0 24 24">
+        <path d="M4 5h16v11H9l-5 4zM8 9h8m-8 3h5" />
+      </symbol>
+      <symbol id="mark-settings" viewBox="0 0 24 24">
+        <path d="M4 7h7m5 0h4M4 17h3m5 0h8" />
+        <circle cx="13.5" cy="7" r="2.5" />
+        <circle cx="9.5" cy="17" r="2.5" />
+      </symbol>
+      <symbol id="mark-explore" viewBox="0 0 24 24">
+        <path d="M4 9h16v11H4zM3 5h18v4H3zM10 13h4" />
+      </symbol>
+      <symbol id="mark-exit" viewBox="0 0 24 24">
+        <path d="M10 4H5v16h5m-1-8h12m-5-5 5 5-5 5" />
+      </symbol>
+    </svg>
+
+    <main id="gate" class="gate" aria-labelledby="gate-title">
+      <div class="gate-sheet">
+        <div class="gate-cover" aria-hidden="true">
+          <span class="cover-edition">EVE &nbsp;/&nbsp; STUDIO</span>
+          <svg class="cover-print" viewBox="0 0 240 180" focusable="false">
+            <circle class="print-sun" cx="174" cy="47" r="19" />
+            <path class="print-lines"
+              d="M17 148h206M28 154h184M120 135c-25-20-53-29-86-29l7 12c30 1 56 10 79 22 24-13 49-21 79-22l7-12c-34 0-61 9-86 29z" />
+            <path class="print-paper"
+              d="M120 132c-25-24-51-36-80-40V67c32 4 59 22 80 48 22-35 45-56 75-67v44c-27 7-53 20-75 40z" />
+            <path class="print-fold"
+              d="M120 131v-16M49 80c23 6 45 19 60 35m24-8c14-20 32-36 51-45" />
+          </svg>
+          <div><p class="cover-name">工作手册</p><span class="cover-edition">OPERATIONS FOLIO</span></div>
+        </div>
+        <div class="gate-body">
+          <div
+            class="brand"><span class="brand-mark"><svg aria-hidden="true"><use href="#mark-folio"/></svg></span><span>EVE <em>Studio</em></span></div>
+          <div class="gate-intro">
+            <p class="eyebrow">管理员入口</p>
+            <h1 id="gate-title" tabindex="-1">打开工作台</h1>
+            <p id="gate-copy" class="muted">正在确认此浏览器的登录状态。</p>
+          </div>
+          <div id="gate-wait" class="gate-wait"
+            role="status"><span class="shell-spinner" aria-hidden="true"></span>正在检查会话…</div>
+          <form id="login-form" class="stack" method="post" action="/api/login" hidden>
+            <div class="field">
+              <label for="login-token">管理员口令</label>
+              <div class="secret-field">
+                <input id="login-token" name="token" type="password" autocomplete="current-password"
+                  autocapitalize="none" spellcheck="false" required aria-describedby="gate-message">
+                <button id="token-toggle" type="button" aria-label="显示口令"
+                  aria-controls="login-token">显示</button>
+              </div>
+            </div>
+            <button id="login-submit" class="btn btn-primary" type="submit">登录工作台</button>
+          </form>
+          <p id="gate-message" class="gate-message" role="alert"></p>
+          <button id="session-retry" class="btn" type="button" hidden>重新检查会话</button>
+          <noscript><p class="gate-message">请启用 JavaScript，再重新打开工作台。</p></noscript>
+        </div>
+      </div>
+    </main>
+
+    <div id="workspace" class="shell" hidden>
+      <a id="skip-content" class="skip-link" href="#main-content">跳到页面内容</a>
+      <aside class="shell-rail" aria-label="工作台侧栏">
+        <a class="brand rail-brand" href="#overview"
+          aria-label="EVE Studio 总览"><span class="brand-mark"><svg aria-hidden="true"><use href="#mark-folio"/></svg></span><span>EVE <em>Studio</em></span></a>
+        <nav class="rail-nav" aria-label="主导航">
+          <p class="rail-caption">工作区 <span aria-hidden="true">/ INDEX</span></p>
+          <div class="rail-links">
+            <a class="nav-link" href="#overview"
+              data-view="overview"><svg class="shell-icon" aria-hidden="true"><use href="#mark-overview"/></svg><span>总览</span></a>
+            <a class="nav-link" href="#chat"
+              data-view="chat"><svg class="shell-icon" aria-hidden="true"><use href="#mark-chat"/></svg><span>对话</span></a>
+            <a class="nav-link" href="#settings"
+              data-view="settings"><svg class="shell-icon" aria-hidden="true"><use href="#mark-settings"/></svg><span>设置</span></a>
+            <a class="nav-link" href="#explore"
+              data-view="explore"><svg class="shell-icon" aria-hidden="true"><use href="#mark-explore"/></svg><span>探索</span></a>
+          </div>
+        </nav>
+        <div
+          class="rail-account"><button id="logout" class="rail-exit" type="button"><svg class="shell-icon" aria-hidden="true"><use href="#mark-exit"/></svg><span id="logout-label">退出登录</span></button></div>
+      </aside>
+      <div class="shell-desk">
+        <header class="desk-bar">
+          <p
+            class="desk-location"><span>工作台</span><span class="desk-slash" aria-hidden="true">/</span><strong id="view-label">总览</strong></p>
+          <span class="session-seal">已登录</span>
+        </header>
+        <main id="main-content" class="desk-main" aria-labelledby="view-label" tabindex="-1">
+          <div id="view-host"></div>
+        </main>
+      </div>
+    </div>
+    <div id="notice" class="shell-toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

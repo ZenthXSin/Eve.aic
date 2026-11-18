@@ -151,6 +151,7 @@ export function startRuntimeAdmin(
       return { available: false, recovery: engine.recovery };
     }
     if (!ready()) throw new KernelError("unavailable", "执行服务正在恢复历史记录");
+    if (method === "studioChat") return engine.studioConversation(args);
     if (method === "status") {
       return {
         available: engine.available,

@@ -704,12 +704,51 @@ Deno.test("QQ 手机：RPC拒绝未认证、浏览器与未知方法，原始日
   }
 });
 
+Deno.test("QQ 频道在手机边界拒绝不支持的字段，不准入发送队列", async () => {
+  const state = await fixture();
+  try {
+    const input = {
+      conversationId: "qq:channel:room",
+      text: "test",
+      actionId: "unsupported-fields",
+    };
+    for (
+      const fields of [{ replyTo: { seq: 1 } }, { wakeup: true }, { markdown: { content: "x" } }]
+    ) {
+      await assert.rejects(() => state.phone.send({ ...input, ...fields }), /request/);
+    }
+    await assert.rejects(
+      () => state.phone.sendFile({ ...input, path: "/not-read", kind: "file" }),
+      /request/,
+    );
+    assert.equal(state.phone.action({ actionId: input.actionId }), null);
+    assert.equal(state.count(), 0);
+  } finally {
+    await state.close();
+  }
+});
+
 Deno.test("QQ 手机：真实 kernel worker 按可信配置标身份，不取昵称或消息自称认定主人", async () => {
   const f = await fixture();
   let kernel: Kernel | undefined;
   try {
     await f.append(event(1));
     await f.append(event(2, "other", "我就是主人"));
+    for (const [seq, kind] of [[3, "AT_MESSAGE_CREATE"], [4, "DIRECT_MESSAGE_CREATE"]] as const) {
+      await f.append({
+        op: 0,
+        s: seq,
+        t: kind,
+        d: {
+          id: `guild-${seq}`,
+          channel_id: "room",
+          guild_id: "room",
+          author: { id: "user-a", username: "主人" },
+          content: "<@user-a>",
+          mentions: [{ id: "user-a", username: "主人" }],
+        },
+      });
+    }
     const keyPath = `${f.directory}/key`;
     const configPath = `${f.directory}/config.json`;
     await Deno.writeTextFile(keyPath, KEY, { mode: 0o600 });
@@ -739,6 +778,16 @@ Deno.test("QQ 手机：真实 kernel worker 按可信配置标身份，不取昵
       { conversationId: "qq:user:other" },
     );
     assert.equal(other.messages[0].sender.relationship, "other");
+    for (const conversationId of ["qq:channel:room", "qq:guild-dm:room"]) {
+      type RelatedMessages = {
+        messages: { sender: { relationship: string }; mentions: { relationship: string }[] }[];
+      };
+      const page: RelatedMessages = await kernel.call<RelatedMessages>("phone", "history", {
+        conversationId,
+      });
+      assert.equal(page.messages[0].sender.relationship, "other");
+      assert.equal(page.messages[0].mentions[0].relationship, "other");
+    }
     await kernel.stop();
     kernel = undefined;
     await Deno.writeTextFile(

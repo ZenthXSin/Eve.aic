@@ -320,18 +320,19 @@ export async function startInstance(configPath: string) {
     }
     if (method === "status") {
       let eve: Json = null;
+      let error = lastError;
       if (kernel) {
         try {
-          eve = await kernel.call("eve", "status");
-        } catch (error) {
-          lastError = error instanceof KernelError ? error.kind : "unknown";
+          eve = await kernel.call("eve", "status", args.brief === true ? { brief: true } : null);
+        } catch (cause) {
+          error ??= cause instanceof KernelError ? cause.kind : "unknown";
         }
       }
       return {
         state,
         sourceCommit: c.sourceCommit,
         instanceId: c.id,
-        error: lastError,
+        error,
         lease: { lastRenewedAt, expiresAt: leaseExpiresAt },
         stopFailure: stopDiagnostics.last as unknown as Json,
         eve,

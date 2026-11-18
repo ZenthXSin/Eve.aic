@@ -9,6 +9,7 @@ export interface TimelineSource {
   message: Omit<PhoneMessage, "seq">;
   notify: boolean;
 }
+export type TimelineFact = Pick<TimelineSource, "key" | "fingerprint" | "observedAt">;
 interface Entry {
   seq: number;
   key: string;
@@ -23,6 +24,9 @@ export class QqTimelineError extends Error {
 
 export class QqTimeline {
   #entries: Entry[] = [];
+  #keys = new Set<string>();
+  #verifiedThrough = 0;
+  #pending = 0;
   #lock?: Deno.FsFile;
   #failed = false;
   #tail: Promise<unknown> = Promise.resolve();
@@ -61,14 +65,13 @@ export class QqTimeline {
         if (data?.schema !== 1 || !Array.isArray(data.entries)) {
           throw new QqTimelineError("corrupt");
         }
-        const keys = new Set<string>();
         for (const [index, e] of data.entries.entries()) {
           if (
             e?.seq !== index + 1 || typeof e.key !== "string" ||
             !/^(incoming:[1-9][0-9]*|outgoing:[a-zA-Z0-9_-]{1,128})$/.test(e.key) ||
-            !/^[a-f0-9]{64}$/.test(e.fingerprint) || keys.has(e.key)
+            !/^[a-f0-9]{64}$/.test(e.fingerprint) || this.#keys.has(e.key)
           ) throw new QqTimelineError("corrupt");
-          keys.add(e.key);
+          this.#keys.add(e.key);
           this.#entries.push({ seq: e.seq, key: e.key, fingerprint: e.fingerprint });
         }
       } catch (error) {
@@ -86,10 +89,34 @@ export class QqTimeline {
   async snapshot(sources: readonly TimelineSource[]) {
     if (!this.#lock || this.#failed || this.#closing) throw new QqTimelineError("unavailable");
     const copy = structuredClone(sources);
+    const keys = await this.sync(0, copy);
+    const byKey = new Map(copy.map((source) => [source.key, source]));
+    return keys.map((key, index) => {
+      const source = byKey.get(key)!;
+      return { key, message: { ...source.message, seq: index + 1 }, notify: source.notify };
+    });
+  }
+
+  current(through: number): boolean {
+    return this.available && !this.#pending && through === this.#verifiedThrough &&
+      through === this.#entries.length;
+  }
+
+  async sync(through: number, sources: readonly TimelineFact[]): Promise<string[]> {
+    if (!this.available) throw new QqTimelineError("unavailable");
+    const copy = sources.map(({ key, fingerprint, observedAt }) => ({
+      key,
+      fingerprint,
+      observedAt,
+    }));
+    this.#pending++;
     const operation = this.#tail.then(async () => {
       if (this.#failed) throw new QqTimelineError("unavailable");
-      const byKey = new Map<string, TimelineSource>();
+      const byKey = new Map<string, TimelineFact>();
       try {
+        if (!Number.isSafeInteger(through) || through < 0 || through > this.#verifiedThrough) {
+          throw new QqTimelineError("corrupt");
+        }
         for (const source of copy) {
           if (
             !/^(incoming:[1-9][0-9]*|outgoing:[a-zA-Z0-9_-]{1,128})$/.test(source.key) ||
@@ -98,19 +125,20 @@ export class QqTimeline {
           ) throw new QqTimelineError("corrupt");
           byKey.set(source.key, source);
         }
-        const known = new Set<string>();
-        for (const entry of this.#entries) {
+        for (let index = through; index < this.#entries.length; index++) {
+          const entry = this.#entries[index];
           if (byKey.get(entry.key)?.fingerprint !== entry.fingerprint) {
             throw new QqTimelineError("corrupt");
           }
-          known.add(entry.key);
+          byKey.delete(entry.key);
         }
-        const fresh = copy.filter((source) => !known.has(source.key)).sort((a, b) =>
+        const fresh = [...byKey.values()].sort((a, b) =>
           Date.parse(a.observedAt) - Date.parse(b.observedAt) || a.key.localeCompare(b.key)
         );
         if (fresh.length) {
           const next = [...this.#entries];
           for (const source of fresh) {
+            if (this.#keys.has(source.key)) throw new QqTimelineError("corrupt");
             next.push({ seq: next.length + 1, key: source.key, fingerprint: source.fingerprint });
           }
           try {
@@ -119,20 +147,15 @@ export class QqTimeline {
             throw new QqTimelineError("storage");
           }
           this.#entries = next;
+          for (const source of fresh) this.#keys.add(source.key);
         }
-        return this.#entries.map((entry) => {
-          const source = byKey.get(entry.key)!;
-          return {
-            key: entry.key,
-            message: { ...source.message, seq: entry.seq },
-            notify: source.notify,
-          };
-        });
+        this.#verifiedThrough = this.#entries.length;
+        return this.#entries.slice(through).map((entry) => entry.key);
       } catch (error) {
         this.#failed = true;
         throw error;
       }
-    });
+    }).finally(() => this.#pending--);
     this.#tail = operation.catch(() => {});
     return await operation;
   }

@@ -1,4 +1,5 @@
 // 手机自己的通知水位和最近一次打开的屏幕；不改平台原件，也不声称对方收到已读回执。
+import { qqDestination } from "../../contracts/qq-conversation.ts";
 import type { PhoneReadingState } from "../../contracts/phone.ts";
 import { KernelError } from "../../kernel/protocol.ts";
 import { writeDurableJson } from "../../sdk/durable-json.ts";
@@ -12,7 +13,7 @@ function sequence(value: unknown, min = 0): value is number {
 }
 function valid(entry: Entry): boolean {
   return !!entry && typeof entry.conversationId === "string" &&
-    /^qq:(user|group):.{1,512}$/.test(entry.conversationId) &&
+    !!qqDestination(entry.conversationId) &&
     sequence(entry.notificationThroughSeq, 1) && !!entry.lastOpened &&
     sequence(entry.lastOpened.snapshotThroughSeq, entry.notificationThroughSeq) &&
     Array.isArray(entry.lastOpened.displayedSeqs) &&

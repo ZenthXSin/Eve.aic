@@ -1,5 +1,6 @@
 // 官方事件到平台事实的投影。原始事件（含平台私有扩展）由适配器日志保留，不送给模型。
 import type { PhoneAttachment, PhoneMessage } from "../../contracts/phone.ts";
+import { guildChatDestination, guildMessageId } from "./channel-chat.ts";
 
 export interface QqDispatch {
   op: 0;
@@ -8,6 +9,8 @@ export interface QqDispatch {
   id?: string;
   d: unknown;
 }
+
+export type QqInboundEvent = Omit<QqDispatch, "s"> & { s?: number };
 
 export interface InboundQqMessage {
   /** 一条平台消息的身份；网关补发序号不参与，避免重连制造新的触发。 */
@@ -18,8 +21,8 @@ export interface InboundQqMessage {
     /** 没有 msg_idx 的旧推送按官方 msg_seq 区分，不采用网关 s。 */
     messageSequence?: number;
   };
-  /** source type 明确区分 C2C 和群聊，发送出口不能从昵称推断目的地。 */
-  destination: { kind: "user" | "group"; openId: string };
+  /** 按平台事件区分 C2C、群、子频道和频道私信；同字符串的标识不能跨类型。 */
+  destination: { kind: "user" | "group" | "channel" | "guild-dm"; openId: string };
   message: Omit<PhoneMessage, "seq">;
   referenceIndex?: string;
   /** 不能证明 @ 全体或正文里提及名字是在 @ Eve。 */
@@ -119,11 +122,63 @@ function attachments(raw: unknown, version: QqProjectionVersion): PhoneAttachmen
   });
 }
 
+function guildMessage(dispatch: QqInboundEvent): InboundQqMessage {
+  const data = dispatch.d;
+  if (
+    !object(data) || !guildMessageId(data.id) || !object(data.author) ||
+    !guildMessageId(data.author.id)
+  ) {
+    throw new TypeError("QQ 频道消息缺少消息或作者标识");
+  }
+  const direct = dispatch.t === "DIRECT_MESSAGE_CREATE";
+  const destination = direct
+    ? guildChatDestination("guild-dm", data.guild_id)
+    : guildChatDestination("channel", data.channel_id);
+  if (!destination || (data.direct_message !== undefined && data.direct_message !== direct)) {
+    throw new TypeError("QQ 频道会话标识不合法");
+  }
+  if (data.author.username !== undefined && typeof data.author.username !== "string") {
+    throw new TypeError("QQ 平台昵称类型不合法");
+  }
+  const cards = attachments(data.attachments, 2);
+  if (typeof data.content !== "string" && !(data.content === undefined && cards?.length)) {
+    throw new TypeError("QQ 频道消息内容不合法");
+  }
+  const reference = data.message_reference;
+  if (reference !== undefined && (!object(reference) || !guildMessageId(reference.message_id))) {
+    throw new TypeError("QQ 频道引用消息标识不合法");
+  }
+  const quoted = (reference as { message_id: string } | undefined)?.message_id;
+  const conversationId = `qq:${destination.kind}:${destination.openId}`;
+  return {
+    destination,
+    deduplication: { conversationId, messageId: data.id },
+    message: {
+      conversationId,
+      platformMessageId: data.id,
+      referenceIndex: data.id,
+      sender: { platformUserId: data.author.id, displayName: data.author.username ?? "" },
+      direction: "incoming",
+      ...(typeof data.timestamp === "string" ? { sentAt: data.timestamp } : {}),
+      text: data.content ?? "",
+      ...(cards === undefined ? {} : { attachments: cards }),
+      ...(quoted === undefined ? {} : { quote: { platformMessageId: quoted } }),
+    },
+    ...(quoted === undefined ? {} : { referenceIndex: quoted }),
+    notify: direct || dispatch.t === "AT_MESSAGE_CREATE",
+  };
+}
+
 /** 未支持事件返回 undefined；支持事件若损坏则报错，不能确认网关消费成功。 */
 export function qqMessage(
-  dispatch: QqDispatch,
+  dispatch: QqInboundEvent,
   version: QqProjectionVersion = 2,
 ): InboundQqMessage | undefined {
+  if (
+    version === 2 && dispatch.op === 0 &&
+    (dispatch.t === "MESSAGE_CREATE" || dispatch.t === "AT_MESSAGE_CREATE" ||
+      dispatch.t === "DIRECT_MESSAGE_CREATE")
+  ) return guildMessage(dispatch);
   if (
     !["C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"].includes(dispatch.t)
   ) {

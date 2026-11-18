@@ -13,9 +13,12 @@ export function contactIndex(
       names.set(JSON.stringify([m.conversationId, m.sender.platformUserId]), m.sender.displayName);
     }
     const group = raw?.group as Record<string, unknown> | undefined;
-    const name = m.conversationId.startsWith("qq:user:")
-      ? m.sender.displayName
-      : raw?.group_name ?? group?.name;
+    const name =
+      record.message.destination.kind === "user" || record.message.destination.kind === "guild-dm"
+        ? m.sender.displayName
+        : record.message.destination.kind === "group"
+        ? raw?.group_name ?? group?.name
+        : undefined;
     if (typeof name === "string" && name && name.length <= 512) {
       conversations.set(m.conversationId, name);
     }

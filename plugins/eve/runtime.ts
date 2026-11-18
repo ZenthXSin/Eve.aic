@@ -1,4 +1,6 @@
 import { READ_SCRIPT_TOOL, readScript } from "./script-reader.ts";
+import { MOMENT_TOOL, planMoment } from "./life.ts";
+import { lanternContext, LANTERNS_TOOL, planLanterns } from "./lanterns.ts";
 import { defaultRestWake, eveCommandCompletions, selfActivityWindow } from "./activity.ts";
 import { DELEGATE_TOOL, delegateTask } from "./delegation.ts";
 import {
@@ -160,9 +162,30 @@ export class EveRuntime {
       ]);
     }
   }
-  #render() {
-    return this.#present(render(this.journal.events, this.#prompt));
+  #renderContext(tools: ToolSpec[], events = this.journal.events) {
+    const messages = this.#present(render(events, this.#prompt));
+    let composition: ReturnType<typeof contextComposition> | undefined;
+    let inputReservation: number | undefined;
+    return {
+      throughSeq: events.length,
+      messages,
+      estimatedTokens: contextEstimate(messages, tools, this.contextCounter),
+      get composition() {
+        return composition ??= contextComposition(messages);
+      },
+      get inputReservation() {
+        return inputReservation ??=
+          new TextEncoder().encode(JSON.stringify({ messages, tools })).length +
+          messages.length * 32;
+      },
+    };
   }
+  #retryIfJournalAdvanced(throughSeq: number) {
+    if (this.journal.events.length === throughSeq) return false;
+    this.#continueImmediately = true;
+    return true;
+  }
+  #initialized = false;
   #running = false;
   #closing = false;
   #busy?: Promise<void>;
@@ -232,6 +255,7 @@ export class EveRuntime {
   #modelBlocked: ModelBlock | null = null;
   #fatal = false;
   #sharedBudget?: {
+    studioChatTurn?: number;
     dailyTokenBudget: number;
     timeZone: string;
     paused: boolean;
@@ -343,6 +367,7 @@ export class EveRuntime {
       });
     }
     if (this.#failures || pendingTools(this.journal.events).length) this.#wake = 0;
+    this.#initialized = true;
   }
   start() {
     if (this.#closing) throw new KernelError("unavailable", "意识流已停止");
@@ -649,6 +674,34 @@ export class EveRuntime {
       });
     }
     let result: Json;
+    if (
+      [MOMENT_TOOL.name, LANTERNS_TOOL.name].includes(call.name) && this.config.restReviewEnabled
+    ) {
+      try {
+        const game = call.name === LANTERNS_TOOL.name;
+        const plan = (game ? planLanterns : planMoment)(
+          withoutThought(call).args,
+          this.journal.events,
+          call.id,
+        );
+        const record = plan.event
+          ? (await this.journal.append(game ? "leisure_lanterns" : "life_moment", plan.event)).seq
+          : plan.existing;
+        result = {
+          status: "completed",
+          output: JSON.stringify({
+            record,
+            externalAction: false,
+            ...(game ? { game: lanternContext(this.journal.events) } : {}),
+          }),
+        };
+      } catch (error) {
+        if (!(error instanceof KernelError && error.kind === "rejected")) throw error;
+        result = { status: "failed", error: toWireError(error) as unknown as Json };
+      }
+      await this.#saveToolResult(call.id, result);
+      return;
+    }
     if (call.name === DELEGATE_TOOL.name && this.config.agentsEnabled) {
       try {
         result = {
@@ -1000,16 +1053,16 @@ export class EveRuntime {
     const previous = lastActiveEvent(events, "context_projection");
     const compression = lastActiveEvent(events, "compression");
     const afterCompression = !!previous && (compression?.seq ?? 0) > previous.seq;
-    const messages = this.#render();
-    const estimated = contextEstimate(messages, tools, this.contextCounter);
+    const context = this.#renderContext(tools);
+    const estimated = context.estimatedTokens;
     // 压缩已经改变摘要前缀，趁第一次后续请求尚未发出时一起固定投影，
     // 避免随后再次支付缓存重建。正常轮次只追加；300k才允许应急投影。
     if (previous && !afterCompression && estimated < CONTEXT_PROJECTION_EMERGENCY_TOKENS) {
-      return messages;
+      return context;
     }
-    const throughSeq = events.at(-1)?.seq ?? 0;
+    const throughSeq = context.throughSeq;
     if (previous && (previous.data as { throughSeq: number }).throughSeq === throughSeq) {
-      return messages;
+      return context;
     }
     const preview: ConsciousEvent = {
       schema: 1,
@@ -1022,12 +1075,12 @@ export class EveRuntime {
     };
     // 完整原件构造临时视图，不写回、追加或修改任何原事件。预演不使用
     // 已投影的 messages 作输入，避免把节选误当原件再压缩。
-    const projected = this.#present(render(appendPreviewEvent(events, preview), this.#prompt));
-    const projectedTokens = contextEstimate(projected, tools, this.contextCounter);
+    const projected = this.#renderContext(tools, appendPreviewEvent(events, preview));
+    const projectedTokens = projected.estimatedTokens;
     if (
       previous && !afterCompression &&
       estimated - projectedTokens < CONTEXT_PROJECTION_MIN_SAVING_TOKENS
-    ) return messages;
+    ) return context;
     // 单条持久事实先提交，随后重启/回滚都从活动日志重建同一边界。
     await this.journal.append("context_projection", {
       throughSeq,
@@ -1040,7 +1093,7 @@ export class EveRuntime {
       estimatedAfter: projectedTokens,
       ...(afterCompression ? { compressionSeq: compression!.seq } : {}),
     });
-    return this.#render();
+    return events.length === projected.throughSeq ? projected : this.#renderContext(tools);
   }
   async #tools(): Promise<ToolSpec[]> {
     const provided = await this.ctx.call<Json>("tools", "list") as unknown as ToolSpec[];
@@ -1050,7 +1103,7 @@ export class EveRuntime {
       ...CONTEXT_TOOLS,
       ...(this.config.agentsEnabled ? [DELEGATE_TOOL] : []),
       ...(this.config.restReviewEnabled
-        ? [FOCUS_TOOL, REST_TOOL, CONVERSATION_TOOL, OUTREACH_TOOL]
+        ? [FOCUS_TOOL, REST_TOOL, CONVERSATION_TOOL, OUTREACH_TOOL, MOMENT_TOOL, LANTERNS_TOOL]
         : []),
     ];
     if (provided.some((tool) => native.some((item) => item.name === tool.name))) {
@@ -1098,6 +1151,21 @@ export class EveRuntime {
     const noticesStarted = performance.now();
     const fresh = await this.#notices();
     const noticesMs = performance.now() - noticesStarted;
+    const queuedTurn = this.#sharedBudget?.studioChatTurn;
+    if (
+      this.config.remoteRecords && Number.isSafeInteger(queuedTurn) && Number(queuedTurn) > 0 &&
+      !this.#closing && !this.#modelBlocked && !this.#sharedBudget?.paused && !fresh
+    ) {
+      const used = await this.ctx.call("model", "studioTurn", {
+        _actionId: `studio_slot_${queuedTurn}`,
+      }, {
+        timeoutMs: MODEL_RPC_TIMEOUT_MS,
+      });
+      if (used === true) {
+        this.#continueImmediately = true;
+        return;
+      }
+    }
     if (
       (this.#restApplied || appliedRest) &&
       (this.config.restReviewEnabled
@@ -1182,16 +1250,16 @@ export class EveRuntime {
     await this.#saveContextStates();
     const contextStarted = performance.now();
     // 必须先固定初次投影，再判断 500k 机械保护，避免旧 raw 历史误触压缩。
-    let messages = await this.#projectContext(tools);
-    const compression = contextEstimate(messages, tools, this.contextCounter) >= 500_000
+    let context = await this.#projectContext(tools);
+    const compression = context.estimatedTokens >= 500_000
       ? mechanicalCompression(this.journal.events, this.#prompt, tools, this.contextCounter)
       : undefined;
     if (compression) {
       await this.journal.append("compression", { ...compression, source: "system" });
-      messages = await this.#projectContext(tools);
+      context = await this.#projectContext(tools);
     }
     const contextProjectionMs = performance.now() - contextStarted;
-    const estimated = contextEstimate(messages, tools, this.contextCounter);
+    const estimated = context.estimatedTokens;
     this.#contextBlocked = estimated >= 500_000;
     if (this.#contextBlocked) {
       if (this.journal.events.at(-1)?.kind !== "context_wait") {
@@ -1209,8 +1277,7 @@ export class EveRuntime {
       estimated,
       this.config.sourceCommit,
     );
-    let reservation = new TextEncoder().encode(JSON.stringify({ messages, tools })).length +
-      messages.length * 32 + this.config.maxOutputTokens;
+    let reservation = context.inputReservation + this.config.maxOutputTokens;
     const state = {
       at: new Date().toISOString(),
       paused: false,
@@ -1220,7 +1287,7 @@ export class EveRuntime {
       contextEstimatedTokens: estimated,
       contextTargetTokens: CONTEXT_TARGET_TOKENS,
       contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",
-      contextComposition: contextComposition(messages),
+      contextComposition: context.composition,
       contextReminder: maintenance.reminder,
       contextMaintenance: {
         level: maintenance.level,
@@ -1237,6 +1304,7 @@ export class EveRuntime {
     const stateStarted = performance.now();
     await this.ctx.call("mind", "update", state as unknown as Json);
     const stateUpdateMs = performance.now() - stateStarted;
+    if (this.#retryIfJournalAdvanced(context.throughSeq)) return;
     if (usage.safetyTotal + reservation > this.config.dailyTokenBudget) {
       if (this.journal.events.at(-1)?.kind !== "budget_wait") {
         await this.journal.append("budget_wait", {
@@ -1294,10 +1362,11 @@ export class EveRuntime {
           }
           : null,
       });
-      messages = this.#render();
+      if (this.#retryIfJournalAdvanced(context.throughSeq + 1)) return;
+      context = this.#renderContext(tools);
     }
     // 感知本身也属于请求；不能在刚低于触线时追加后直接发出超线请求。
-    if (contextEstimate(messages, tools, this.contextCounter) >= 500_000) {
+    if (context.estimatedTokens >= 500_000) {
       const finalCompression = mechanicalCompression(
         this.journal.events,
         this.#prompt,
@@ -1306,31 +1375,34 @@ export class EveRuntime {
       );
       if (finalCompression) {
         await this.journal.append("compression", { ...finalCompression, source: "system" });
-        messages = await this.#projectContext(tools);
+        context = await this.#projectContext(tools);
       }
-      if (contextEstimate(messages, tools, this.contextCounter) >= 500_000) {
+      if (context.estimatedTokens >= 500_000) {
         this.#contextBlocked = true;
         await this.journal.append("context_wait", { reason: "最终完整请求仍超出估算触线" });
         return;
       }
     }
-    reservation = new TextEncoder().encode(JSON.stringify({ messages, tools })).length +
-      messages.length * 32 + this.config.maxOutputTokens;
-    this.#contextComposition = contextComposition(messages);
+    reservation = context.inputReservation + this.config.maxOutputTokens;
+    this.#contextComposition = context.composition;
     if (usage.safetyTotal + reservation > this.config.dailyTokenBudget) {
       await this.journal.append("budget_wait", { day, reason: "含感知的完整请求预算余量不足" });
       return;
     }
     if (this.#closing) return;
+    let throughSeq = context.throughSeq;
     if (this.#selfIdeas.length) {
       await this.journal.append("self_reflection", { ideas: this.#selfIdeas } as unknown as Json);
+      throughSeq++;
     }
-    const requestId = `model_${this.journal.events.length + 1}`;
+    if (this.#retryIfJournalAdvanced(throughSeq)) return;
+    const startSeq = throughSeq + 1;
+    const requestId = `model_${startSeq}`;
     await this.journal.append("model_start", {
       requestId,
       day,
       reservation,
-      estimatedTokens: contextEstimate(messages, tools, this.contextCounter),
+      estimatedTokens: context.estimatedTokens,
       contextComposition: this.#contextComposition,
       sourceCommit: this.config.sourceCommit,
       runtimeTiming: {
@@ -1349,11 +1421,14 @@ export class EveRuntime {
     let response: ModelResponse;
     try {
       if (this.#closing) throw new KernelError("unavailable", "实例已进入停止，模型请求未派发");
+      if (this.journal.events.length !== startSeq) {
+        throw new KernelError("unavailable", "提交轮次时意识记录已变化，模型请求未派发");
+      }
       response = await this.ctx.call<Json>(
         "model",
         "complete",
         {
-          messages,
+          messages: context.messages,
           tools,
           ...(this.config.remoteRecords ? { _actionId: requestId } : {}),
         } as unknown as Json,
@@ -1437,11 +1512,17 @@ export class EveRuntime {
       this.#continueImmediately = true;
     }
   }
-  status() {
+  briefStatus() {
     return {
       running: this.#running,
       busy: this.#busy !== undefined,
-      healthy: this.journal.available && !this.#closing && !this.#fatal,
+      healthy: this.#initialized && this.journal.available && !this.#closing && !this.#fatal,
+      lastError: this.#lastError ?? null,
+    };
+  }
+  status() {
+    return {
+      ...this.briefStatus(),
       sourceCommit: this.config.sourceCommit,
       records: this.journal.events.length,
       agentThroughSeq: this.#agentThrough,
@@ -1452,7 +1533,6 @@ export class EveRuntime {
       wakeAt: this.#wake,
       budget: this.#sharedBudget ??
         budget(this.journal.events, accountingDay(this.config.timeZone)),
-      lastError: this.#lastError ?? null,
       contextBlocked: this.#contextBlocked,
       contextTargetTokens: CONTEXT_TARGET_TOKENS,
       contextTargetCounting: "上游实际inputTokens平均目标；本地组成数字仅为估算",

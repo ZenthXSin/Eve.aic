@@ -1,4 +1,5 @@
 import { QqClient, type QqSendResult, type QqSendText, validateQqSendText } from "./client.ts";
+import { isGuildChatKind } from "./channel-chat.ts";
 import { writeAtomic } from "./journal.ts";
 
 /** 兼容旧调用方的回复参数；新动作统一主动发送，不再分配被动回复序号。 */
@@ -220,6 +221,8 @@ function conversation(request: QqSendText): string {
 /** 同会话串行。未知保留屏障；v2明确失败保留回执、放行后项，v1保持原语义。 */
 export class QqSendActions {
   #records = new Map<string, SendRecord>();
+  #ids: string[] = [];
+  #sentReferences = new Map<string, string[]>();
   // 首个异步哈希/落盘前同步预留，保证并发动作准入及会话顺序稳定。
   #admissions = new Map<string, QqSendText>();
   #inflight = new Map<string, Promise<SendStatus>>();
@@ -346,6 +349,30 @@ export class QqSendActions {
     this.#available();
     return Array.from(this.#records.values(), (record) => structuredClone(record));
   }
+  newRecords(after: number): SendRecord[] {
+    this.#available();
+    return this.#ids.slice(after).map((id) => structuredClone(this.#records.get(id)!));
+  }
+  record(actionId: string): SendRecord | undefined {
+    this.#available();
+    const record = this.#records.get(actionId);
+    return record && structuredClone(record);
+  }
+  sentReferences(conversationId: string, index: string): string[] {
+    this.#available();
+    return this.#sentReferences.get(JSON.stringify([conversationId, index]))?.slice() ?? [];
+  }
+  #publish(record: SendRecord) {
+    if (!this.#records.has(record.actionId)) this.#ids.push(record.actionId);
+    this.#records.set(record.actionId, record);
+    if (record.result?.status === "sent" && record.result.referenceIndex !== undefined) {
+      const { kind, openId } = record.request.destination;
+      const key = JSON.stringify([`qq:${kind}:${openId}`, record.result.referenceIndex]);
+      const ids = this.#sentReferences.get(key) ?? [];
+      ids.push(record.actionId);
+      this.#sentReferences.set(key, ids);
+    }
+  }
   async #receipt(record: SendRecord): Promise<string> {
     try {
       const path = `${this.directory}/records/${record.actionId}.json`;
@@ -458,7 +485,7 @@ export class QqSendActions {
     if (
       !Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 ||
       limit > 32 ||
-      (args.conversationId !== undefined && !/^qq:(user|group):.{1,512}$/.test(args.conversationId))
+      (args.conversationId !== undefined && !qqDestination(args.conversationId))
     ) throw new QqActionError("request");
     const eligible = [...this.#records.values()].filter((record) => {
       if (
@@ -715,7 +742,7 @@ export class QqSendActions {
             this.#enqueue(record);
           }
         }
-        this.#records.set(record.actionId, record);
+        this.#publish(record);
       }
       await this.#restoreAttempts();
       for (const record of this.#records.values()) {
@@ -814,7 +841,7 @@ export class QqSendActions {
       this.#failed = true;
       throw new QqActionError("storage");
     }
-    this.#records.set(record.actionId, record);
+    this.#publish(record);
   }
   /** 每次尝试的开始、真实结果、中断观察各只创建一次，绝不改写已存在事实。 */
   async #attemptFact(
@@ -947,7 +974,8 @@ export class QqSendActions {
         JSON.stringify(
           await this.client.sendText(
             plainFallback ? { ...started.request, format: "plain" } : started.request,
-            started.policy?.kind === "until_sent_v2"
+            started.policy?.kind === "until_sent_v2" &&
+              !isGuildChatKind(started.request.destination.kind)
               ? started.policy.sequence * 2 + (plainFallback ? 1 : 0)
               : undefined,
           ),
@@ -979,7 +1007,9 @@ export class QqSendActions {
     // Freeze the wire format before the first attempt. Existing plain/legacy retries stay plain.
     if (snapshot && typeof snapshot === "object" && snapshot.format === undefined) {
       if (previous?.format !== undefined) snapshot.format = previous.format;
-      else if (!previous && snapshot.attachment === undefined) snapshot.format = "markdown";
+      else if (!previous && snapshot.attachment === undefined) {
+        snapshot.format = isGuildChatKind(snapshot.destination?.kind) ? "plain" : "markdown";
+      }
     }
     // Validate legacy-shaped caller input before ignoring its passive reply metadata.
     const validation = structuredClone(snapshot);
@@ -1127,3 +1157,4 @@ export class QqSendActions {
     }
   }
 }
+import { qqDestination } from "../../contracts/qq-conversation.ts";

@@ -1,4 +1,13 @@
 import type { PhoneActionReceipt, PhoneBurstReceipt, PhoneBurstStatus } from "./phone-details.ts";
+import type {
+  PhonePlatformCapabilities,
+  PhonePlatformCapabilitiesArgs,
+  PhonePlatformEvents,
+  PhonePlatformEventsArgs,
+  PhonePlatformReadArgs,
+  PhonePlatformReadResult,
+} from "./phone-platform.ts";
+export type * from "./phone-platform.ts";
 export type { PhoneActionReceipt, PhoneBurstReceipt, PhoneBurstStatus } from "./phone-details.ts";
 
 // 平台事实与手机屏幕契约。阅读状态另存于独立适配器，不随手机 worker 换版回滚。
@@ -23,7 +32,7 @@ export interface PhoneMessage {
   sentAt?: string;
   text: string;
   quote?: { platformMessageId: string };
-  /** 本消息的平台引用索引；仅用于 referenceIndex，不等于 platformMessageId。 */
+  /** 本消息可用的引用标识。群聊/C2C 使用引用索引；频道/频道私信使用消息 ID。 */
   referenceIndex?: string;
   /** 平台明确带有引用；target 缺失表示本机无法唯一定位，不能猜测对象或内容。 */
   reference?: PhoneReference;
@@ -85,7 +94,7 @@ export interface MessageScreen {
   };
   body: TextPreview;
   quote?: { platformMessageId: string };
-  /** 本消息的平台引用索引；仅用于 referenceIndex，不等于 platformMessageId。 */
+  /** 本消息可用的引用标识。群聊/C2C 使用引用索引；频道/频道私信使用消息 ID。 */
   referenceIndex?: string;
   /** 平台明确带有引用；target 缺失表示本机无法唯一定位，不能猜测对象或内容。 */
   reference?: PhoneReference;
@@ -143,7 +152,7 @@ export interface PhoneSend {
   actionId: string;
   conversationId: string;
   text: string;
-  /** 平台已提供的引用索引；不是平台消息编号。 */
+  /** 传目标消息屏幕给出的 referenceIndex；不要从其它会话或编号推断。 */
   referenceIndex?: string;
   wakeup?: boolean;
 }
@@ -222,12 +231,18 @@ export type PhoneImage = {
 
 /** 脚本可用的手机接口。只有 open 更新本机会话通知水位，历史/搜索只浏览。 */
 export interface PhoneApi {
+  /** 只读发现；空参数取目录首页，详情与分页见 scripts.contracts({name:"phone-platform"})。 */
+  platformCapabilities(args?: PhonePlatformCapabilitiesArgs): Promise<PhonePlatformCapabilities>;
+  /** 按本机日志序号浏览平台事件，不更新会话已读或执行事件中的动作。 */
+  platformEvents(args?: PhonePlatformEventsArgs): Promise<PhonePlatformEvents>;
+  /** 仅查询契约列出的只读操作；不接受 URL、任意 HTTP 方法或 operator 写操作。 */
+  platformRead(args: PhonePlatformReadArgs): Promise<PhonePlatformReadResult>;
   conversations(args?: {
     cursor?: { snapshotThroughSeq: number; beforeLastSeq: number; beforePinned?: boolean };
   }): Promise<{
     items: {
       conversationId: string;
-      kind: "user" | "group";
+      kind: "user" | "group" | "channel" | "guild-dm";
       platformName?: string;
       remark?: string;
       alias?: string;

@@ -71,6 +71,28 @@ def inspect_owner_history(fetch, now, report):
         report['issues'].append('owner_dm_age_unknown')
 
 
+def inspect_instance(live, report):
+    if not isinstance(live, dict):
+        raise ValueError('invalid instance status')
+    state = live.get('state') if isinstance(live.get('state'), str) else None
+    eve = live.get('eve') if isinstance(live.get('eve'), dict) else {}
+    running, healthy = eve.get('running'), eve.get('healthy')
+    report.update(instance=state,
+                  running=running if isinstance(running, bool) else None,
+                  healthy=healthy if isinstance(healthy, bool) else None)
+    if (state and state != 'active') or running is False or healthy is False:
+        probe = 'unhealthy'
+    elif state == 'active' and running is True and healthy is True:
+        probe = 'unhealthy' if live.get('error') else 'healthy'
+    else:
+        probe = 'unknown'
+    report['instance_probe'] = probe
+    if probe == 'unhealthy':
+        report['issues'].append('instance_unhealthy')
+    elif probe == 'unknown':
+        report['issues'].append('instance_probe_unknown')
+
+
 def main():
     now = datetime.now(timezone.utc)
     report = {'at': now.isoformat(), 'issues': []}
@@ -98,13 +120,12 @@ def main():
         instance = check('instance_config', lambda: read(f'/etc/eve-rebuild/instances/{current}/config.json'))
         phone = check('qq_health', lambda: rpc(instance['phone'], 'health', channel='phone'))
         report['gateway'] = phone.get('gateway', {}).get('status')
-        if not phone.get('available') or report['gateway'] not in ('ready', 'resumed'):
+        if (phone.get('available') is not True or
+                report['gateway'] not in ('ready', 'resumed', 'webhook_verified')):
             issues.append('qq_unavailable')
-        live = check('instance', lambda: rpc(instance['instance'], 'status'))
-        eve = live.get('eve') or {}
-        report.update(instance=live.get('state'), running=eve.get('running'), healthy=eve.get('healthy'))
-        if live.get('state') != 'active' or not eve.get('running') or not eve.get('healthy'):
-            issues.append('instance_unhealthy')
+        report.update(instance=None, running=None, healthy=None, instance_probe='unknown')
+        check('instance', lambda: inspect_instance(
+            rpc(instance['instance'], 'status', {'brief': True}), report))
     else:
         issues.append('no_current_instance')
 

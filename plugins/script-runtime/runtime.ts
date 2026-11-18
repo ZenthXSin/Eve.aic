@@ -36,6 +36,7 @@ const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
 const CONTRACT_FILES: Record<string, string> = {
   phone: "phone",
   "phone-details": "phone-details",
+  "phone-platform": "phone-platform",
   agents: "agents",
   mind: "mind",
   notes: "notes",

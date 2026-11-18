@@ -17,7 +17,7 @@ export async function composePhonePlugin(directory: string, configPath: string):
       {
         name: "phone",
         version: "1.0.0",
-        provides: { phone: "1.0.0" },
+        provides: { phone: "1.1.0" },
         ...(config.describeImages
           ? { requires: { model: "^1.0.0" } }
           : { optional: { model: "^1.0.0" } }),

@@ -18,6 +18,7 @@ tools.notes.get({id:"工具契约目录"})，再按目录中的短名读取所�
 type ContractName =
   | "phone"
   | "phone-details"
+  | "phone-platform"
   | "agents"
   | "mind"
   | "notes"
@@ -146,6 +147,10 @@ interface CoreTools {
 
 目录（调用前按 name 读取完整契约）： phone：上述常用项，以及
 history/search/notifications/settings、waitForMessages、download/image/file、sendBurst/burstStatus、listSendQueue/cancelSend。phone-details：送达与分段回执。
+QQ 平台：先 `return await tools.phone.platformCapabilities({})` 查目录；`platformEvents` 读事件，
+`platformRead` 只接受 chatReadable 操作。目录不是授权，详见
+`scripts.contracts({name:"phone-platform"})`。
+
 agents：上述常用项，以及 create/configure/history/search/notifications/close。
 mind：上述常用项，以及 watch/compress。整理上下文优先用原生 inspect_context 给出的完整边界与
 compress_context，直接返回生效和前后用量；200k 准备，270k 一次整理到约100k。 notes：上述常用项，以及

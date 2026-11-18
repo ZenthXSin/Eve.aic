@@ -1,4 +1,5 @@
 // 手机设备自己的设置，保存在独立设备目录；不改变平台身份、入站日志或发送回执。
+import { qqDestination } from "../../contracts/qq-conversation.ts";
 import type { PhoneConversationSettings } from "../../contracts/phone.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
@@ -23,7 +24,7 @@ export class QqPhoneDevice {
         };
         if (
           event.kind !== "settings" || !value ||
-          !/^qq:(user|group):.{1,512}$/.test(value.conversationId) ||
+          !qqDestination(value.conversationId) ||
           typeof value.settings?.muted !== "boolean" ||
           typeof value.settings.pinned !== "boolean" || typeof value.settings.draft !== "string" ||
           value.settings.remark !== undefined &&
@@ -42,7 +43,7 @@ export class QqPhoneDevice {
   }
   resolve(reference: string): string {
     if (!this.available) throw new KernelError("unavailable", "手机设置不可用");
-    if (/^qq:(user|group):.{1,512}$/.test(reference)) return reference;
+    if (qqDestination(reference)) return reference;
     if (!conversationAlias(reference)) throw new KernelError("rejected", "会话短名无效");
     const matches = [...this.#settings].filter(([, settings]) => settings.alias === reference);
     if (matches.length !== 1) {

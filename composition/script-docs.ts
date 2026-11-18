@@ -38,6 +38,7 @@ export async function renderScriptContracts(
   let nativeThoughts = false;
   let web = false;
   let sendBurst = false;
+  let platformCapabilities = false;
   let directReplacement = false;
   for (const file of files) {
     const path = `contracts/${file.pathname.split("/").at(-1)}`;
@@ -46,7 +47,10 @@ export async function renderScriptContracts(
       : await (readSource ? readSource(path) : Deno.readTextFile(file));
     // 旧源码没有该声明，必须逐字复原旧前言来识别现役提示生成区。
     // 源码仅作为已固定的数据读取；绝不 import 候选生成器或执行标记表达式。
-    if (path === "contracts/phone.ts") sendBurst = /^\s*sendBurst\(/m.test(source);
+    if (path === "contracts/phone.ts") {
+      sendBurst = /^\s*sendBurst\(/m.test(source);
+      platformCapabilities = /^\s*platformCapabilities\(/m.test(source);
+    }
     if (path === "contracts/script.ts") {
       contractLookup = /^export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       agents = /^export const AGENT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
@@ -110,6 +114,9 @@ export async function renderScriptContracts(
     } 在 ScriptApi 中省去 actionId，由宿主提供。ScriptHostApi 供宿主领取任务/通知，不是 tools 内的额外对象。\n\n` +
     (contractLookup
       ? '详细发送回执与子代理完整契约按需读取：return await tools.scripts.contracts({name:"phone-details"}) 或 {name:"agents"}，用nextChar分页。子代理常用：list({})、send({agentId,text})、status({jobId})、message({seq,startChar?,limit?})；完整参数先查契约，不猜。\n\n'
+      : "") +
+    (platformCapabilities
+      ? "可用 tools.phone.platformCapabilities({}) 按需查 QQ 平台能力目录。\n\n"
       : "") +
     sections.join("\n\n");
 }

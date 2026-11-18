@@ -1,4 +1,5 @@
 import { type Json, KernelError } from "../../kernel/protocol.ts";
+import type { StudioRequest } from "./studio-protocol.ts";
 
 export const ADMIN_READS = {
   agents: ["page", "get", "search"],
@@ -44,12 +45,14 @@ export function validateFailedResolution(value: Record<string, Json>): ResolveFa
 
 /** 仅由进程管理者注入。返回值必须是可展示数据，不含任何连接凭据、私钥或环境变量。 */
 export interface AdminBackend {
+  studio?(request: StudioRequest): Promise<Json>;
   status(): Promise<Json>;
   query(request: AdminQuery): Promise<Json>;
   control(request: AdminControl): Promise<Json>;
 }
 
 export type AdminRequest =
+  | { method: "studio"; request: StudioRequest }
   | { method: "status" }
   | { method: "query"; request: AdminQuery }
   | { method: "control"; request: AdminControl };

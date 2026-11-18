@@ -10,6 +10,7 @@ import { readAdminBody, startAdminControlServer } from "../services/admin/server
 import { LocalInstanceDriver, readTrustedInstanceConfig } from "./driver.ts";
 import { type GuardianControl, type InstanceSpec, Supervisor } from "./controller.ts";
 import { UpgradeRequests } from "./upgrades.ts";
+import { createStudioSettings } from "./studio-settings.ts";
 
 export interface SupervisorConfig {
   supervisor: {
@@ -218,7 +219,24 @@ export async function startSupervisor(configPath: string) {
     }
   };
   let workspaceObserver: { instanceId: string; observer: ScriptObserver } | undefined;
+  const settings = createStudioSettings({
+    configPath,
+    controller,
+    runtime,
+    changePause,
+    serialControl,
+  });
   const admin = await startAdminControlServer({
+    async studio(request) {
+      if (request.action === "settings") return await settings.read() as unknown as Json;
+      if (request.action === "settingsUpdate") {
+        return await settings.update({
+          revision: request.revision,
+          changes: request.changes,
+        }) as unknown as Json;
+      }
+      return await runtime.call("studioChat", request);
+    },
     async status() {
       return {
         supervisor: controller.state as unknown as Json,

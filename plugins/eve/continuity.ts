@@ -3,6 +3,8 @@ import { type Json, KernelError } from "../../kernel/protocol.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import { activeEvents, lastActiveEvent } from "./view.ts";
 import { socialContext } from "./social.ts";
+import { momentContext } from "./life.ts";
+import { lanternContext } from "./lanterns.ts";
 
 export interface FocusItem {
   id: string;
@@ -277,6 +279,10 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
         pendingJobs: pending.map(([jobId, job]) => ({ jobId, status: job.status })),
         unknownJobCount: unknown.length,
         ...socialContext(events),
+        moment: momentContext(events),
+        lanterns: lanternContext(events),
+        leisure:
+          "不是每次醒来都要找工作。想玩可自己接一个字谜、编一段小故事、继续昨天的兴趣；想热闹可以看看已加入群的一小段当前话题，有具体想接的再开口；没人接、在忙或想独处就转做自己的事。不把意愿当成已做的事。",
         recentUnknownJobs: unknown.slice(-5).map(([jobId]) => jobId),
         recentToolFailures: recentToolFailures(events, rest?.seq ?? 0),
         failureRecovery:

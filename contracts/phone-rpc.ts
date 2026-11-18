@@ -1,5 +1,6 @@
 import type { Json } from "../kernel/protocol.ts";
 import type { OwnershipProof } from "./ownership.ts";
+import type { PhoneApi } from "./phone.ts";
 
 /** 与适配器通讯的窄接口；认证信息不在工具参数、返回值或模型上下文里。 */
 export const PHONE_METHODS = [
@@ -22,7 +23,10 @@ export const PHONE_METHODS = [
   "image",
   "file",
   "sendFile",
-] as const;
+  "platformCapabilities",
+  "platformEvents",
+  "platformRead",
+] as const satisfies readonly (keyof PhoneApi)[];
 export type PhoneMethod = typeof PHONE_METHODS[number];
 
 /** 仅允许稳定原因码及 HTTP 状态；不携带资源 URL、签名或远端响应原文。 */

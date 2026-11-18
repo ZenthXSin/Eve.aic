@@ -2,6 +2,12 @@
 // 返回平台事实；持久动作记录、入站日志和所有权交接由适配器服务另行接入。
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
+import {
+  guildChatSendPlan,
+  guildImageBody,
+  guildMessageId,
+  isGuildChatKind,
+} from "./channel-chat.ts";
 import { sdkRequest } from "./satori/api.ts";
 import { type DiagnosticSink, qqHttps, QqTransportError } from "./transport.ts";
 import {
@@ -31,7 +37,7 @@ export interface QqClientOptions {
   tokenTimeoutMs?: number;
   maxResponseBytes?: number;
   now?: () => number;
-  /** 缺省仅私信；显式 all 才允许群聊，在认证或发送请求前落实。 */
+  /** 缺省仅 C2C；群聊、子频道和频道私信都需显式 all，在认证前落实。 */
   sendScope?: "all" | "private";
 }
 
@@ -87,16 +93,16 @@ export class QqRequestError extends Error {
 }
 
 export interface QqSendText {
-  destination: { kind: "user" | "group"; openId: string };
+  destination: { kind: "user" | "group" | "channel" | "guild-dm"; openId: string };
   text: string;
   /** Pinned at admission; absent in legacy records means plain text. */
   format?: "plain" | "markdown";
-  /** 兼容旧动作账本的回复来源；新发送统一主动，不写入平台被动回复字段。 */
+  /** 兼容旧 C2C/群动作的被动来源；频道不接受这个字段。 */
   reply?: { messageId: string; sequence: number } | { eventId: string };
-  /** 引用展示用的 ref_idx，不是被动回复用的 msg_id。 */
+  /** 展示引用：群/C2C 的 ref_idx 或频道的 Message.id，不是被动回复的 msg_id。 */
   referenceIndex?: string;
   wakeup?: boolean;
-  /** 先上传平台取得 file_info，再提交媒体消息。任何阶段都不擅自重试。 */
+  /** 群/C2C 先上传取得 file_info；频道图片直接随消息提交。 */
   attachment?: { path: string; kind: "image" | "file" };
 }
 
@@ -120,6 +126,7 @@ export type QqSendResult =
 interface ResponseInfo {
   httpStatus: number;
   data: Record<string, unknown>;
+  list?: unknown[];
   traceId?: string;
   retryAfterMs?: number;
 }
@@ -134,6 +141,14 @@ function nonempty(value: unknown): value is string {
 
 function requestError(): never {
   throw new QqRequestError({ category: "request" });
+}
+
+function attachmentReadFailure(): QqSendResult {
+  return {
+    status: "failed",
+    attempted: false,
+    error: { category: "request", failureStage: "upload", reason: "attachment_read_failed" },
+  };
 }
 
 function parsedCode(value: unknown): number | undefined {
@@ -207,7 +222,11 @@ function fileName(path: string): string {
   return path.split("/").at(-1)!.replace(/[\x00-\x1f\x7f\\/:*?"<>|]/g, "_").slice(0, 255) || "file";
 }
 
-async function readObject(response: Response, limit: number): Promise<Record<string, unknown>> {
+async function readObject(
+  response: Response,
+  limit: number,
+  acceptList: boolean,
+): Promise<Record<string, unknown> | unknown[]> {
   if (!response.body) {
     throw new QqRequestError({ category: "invalid_response", httpStatus: response.status });
   }
@@ -243,6 +262,7 @@ async function readObject(response: Response, limit: number): Promise<Record<str
   try {
     const parsed: unknown = JSON.parse(text);
     if (object(parsed)) return parsed;
+    if (acceptList && Array.isArray(parsed)) return parsed;
   } catch {
     // Gateways may serve plain text or HTML for a definite HTTP rejection.
   }
@@ -250,11 +270,18 @@ async function readObject(response: Response, limit: number): Promise<Record<str
   throw new QqRequestError({ category: "invalid_response", httpStatus: response.status });
 }
 
-function textBody(request: QqSendText): Record<string, unknown> {
+const openIdRoutes = {
+  user: { send: "sendPrivateMessage", upload: "sendFilePrivate" },
+  group: { send: "sendMessage", upload: "sendFileGuild" },
+} as const;
+
+function sendPlan(request: QqSendText) {
+  if (!object(request) || !object(request.destination)) requestError();
+  const { kind, openId } = request.destination;
+  if (isGuildChatKind(kind)) return guildChatSendPlan(request) ?? requestError();
   if (
-    !object(request) || !object(request.destination) ||
-    !["user", "group"].includes(request.destination.kind) ||
-    !nonempty(request.destination.openId) || typeof request.text !== "string" ||
+    (kind !== "user" && kind !== "group") || !nonempty(openId) ||
+    typeof request.text !== "string" ||
     (!nonempty(request.text) && request.attachment === undefined)
   ) requestError();
   if (request.format !== undefined && !["plain", "markdown"].includes(request.format)) {
@@ -303,12 +330,12 @@ function textBody(request: QqSendText): Record<string, unknown> {
       body.is_wakeup = true;
     }
   }
-  return body;
+  return { kind, target: encodeURIComponent(openId), body, ...openIdRoutes[kind] };
 }
 
 /** 无网络预检，动作服务可在登记“执行中”之前确认参数确实满足当前传输契约。 */
 export function validateQqSendText(request: QqSendText): void {
-  textBody(request);
+  sendPlan(request);
 }
 
 export class QqClient {
@@ -383,10 +410,22 @@ export class QqClient {
     this.#downloadedReader = reader;
   }
 
+  async #readAttachment(path: string): Promise<Uint8Array> {
+    const bytes = await this.#downloadedReader?.(path) ?? await this.#attachmentReader?.(path);
+    if (!(bytes instanceof Uint8Array)) requestError();
+    return bytes;
+  }
+
   async #request(
     path: string,
     init: RequestInit,
-    options: { origin?: URL; timeoutMs?: number; raw?: boolean; signal?: AbortSignal } = {},
+    options: {
+      origin?: URL;
+      timeoutMs?: number;
+      raw?: boolean;
+      signal?: AbortSignal;
+      acceptList?: boolean;
+    } = {},
   ): Promise<ResponseInfo> {
     const startedAt = performance.now();
     const timeout = AbortSignal.timeout(options.timeoutMs ?? this.#timeout);
@@ -408,11 +447,18 @@ export class QqClient {
       });
       phase = "body";
       let data: Record<string, unknown>;
+      let list: unknown[] | undefined;
       try {
         if (options.raw || response.status === 204) {
           await response.body?.cancel();
           data = {};
-        } else data = await readObject(response, this.#limit);
+        } else {
+          const received = await readObject(response, this.#limit, options.acceptList === true);
+          if (Array.isArray(received)) {
+            data = {};
+            list = received;
+          } else data = received;
+        }
       } catch (error) {
         // A known HTTP rejection remains useful even when a gateway serves HTML.
         // A body timeout still retains the unknown delivery boundary.
@@ -432,6 +478,7 @@ export class QqClient {
       return {
         httpStatus: response.status,
         data,
+        ...(list ? { list } : {}),
         traceId: traceOf(data, response.headers.get("X-Tps-trace-ID")),
         retryAfterMs: retryAfter(response.headers.get("Retry-After"), this.#now()),
       };
@@ -711,6 +758,43 @@ export class QqClient {
     };
   }
 
+  async platformRequest(method: string, path: string, body?: unknown) {
+    if (
+      !["GET", "POST", "PUT", "PATCH", "DELETE"].includes(method) ||
+      !/^\/(?!\/)/.test(path) || /[\\#\r\n]/.test(path) || path.length > 8192 ||
+      new URL(path, this.#base).origin !== this.#base.origin ||
+      (method === "GET" && body !== undefined)
+    ) requestError();
+    const target = new URL(path, this.#base);
+    if (target.pathname !== path.split("?")[0] || /%(?:2f|5c|2e|00|25)/i.test(target.pathname)) {
+      requestError();
+    }
+    if (
+      method !== "GET" && this.#scope === "private" &&
+      !/^\/v2\/users\/[\w-]+\//.test(target.pathname)
+    ) requestError();
+    let token: string;
+    try {
+      token = await this.#accessToken();
+    } catch (error) {
+      if (error instanceof QqRequestError) {
+        throw new QqRequestError({ ...error.info, requestStarted: false, failureStage: "auth" });
+      }
+      throw error;
+    }
+    const response = await this.#request(path, {
+      method,
+      headers: { Authorization: `QQBot ${token}`, "Content-Type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }, { acceptList: true });
+    return {
+      httpStatus: response.httpStatus,
+      data: response.list ?? response.data,
+      traceId: response.traceId,
+      retryAfterMs: response.retryAfterMs,
+    };
+  }
+
   /** Read-only platform metadata for display, never identity or permission evidence. */
   async groupInfo(
     openId: string,
@@ -790,16 +874,30 @@ export class QqClient {
   /** 一次调用只尝试主动发送一次；不自动重试、改正文或补写被动回复字段。 */
   async sendText(request: QqSendText, messageSequence?: number): Promise<QqSendResult> {
     request = structuredClone(request);
-    const body = textBody(request);
+    const plan = sendPlan(request);
+    const { body } = plan;
     if (messageSequence !== undefined) {
       if (
-        !Number.isSafeInteger(messageSequence) || messageSequence < 1 ||
+        plan.kind === "guild" || !Number.isSafeInteger(messageSequence) || messageSequence < 1 ||
         messageSequence > 2_147_483_646
       ) requestError();
       body.msg_seq = messageSequence;
     }
     if (this.#scope === "private" && request.destination.kind !== "user") {
       return { status: "failed", attempted: false, error: { category: "scope" } };
+    }
+    let guildImage: Awaited<ReturnType<typeof guildImageBody>> | undefined;
+    if (plan.kind === "guild" && request.attachment) {
+      try {
+        const path = request.attachment.path;
+        guildImage = await guildImageBody(
+          request.text,
+          await this.#readAttachment(path),
+          fileName(path),
+        );
+      } catch {
+        return attachmentReadFailure();
+      }
     }
     let token: string;
     try {
@@ -812,22 +910,12 @@ export class QqClient {
       };
     }
     let response: ResponseInfo;
-    const scope = request.destination.kind === "user" ? "c2c" : "group";
-    const target = encodeURIComponent(request.destination.openId);
-    if (request.attachment) {
+    if (plan.kind !== "guild" && request.attachment) {
       let bytes: Uint8Array;
       try {
-        const downloaded = await this.#downloadedReader?.(request.attachment.path);
-        if (downloaded) bytes = downloaded;
-        else if (this.#attachmentReader) {
-          bytes = await this.#attachmentReader(request.attachment.path);
-        } else requestError();
+        bytes = await this.#readAttachment(request.attachment.path);
       } catch {
-        return {
-          status: "failed",
-          attempted: false,
-          error: { category: "request", failureStage: "upload", reason: "attachment_read_failed" },
-        };
+        return attachmentReadFailure();
       }
       let upload: ResponseInfo;
       try {
@@ -835,14 +923,14 @@ export class QqClient {
           ? await this.#uploadChunks(
             bytes,
             fileName(request.attachment.path),
-            target,
-            scope === "c2c",
+            plan.target,
+            plan.kind === "user",
             token,
             request.attachment.kind === "image" ? 1 : 4,
           )
           : await this.#sdk(
-            scope === "c2c" ? "sendFilePrivate" : "sendFileGuild",
-            [target],
+            plan.upload,
+            [plan.target],
             {
               method: "POST",
               headers: {
@@ -911,18 +999,17 @@ export class QqClient {
       body.media = { file_info: upload.data.file_info };
     }
     try {
-      response = await this.#sdk(
-        scope === "c2c" ? "sendPrivateMessage" : "sendMessage",
-        [target],
-        {
-          method: "POST",
-          headers: {
-            Authorization: `QQBot ${token}`,
-            "Content-Type": "application/json; charset=utf-8",
-          },
-          body: JSON.stringify(body),
+      const init = {
+        method: "POST",
+        headers: {
+          Authorization: `QQBot ${token}`,
+          "Content-Type": guildImage?.contentType ?? "application/json; charset=utf-8",
         },
-      );
+        body: guildImage?.body ?? JSON.stringify(body),
+      };
+      response = plan.kind === "guild"
+        ? await this.#request(plan.path, init, guildImage ? { timeoutMs: this.#uploadTimeout } : {})
+        : await this.#sdk(plan.send, [plan.target], init);
     } catch (error) {
       const info = { ...(error as QqRequestError).info, failureStage: "message" as const };
       return info.category === "transport" && info.requestStarted === false
@@ -941,10 +1028,10 @@ export class QqClient {
       ...(code === 40034105 ? { reason: "active_permission_denied" as const } : {}),
     };
     if (
-      code === 40034105 && request.destination.kind === "group" &&
+      code === 40034105 && plan.kind === "group" &&
       response.httpStatus >= 400 && response.httpStatus < 500
     ) {
-      error.groupPermission = await this.#groupPermission(target, token);
+      error.groupPermission = await this.#groupPermission(plan.target, token);
     }
     const detail = response.data.message ?? response.data.msg;
     // Only an explicit format refusal permits the persisted plain-text fallback.
@@ -973,7 +1060,10 @@ export class QqClient {
     }
     if (code !== undefined && code !== 0) return { status: "failed", attempted: true, error };
     if (response.httpStatus >= 400) return { status: "failed", attempted: true, error };
-    if (![200, 201].includes(response.httpStatus) || !nonempty(response.data.id)) {
+    if (
+      ![200, 201].includes(response.httpStatus) || !nonempty(response.data.id) ||
+      (plan.kind === "guild" && !guildMessageId(response.data.id))
+    ) {
       return {
         status: "unknown",
         attempted: true,
@@ -987,7 +1077,11 @@ export class QqClient {
       ...(typeof response.data.timestamp === "string"
         ? { timestamp: response.data.timestamp }
         : {}),
-      ...(object(ext) && nonempty(ext.ref_idx) ? { referenceIndex: ext.ref_idx } : {}),
+      ...(plan.kind === "guild"
+        ? { referenceIndex: response.data.id }
+        : object(ext) && nonempty(ext.ref_idx)
+        ? { referenceIndex: ext.ref_idx }
+        : {}),
       ...(response.traceId ? { traceId: response.traceId } : {}),
     };
   }

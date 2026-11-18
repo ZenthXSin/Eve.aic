@@ -4,13 +4,14 @@ import { QqSendActions } from "./actions.ts";
 import { QqClient } from "./client.ts";
 import { QqGroupNames } from "./contacts.ts";
 import { QqPhone } from "./phone.ts";
-import { QqReceiver, type QqReceiverStatus } from "./receiver.ts";
+import { type QqIngressOptions, QqReceiver, type QqReceiverStatus } from "./receiver.ts";
 import { startPhoneRpc } from "./rpc.ts";
 import { QqTimeline } from "./timeline.ts";
 import { QqPhoneReading } from "./reading.ts";
 import { QqPhoneDevice } from "./device.ts";
 import { QqPhoneDownloads } from "./downloads.ts";
 import { QqAttachmentPrefetch } from "./attachment-prefetch.ts";
+import { phonePlatformTools } from "./platform-bridge.ts";
 import { ensurePhoneActivationBoundary } from "./activation.ts";
 import type { OwnershipFence } from "../../sdk/ownership-fence.ts";
 import { fingerprint } from "../../kernel/calls.ts";
@@ -26,6 +27,7 @@ export async function startQqPhoneAdapter(
   fence?: OwnershipFence,
   options: {
     captureActivationBoundary?: boolean;
+    ingress?: QqIngressOptions;
     modelCommands?: QqModelCommandOptions;
     attachmentDownloads?: {
       temporaryDirectory?: string;
@@ -64,6 +66,7 @@ export async function startQqPhoneAdapter(
         prefetch.offer(record);
       },
     },
+    options.ingress,
   );
   let rpc: ReturnType<typeof startPhoneRpc> | undefined;
   let failure: unknown;
@@ -93,7 +96,7 @@ export async function startQqPhoneAdapter(
     receive = receiver.run(controller.signal, (event) => {
       status = event;
       // 网关开始连接前，入站日志已恢复且目录锁已拿到；不是平台 Ready。
-      if (event.status === "connecting") initialized();
+      if (event.status === "connecting" || event.status === "webhook_listening") initialized();
       onStatus?.(event);
     });
     receive.catch((error) => {
@@ -107,7 +110,7 @@ export async function startQqPhoneAdapter(
       }),
     ]);
     phone = new QqPhone(
-      () => receiver.messages().map((record) => modelCommands?.project(record) ?? record),
+      receiver.journal,
       actions,
       timeline,
       {
@@ -120,6 +123,11 @@ export async function startQqPhoneAdapter(
       downloads,
       true,
       new QqGroupNames((openId, signal) => client.groupInfo(openId, signal)),
+      modelCommands,
+      phonePlatformTools(
+        client.platformRequest.bind(client),
+        (args) => receiver.platformEvents.page(args),
+      ),
     );
     prefetch.start();
     if (options.captureActivationBoundary) await ensurePhoneActivationBoundary(phone, directory);
@@ -128,6 +136,7 @@ export async function startQqPhoneAdapter(
       key,
       () => ({
         available: failure === undefined && !controller.signal.aborted && actions.available &&
+          receiver.platformEvents.available &&
           timeline.available && reading.available && device.available && downloads.available &&
           (!modelCommands || modelCommands.available),
         gateway: status,

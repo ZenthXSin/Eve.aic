@@ -1,6 +1,7 @@
 import type { Json } from "../../kernel/protocol.ts";
 import { KernelError } from "../../kernel/protocol.ts";
 import type { AdminBackend, AdminControl, AdminQuery, AdminRequest } from "./contracts.ts";
+import type { StudioRequest } from "./studio-protocol.ts";
 
 /** 仅管理进程读取此密钥。管理服务不持有 Eve 的所有权令牌或模型密钥。 */
 export class AdminControlClient implements AdminBackend {
@@ -41,6 +42,9 @@ export class AdminControlClient implements AdminBackend {
   }
   query(request: AdminQuery) {
     return this.request({ method: "query", request });
+  }
+  studio(request: StudioRequest) {
+    return this.request({ method: "studio", request });
   }
   control(request: AdminControl) {
     return this.request({ method: "control", request });

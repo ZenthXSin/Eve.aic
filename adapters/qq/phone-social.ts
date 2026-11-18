@@ -1,4 +1,5 @@
 // 显式社交动作的冻结请求与静默窗口；不合成入站，也不在传输层暗中拆消息。
+import { qqDestination } from "../../contracts/qq-conversation.ts";
 import type { PhoneSendBurst, PhoneWaitForMessages } from "../../contracts/phone.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
@@ -28,7 +29,7 @@ function validateBurst(args: PhoneSendBurst) {
       (typeof args.resumeActionId !== "string" ||
         !/^[a-zA-Z0-9_-]{1,128}$/.test(args.resumeActionId))) ||
     typeof args.conversationId !== "string" ||
-    !/^qq:(user|group):.{1,512}$/.test(args.conversationId) ||
+    !qqDestination(args.conversationId) ||
     !Array.isArray(args.messages) || args.messages.length < 1 ||
     args.messages.some((text) => typeof text !== "string" || !text.trim()) ||
     (args.splitLongText !== undefined && typeof args.splitLongText !== "boolean") ||
@@ -176,7 +177,7 @@ export async function waitForQuiet(
       !["conversationId", "purpose", "quietMs", "maxWaitMs"].includes(key)
     ) ||
     typeof args.conversationId !== "string" ||
-    !/^qq:(user|group):.{1,512}$/.test(args.conversationId) ||
+    !qqDestination(args.conversationId) ||
     args.purpose !== "reply" || !Number.isSafeInteger(quietMs) || quietMs < 1 || quietMs > 60_000 ||
     !Number.isSafeInteger(maxWaitMs) || maxWaitMs < 1 || maxWaitMs > 120_000
   ) throw new QqActionError("request");

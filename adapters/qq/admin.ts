@@ -1,3 +1,4 @@
+import { qqDestination } from "../../contracts/qq-conversation.ts";
 import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import { readAdminBody } from "../../services/admin/server.ts";
 import { type ResolveFailedQq, validateFailedResolution } from "../../services/admin/contracts.ts";
@@ -32,7 +33,7 @@ function validatePhoneQuery(args: unknown, conversations: boolean): void {
   fields(args, conversations ? ["cursor"] : ["conversationId", "cursor"]);
   if (
     !conversations && (typeof args.conversationId !== "string" ||
-      !/^qq:(user|group):[^\r\n]{1,512}$/.test(args.conversationId))
+      !qqDestination(args.conversationId))
   ) {
     throw new KernelError("rejected", "QQ 会话标识无效");
   }

@@ -30,5 +30,5 @@ export const RUNTIME_METHODS = {
   files: ["read", "write", "replace", "list", "search"],
   commands: ["start", "poll", "write", "cancel", "completions"],
   memory: ["remember", "recall", "used", "list", "get"],
-  model: ["complete", "result", "budget", "describeImage"],
+  model: ["complete", "result", "budget", "describeImage", "studioTurn"],
 } as const;

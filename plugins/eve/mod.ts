@@ -57,7 +57,10 @@ export function createEvePlugin(configPath: string) {
           await current().pulse();
           return current().status() as unknown as Json;
         },
-        status: () => current().status() as unknown as Json,
+        status: (args) =>
+          args && typeof args === "object" && !Array.isArray(args) && args.brief === true
+            ? current().briefStatus()
+            : current().status() as unknown as Json,
         resumeModel: (args) => {
           const requestId = (args as { expectedRequestId?: string })?.expectedRequestId;
           if (typeof requestId !== "string") {
@@ -74,7 +77,7 @@ export function createEvePlugin(configPath: string) {
       await runtime.initialize();
     },
     health() {
-      if (!runtime?.status().healthy) throw new KernelError("unavailable", "意识流不健康");
+      if (!runtime?.briefStatus().healthy) throw new KernelError("unavailable", "意识流不健康");
     },
   });
 }

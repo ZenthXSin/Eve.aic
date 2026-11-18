@@ -1,3 +1,6 @@
+import { StudioChatMailbox } from "../../supervisor/studio-chat.ts";
+import { StudioChatTurns, studioModelOptions } from "../../supervisor/studio-chat-runtime.ts";
+import { chatRequest } from "../admin/studio-chat-contract.ts";
 import { AgentService } from "./agents.ts";
 import type { AgentConfig } from "../../contracts/agents.ts";
 import type { AgentModels } from "./agent-models.ts";
@@ -85,6 +88,28 @@ export class RuntimeEngine {
   #modelSelectionTail: Promise<unknown> = Promise.resolve();
   #closing = false;
   #ready = false;
+  #studio?: { box: StudioChatMailbox; turns: StudioChatTurns };
+  #pendingStudio: number | null = null;
+  #openStudio() {
+    if (this.#studio) return this.#studio;
+    const box = StudioChatMailbox.open(`${this.options.directory}/studio-chat`);
+    try {
+      const turns = new StudioChatTurns(box, this);
+      turns.recover();
+      this.#pendingStudio = box.queuedTurn();
+      return this.#studio = { box, turns };
+    } catch (error) {
+      box.close();
+      throw error;
+    }
+  }
+  studioConversation(input: unknown): Json {
+    if (!this.available) throw new KernelError("unavailable", "执行服务正在恢复");
+    const request = chatRequest(input), { box } = this.#openStudio();
+    const answer = box.handle(request);
+    if (request.action === "chatSend") this.#pendingStudio = box.queuedTurn();
+    return answer as unknown as Json;
+  }
   #recoveryStage = "pending";
   #modelBlocked: (ModelBlock & { modelName?: string; modelRevision?: number }) | null = null;
   constructor(readonly options: Options) {
@@ -328,6 +353,14 @@ export class RuntimeEngine {
       }
       this.#recoveryStage = "ready";
       this.#ready = true;
+      try {
+        await Deno.lstat(`${this.options.directory}/studio-chat/chat.sqlite`);
+        this.#openStudio();
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) {
+          console.error("studio chat unavailable on reopen");
+        }
+      }
       this.agents.resume();
     } catch (error) {
       this.#recoveryStage = "failed";
@@ -714,8 +747,27 @@ export class RuntimeEngine {
         )) as unknown as Json;
     }
     if (namespace === "model") {
+      if (method === "studioTurn") {
+        if (!/^studio_slot_[1-9][0-9]{0,15}$/.test(id) || Object.keys(args).length) {
+          throw new KernelError("rejected", "私聊轮次参数无效");
+        }
+        if (
+          this.#pendingStudio === null || id !== `studio_slot_${this.#pendingStudio}` ||
+          (await this.budget.settings()).paused || this.modelStatus().blocked
+        ) return false;
+        const { box, turns } = this.#openStudio();
+        try {
+          return await turns.offer(id, args);
+        } finally {
+          this.#pendingStudio = box.queuedTurn();
+        }
+      }
       if (method === "budget") {
-        return { ...await this.budget.status(), model: this.modelStatus() } as unknown as Json;
+        return {
+          ...await this.budget.status(),
+          model: this.modelStatus(),
+          ...(this.#pendingStudio === null ? {} : { studioChatTurn: this.#pendingStudio }),
+        } as unknown as Json;
       }
       if (method === "result") {
         const result = this.#modelResult(String(args.requestId));
@@ -748,6 +800,11 @@ export class RuntimeEngine {
             : { maxOutputTokens: overrides.maxOutputTokens }),
         };
       }
+      overrides ??= studioModelOptions(
+        id,
+        purpose,
+        selected?.maxOutputTokens ?? this.options.maxOutputTokens,
+      );
       const outputTokens = overrides?.maxOutputTokens ?? selected?.maxOutputTokens ??
         this.options.maxOutputTokens;
       const request = description
@@ -848,6 +905,7 @@ export class RuntimeEngine {
     }
     await this.agents.close();
     await Promise.allSettled([...this.#live.values(), this.#modelSelectionTail]);
+    this.#studio?.box.close();
     for (
       const service of [
         this.budget,

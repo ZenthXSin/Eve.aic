@@ -50,6 +50,9 @@ export async function readPhoneConfig(path: string): Promise<PhoneConfig> {
 function relationships(value: Json, ownerId?: string): Json {
   if (Array.isArray(value)) return value.map((item) => relationships(item, ownerId));
   if (value !== null && typeof value === "object") {
+    const handle = value.handle;
+    const ownerNamespace = handle && typeof handle === "object" && !Array.isArray(handle) &&
+      typeof handle.conversationId === "string" && /^qq:(user|group):/.test(handle.conversationId);
     const mapped: Record<string, Json> = {};
     for (const [key, child] of Object.entries(value)) mapped[key] = relationships(child, ownerId);
     if (Array.isArray(value.mentions)) {
@@ -57,7 +60,7 @@ function relationships(value: Json, ownerId?: string): Json {
         if (!item || typeof item !== "object" || Array.isArray(item)) return item;
         return {
           ...item,
-          relationship: item.platformUserId === ownerId
+          relationship: ownerNamespace && ownerId !== undefined && item.platformUserId === ownerId
             ? "owner"
             : item.relationship === "self"
             ? "self"
@@ -73,7 +76,7 @@ function relationships(value: Json, ownerId?: string): Json {
       const sender = mapped.sender as Record<string, Json>;
       sender.relationship = value.direction === "outgoing"
         ? "self"
-        : ownerId !== undefined && value.sender.platformUserId === ownerId
+        : ownerNamespace && ownerId !== undefined && value.sender.platformUserId === ownerId
         ? "owner"
         : "other";
     }

@@ -16,11 +16,18 @@ import { FileTools } from "../services/runtime/files.ts";
 import { NoteStore } from "../services/runtime/notes.ts";
 import { MemoryStore } from "../services/runtime/memory.ts";
 import { FactJournal } from "../sdk/fact-journal.ts";
+import { studioChatRoutes } from "../services/admin/studio-chat.ts";
+import { RuntimeAdminClient, startRuntimeAdmin } from "../services/runtime/admin.ts";
+import { EveRuntime } from "../plugins/eve/runtime.ts";
+import type { PluginContext } from "../sdk/plugin.ts";
 
 const key = "fixture_runtime_bridge_012345678901234567890";
 const oldKey = "fixture_runtime_old_key_012345678901234567890";
 const nextKey = "fixture_runtime_next_key_01234567890123456789";
-async function fixture(web?: WebApi) {
+async function fixture(
+  web?: WebApi,
+  provider?: ConstructorParameters<typeof RuntimeEngine>[0]["model"],
+) {
   const directory = await Deno.makeTempDir({ prefix: "eve-runtime-service-" });
   const settingsFile = `${directory}/settings.json`;
   await writeDurableJson(settingsFile, {
@@ -60,7 +67,7 @@ async function fixture(web?: WebApi) {
     directory: `${directory}/data`,
     workspace: `${directory}/workspace`,
     settingsFile,
-    model,
+    model: provider ?? model,
     maxOutputTokens: 100,
     web,
   };
@@ -105,6 +112,129 @@ async function fixture(web?: WebApi) {
     },
   };
 }
+
+Deno.test("Studio 私聊贯通 HTTP、管理 IPC、在线 Eve 调度、所有权和共享账本，恢复不重派", async () => {
+  const id = crypto.randomUUID(), text = "我把日期改到周二了", reply = "记下了，是周二。";
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  let calls = 0;
+  const environment = await fixture(undefined, {
+    async complete(request, options) {
+      calls++;
+      entered.resolve();
+      assert.deepEqual(request.messages.map((message) => message.role), ["system", "user"]);
+      assert.equal(request.messages[1].content, text);
+      assert(!JSON.stringify(request).includes("PRIVATE_CORE"));
+      assert.deepEqual(request.tools, []);
+      assert.deepEqual(options, { sessionId: `studio_web_${id}`, maxOutputTokens: 100 });
+      await finish.promise;
+      return {
+        content: JSON.stringify({ replyTo: id, text: reply }),
+        toolCalls: [],
+        usage: { status: "reported", inputTokens: 50, cachedInputTokens: 25, outputTokens: 10 },
+      };
+    },
+    close() {},
+  });
+  const store = environment.directory, sourceCommit = "a".repeat(40);
+  const runtimeAdmin = startRuntimeAdmin(environment.engine(), nextKey, () => Promise.resolve());
+  const connectionFile = `${store}/admin.json`, keyFile = `${store}/admin.key`;
+  const admin = new RuntimeAdminClient({ connectionFile, keyFile });
+  const route = studioChatRoutes((request) => admin.call("studioChat", request));
+  const origin = "https://private.test", session = { csrf: "fixture-only" };
+  const send = (messageId: string) =>
+    route(
+      new Request(`${origin}/api/chat/send`, {
+        method: "POST",
+        headers: { origin, "content-type": "application/json", "x-eve-csrf": session.csrf },
+        body: JSON.stringify({ id: messageId, text }),
+      }),
+      session,
+      origin,
+    );
+  const read = async () =>
+    (await route(new Request(`${origin}/api/chat`), session, origin))!.json();
+  const context = {
+    call(contract: string, method: string, args: Record<string, Json> = {}) {
+      if (contract === "mind" && method === "update") return Promise.resolve(null);
+      if (
+        contract === "phone" && method === "notifications" ||
+        contract === "mind" && method === "poll" ||
+        contract === "scripts" && method === "completions"
+      ) {
+        return Promise.resolve({ items: [], throughSeq: 0, hasMore: false });
+      }
+      const { _actionId, ...payload } = args;
+      return environment.client.call(
+        contract,
+        method,
+        payload,
+        typeof _actionId === "string" ? _actionId : undefined,
+      );
+    },
+  } as unknown as PluginContext;
+  const eve = new EveRuntime(context, {
+    directory: `${store}/mirror`,
+    promptFile: `${store}/prompt`,
+    sourceCommit,
+    remoteRecords: true,
+    pollMs: 60000,
+    defaultSleepMs: 60000,
+    maxOutputTokens: 100,
+    modelTimeoutMs: 5000,
+    dailyTokenBudget: 200_000_000,
+    restReviewEnabled: true,
+  });
+  let running: Promise<void> | undefined;
+  try {
+    await Deno.writeTextFile(keyFile, nextKey);
+    await writeDurableJson(connectionFile, { url: runtimeAdmin.url });
+    await Deno.writeTextFile(`${store}/prompt`, "PRIVATE_CORE");
+    await environment.engine().records.append("rest", {
+      wakeAt: Date.now() + 3600000,
+      sourceCommit,
+    });
+    await eve.initialize();
+    await admin.settings({ paused: true });
+    assert.equal((await send(id))?.status, 202);
+    await eve.pulse();
+    assert.equal(calls, 0);
+    assert.equal((await read()).messages[0].status, "queued");
+    await admin.settings({ paused: false });
+    running = eve.pulse();
+    await Promise.race([
+      entered.promise,
+      running.then(() => {
+        if (!calls) throw Error("在线调度未领取网页消息");
+      }),
+    ]);
+    assert.equal((await read()).messages[0].status, "processing");
+    assert.equal((await send(crypto.randomUUID()))?.status, 429);
+    finish.resolve();
+    await running;
+    const history = (await read()).messages;
+    assert.deepEqual(
+      history.map((row: { text: string; status: string }) => [row.text, row.status]),
+      [[text, "answered"], [reply, "sent"]],
+    );
+    assert.equal(history[1].replyTo, id);
+    assert.equal((await send(id))?.status, 200);
+    await eve.pulse();
+    assert.equal((await environment.engine().budget.status()).knownNoncachedTokens, 35);
+    await environment.restart();
+    const restored = environment.engine().studioConversation({ action: "chat" }) as {
+      messages: Json[];
+    };
+    assert.deepEqual(restored.messages, history);
+    await eve.pulse();
+    assert.equal(calls, 1);
+  } finally {
+    finish.resolve();
+    await running?.catch(() => {});
+    await eve.close();
+    await runtimeAdmin.close();
+    await environment.close();
+  }
+});
 
 Deno.test("独立执行出口：意识流/文件/模型共用令牌与原回执，换版和重启不重放，预算动态且共享", async () => {
   const f = await fixture();

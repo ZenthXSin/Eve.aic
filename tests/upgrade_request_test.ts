@@ -78,6 +78,7 @@ for (const mode of ["replace", "observed"] as const) {
         const promptFiles = [
           "prompts/qq-social.md",
           "prompts/qq-mechanics.md",
+          "prompts/script-tools.md",
           ...[
             "phone",
             "agents",

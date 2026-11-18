@@ -4,8 +4,9 @@ import { writeAtomic } from "./journal.ts";
 import { startQqAdminServer } from "./admin.ts";
 import { startQqPhoneAdapter } from "./service.ts";
 import { readQqOwnershipFence } from "../../composition/ownership.ts";
-import { RuntimeModelControlClient } from "../../services/runtime/model-control.ts";
+import { RuntimeModelControlClient } from "../../services/runtime/model-control-client.ts";
 import { writeDurableJson } from "../../sdk/durable-json.ts";
+import { configuredIngress } from "./ingress-config.ts";
 
 export async function runQqAdapter(configPath: string, directory: string): Promise<void> {
   if (!configPath.startsWith("/") || !directory.startsWith("/")) {
@@ -27,6 +28,10 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     await Deno.writeTextFile(keyFile, key + "\n", { createNew: true, mode: 0o600 });
   }
   const startupConfig = JSON.parse(await Deno.readTextFile(configPath));
+  const operatorInteractionTargets = startupConfig.qq?.operatorInteractionTargets;
+  if (operatorInteractionTargets !== undefined && typeof operatorInteractionTargets !== "boolean") {
+    throw new Error("QQ 互动回执开关须为布尔值");
+  }
   if (
     startupConfig.qq?.captureActivationBoundary !== undefined &&
     typeof startupConfig.qq.captureActivationBoundary !== "boolean"
@@ -80,6 +85,7 @@ export async function runQqAdapter(configPath: string, directory: string): Promi
     fence,
     {
       captureActivationBoundary: startupConfig.qq?.captureActivationBoundary === true,
+      ingress: { ...await configuredIngress(startupConfig.qq), operatorInteractionTargets },
       ...(startupConfig.qq?.attachmentDownloads === undefined ? {} : {
         attachmentDownloads: startupConfig.qq.attachmentDownloads,
       }),
