@@ -539,6 +539,142 @@ Deno.test("four ingress × terminal/unknown policy and freeze protections match 
   }
 });
 
+Deno.test("server terminal receipts resolve unknown while script reports cannot, with replay and final freeze", () => {
+  for (const source of ["tool_receipt", "scripts_notification"]) {
+    const receipt = ingress[source];
+    for (const status of ["completed", "failed", "cancelled"]) {
+      const unknownEvent = receipt(71700, { ...agentJob, status: "unknown" });
+      const events = [saved[0], unknownEvent];
+      const projection = replay(events);
+      const unknown = structuredClone(projection.jobs.get(jobId));
+      assert.deepEqual(unknown, {
+        status: "unknown",
+        observation: { record: unknownEvent.seq, recordedAt: unknownEvent.at, source },
+      });
+      assert.deepEqual(pending(projection), []);
+      assertReplay(projection, events);
+      for (const reportedStatus of ["completed", "failed", "cancelled"]) {
+        const e = returned(71701 + events.length, { ...agentJob, status: reportedStatus });
+        events.push(e);
+        projection.observe(e);
+        assert.deepEqual(projection.jobs.get(jobId), unknown, "script cannot resolve unknown");
+        assert.deepEqual(pending(projection), []);
+        assert.deepEqual(scriptReports(projection), [{
+          jobId,
+          reportedStatus,
+          observation: { record: e.seq, recordedAt: e.at, source: "script_result" },
+        }]);
+        assertReplay(projection, events);
+      }
+      const resolved = receipt(71710, { ...agentJob, status });
+      events.push(resolved);
+      projection.observe(resolved);
+      const terminalJob = {
+        status,
+        observation: { record: resolved.seq, recordedAt: resolved.at, source },
+      };
+      assert.deepEqual(projection.jobs.get(jobId), terminalJob, `${source}: unknown → ${status}`);
+      assert.deepEqual(pending(projection), []);
+      assertReplay(projection, events);
+      // Resolution is one-way: every later ingress leaves terminal status and observation frozen.
+      for (const [lateSource, lateReceipt] of Object.entries(ingress)) {
+        for (
+          const lateStatus of [
+            "queued",
+            "checking",
+            "running",
+            "unknown",
+            "completed",
+            "failed",
+            "cancelled",
+          ]
+        ) {
+          const e = lateReceipt(71711 + events.length, { ...agentJob, status: lateStatus });
+          events.push(e);
+          projection.observe(e);
+          assert.deepEqual(
+            projection.jobs.get(jobId),
+            terminalJob,
+            `${source}/${status}/${lateSource}/${lateStatus}`,
+          );
+          assert.deepEqual(pending(projection), []);
+          if (lateSource === "script_result") {
+            assert.deepEqual(scriptReports(projection), [{
+              jobId,
+              reportedStatus: lateStatus,
+              observation: { record: e.seq, recordedAt: e.at, source: "script_result" },
+            }]);
+          }
+          assertReplay(projection, events);
+        }
+      }
+    }
+  }
+});
+
+Deno.test("full script reports refresh an existing key and reinsert it last without eviction, with replay", () => {
+  const events = [saved[0]];
+  const projection = replay(events);
+  const before = pending(projection);
+  const ids = ["report_0", "report_1", "report_2", "report_3", "report_4"];
+  for (const [i, id] of ids.entries()) {
+    const e = returned(71800 + i, { ...agentJob, jobId: id });
+    events.push(e);
+    projection.observe(e);
+  }
+  assert.deepEqual([...projection.jobs.scriptReports.keys()], ids);
+  assert.equal(scriptReports(projection).length, 5);
+  assertReplay(projection, events);
+  for (
+    const [i, repeat] of [
+      {
+        jobId: "report_0",
+        status: "running",
+        order: ["report_1", "report_2", "report_3", "report_4", "report_0"],
+      },
+      {
+        jobId: "report_1",
+        status: "failed",
+        order: ["report_2", "report_3", "report_4", "report_0", "report_1"],
+      },
+      {
+        jobId: "report_0",
+        status: "failed",
+        order: ["report_2", "report_3", "report_4", "report_1", "report_0"],
+      },
+    ].entries()
+  ) {
+    const untouched = [...projection.jobs.scriptReports.values()].filter((r) =>
+      r.jobId !== repeat.jobId
+    );
+    const previous = projection.jobs.scriptReports.get(repeat.jobId)!;
+    const e = returned(71810 + i, { ...agentJob, jobId: repeat.jobId, status: repeat.status });
+    events.push(e);
+    projection.observe(e);
+    assert.equal(projection.jobs.scriptReports.size, 5);
+    assert.equal(scriptReports(projection).length, 5);
+    assert.deepEqual(projection.jobs.scriptReports.get(repeat.jobId), {
+      jobId: repeat.jobId,
+      reportedStatus: repeat.status,
+      observation: { record: e.seq, recordedAt: e.at, source: "script_result" },
+    });
+    assert.notEqual(previous.observation.record, e.seq);
+    assert.notEqual(previous.observation.recordedAt, e.at);
+    assert.deepEqual([...projection.jobs.scriptReports.keys()], repeat.order);
+    assert.deepEqual(
+      scriptReports(projection).map((r: { jobId: string }) => r.jobId),
+      repeat.order,
+    );
+    assert.deepEqual(
+      [...projection.jobs.scriptReports.values()].filter((r) => r.jobId !== repeat.jobId),
+      untouched,
+      "other reports retain their values and relative order",
+    );
+    assert.deepEqual(pending(projection), before);
+    assertReplay(projection, events);
+  }
+});
+
 Deno.test("script reports are bounded latest clues and preserve replay without changing jobs", () => {
   const events = [saved[0]];
   const projection = replay(events);
