@@ -165,7 +165,11 @@ Deno.test("agent completions retire queued continuity jobs live and after restar
       callId: `call_${id}`,
       result: {
         status: "completed",
-        output: JSON.stringify({ jobId: id, status: "queued" }),
+        output: JSON.stringify({
+          ...JSON.parse(receipts[0].data.result.output),
+          jobId: id,
+          status: "queued",
+        }),
       },
     });
   };

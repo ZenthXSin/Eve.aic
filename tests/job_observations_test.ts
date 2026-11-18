@@ -7,9 +7,10 @@ import receipts from "./fixtures/continuity-agent-status.json" with { type: "jso
 
 const saved = receipts as ConsciousEvent[];
 const jobId = "eve_70266_0_task";
+const admission = JSON.parse(receipts[0].data.result.output);
 const agentJob = {
   jobId,
-  agentId: "agent_fixture",
+  agentId: admission.agentId,
   status: "running",
   requestSeq: 12152,
   childJobIds: ["child_a", "child_b", "child_c"],
@@ -68,6 +69,7 @@ Deno.test("saved 70268 → 70488: complete returned AgentJob advances queued, wi
     },
   }]);
   assert.equal(projection.jobs.size, 2, "children are not inferred or indexed");
+  assert.deepEqual(scriptReports(projection), [], "matching fixture is not an unverified report");
   projection.observe(event(70500, saved[0].data));
   assert.equal(
     projection.jobs.get(jobId)?.observation?.record,
@@ -282,4 +284,202 @@ Deno.test("qualified same-state observations refresh record/time and distinguish
 Deno.test("legacy caller with no observation does not invent a timestamp", () => {
   const message = continuityMessage([], new Map([[jobId, { status: "queued" }]]));
   assert.equal(JSON.parse(message.content.split("\n")[1]).pendingJobs[0].observation, null);
+});
+
+const scriptReports = (projection: JobObservations) => {
+  const message = continuityMessage([], projection.jobs);
+  const payload = JSON.parse(message.content.split("\n")[1]);
+  assert.match(payload.scriptReportGuidance, /脚本自述、未经服务端证明/);
+  assert.match(payload.scriptReportGuidance, /不据此退休任务或更新pendingJobs状态/);
+  return payload.scriptReports;
+};
+const replay = (events: ConsciousEvent[]) => {
+  const projection = new JobObservations();
+  for (const e of events) projection.observe(e);
+  return projection;
+};
+const assertReplay = (projection: JobObservations, events: ConsciousEvent[]) => {
+  const restored = replay(events);
+  assert.deepEqual([...restored.jobs], [...projection.jobs]);
+  assert.deepEqual(pending(restored), pending(projection));
+  assert.deepEqual(scriptReports(restored), scriptReports(projection));
+};
+
+Deno.test("script identity mismatches cannot advance or retire and are only unverified reports", () => {
+  const { agentId: _agent, ...missingAgent } = agentJob;
+  const { requestSeq: _request, ...missingRequest } = agentJob;
+  const invalidIdentities = [
+    { job: { ...agentJob, agentId: "forged_agent" }, report: true },
+    { job: { ...agentJob, requestSeq: 1 }, report: true },
+    { job: missingAgent, report: false },
+    { job: missingRequest, report: false },
+    { job: { ...agentJob, requestSeq: 1.5 }, report: false },
+    { job: { ...agentJob, requestSeq: "12152" }, report: false },
+  ];
+  for (const status of ["running", "completed", "failed", "cancelled", "unknown"]) {
+    for (const invalid of invalidIdentities) {
+      const events = [saved[0], returned(71000, { ...invalid.job, status })];
+      const projection = replay([events[0]]);
+      const before = pending(projection);
+      projection.observe(events[1]);
+      assert.deepEqual(pending(projection), before, "identity mismatch: " + status);
+      assert.equal(projection.jobs.get(jobId)?.observation?.record, 70268);
+      assert.deepEqual(
+        scriptReports(projection),
+        invalid.report
+          ? [{
+            jobId,
+            reportedStatus: status,
+            observation: {
+              record: events[1].seq,
+              recordedAt: events[1].at,
+              source: "script_result",
+            },
+          }]
+          : [],
+      );
+      assertReplay(projection, events);
+      // Unverified terminal/unknown reports cannot poison subsequent legitimate progress.
+      events.push(event(71001, saved[1].data));
+      projection.observe(events[2]);
+      assert.equal(projection.jobs.get(jobId)?.status, "running");
+      assert.equal(projection.jobs.get(jobId)?.observation?.record, 71001);
+      assertReplay(projection, events);
+    }
+  }
+});
+
+Deno.test("unbound whole script reports cannot create jobs or establish admission identity", () => {
+  for (const tracked of [false, true]) {
+    const events: ConsciousEvent[] = tracked
+      ? [toolReceipt(71100, { jobId, status: "queued" })]
+      : [];
+    const projection = replay(events);
+    const before = pending(projection);
+    for (const status of ["running", "completed", "unknown"]) {
+      const e = returned(71101 + events.length, { ...agentJob, status });
+      events.push(e);
+      projection.observe(e);
+      assert.deepEqual(pending(projection), before);
+      assert.equal(projection.jobs.has(jobId), tracked);
+      assert.equal(scriptReports(projection).length, 1);
+      assert.equal(scriptReports(projection)[0].reportedStatus, status);
+      assertReplay(projection, events);
+    }
+    // A later *server* receipt may supply the missing binding; scripts never do.
+    events.push(toolReceipt(71110, { ...agentJob, status: "queued" }));
+    events.push(returned(71111, agentJob));
+    projection.observe(events.at(-2)!);
+    projection.observe(events.at(-1)!);
+    assert.equal(projection.jobs.get(jobId)?.status, "running");
+    assert.equal(projection.jobs.get(jobId)?.observation?.record, 71111);
+    assertReplay(projection, events);
+  }
+});
+
+Deno.test("only server receipts bind admission identity and conflicts never replace it", () => {
+  for (const [source, receipt] of Object.entries(ingress)) {
+    if (source === "script_result") continue;
+    const events = [receipt(71200, { ...agentJob, status: "queued" })];
+    const projection = replay(events);
+    // Server status semantics are unchanged, but mismatched server identity cannot rebind.
+    events.push(receipt(71201, {
+      ...agentJob,
+      agentId: "conflicting_agent",
+      requestSeq: 1,
+      status: "queued",
+    }));
+    projection.observe(events[1]);
+    assert.equal(projection.jobs.get(jobId)?.status, "queued");
+    const before = pending(projection);
+    events.push(returned(71202, {
+      ...agentJob,
+      agentId: "conflicting_agent",
+      requestSeq: 1,
+      status: "completed",
+    }));
+    projection.observe(events[2]);
+    assert.deepEqual(pending(projection), before);
+    assert.equal(scriptReports(projection)[0].reportedStatus, "completed");
+    events.push(returned(71203, agentJob));
+    projection.observe(events[3]);
+    assert.equal(projection.jobs.get(jobId)?.status, "running");
+    assert.equal(projection.jobs.get(jobId)?.observation?.record, 71203);
+    assertReplay(projection, events);
+  }
+});
+
+Deno.test("checking rejects late queued through all four ingress paths and replay", () => {
+  for (const [source, receipt] of Object.entries(ingress)) {
+    const events = [saved[0], toolReceipt(71300, { ...agentJob, status: "checking" })];
+    const projection = replay(events);
+    const before = pending(projection);
+    events.push(receipt(71301, { ...agentJob, status: "queued" }));
+    projection.observe(events[2]);
+    assert.equal(projection.jobs.get(jobId)?.status, "checking", source);
+    assert.equal(projection.jobs.get(jobId)?.observation?.record, 71300, source);
+    assert.deepEqual(pending(projection), before);
+    assert.deepEqual(scriptReports(projection), []);
+    assertReplay(projection, events);
+  }
+});
+
+Deno.test("four ingress × terminal/unknown protections keep live and restart replay identical", () => {
+  for (const [source, receipt] of Object.entries(ingress)) {
+    for (const status of ["completed", "failed", "cancelled", "unknown"]) {
+      const events = [saved[0], event(71400, saved[1].data)];
+      const projection = replay(events);
+      const finalEvent = receipt(71401, { ...agentJob, status });
+      events.push(finalEvent);
+      projection.observe(finalEvent);
+      assert.equal(projection.jobs.get(jobId)?.status, status, source);
+      assert.equal(projection.jobs.get(jobId)?.observation?.record, 71401, source);
+      assert.equal(projection.jobs.get(jobId)?.observation?.source, source);
+      assert.deepEqual(pending(projection), []);
+      const retired = structuredClone(projection.jobs.get(jobId));
+      for (const [lateSource, lateReceipt] of Object.entries(ingress)) {
+        for (const lateStatus of ["queued", "checking", "running", "unknown"]) {
+          const e = lateReceipt(71402 + events.length, { ...agentJob, status: lateStatus });
+          events.push(e);
+          projection.observe(e);
+          assert.deepEqual(
+            projection.jobs.get(jobId),
+            retired,
+            [source, status, lateStatus].join("/"),
+          );
+          assert.deepEqual(pending(projection), []);
+          assert.deepEqual(scriptReports(projection), []);
+          assertReplay(projection, events);
+        }
+      }
+      if (status === "unknown") {
+        const completed = receipt(71500, { ...agentJob, status: "completed" });
+        events.push(completed);
+        projection.observe(completed);
+        assert.equal(projection.jobs.get(jobId)?.status, "completed");
+        assertReplay(projection, events);
+      }
+    }
+  }
+});
+
+Deno.test("script reports are bounded latest clues and preserve replay without changing jobs", () => {
+  const events = [saved[0]];
+  const projection = replay(events);
+  const before = pending(projection);
+  for (let i = 0; i < 8; i++) {
+    const e = returned(71600 + i, { ...agentJob, jobId: `unbound_${i}` });
+    events.push(e);
+    projection.observe(e);
+  }
+  assert.deepEqual(pending(projection), before);
+  assert.equal(scriptReports(projection).length, 5);
+  assert.deepEqual(scriptReports(projection).map((r: { jobId: string }) => r.jobId), [
+    "unbound_3",
+    "unbound_4",
+    "unbound_5",
+    "unbound_6",
+    "unbound_7",
+  ]);
+  assertReplay(projection, events);
 });

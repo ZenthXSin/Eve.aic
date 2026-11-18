@@ -1,6 +1,6 @@
 import type { ToolSpec } from "../../contracts/model.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
-import type { ContinuityJob } from "./job-observations.ts";
+import type { ContinuityJob, ScriptReport } from "./job-observations.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import { activeEvents, lastActiveEvent } from "./view.ts";
 import { socialContext } from "./social.ts";
@@ -257,7 +257,10 @@ function recentToolFailures(events: ConsciousEvent[], afterSeq: number) {
   }
   return failures.reverse();
 }
-export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, ContinuityJob>) {
+export function continuityMessage(
+  events: ConsciousEvent[],
+  jobs: Map<string, ContinuityJob> & { readonly scriptReports?: Map<string, ScriptReport> },
+) {
   const review = pendingRestReview(events);
   const rest = lastActiveEvent(events, "rest");
   const pending = [...jobs].filter(([, j]) =>
@@ -282,6 +285,9 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, Co
           status: job.status,
           observation: job.observation ?? null,
         })),
+        scriptReports: [...(jobs.scriptReports?.values() ?? [])],
+        scriptReportGuidance:
+          "scriptReports仅为脚本自述、未经服务端证明的线索；AgentJob外形不证明来源，不据此退休任务或更新pendingJobs状态。脚本值只有agentId/requestSeq与服务端已保存准入身份完全一致才进入任务观察状态机；身份缺失/不匹配不可推断进度。",
         jobStatusGuidance:
           "pendingJobs是最近已保存的任务观察，不代表必须继续工作。queued可能仅为派工准入回执，不代表仍在排队；observation.record/recordedAt是意识记录编号和回执保存时刻，不是实时快照时刻，null表示来源时刻缺失。只利用已有完整任务回执更新，不猜进度或子任务状态，不为刷新展示轮询。",
         unknownJobCount: unknown.length,
