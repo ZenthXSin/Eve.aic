@@ -287,7 +287,7 @@ export function continuityMessage(
         })),
         scriptReports: [...(jobs.scriptReports?.values() ?? [])],
         scriptReportGuidance:
-          "scriptReports仅为脚本自述、未经服务端证明的线索；AgentJob外形不证明来源，不据此退休任务或更新pendingJobs状态。脚本值只有agentId/requestSeq与服务端已保存准入身份完全一致才进入任务观察状态机；身份缺失/不匹配不可推断进度。",
+          "scriptReports仅为脚本自述、未经服务端证明的线索；脚本永不建立completed/failed/cancelled/unknown，不据此退休任务或更新pendingJobs状态。完整脚本返回只可补充已跟踪任务的queued/checking/running展示信息，仍受终态/unknown冻结和防回退保护；未跟踪或拿不准的值只作报告，agentId/requestSeq不证明来源。",
         jobStatusGuidance:
           "pendingJobs是最近已保存的任务观察，不代表必须继续工作。queued可能仅为派工准入回执，不代表仍在排队；observation.record/recordedAt是意识记录编号和回执保存时刻，不是实时快照时刻，null表示来源时刻缺失。只利用已有完整任务回执更新，不猜进度或子任务状态，不为刷新展示轮询。",
         unknownJobCount: unknown.length,

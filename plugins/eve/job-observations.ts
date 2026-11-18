@@ -14,10 +14,6 @@ export interface ScriptReport {
 export class JobObservationIndex extends Map<string, ContinuityJob> {
   readonly scriptReports = new Map<string, ScriptReport>();
 }
-interface AdmissionIdentity {
-  agentId: string;
-  requestSeq: number;
-}
 const statuses = ["queued", "checking", "running", "completed", "failed", "cancelled", "unknown"];
 const terminal = ["completed", "failed", "cancelled"];
 function object(value: Json | undefined): Record<string, Json> | undefined {
@@ -27,7 +23,17 @@ function object(value: Json | undefined): Record<string, Json> | undefined {
 /** Presentation only: consume saved receipts, never query jobs or drive wake/execution state. */
 export class JobObservations {
   readonly jobs = new JobObservationIndex();
-  readonly #admissions = new Map<string, AdmissionIdentity>();
+
+  #report(jobId: string, reportedStatus: string, event: ConsciousEvent) {
+    const reports = this.jobs.scriptReports;
+    reports.delete(jobId);
+    reports.set(jobId, {
+      jobId,
+      reportedStatus,
+      observation: { record: event.seq, recordedAt: event.at, source: "script_result" },
+    });
+    if (reports.size > 5) reports.delete(reports.keys().next().value!);
+  }
 
   #remember(value: Json, event: ConsciousEvent, source: string, returnedAgent = false) {
     const job = object(value);
@@ -36,38 +42,19 @@ export class JobObservations {
       !statuses.includes(job.status)
     ) return;
     const previous = this.jobs.get(job.jobId);
-    const identity = typeof job.agentId === "string" && !!job.agentId &&
-        Number.isSafeInteger(job.requestSeq) && Number(job.requestSeq) > 0
-      ? { agentId: job.agentId, requestSeq: Number(job.requestSeq) }
-      : undefined;
-    const admission = this.#admissions.get(job.jobId);
     if (returnedAgent) {
-      // Shape alone is not provenance. Incomplete values are ignored; whole but
-      // unbound/mismatched AgentJob reports remain explicitly unverified clues.
+      // Script text is an unverified display hint, never retirement evidence.
+      // Even a complete value with matching agent identity cannot set terminal/unknown.
       if (
-        !identity || job.status === "checking" ||
+        terminal.includes(job.status) || job.status === "unknown" || !previous ||
+        typeof job.agentId !== "string" || !job.agentId ||
+        !Number.isSafeInteger(job.requestSeq) || Number(job.requestSeq) < 1 ||
         job.childJobIds !== undefined && (!Array.isArray(job.childJobIds) ||
             !job.childJobIds.every((id) => typeof id === "string" && !!id))
-      ) return;
-      if (
-        !previous || !admission || identity.agentId !== admission.agentId ||
-        identity.requestSeq !== admission.requestSeq
       ) {
-        const reports = this.jobs.scriptReports;
-        reports.delete(job.jobId);
-        reports.set(job.jobId, {
-          jobId: job.jobId,
-          reportedStatus: job.status,
-          observation: { record: event.seq, recordedAt: event.at, source: "script_result" },
-        });
-        if (reports.size > 5) reports.delete(reports.keys().next().value!);
+        this.#report(job.jobId, job.status, event);
         return;
       }
-    } else if (identity && !admission) {
-      // Only server envelopes/notices may establish a binding, including a later
-      // complete server receipt for a legacy job. Conflicts never overwrite it;
-      // authoritative server status receipts still retain their existing semantics.
-      this.#admissions.set(job.jobId, identity);
     }
     const status = job.status;
     // Preserve the existing terminal/unknown retirement contract. A late admission
@@ -77,7 +64,10 @@ export class JobObservations {
         previous.status === "unknown" && !terminal.includes(status) ||
         previous.status === "running" && ["queued", "checking"].includes(status) ||
         previous.status === "checking" && status === "queued")
-    ) return;
+    ) {
+      if (returnedAgent) this.#report(job.jobId, status, event);
+      return;
+    }
     this.jobs.set(job.jobId, {
       status,
       observation: { record: event.seq, recordedAt: event.at, source },
