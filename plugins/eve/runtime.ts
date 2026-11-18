@@ -1,3 +1,4 @@
+import { JobObservations } from "./job-observations.ts";
 import { READ_SCRIPT_TOOL, readScript } from "./script-reader.ts";
 import { MOMENT_TOOL, planMoment } from "./life.ts";
 import { lanternContext, LANTERNS_TOOL, planLanterns } from "./lanterns.ts";
@@ -162,7 +163,7 @@ export class EveRuntime {
     await this.#saveContextState("self", this.#selfMessages);
     if (this.config.restReviewEnabled) {
       await this.#saveContextState("continuity", [
-        continuityMessage(this.journal.events, this.#observedJobs),
+        continuityMessage(this.journal.events, this.#jobObservations.jobs),
       ]);
     }
   }
@@ -196,6 +197,7 @@ export class EveRuntime {
   #timer?: ReturnType<typeof setTimeout>;
   #toolStartedAt = new Map<string, number>();
   #continueImmediately = false;
+  #jobObservations = new JobObservations();
   #observedJobs = new Map<string, { callId?: string; status: string }>();
   #rememberJobSummary(summary: Json, callId?: string) {
     if (!summary || typeof summary !== "object" || Array.isArray(summary)) return;
@@ -225,7 +227,7 @@ export class EveRuntime {
   }
   async #saveToolResult(callId: string, result: Json) {
     const started = this.#toolStartedAt.get(callId);
-    await this.journal.append("tool_result", {
+    const event = await this.journal.append("tool_result", {
       callId,
       sourceCommit: this.config.sourceCommit,
       result,
@@ -233,6 +235,7 @@ export class EveRuntime {
         ? {}
         : { executionMs: Math.round((performance.now() - started) * 100) / 100 }),
     });
+    this.#jobObservations.observe(event);
     this.#toolStartedAt.delete(callId);
     this.#rememberJob(callId, result);
   }
@@ -282,7 +285,10 @@ export class EveRuntime {
     await this.journal.initialize();
     const requests: string[] = [];
     const responded = new Set<string>();
-    for (const { kind, data, at } of activeRecoveryFacts(this.journal.events)) {
+    for (const { kind, data, at, seq } of activeRecoveryFacts(this.journal.events)) {
+      if (kind === "tool_result" || kind === "notice") {
+        this.#jobObservations.observe(this.journal.events[seq - 1]);
+      }
       if (kind === "tool_result" && data.job) {
         this.#rememberJobSummary(data.job, String(data.callId));
       }
@@ -491,11 +497,12 @@ export class EveRuntime {
     if (agents) {
       const page = agents as unknown as { items: Json[]; throughSeq: number };
       if (page.throughSeq > this.#agentThrough) {
-        await this.journal.append("notice", {
+        const event = await this.journal.append("notice", {
           source: "agents",
           throughSeq: page.throughSeq,
           items: page.items,
         });
+        this.#jobObservations.observe(event);
         this.#agentThrough = page.throughSeq;
         this.#rememberCompletions(page.items);
         if (page.items.length) {
@@ -515,12 +522,13 @@ export class EveRuntime {
         const job = (item as { job?: { jobId?: string; status?: string } }).job;
         return !job?.jobId || this.#observedJobs.get(job.jobId)?.status !== job.status;
       });
-      await this.journal.append("notice", {
+      const event = await this.journal.append("notice", {
         source: "scripts",
         throughSeq: completion.throughSeq,
         items: newItems,
         alreadyObserved: completion.items.length - newItems.length,
       });
+      this.#jobObservations.observe(event);
       this.#rememberCompletions(newItems);
       this.#scriptThrough = completion.throughSeq;
       if (newItems.length) {

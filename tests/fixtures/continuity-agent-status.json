@@ -1,0 +1,36 @@
+[
+  {
+    "schema": 1,
+    "seq": 70268,
+    "at": "2026-11-18T11:01:04.508Z",
+    "kind": "tool_result",
+    "data": {
+      "callId": "eve_70266_0",
+      "sourceCommit": "049dcf6c63c290193366a1e9940a5b21f755072b",
+      "result": {
+        "status": "completed",
+        "output": "{\"jobId\":\"eve_70266_0_task\",\"agentId\":\"agent_d33f8bbef7e5be7fbe2ca2d4513aaf6e46db46a995f3db281997ed41e90bd898\",\"status\":\"queued\",\"requestSeq\":12152}"
+      },
+      "executionMs": 3711.52
+    },
+    "previous": "3e53e1916825a90a26b661f370644ec9be02309b997bc9e6af93aa6749e51c97",
+    "digest": "d9f0beea5aab75ed929082fc6e7aa4b54e1ef1a5cc204b73634202bf2baa2834"
+  },
+  {
+    "schema": 1,
+    "seq": 70488,
+    "at": "2026-11-18T11:41:52.987Z",
+    "kind": "tool_result",
+    "data": {
+      "callId": "eve_70486_0",
+      "sourceCommit": "049dcf6c63c290193366a1e9940a5b21f755072b",
+      "result": {
+        "status": "completed",
+        "output": "{\"jobId\":\"0d96e23c74ccd038d7db6ebda0f6dbd14b0b1df02e0847c9118a3fb1c7508dc9\",\"status\":\"completed\",\"scriptStarted\":true,\"actions\":1,\"timing\":{\"prewarmed\":true,\"checkMs\":9320.27820800012,\"workerWaitMs\":0.008590999990701675,\"preparationMs\":9371.130158999935,\"executionMs\":1419.5514400000684},\"startedAt\":\"2026-11-18T11:41:41.000Z\",\"finishedAt\":\"2026-11-18T11:41:51.852Z\",\"result\":{\"text\":\"{\\\"jobId\\\":\\\"eve_70266_0_task\\\",\\\"agentId\\\":\\\"agent_d33f8bbef7e5be7fbe2ca2d4513aaf6e46db46a995f3db281997ed41e90bd898\\\",\\\"status\\\":\\\"running\\\",\\\"requestSeq\\\":12152,\\\"childJobIds\\\":[\\\"agent_6b77893a9da443885bb6e14ee491d65bcdf9d5f866817a878035f32859651913\\\",\\\"agent_6bd3add0887a9d40d731f2b47a117c2e82767575b9a6977813c5bc45acea5ee4\\\",\\\"agent_7f910c4947ca4bca643683e993146cb41ce55f9c9886d145931fa4a95f774fb2\\\"]}\",\"characters\":384,\"truncated\":false}}"
+      },
+      "executionMs": 11663.81
+    },
+    "previous": "604480f793d0c8a818d266e89140f524d035a8a945632808e3327e5c39ddc07a",
+    "digest": "56d7721857212eb065dfe475744cfba81491454a6a6d2d6627755ce69a7fc0e7"
+  }
+]

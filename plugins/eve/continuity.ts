@@ -1,5 +1,6 @@
 import type { ToolSpec } from "../../contracts/model.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
+import type { ContinuityJob } from "./job-observations.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import { activeEvents, lastActiveEvent } from "./view.ts";
 import { socialContext } from "./social.ts";
@@ -256,7 +257,7 @@ function recentToolFailures(events: ConsciousEvent[], afterSeq: number) {
   }
   return failures.reverse();
 }
-export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { status: string }>) {
+export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, ContinuityJob>) {
   const review = pendingRestReview(events);
   const rest = lastActiveEvent(events, "rest");
   const pending = [...jobs].filter(([, j]) =>
@@ -265,7 +266,7 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
   const unknown = [...jobs].filter(([, j]) => j.status === "unknown");
   return {
     role: "user" as const,
-    content: "当前生活接续（任务状态是回执，不代表必须继续工作；unknown不可盲目重跑）：\n" +
+    content: "当前生活接续（任务状态仅为已保存的观察，不是实时状态；unknown不可盲目重跑）：\n" +
       JSON.stringify({
         focus: (() => {
           const focus = lastActiveEvent(events, "focus");
@@ -276,7 +277,13 @@ export function continuityMessage(events: ConsciousEvent[], jobs: Map<string, { 
               "自己维护的近期重心，不要求填满。自己的兴趣与别人委托分开；新反馈只调整被明确提到的那一项，旧依据不重复强化。过期、没人接或失去兴趣可搁置，完成或放弃后不反复重提。",
           };
         })(),
-        pendingJobs: pending.map(([jobId, job]) => ({ jobId, status: job.status })),
+        pendingJobs: pending.map(([jobId, job]) => ({
+          jobId,
+          status: job.status,
+          observation: job.observation ?? null,
+        })),
+        jobStatusGuidance:
+          "pendingJobs是最近已保存的任务观察，不代表必须继续工作。queued可能仅为派工准入回执，不代表仍在排队；observation.record/recordedAt是意识记录编号和回执保存时刻，不是实时快照时刻，null表示来源时刻缺失。只利用已有完整任务回执更新，不猜进度或子任务状态，不为刷新展示轮询。",
         unknownJobCount: unknown.length,
         ...socialContext(events),
         moment: momentContext(events),

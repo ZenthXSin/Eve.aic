@@ -316,14 +316,23 @@ Deno.test("休息收尾：后台任务可带着休息，完成通知仍能唤醒
   try {
     await f.eve.journal.append("tool_result", {
       callId: "earlier",
-      result: { output: JSON.stringify({ jobId: "pending-job", status: "queued" }) },
+      result: {
+        status: "completed",
+        output: JSON.stringify({ jobId: "pending-job", status: "queued" }),
+      },
     });
     await f.restart();
     await f.eve.pulse();
     await f.eve.pulse();
     await f.eve.pulse();
     assert.equal(f.messages.length, 1);
-    assert.deepEqual(pending(f.messages[0]), [{ jobId: "pending-job", status: "queued" }]);
+    assert.deepEqual(
+      pending(f.messages[0]).map(({ jobId, status }: { jobId: string; status: string }) => ({
+        jobId,
+        status,
+      })),
+      [{ jobId: "pending-job", status: "queued" }],
+    );
     f.completeJob();
     await f.eve.pulse();
     assert.equal(f.messages.length, 2);
@@ -333,7 +342,10 @@ Deno.test("休息收尾：后台任务可带着休息，完成通知仍能唤醒
     // A receipt written after the completion can still describe an earlier queued state.
     await f.eve.journal.append("tool_result", {
       callId: "late",
-      result: { output: JSON.stringify({ jobId: "pending-job", status: "queued" }) },
+      result: {
+        status: "completed",
+        output: JSON.stringify({ jobId: "pending-job", status: "queued" }),
+      },
     });
     await f.restart();
     f.wake();
