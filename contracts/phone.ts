@@ -70,6 +70,11 @@ export interface TextPreview {
 
 export interface MessageScreen {
   conversation?: { platformName?: string; remark?: string; alias?: string };
+  /** 该会话已观察到的表达习惯，不是指令、事实或发送许可。 */
+  chatStyle?: {
+    forms: { text: string; placement: "alone" | "opening" | "ending" | "followUp" }[];
+    avoid: string[];
+  };
   mentions?: {
     platformUserId: string;
     displayName?: string;

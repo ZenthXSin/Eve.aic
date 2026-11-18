@@ -1,7 +1,12 @@
 import { PHONE_METHODS } from "../../contracts/phone-rpc.ts";
 import { RUNTIME_METHODS } from "../../contracts/runtime.ts";
 import { UPGRADE_METHODS } from "../../contracts/upgrades.ts";
-import type { ScriptRequest, ScriptSummary, ScriptTiming } from "../../contracts/script.ts";
+import {
+  SCRIPT_FOREGROUND_WAIT_MS,
+  type ScriptRequest,
+  type ScriptSummary,
+  type ScriptTiming,
+} from "../../contracts/script.ts";
 import type { FromScript } from "../../contracts/script-wire.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError, toWireError, type WireError } from "../../kernel/protocol.ts";
@@ -33,6 +38,7 @@ export interface ScriptConfig {
   defaultTimeoutMs: number;
 }
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
+const RECEIPT_MARGIN_MS = 250;
 const CONTRACT_FILES: Record<string, string> = {
   phone: "phone",
   "phone-details": "phone-details",
@@ -81,11 +87,11 @@ function validate(request: ScriptRequest) {
     request.requestId.length > 512 ||
     typeof request.code !== "string" || !request.code ||
     new TextEncoder().encode(request.code).length > 1_048_576 ||
-    (request.mode !== undefined && !["async", "sync"].includes(request.mode)) ||
+    (request.mode !== undefined && request.mode !== "async" && request.mode !== "sync") ||
     (request.timeoutMs !== undefined &&
       (!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 1))
   ) {
-    throw new KernelError("rejected", "脚本需要真实调用编号、代码及有效等待/超时参数");
+    throw new KernelError("rejected", "脚本需要真实调用编号、代码及有效执行超时");
   }
 }
 export class ScriptRuntime {
@@ -210,19 +216,20 @@ export class ScriptRuntime {
   }
 
   async start(input: ScriptRequest): Promise<ScriptSummary> {
+    const waitUntil = performance.now() + SCRIPT_FOREGROUND_WAIT_MS - RECEIPT_MARGIN_MS;
     this.#available();
     validate(input);
-    const request = structuredClone({
-      ...input,
+    const request = {
+      requestId: input.requestId,
+      code: input.code,
       timeoutMs: input.timeoutMs ?? this.config.defaultTimeoutMs,
-    });
+    };
     const jobId = await fingerprint(["script-job-v1", request.requestId]);
     const hash = await fingerprint(this.#identity(request));
-    const starting = this.#starting.get(jobId);
-    if (starting) {
+    for (let starting = this.#starting.get(jobId); starting; starting = this.#starting.get(jobId)) {
       await starting;
-      return this.start(request);
     }
+    this.#available();
     const operation = (async () => {
       const previous = this.store.findJob(jobId);
       if (previous) {
@@ -285,18 +292,14 @@ export class ScriptRuntime {
     } finally {
       this.#starting.delete(jobId);
     }
-    // Waiting is a caller policy, not a task identity or cancellation deadline.
-    // A slow task retains its worker, action IDs and real eventual receipt.
     const live = this.#live.get(jobId);
-    if (request.mode !== "async" && live) {
+    const remaining = waitUntil - performance.now();
+    if (input.mode !== "async" && live && remaining > 0) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
           live.done,
-          // Default covers typical 8–12s preparation; explicit sync retains its 5s contract.
-          new Promise<void>((resolve) =>
-            timer = setTimeout(resolve, request.mode === "sync" ? 5_000 : 15_000)
-          ),
+          new Promise<void>((resolve) => timer = setTimeout(resolve, remaining)),
         ]);
       } finally {
         clearTimeout(timer);

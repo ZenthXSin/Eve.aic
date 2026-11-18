@@ -3,7 +3,7 @@ import { renderScriptContracts } from "../composition/script-docs.ts";
 import { SCRIPT_AUTO_WAIT_CAPABILITY_VERSION } from "../contracts/script.ts";
 import { SCRIPT_TOOL } from "../plugins/script-runtime/mod.ts";
 
-Deno.test("脚本等待契约：新默认15秒，sync仍5秒，准确复原旧5秒和异步提示", async () => {
+Deno.test("脚本前台最多10秒；提示升级仍能复原旧等待契约", async () => {
   const render = (declaration: string) =>
     renderScriptContracts((path) =>
       Promise.resolve(path === "contracts/script.ts" ? declaration : `// ${path}\n`)
@@ -22,8 +22,9 @@ Deno.test("脚本等待契约：新默认15秒，sync仍5秒，准确复原旧5�
   // Untrusted expressions cannot opt into a capability or execute during prompt generation.
   assert.ok((await render("export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 1 + 1;\n"))
     .includes("脚本默认异步返回持久任务编号"));
-  assert.equal(SCRIPT_AUTO_WAIT_CAPABILITY_VERSION, 2);
-  assert.ok((await renderScriptContracts()).includes("默认最多等待15秒"));
-  assert.ok(SCRIPT_TOOL.description.includes("默认最多等待15秒"));
-  assert.ok(SCRIPT_TOOL.description.includes("mode:sync也最多等待5秒"));
+  assert.equal(SCRIPT_AUTO_WAIT_CAPABILITY_VERSION, 3);
+  const bounded = await render("export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 3;\r\n");
+  assert.ok(bounded.includes("mode:sync 最多等待10秒"));
+  assert.ok((await renderScriptContracts()).includes("最多等待10秒"));
+  assert.ok(SCRIPT_TOOL.description.includes("最多等待10秒"));
 });

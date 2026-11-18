@@ -21,7 +21,8 @@ export const SCRIPTS = "scripts";
 export const NATIVE_THOUGHT_CAPABILITY_VERSION = 1;
 export const WEB_CAPABILITY_VERSION = 1;
 /** 默认工具等待上限与后台续行能力，用于准确复原旧版本生成提示。 */
-export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 2;
+export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 3;
+export const SCRIPT_FOREGROUND_WAIT_MS = 10_000;
 export const AGENT_CAPABILITY_VERSION = 1;
 export const GENERAL_AGENT_CAPABILITY_VERSION = 1;
 export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 2;
@@ -52,8 +53,9 @@ export interface ScriptRequest {
   /** 原生工具调用的真实编号；意识流须先保存，不由重试生成新编号。 */
   requestId: string;
   code: string;
-  /** 默认最多等待15秒（含准备）；sync仍最多5秒；async立即返回；等待结束不取消或重跑。 */
+  /** 默认和 sync 最多等 10 秒，async 不等待执行；到期后原任务继续。 */
   mode?: "async" | "sync";
+  /** 限制实际任务执行，不是前台等待时间。 */
   timeoutMs?: number;
 }
 export type ScriptStatus =

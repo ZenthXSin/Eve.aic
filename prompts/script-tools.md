@@ -1,8 +1,8 @@
 工具入口：execute_script 的 code 是异步 TypeScript 函数正文，参数 tools；可
 await/return，真实结果必须 return 才带回主意识。thought 或 write_thought 留简短随记，不发送
-QQ，同一内容不重复记录。 脚本默认最多等待15秒（含准备），mode:sync 最多5秒，mode:async
-立即返回；未完成返回原 jobId 后台继续，等待结束不取消、不重跑。已完成回执 result 是返回值 JSON
-文本页；truncated 时按 nextChar 用 scripts.result 续读，limit
+QQ，同一内容不重复记录。脚本默认和 mode:sync 最多等待10秒（含准备），未完成时返回原 jobId
+在后台继续。mode:async 接纳后立即返回。后台完成会通知，不重发；用原 jobId 调 scripts.result 取返回值
+JSON 文本页；truncated 时按 nextChar 续读，limit
 为1..8192。失败看真实回执后继续处理，未知状态查原编号，不重发猜结果。
 
 以下保留常用调用的输入类型；返回值由真实结构化回执给出。省略的接口仍可使用，详细参数和返回类型按需读取：return

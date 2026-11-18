@@ -23,6 +23,7 @@ import {
   updateConversation,
 } from "./social.ts";
 import type { HistoryScreen, MessageScreen, PhoneActionReceipt } from "../../contracts/phone.ts";
+import { SCRIPT_FOREGROUND_WAIT_MS } from "../../contracts/script.ts";
 import { MODEL_RPC_TIMEOUT_MS } from "../../sdk/model-timeouts.ts";
 import type { Message, ModelResponse, ToolSpec } from "../../contracts/model.ts";
 import type { NoteApi } from "../../contracts/notes.ts";
@@ -99,7 +100,7 @@ export class EveRuntime {
         this.#selfMessages.push({
           role: "user",
           content:
-            "独处时翻到自己写的几条原话。接着可推进的重心；若它们都在等人或后台结果，挑一件自己感兴趣的去查、去试，工具改进也可以。无需为选题另外汇报：\n" +
+            "独处时翻到自己写的几条原话。答应的事有进展就接上；有空也可以继续感兴趣的东西、看看熟群在聊什么，或者就休息。不必为选题另外汇报：\n" +
             self.ideas.map((idea) => `便签 ${idea.noteId} v${idea.revision}：\n${idea.text}`).join(
               "\n\n",
             ),
@@ -662,6 +663,23 @@ export class EveRuntime {
     }
   }
 
+  async #scriptForeground<T>(operation: (timeoutMs: number) => Promise<T>): Promise<T> {
+    const timeoutMs = Math.min(this.config.modelTimeoutMs, SCRIPT_FOREGROUND_WAIT_MS);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation(timeoutMs),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new KernelError("timeout", "脚本回执等待已结束；按原任务编号跟进，不重发"));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async #tool(pending: PendingTool) {
     const call = pending.call;
     this.#toolStartedAt.set(call.id, performance.now());
@@ -996,16 +1014,29 @@ export class EveRuntime {
       await this.#saveToolResult(call.id, result);
       return;
     }
-    if (pending.started && call.name === "execute_script") {
-      const jobId = await fingerprint(["script-job-v1", call.id]);
+    const scriptJobId = call.name === "execute_script"
+      ? await fingerprint(["script-job-v1", call.id])
+      : undefined;
+    if (pending.started && scriptJobId) {
       try {
-        const summary = await this.ctx.call<Json>("scripts", "status", { jobId });
+        const summary = await this.#scriptForeground((timeoutMs) =>
+          this.ctx.call<Json>("scripts", "status", { jobId: scriptJobId }, { timeoutMs })
+        );
         result = { status: "completed", output: JSON.stringify(summary), adopted: true };
         await this.#saveToolResult(call.id, result);
-        await this.#observations(jobId);
         return;
       } catch (error) {
-        if (!(error instanceof KernelError && error.kind === "not_found")) throw error;
+        if (!(error instanceof KernelError)) throw error;
+        if (error.kind === "timeout" || error.kind === "unknown") {
+          await this.#saveToolResult(call.id, {
+            status: "unknown",
+            requestId: call.id,
+            jobId: scriptJobId,
+            error: toWireError(error) as unknown as Json,
+          });
+          return;
+        }
+        if (error.kind !== "not_found") throw error;
       }
     }
     if (
@@ -1024,14 +1055,13 @@ export class EveRuntime {
       return;
     }
     try {
-      result = await this.ctx.call<Json>(
-        "tools",
-        "execute",
-        withoutThought(call) as unknown as Json,
-        {
-          timeoutMs: this.config.modelTimeoutMs,
-        },
-      );
+      const execute = (timeoutMs: number) =>
+        this.ctx.call<Json>("tools", "execute", withoutThought(call) as unknown as Json, {
+          timeoutMs,
+        });
+      result = scriptJobId
+        ? await this.#scriptForeground(execute)
+        : await execute(this.config.modelTimeoutMs);
     } catch (error) {
       const wire = toWireError(error);
       result = {
@@ -1040,13 +1070,11 @@ export class EveRuntime {
           : "failed",
         error: wire as unknown as Json,
         requestId: call.id,
+        ...(scriptJobId ? { jobId: scriptJobId } : {}),
       };
       if (wire.kind === "storage") throw error;
     }
     await this.#saveToolResult(call.id, result);
-    if (call.name === "execute_script") {
-      await this.#observations(await fingerprint(["script-job-v1", call.id]));
-    }
   }
   async #projectContext(tools: ToolSpec[]) {
     const events = this.journal.events;
@@ -1487,7 +1515,7 @@ export class EveRuntime {
           wakeAt: defaultRestWake(Date.now(), this.config.defaultSleepMs, true),
           responseSeq: this.journal.events.at(-1)!.seq,
           reason:
-            "本步没有继续动作，核对可推进的重心、自己的兴趣与工具改进；等待一项不妨碍推进另一项",
+            "本步没有继续动作，核对未完成的承诺；有空可看群里有没有新话题、继续自己的兴趣，或安心休息",
         });
         this.#wake = 0;
         this.#continueImmediately = true;
@@ -1501,7 +1529,7 @@ export class EveRuntime {
         await this.journal.append("rest", {
           wakeAt: this.#wake,
           sourceCommit: this.config.sourceCommit,
-          reason: "本步没有继续动作；稍后再看自己的兴趣与改进事项，Eve可明确安排唤醒",
+          reason: "本步没有继续动作；稍后再看消息和自己的兴趣，Eve可明确安排唤醒",
           ...(this.config.restReviewEnabled
             ? { summary: response.content, reviewSeq: review!.seq }
             : {}),

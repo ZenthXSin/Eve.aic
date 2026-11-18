@@ -2,12 +2,81 @@ import assert from "node:assert/strict";
 import { EveRuntime } from "../plugins/eve/runtime.ts";
 import type { PluginContext } from "../sdk/plugin.ts";
 import { pendingTools } from "../plugins/eve/view.ts";
+import { fingerprint } from "../kernel/calls.ts";
 
 function deferred() {
   let resolve!: (value?: unknown) => void;
   const promise = new Promise((done) => resolve = done);
   return { promise, resolve };
 }
+
+Deno.test("脚本回执不返回也能继续下一轮，保留原任务编号，不重复提交", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "eve-script-handoff-" });
+  const late = deferred();
+  let executed = 0, rounds = 0;
+  const context = {
+    async call(contract: string, method: string) {
+      switch (`${contract}.${method}`) {
+        case "tools.list":
+          return [{
+            name: "execute_script",
+            description: "fixture",
+            parameters: { type: "object" },
+          }];
+        case "model.complete":
+          return rounds++ === 0
+            ? {
+              content: "查一下",
+              toolCalls: [{ id: "fixture", name: "execute_script", args: { code: "return 1" } }],
+            }
+            : { content: "暂时没结果", toolCalls: [] };
+        case "tools.execute":
+          executed++;
+          return await late.promise;
+        case "mind.update":
+          return null;
+        case "phone.notifications":
+        case "scripts.completions":
+        case "mind.poll":
+          return { items: [], throughSeq: 0 };
+        default:
+          throw new Error(`Unexpected fixture call: ${contract}.${method}`);
+      }
+    },
+  } as unknown as PluginContext;
+  const runtime = new EveRuntime(context, {
+    directory: `${directory}/journal`,
+    promptFile: `${directory}/prompt.md`,
+    sourceCommit: "fixture",
+    modelTimeoutMs: 50,
+    maxOutputTokens: 100,
+    pollMs: 60_000,
+    defaultSleepMs: 60_000,
+    dailyTokenBudget: 1_000_000,
+  });
+  try {
+    await Deno.writeTextFile(`${directory}/prompt.md`, "fixture");
+    await runtime.initialize();
+    await runtime.pulse();
+    const [original] = pendingTools(runtime.journal.events);
+    assert.ok(original);
+    await runtime.pulse();
+    const receipt = runtime.journal.events.findLast((event) => event.kind === "tool_result")
+      ?.data as {
+        result: { status: string; jobId: string };
+      };
+    assert.equal(receipt.result.status, "unknown");
+    assert.equal(receipt.result.jobId, await fingerprint(["script-job-v1", original.call.id]));
+    assert.equal(pendingTools(runtime.journal.events).length, 0);
+    await runtime.pulse();
+    assert.equal(rounds, 2);
+    assert.equal(executed, 1);
+  } finally {
+    late.resolve({ status: "completed" });
+    await runtime.close();
+    await Deno.remove(directory, { recursive: true });
+  }
+});
 
 for (const stage of ["tools.list", "model.complete"]) {
   Deno.test(`意识流停止：${stage}在途时不派发新工作，已收到响应和工具决定保留`, async () => {

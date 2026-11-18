@@ -55,8 +55,10 @@ export async function renderScriptContracts(
       contractLookup = /^export const CONTRACT_LOOKUP_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       agents = /^export const AGENT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
       generalAgent = /^export const GENERAL_AGENT_CAPABILITY_VERSION = 1;\r?$/m.test(source);
-      autoWait = !options.legacyAutoWaitV2 &&
-          /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 2;\r?$/m.test(source)
+      autoWait = /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 3;\r?$/m.test(source)
+        ? 3
+        : !options.legacyAutoWaitV2 &&
+            /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 2;\r?$/m.test(source)
         ? 2
         : /^export const SCRIPT_AUTO_WAIT_CAPABILITY_VERSION = 1;\r?$/m.test(source)
         ? 1
@@ -90,7 +92,9 @@ export async function renderScriptContracts(
       "execute_script 可选参数 thought 用于留下此刻愿意表达的简短随记、感受或打算；没有脚本动作时可单独调用 write_thought({thought})。随记进入自己的上下文，不自动发送QQ，不要求逐步内部推演；普通文字、thought 和 write_thought 选择合适入口，同一内容不重复记录。\n"
     : "唯一原生工具 execute_script 的 code 是异步函数正文。当前参数名 tools，类型为 ScriptApi；可 await 和 return。\n";
   return preamble +
-    (autoWait === 2
+    (autoWait === 3
+      ? "脚本默认和 mode:sync 最多等待10秒（含类型检查和沙箱准备），到时返回原 jobId 在后台继续，完成会通知。mode:async 接纳后立即返回。timeoutMs 独立限制实际任务；具体动作编号由宿主生成。"
+      : autoWait === 2
       ? "脚本默认最多等待15秒（含类型检查和沙箱准备）：完成就直接带回真实结果，未完成则返回原持久任务编号，在后台并行继续。mode:async可立即返回；mode:sync仍最多等待5秒，等待结束不会取消或重跑任务。具体动作编号由宿主生成。"
       : autoWait === 1
       ? "脚本默认最多等待5秒：完成就直接带回真实结果，未完成则返回原持久任务编号，在后台并行继续。mode:async可立即返回；mode:sync也最多等待5秒，等待结束不会取消或重跑任务。具体动作编号由宿主生成。"

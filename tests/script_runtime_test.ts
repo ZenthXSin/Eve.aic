@@ -130,7 +130,7 @@ Deno.test("脚本：一个原生工具经类型接口发送，每个动作当场
       f.kernel().call<{ output: string }>("tools", "execute", call),
       f.kernel().call<{ output: string }>("tools", "execute", call),
     ]);
-    assert.deepEqual(results[0], results[1]);
+    assert.equal(JSON.parse(results[0].output).jobId, JSON.parse(results[1].output).jobId);
     const job = await settleScript(f.kernel(), JSON.parse(results[0].output));
     const settled = await f.kernel().call<{ output: string }>("tools", "execute", call);
     assert.equal(JSON.parse(settled.output).status, "completed");
@@ -184,8 +184,9 @@ Deno.test("脚本：执行期限区分未开始与已开始，超长期限不溢
       timeoutMs: 1,
       code: "return 1;",
     });
-    assert.equal(early.status, "cancelled");
-    assert.equal(early.scriptStarted, false);
+    const expired = await settleScript(f.kernel(), early);
+    assert.equal(expired.status, "cancelled");
+    assert.equal(expired.scriptStarted, false);
     assert.equal(f.count(), 0);
     const long = await f.kernel().call<ScriptSummary & Json>("scripts", "start", {
       requestId: "long-deadline",

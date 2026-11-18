@@ -236,7 +236,7 @@ Deno.test("原生脚本返回值：异步手机大原件完成后可通过原生
   }
 });
 
-Deno.test("原生脚本：默认最多15秒且sync仍最多5秒，原任务后台并行，迟到结果只执行一次", async () => {
+Deno.test("原生脚本：默认和sync十秒后转后台，堵住的工具不阻挡其他脚本", async () => {
   for (const mode of [undefined, "sync"]) {
     const f = await fixture();
     try {
@@ -247,10 +247,8 @@ Deno.test("原生脚本：默认最多15秒且sync仍最多5秒，原任务后�
         mode,
         false,
       );
-      const waitMs = mode === "sync" ? 5_000 : 15_000;
       const elapsed = performance.now() - started;
-      assert.ok(elapsed >= waitMs - 100, "不能提前结束声明的等待");
-      assert.ok(elapsed < waitMs + 2_000, "到期必须返回，不等实际工具结束");
+      assert.ok(elapsed >= 9_650 && elapsed < 10_500, `应在十秒附近转后台：${elapsed}ms`);
       console.log("bounded wait", JSON.stringify({ mode: mode ?? "default", elapsed }));
       assert.ok(["queued", "checking", "running"].includes(job.status));
       assert.equal(job.result, undefined);
@@ -286,7 +284,7 @@ Deno.test("原生脚本：默认最多15秒且sync仍最多5秒，原任务后�
   }
 });
 
-Deno.test("原生脚本等待：默认覆盖超过5秒的真实检查准备并直接返回结果，async不等待准备", async () => {
+Deno.test("原生脚本：十秒内完成直接返回，显式async不等检查", async () => {
   const f = await fixture(true);
   try {
     // Prime Deno's real check cache so full-suite host load does not extend our 7s floor.
@@ -301,13 +299,13 @@ Deno.test("原生脚本等待：默认覆盖超过5秒的真实检查准备并�
       undefined,
       false,
     );
-    assert.equal(job.status, "completed", "超过旧5秒等待的准备应直接带回结果，不补查原任务");
+    assert.equal(job.status, "completed");
     assert.ok(performance.now() - started >= 6900);
     assert.ok(job.timing!.checkMs! >= 6900);
     assert.ok(job.result);
     assert.equal(JSON.parse(job.result.text), 42);
     assert.equal(f.phoneCalls(), 0);
-    console.log("slow preparation default receipt", JSON.stringify(job.timing));
+    console.log("slow preparation result", JSON.stringify(job.timing));
 
     const asyncStarted = performance.now();
     const pending = await f.execute(

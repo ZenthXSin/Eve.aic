@@ -5,6 +5,7 @@ import { PhoneRpcClient } from "./client.ts";
 import type { OwnershipProof } from "../../contracts/ownership.ts";
 import type { ModelImage } from "../../contracts/model.ts";
 import { fingerprint } from "../../kernel/calls.ts";
+import { ChatStyleMemory } from "./chat-style.ts";
 
 export interface PhoneConfig {
   adapterUrl: string;
@@ -88,6 +89,7 @@ function relationships(value: Json, ownerId?: string): Json {
 export function createPhonePlugin(configPath: string) {
   let client: PhoneRpcClient | undefined;
   let ownerId: string | undefined;
+  const chatStyle = new ChatStyleMemory();
   const health = async () => {
     if (!client) throw new Error("手机尚未启用");
     const value = await client.call("health");
@@ -144,7 +146,8 @@ export function createPhonePlugin(configPath: string) {
               download: raw.download,
             };
           }
-          return relationships(await client.call(method, args), ownerId);
+          const screen = relationships(await client.call(method, args), ownerId);
+          return chatStyle.project(method, screen);
         };
       }
       ctx.provide(PHONE, handlers);

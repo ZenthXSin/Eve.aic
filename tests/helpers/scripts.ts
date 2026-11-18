@@ -3,7 +3,7 @@ import type { ScriptSummary } from "../../contracts/script.ts";
 import type { Kernel } from "../../kernel/kernel.ts";
 import type { Json } from "../../kernel/protocol.ts";
 
-/** Sync admission is bounded at five seconds; assert effects only after the original job settles. */
+/** Assert effects only after the original background job settles. */
 export async function settleScript(kernel: Kernel, job: ScriptSummary): Promise<ScriptSummary> {
   const deadline = performance.now() + 60_000;
   while (["queued", "checking", "running"].includes(job.status)) {
