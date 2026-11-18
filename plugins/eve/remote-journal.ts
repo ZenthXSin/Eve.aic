@@ -2,6 +2,7 @@ import { type FactEvent, FactJournal } from "../../sdk/fact-journal.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
 import { type Json, KernelError } from "../../kernel/protocol.ts";
+import { eveHistoryCheckpoint } from "./recovery-index.ts";
 
 /** 稳定出口持有原件；本实例仅保存经校验的镜像，正文按需从磁盘读取。 */
 export class RemoteJournal {
@@ -12,7 +13,7 @@ export class RemoteJournal {
   #initializing = false;
   #initializationFinished?: Promise<void>;
   constructor(readonly ctx: PluginContext, directory: string) {
-    this.#mirror = new FactJournal(`${directory}/remote-mirror`);
+    this.#mirror = new FactJournal(`${directory}/remote-mirror`, eveHistoryCheckpoint);
   }
   get events() {
     return this.#mirror.events;

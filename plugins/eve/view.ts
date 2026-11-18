@@ -3,6 +3,7 @@ import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { withFactReadCache } from "../../sdk/fact-journal.ts";
 import { imageTextView } from "../../sdk/image-text.ts";
 import type { ConsciousEvent } from "./journal.ts";
+import { eveFactAt } from "./recovery-index.ts";
 import { projectThoughts, withoutThought } from "./thoughts.ts";
 
 interface ActiveIndex {
@@ -101,7 +102,7 @@ export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
     index = current;
   }
   for (let i = index.scanned; i < events.length; i++) {
-    const event = events[i];
+    const event = eveFactAt(events, i);
     if (event.kind === "upgrade_rollback") {
       const range = event.data as { afterSeq: number; throughSeq: number };
       if (
@@ -158,6 +159,21 @@ export function* selectedEvents(events: ConsciousEvent[], kind?: string, afterSe
     yield source[positions[i]];
   }
 }
+export function* activeRecoveryFacts(events: ConsciousEvent[]) {
+  const { source, positions } = selectedPositions(events);
+  for (const position of positions) yield eveFactAt(source, position);
+}
+export function lastActiveRecoveryFact(
+  events: ConsciousEvent[],
+  kind: string,
+  matches?: (data: Record<string, Json>) => boolean,
+) {
+  const { source, positions } = selectedPositions(events, kind);
+  for (let index = positions.length - 1; index >= 0; index--) {
+    const fact = eveFactAt(source, positions[index]);
+    if (!matches || matches(fact.data)) return fact;
+  }
+}
 export function lastActiveEvent(
   events: ConsciousEvent[],
   kind: string,
@@ -199,15 +215,15 @@ interface PendingIndex {
 const toolIndexes = new WeakMap<ConsciousEvent[], PendingIndex>();
 function pendingToolsUncached(events: ConsciousEvent[]): PendingTool[] {
   const source = activeSources.get(events) ?? events;
-  events = activeEvents(source);
-  const revision = activeIndexes.get(source)!.revision;
+  activeEvents(source);
+  const { indices, revision } = activeIndexes.get(source)!;
   let state = toolIndexes.get(source);
   if (!state || state.revision !== revision) {
     state = { scanned: 0, revision, started: new Set(), finished: new Set(), pending: new Map() };
     toolIndexes.set(source, state);
   }
-  for (let i = state.scanned; i < events.length; i++) {
-    const event = events[i];
+  for (let i = state.scanned; i < indices.length; i++) {
+    const event = eveFactAt(source, indices[i]);
     if (event.kind === "tool_start") state.started.add((event.data as { callId: string }).callId);
     if (event.kind === "tool_result") {
       const id = (event.data as { callId: string }).callId;
@@ -215,8 +231,11 @@ function pendingToolsUncached(events: ConsciousEvent[]): PendingTool[] {
       state.pending.delete(id);
     }
     if (event.kind === "model_response") {
-      const response = (event.data as unknown as { response: ModelResponse }).response;
-      for (let index = 0; index < response.toolCalls.length; index++) {
+      const toolCount = Number(event.data.toolCount);
+      if (!Number.isSafeInteger(toolCount) || toolCount < 0) {
+        throw new KernelError("corrupt", "模型回执缺少有效的工具调用列表");
+      }
+      for (let index = 0; index < toolCount; index++) {
         const id = `eve_${event.seq}_${index}`;
         if (!state.finished.has(id)) state.pending.set(id, { responseSeq: event.seq, index });
       }

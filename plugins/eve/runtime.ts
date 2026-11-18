@@ -30,7 +30,7 @@ import type { NoteApi } from "../../contracts/notes.ts";
 import { presentContext } from "../../sdk/context-presentation.ts";
 import type { MindEvent } from "../../contracts/mind.ts";
 import { canonical, fingerprint } from "../../kernel/calls.ts";
-import { type ErrorKind, type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
+import { type Json, KernelError, toWireError } from "../../kernel/protocol.ts";
 import type { PluginContext } from "../../sdk/plugin.ts";
 import { CONTEXT_TOOLS, inspectContext, previewCompression } from "./context-tools.ts";
 import {
@@ -42,11 +42,13 @@ import {
 import { recallQuery } from "./recall-query.ts";
 import { type ModelBlock, providerRejection } from "../../sdk/model-failure.ts";
 import { type ConsciousEvent, ConsciousJournal } from "./journal.ts";
+import { eveFactAt, eveHistoryCheckpoint, jobSummaryFromResult } from "./recovery-index.ts";
 import { RemoteJournal } from "./remote-journal.ts";
 import { thoughtForCall, withoutThought, WRITE_THOUGHT_TOOL } from "./thoughts.ts";
 import {
   accountingDay,
   activeEvents,
+  activeRecoveryFacts,
   appendPreviewEvent,
   blocks,
   budget,
@@ -54,6 +56,7 @@ import {
   type ContextCounter,
   contextEstimate,
   lastActiveEvent,
+  lastActiveRecoveryFact,
   mechanicalCompression,
   type PendingTool,
   pendingTools,
@@ -121,23 +124,23 @@ export class EveRuntime {
     const events = this.journal.events;
     let rebuild = events.length < this.#presentationScanned;
     for (let i = this.#presentationScanned; i < events.length; i++) {
-      if (events[i].kind === "upgrade_rollback") rebuild = true;
+      if (eveFactAt(events, i).kind === "upgrade_rollback") rebuild = true;
     }
+    const remember = ({ kind, seq, data }: ReturnType<typeof eveFactAt>) => {
+      if (kind === "tool_result") this.#receiptRecords.set(data.callId as string, seq);
+      if (kind === "retain") {
+        const id = `eve_${data.responseSeq}_${data.toolIndex}`;
+        if (data.mode === "raw") this.#rawCalls.add(id);
+        else this.#rawCalls.delete(id);
+      }
+    };
     if (rebuild) {
       this.#rawCalls.clear();
       this.#receiptRecords.clear();
-    }
-    const source = rebuild ? activeEvents(events) : events;
-    for (let i = rebuild ? 0 : this.#presentationScanned; i < source.length; i++) {
-      const event = source[i];
-      if (event.kind === "tool_result") {
-        this.#receiptRecords.set((event.data as { callId: string }).callId, event.seq);
-      }
-      if (event.kind === "retain") {
-        const d = event.data as { responseSeq: number; toolIndex: number; mode: string };
-        const id = `eve_${d.responseSeq}_${d.toolIndex}`;
-        if (d.mode === "raw") this.#rawCalls.add(id);
-        else this.#rawCalls.delete(id);
+      for (const fact of activeRecoveryFacts(events)) remember(fact);
+    } else {
+      for (let index = this.#presentationScanned; index < events.length; index++) {
+        remember(eveFactAt(events, index));
       }
     }
     this.#presentationScanned = events.length;
@@ -217,11 +220,8 @@ export class EveRuntime {
     }
   }
   #rememberJob(callId: string, result: Json) {
-    try {
-      const output = (result as { output?: string })?.output;
-      if (typeof output !== "string") return;
-      this.#rememberJobSummary(JSON.parse(output), callId);
-    } catch { /* 非脚本回执不建立任务索引。 */ }
+    const summary = jobSummaryFromResult(result);
+    if (summary) this.#rememberJobSummary(summary, callId);
   }
   async #saveToolResult(callId: string, result: Json) {
     const started = this.#toolStartedAt.get(callId);
@@ -274,92 +274,81 @@ export class EveRuntime {
   ) {
     this.journal = config.remoteRecords
       ? new RemoteJournal(ctx, config.directory)
-      : new ConsciousJournal(config.directory);
+      : new ConsciousJournal(config.directory, eveHistoryCheckpoint);
   }
   async initialize() {
     this.#prompt = await Deno.readTextFile(this.config.promptFile);
     if (!this.#prompt.trim()) throw new KernelError("rejected", "需要稳定身份与真实能力说明");
     await this.journal.initialize();
-    for (const event of activeEvents(this.journal.events)) {
-      const data = event.data as Record<string, Json>;
-      if (event.kind === "tool_result") {
-        this.#rememberJob(String(data.callId), data.result);
+    const requests: string[] = [];
+    const responded = new Set<string>();
+    for (const { kind, data, at } of activeRecoveryFacts(this.journal.events)) {
+      if (kind === "tool_result" && data.job) {
+        this.#rememberJobSummary(data.job, String(data.callId));
       }
-      if (event.kind === "notice") {
+      if (kind === "notice") {
         if (
           ["image", "image_description"].includes(String(data.source)) &&
           typeof data.actionId === "string"
         ) this.#imageActions.add(data.actionId);
         if (data.source === "agents") {
           this.#agentThrough = Number(data.throughSeq);
-          this.#rememberCompletions(data.items);
         }
         if (data.source === "phone") this.#phoneThrough = Number(data.throughSeq);
         if (data.source === "scripts") {
           this.#scriptThrough = Number(data.throughSeq);
-          this.#rememberCompletions(data.items);
         }
+        if (Array.isArray(data.jobs)) this.#rememberCompletions(data.jobs);
         if (data.source === "commands") this.#commandThrough = Number(data.throughSeq);
-        if ((Array.isArray(data.items) && data.items.length) || data.source === "reminder") {
-          this.#wake = 0;
-        }
+        if (data.wakes) this.#wake = 0;
       }
-      if (event.kind === "mind_applied") {
+      if (kind === "mind_applied") {
         this.#mindThrough = Number(data.throughSeq);
         if (data.wakeAt !== undefined) this.#wake = Number(data.wakeAt);
       }
-      if (event.kind === "rest") this.#wake = Number(data.wakeAt);
-      if (event.kind === "wake") this.#wake = 0;
-      if (event.kind === "channel_failure") this.#lastError = String(data.errorKind);
-      if (event.kind === "channel_recovered") this.#lastError = undefined;
-      if (event.kind === "model_failure") {
+      if (kind === "rest") this.#wake = Number(data.wakeAt);
+      if (kind === "wake") this.#wake = 0;
+      if (kind === "channel_failure") this.#lastError = String(data.errorKind);
+      if (kind === "channel_recovered") this.#lastError = undefined;
+      if (kind === "model_failure") {
         this.#failures++;
         this.#retryAt = Number(data.retryAt);
-        const failure = data.error as { kind: ErrorKind; message: string };
-        const status = failure && providerRejection(new KernelError(failure.kind, failure.message));
-        if (status !== undefined) {
+        if (typeof data.httpStatus === "number") {
           this.#modelBlocked = {
             category: "provider_rejected",
-            httpStatus: status,
+            httpStatus: data.httpStatus,
             requestId: String(data.requestId),
-            at: event.at,
+            at,
           };
         }
       }
-      if (event.kind === "model_resume") this.#modelBlocked = null;
-      if (event.kind === "model_response") {
+      if (kind === "model_resume") this.#modelBlocked = null;
+      if (kind === "model_response") {
         this.#failures = 0;
         this.#retryAt = 0;
-        if ((data.response as unknown as ModelResponse).toolCalls.length) this.#wake = 0;
+        if (Number(data.toolCount) > 0) this.#wake = 0;
+      }
+      if (kind === "model_start") requests.push(data.requestId as string);
+      if (kind === "model_response" || kind === "model_failure" || kind === "recovery") {
+        responded.add(data.requestId as string);
       }
     }
-    const responded = new Set<string>();
-    for (const event of activeEvents(this.journal.events)) {
-      if (["model_response", "model_failure", "recovery"].includes(event.kind)) {
-        responded.add((event.data as { requestId: string }).requestId);
-      }
-    }
-    for (const event of activeEvents(this.journal.events)) {
-      if (
-        event.kind === "model_start" &&
-        !responded.has((event.data as { requestId: string }).requestId)
-      ) {
-        if (this.config.remoteRecords) {
-          try {
-            const requestId = (event.data as { requestId: string }).requestId;
-            const response = await this.ctx.call("model", "result", { requestId });
-            await this.journal.append("model_response", { requestId, response, adopted: true });
-            continue;
-          } catch (error) {
-            if (!(error instanceof KernelError && error.kind === "not_found")) throw error;
-          }
+    for (const requestId of requests) {
+      if (responded.has(requestId)) continue;
+      if (this.config.remoteRecords) {
+        try {
+          const response = await this.ctx.call("model", "result", { requestId });
+          await this.journal.append("model_response", { requestId, response, adopted: true });
+          continue;
+        } catch (error) {
+          if (!(error instanceof KernelError && error.kind === "not_found")) throw error;
         }
-        await this.journal.append("recovery", {
-          requestId: (event.data as { requestId: string }).requestId,
-          result: "模型请求在宿主中断时未确认；费用与结果未知，未重放任何工具动作",
-        });
-        // 未确认请求的预算预留保留。下一次新请求只在恢复通知/醒来且预算足够时发生。
       }
+      await this.journal.append("recovery", {
+        requestId,
+        result: "模型请求在宿主中断时未确认；费用与结果未知，未重放任何工具动作",
+      });
+      // 未确认请求的预算预留保留。下一次新请求只在恢复通知/醒来且预算足够时发生。
     }
     if (!this.journal.events.length) {
       await this.journal.append("activation", {
@@ -1159,8 +1148,10 @@ export class EveRuntime {
       const previous = lastActiveEvent(this.journal.events, "rest");
       if (decision && decision.seq > (previous?.seq ?? 0)) {
         const data = decision.data as { callId: string; wakeAt?: string };
-        const receipt = activeEvents(this.journal.events).findLast((e) =>
-          e.kind === "tool_result" && (e.data as { callId: string }).callId === data.callId
+        const receipt = lastActiveRecoveryFact(
+          this.journal.events,
+          "tool_result",
+          (fact) => fact.callId === data.callId,
         );
         if (receipt) {
           this.#wake = data.wakeAt && Date.parse(data.wakeAt) > Date.now()
@@ -1223,15 +1214,20 @@ export class EveRuntime {
         const started = performance.now();
         try {
           if (this.config.remoteRecords) {
-            const query = recallQuery(activeEvents(this.journal.events));
-            const anchor = activeEvents(this.journal.events).findLast((e) =>
-              e.kind === "model_response" || e.kind === "tool_result" ||
-              e.kind === "notice" && (e.data as { source?: string }).source !== "memory"
-            )?.seq ?? 0;
-            const lastRecall = activeEvents(this.journal.events).findLast((e) =>
-              e.kind === "notice" && (e.data as { source?: string }).source === "memory"
+            const events = this.journal.events;
+            const query = recallQuery(activeEvents(events));
+            const anchor = Math.max(
+              lastActiveRecoveryFact(events, "model_response")?.seq ?? 0,
+              lastActiveRecoveryFact(events, "tool_result")?.seq ?? 0,
+              lastActiveRecoveryFact(events, "notice", (data) => data.source !== "memory")?.seq ??
+                0,
             );
-            if (query && (lastRecall?.data as { anchor?: number } | undefined)?.anchor !== anchor) {
+            const lastRecall = lastActiveRecoveryFact(
+              events,
+              "notice",
+              (data) => data.source === "memory",
+            );
+            if (query && lastRecall?.data.anchor !== anchor) {
               let recalled: { items: Json[]; related?: Json[]; guidance?: string };
               try {
                 recalled = await this.ctx.call("memory", "recall", {

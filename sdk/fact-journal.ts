@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { canonical, fingerprint } from "../kernel/calls.ts";
 import { type Json, KernelError } from "../kernel/protocol.ts";
@@ -20,6 +21,19 @@ const PAGE_BYTES = 8_388_608;
 // Rendering a turn needs a few recent passes, not a second 64 MiB history heap.
 const READ_CACHE_BYTES = 8_388_608;
 const CHUNK_RECORDS = 4096;
+const CHECKPOINT_INTERVAL = 1024;
+const MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024;
+interface FactCheckpointProfile {
+  version: string;
+  project(event: FactEvent): Json;
+}
+interface FactCheckpoint {
+  schema: 1;
+  profile: string;
+  through: number;
+  digests: string[];
+  projection: Json[];
+}
 function filename(seq: number) {
   return `${String(seq).padStart(16, "0")}.json`;
 }
@@ -37,6 +51,9 @@ const journals = new WeakMap<FactEvent[], FactJournal>();
 export function withFactReadCache<T>(events: FactEvent[], operation: () => T): T {
   const journal = journals.get(events);
   return journal ? journal.withReadCache(operation) : operation();
+}
+export function factProjectionAt(events: FactEvent[], index: number): Json | undefined {
+  return journals.get(events)?.projectionAt(index);
 }
 /**
  * 原件只追加。常驻索引每条仅 32 字节摘要，不保留所有历史正文。
@@ -58,6 +75,10 @@ export class FactJournal {
   }
   #digests: Uint8Array[] = [];
   #count = 0;
+  #projection: Json[] = [];
+  #checkpointThrough = 0;
+  #checkpointAttemptThrough = 0;
+  #checkpointWork?: Promise<void>;
   #lock?: Deno.FsFile;
   #failed = false;
   #failure?: KernelError;
@@ -70,7 +91,7 @@ export class FactJournal {
   #closing = false;
   #initializing = false;
   #initializationFinished?: Promise<void>;
-  constructor(readonly directory: string) {
+  constructor(readonly directory: string, readonly checkpoint?: FactCheckpointProfile) {
     this.events = new Proxy(this.#view, {
       get: (target, property, receiver) => {
         if (property === "length") return this.#count;
@@ -122,6 +143,10 @@ export class FactJournal {
   get available() {
     return this.#lock !== undefined && !this.#failed && !this.#closed;
   }
+  projectionAt(index: number): Json | undefined {
+    if (this.#failure) throw this.#failure;
+    return this.#projection[index];
+  }
   #digest(seq: number) {
     if (seq === 0) return ZERO;
     const offset = (seq - 1) % CHUNK_RECORDS * 32;
@@ -131,11 +156,90 @@ export class FactJournal {
     ).join("");
   }
   #index(event: FactEvent) {
+    if (this.checkpoint) this.#projection.push(this.checkpoint.project(event));
     const chunk = Math.floor(this.#count / CHUNK_RECORDS);
     this.#digests[chunk] ??= new Uint8Array(CHUNK_RECORDS * 32);
     const bytes = Uint8Array.from(event.digest.match(/../g)!, (hex) => parseInt(hex, 16));
     this.#digests[chunk].set(bytes, this.#count % CHUNK_RECORDS * 32);
     this.#count++;
+  }
+  async #readOriginal(seq: number) {
+    const path = `${this.directory}/events/${filename(seq)}`;
+    const stat = await Deno.lstat(path);
+    if (!stat.isFile || stat.isSymlink || stat.size > MAX_RECORD_BYTES) {
+      throw new Error("invalid file");
+    }
+    return await Deno.readTextFile(path);
+  }
+  async #restoreCheckpoint(count: number) {
+    const path = `${this.directory}/index-checkpoint.json`;
+    try {
+      const stat = await Deno.lstat(path);
+      if (!stat.isFile || stat.isSymlink || stat.size > MAX_CHECKPOINT_BYTES) return;
+      const { state, checksum } = JSON.parse(await Deno.readTextFile(path)) as {
+        state: FactCheckpoint;
+        checksum: string;
+      };
+      if (
+        state?.schema !== 1 || state.profile !== this.checkpoint?.version ||
+        !Number.isSafeInteger(state.through) || state.through < 1 || state.through > count ||
+        !Array.isArray(state.digests) ||
+        state.digests.length !== Math.ceil(state.through / CHUNK_RECORDS) ||
+        !Array.isArray(state.projection) || state.projection.length !== state.through ||
+        checksum !== createHash("sha256").update(JSON.stringify(state)).digest("hex")
+      ) return;
+      const digests = state.digests.map((encoded, index) => {
+        const length = Math.min(CHUNK_RECORDS, state.through - index * CHUNK_RECORDS) * 32;
+        if (typeof encoded !== "string" || encoded.length !== Math.ceil(length / 3) * 4) {
+          throw new Error("invalid checkpoint digest length");
+        }
+        const decoded = Buffer.from(encoded, "base64");
+        if (decoded.length !== length) throw new Error("invalid checkpoint digest chunk");
+        const chunk = new Uint8Array(CHUNK_RECORDS * 32);
+        chunk.set(decoded);
+        return chunk;
+      });
+      this.#digests = digests;
+      const anchor = this.#validate(
+        await this.#readOriginal(state.through),
+        state.through,
+        this.#digest(state.through - 1),
+      );
+      if (anchor.digest !== this.#digest(state.through)) throw new Error("checkpoint anchor");
+      this.#projection = state.projection;
+      this.#count = this.#checkpointThrough = state.through;
+    } catch {
+      this.#digests = [];
+    }
+  }
+  async #writeCheckpoint() {
+    if (!this.checkpoint || !this.available || this.#count === this.#checkpointThrough) return;
+    const through = this.#count;
+    this.#checkpointAttemptThrough = through;
+    const path = `${this.directory}/index-checkpoint.json`;
+    const temporary = `${path}.tmp`;
+    try {
+      const state: FactCheckpoint = {
+        schema: 1,
+        profile: this.checkpoint.version,
+        through,
+        digests: this.#digests.map((chunk, index) =>
+          Buffer.from(chunk.subarray(0, Math.min(CHUNK_RECORDS, through - index * CHUNK_RECORDS) * 32))
+            .toString("base64")
+        ),
+        projection: this.#projection,
+      };
+      const contents = JSON.stringify(state);
+      const checksum = createHash("sha256").update(contents).digest("hex");
+      const bytes = new TextEncoder().encode(`{"state":${contents},"checksum":"${checksum}"}\n`);
+      if (bytes.length > MAX_CHECKPOINT_BYTES) return;
+      await Deno.remove(temporary).catch(() => {});
+      await Deno.writeFile(temporary, bytes, { createNew: true, mode: 0o600 });
+      await Deno.rename(temporary, path);
+      this.#checkpointThrough = through;
+    } catch {
+      await Deno.remove(temporary).catch(() => {});
+    }
   }
   #validate(raw: string, seq: number, previous: string): FactEvent {
     const event: FactEvent = JSON.parse(raw);
@@ -237,26 +341,28 @@ export class FactJournal {
       this.#lock = lock;
       this.#recovery.phase = "counting";
       let count = 0;
+      let maximum = 0;
       for await (const entry of Deno.readDir(`${this.directory}/events`)) {
         if (!entry.isFile || !/^\d{16}\.json$/.test(entry.name)) {
           throw new KernelError("corrupt", "事实日志有未完成或未知记录，原件保留");
         }
+        const sequence = Number(entry.name.slice(0, -5));
+        if (!Number.isSafeInteger(sequence) || sequence < 1) {
+          throw new KernelError("corrupt", "事实日志序号无效，原件保留");
+        }
+        maximum = Math.max(maximum, sequence);
         count++;
       }
-      this.#recovery = { phase: "reading", read: 0, total: count };
+      if (maximum !== count) throw new KernelError("corrupt", "事实日志存在缺失原件");
+      if (this.checkpoint && !replay && count) await this.#restoreCheckpoint(count);
+      this.#recovery = { phase: "reading", read: this.#count, total: count };
       // Bounded prefetch overlaps filesystem waits. Validate and project in chain order;
       // never retain the complete history or release the lock with unfinished reads.
-      for (let start = 1; start <= count; start += 4) {
+      for (let start = this.#count + 1; start <= count; start += 4) {
         const reads = await Promise.allSettled(
-          Array.from({ length: Math.min(4, count - start + 1) }, async (_, offset) => {
-            const seq = start + offset;
-            const path = `${this.directory}/events/${filename(seq)}`;
-            const stat = await Deno.lstat(path);
-            if (!stat.isFile || stat.isSymlink || stat.size > MAX_RECORD_BYTES) {
-              throw new Error("invalid file");
-            }
-            return await Deno.readTextFile(path);
-          }),
+          Array.from({ length: Math.min(4, count - start + 1) }, (_, offset) =>
+            this.#readOriginal(start + offset)
+          ),
         );
         for (let offset = 0; offset < reads.length; offset++) {
           const read = reads[offset];
@@ -268,8 +374,9 @@ export class FactJournal {
           this.#recovery.read = seq;
         }
         // Keep status, shutdown and other services responsive during long recovery.
-        if (this.#recovery.read % 128 === 0) await new Promise((r) => setTimeout(r, 0));
+        if ((start - 1) % 128 < 4) await new Promise((resolve) => setTimeout(resolve, 0));
       }
+      await this.#writeCheckpoint();
       this.#recovery.phase = "ready";
     } catch (error) {
       this.#recovery.phase = "failed";
@@ -355,12 +462,23 @@ export class FactJournal {
       throw this.#fail(new KernelError("storage", `事实日志存盘失败（${category}），保留原件`));
     }
     this.#index(event);
+    if (
+      this.checkpoint && !this.#checkpointWork &&
+      this.#count - Math.max(this.#checkpointThrough, this.#checkpointAttemptThrough) >=
+        CHECKPOINT_INTERVAL
+    ) {
+      this.#checkpointWork = this.#writeCheckpoint().finally(() => {
+        this.#checkpointWork = undefined;
+      });
+    }
     return structuredClone(event);
   }
   async close() {
     this.#closing = true;
     await this.#initializationFinished;
     await this.#tail;
+    await this.#checkpointWork;
+    await this.#writeCheckpoint();
     this.#closed = true;
     this.#lock?.close();
     this.#lock = undefined;
