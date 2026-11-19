@@ -86,12 +86,26 @@ export class JobObservations {
     }
     if (event.kind !== "tool_result") return;
     const result = object(data.result);
-    if (result?.status !== "completed" || typeof result.output !== "string") return;
+    if (!result || typeof result.output !== "string") return;
     let summary: Record<string, Json> | undefined;
     try {
       summary = object(JSON.parse(result.output));
     } catch { /* Not a structured job receipt. */ }
     if (!summary) return;
+    if (!Object.hasOwn(result, "status")) {
+      // Historical admissions lacked the outer ToolResult completion status. Keep
+      // their bare nonterminal handle visible as an unverified report, not a live
+      // job observation or retirement proof. Never unwrap nested script output.
+      if (
+        Object.keys(result).length === 1 &&
+        Object.keys(summary).every((key) => ["jobId", "status"].includes(key)) &&
+        typeof summary.jobId === "string" && !!summary.jobId &&
+        typeof summary.status === "string" &&
+        ["queued", "checking", "running"].includes(summary.status)
+      ) this.#report(summary.jobId, summary.status, event);
+      return;
+    }
+    if (result.status !== "completed") return;
     this.#remember(summary, event, "tool_receipt");
     const page = object(summary.result);
     // Only the documented completed script envelope and a whole first result page.

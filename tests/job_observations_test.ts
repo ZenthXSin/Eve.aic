@@ -695,3 +695,20 @@ Deno.test("script reports are bounded latest clues and preserve replay without c
   ]);
   assertReplay(projection, events);
 });
+
+Deno.test("legacy bare admission handle remains visible without becoming a trusted observation", () => {
+  const projection = new JobObservations();
+  projection.observe(
+    event(1, { result: { output: JSON.stringify({ jobId: "waiting-helper", status: "queued" }) } }),
+  );
+  assert.equal(projection.jobs.has("waiting-helper"), false);
+  assert.equal(projection.jobs.scriptReports.get("waiting-helper")?.reportedStatus, "queued");
+  assert.ok(continuityMessage([], projection.jobs).content.includes("waiting-helper"));
+  projection.observe(
+    event(2, {
+      result: { output: JSON.stringify({ jobId: "waiting-helper", status: "completed" }) },
+    }),
+  );
+  assert.equal(projection.jobs.has("waiting-helper"), false);
+  assert.equal(projection.jobs.scriptReports.get("waiting-helper")?.reportedStatus, "queued");
+});
