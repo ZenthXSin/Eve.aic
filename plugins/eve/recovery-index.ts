@@ -97,6 +97,17 @@ function project(event: ConsciousEvent): FactProjection {
 
 export const eveHistoryCheckpoint = { version: "eve-history-v1", project };
 
+/** Active membership needs only headers (and rollback ranges), not recovery bodies.
+ * Without a checkpoint, leave data lazy so compressed model/tool originals are
+ * never projected merely to discover their kind. Full recovery still uses eveFactAt. */
+export function eveEventHeaderAt(events: ConsciousEvent[], position: number) {
+  const saved = factProjectionAt(events, position) as FactProjection | undefined;
+  if (saved === undefined) return events[position];
+  return typeof saved === "string"
+    ? { kind: saved, seq: position + 1, data: EMPTY }
+    : { kind: saved[0], seq: position + 1, data: saved[1] };
+}
+
 export function eveFactAt(events: ConsciousEvent[], position: number) {
   const saved = factProjectionAt(events, position) as FactProjection | undefined;
   const event = saved === undefined ? events[position] : undefined;

@@ -3,7 +3,7 @@ import { type Json, KernelError } from "../../kernel/protocol.ts";
 import { withFactReadCache } from "../../sdk/fact-journal.ts";
 import { imageTextView } from "../../sdk/image-text.ts";
 import type { ConsciousEvent } from "./journal.ts";
-import { eveFactAt } from "./recovery-index.ts";
+import { eveEventHeaderAt, eveFactAt } from "./recovery-index.ts";
 import { projectThoughts, withoutThought } from "./thoughts.ts";
 
 interface ActiveIndex {
@@ -102,7 +102,7 @@ export function activeEvents(events: ConsciousEvent[]): ConsciousEvent[] {
     index = current;
   }
   for (let i = index.scanned; i < events.length; i++) {
-    const event = eveFactAt(events, i);
+    const event = eveEventHeaderAt(events, i);
     if (event.kind === "upgrade_rollback") {
       const range = event.data as { afterSeq: number; throughSeq: number };
       if (
