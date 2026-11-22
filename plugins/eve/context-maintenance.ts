@@ -2,12 +2,12 @@ import type { ModelResponse } from "../../contracts/model.ts";
 import type { ConsciousEvent } from "./journal.ts";
 import { activeEvents, lastActiveEvent } from "./view.ts";
 
-export const CONTEXT_TARGET_TOKENS = 270_000;
-export const CONTEXT_REMINDER_TOKENS = 200_000;
-export const CONTEXT_RETAIN_TARGET_TOKENS = 100_000;
+export const CONTEXT_TARGET_TOKENS = 140_000;
+export const CONTEXT_REMINDER_TOKENS = 100_000;
+export const CONTEXT_RETAIN_TARGET_TOKENS = 45_000;
 export const CONTEXT_SUMMARY_RESERVE_TOKENS = 4_000;
-export const CONTEXT_PROJECTION_EMERGENCY_TOKENS = CONTEXT_TARGET_TOKENS + 30_000;
-export const CONTEXT_PROJECTION_MIN_SAVING_TOKENS = 30_000;
+export const CONTEXT_PROJECTION_EMERGENCY_TOKENS = CONTEXT_TARGET_TOKENS + 20_000;
+export const CONTEXT_PROJECTION_MIN_SAVING_TOKENS = 15_000;
 
 /** A reported input only describes the view actually sent, not a later compression or release. */
 export function currentProviderInput(events: ConsciousEvent[], sourceCommit?: string) {
@@ -71,8 +71,8 @@ export function contextMaintenanceState(
   const reminder = level === "normal"
     ? null
     : level === "urgent"
-    ? "上下文已达到270k整理线：先完成眼前必要回复，再一次整理到约100k，保留最新往来、自己已说的话、承诺和子代理任务；宿主在同次整理中固定历史投影，随后复用缓存。"
-    : "上下文已达到200k预提醒线：先保留稳定请求前缀，继续当前阶段；只准备摘要要点，不因预提醒或睡前就压缩。约270k时再一次整理到约100k；原件保留。";
+    ? "上下文已到140k整理线：忙完手头这句后一次压缩到约45k，只留近期往来、承诺和进行中的任务。"
+    : "上下文已到100k提醒线：正常继续，接近140k时再压缩到约45k。";
   return {
     level,
     estimatedTokens,

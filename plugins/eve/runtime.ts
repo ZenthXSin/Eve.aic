@@ -1,3 +1,4 @@
+import { factProjectionAt } from "../../sdk/fact-journal.ts";
 import { JobObservations } from "./job-observations.ts";
 import { READ_SCRIPT_TOOL, readScript } from "./script-reader.ts";
 import { MOMENT_TOOL, planMoment } from "./life.ts";
@@ -598,10 +599,20 @@ export class EveRuntime {
           mode: string;
           summary?: string;
         };
-        const result = this.journal.events.find((e) =>
-          e.kind === "tool_result" &&
-          (e.data as { callId: string }).callId === `eve_${args.responseSeq}_${args.toolIndex}`
-        );
+        const targetCallId = `eve_${args.responseSeq}_${args.toolIndex}`;
+        let result: ConsciousEvent | undefined;
+        const all = this.journal.events;
+        for (let i = all.length - 1; i >= 0; i--) {
+          const proj = factProjectionAt(all, i) as { kind?: string } | undefined;
+          if (proj && proj.kind !== "tool_result") continue;
+          const ev = all[i];
+          if (
+            ev.kind === "tool_result" && (ev.data as { callId: string }).callId === targetCallId
+          ) {
+            result = ev;
+            break;
+          }
+        }
         if (result) await this.journal.append("retain", event.args);
         else outcome = { status: "rejected", reason: "对应工具回执尚未确认，未修改当前视图" };
       }
@@ -623,10 +634,16 @@ export class EveRuntime {
       if (wakeAt !== undefined) this.#wake = wakeAt;
     }
     if (events.items.length) {
-      await this.ctx.call("mind", "update", {
-        lastControls: this.journal.events.filter((event) => event.kind === "mind_applied").slice(-8)
-          .map((event) => event.data),
-      });
+      const lastControls: Json[] = [];
+      const all = this.journal.events;
+      for (let i = all.length - 1; i >= 0 && lastControls.length < 8; i--) {
+        const proj = factProjectionAt(all, i) as { kind?: string } | undefined;
+        if (proj && proj.kind !== "mind_applied") continue;
+        const ev = all[i];
+        if (ev.kind === "mind_applied") lastControls.push(ev.data);
+      }
+      lastControls.reverse();
+      await this.ctx.call("mind", "update", { lastControls });
     }
     return fresh;
   }

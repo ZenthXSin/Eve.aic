@@ -305,8 +305,7 @@ export function socialContext(events: ConsciousEvent[]) {
       ? {
         conversations: {
           ...conversations,
-          guidance:
-            "上次聊天的接续线索；close只表示那段结束，新消息照常回应，不为收尾补一句。无变化不改写。",
+          guidance: "聊天接续：close只结束那一段，新消息照常回应；不补收尾句，无变化不改写。",
         },
       }
       : {}),
@@ -314,8 +313,7 @@ export function socialContext(events: ConsciousEvent[]) {
       ? {
         outreach: {
           recent: outreach.slice(-4),
-          guidance:
-            "这是主动开话题的原尝试记录，不等于送达或对方赞同；只有真实反馈才调整对应重心，沉默就先放下。",
+          guidance: "主动搭话尝试，不证明送达或赞同；真实反馈才调整对应重心，沉默先放下。",
         },
       }
       : {}),

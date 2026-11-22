@@ -213,7 +213,7 @@ export function presentContext(
               ...(script.status === "failed"
                 ? {
                   recovery:
-                    "脚本任务失败，本次读取完成不等于任务成功。具体错误见receipt.output.error；参数rejected先查契约并修正，不能据此判定整条链路不可用。脚本可能已执行部分动作，先查原动作回执，再继续未完成部分或委派；重复read_script不会修复同一个已失败任务。",
+                    "任务失败，读取完成不等于任务成功；详见receipt.output.error。参数rejected先查契约并修正，不能判定整条链路不可用；脚本可能部分执行，先查原动作回执再继续或委派，不要重复read_script同一个失败任务。",
                 }
                 : {}),
               ...(script.status === "completed" ? {} : {

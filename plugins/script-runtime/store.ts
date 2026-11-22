@@ -8,6 +8,7 @@ import type {
   ScriptTiming,
 } from "../../contracts/script.ts";
 import { createHash } from "node:crypto";
+import { basename, dirname, resolve } from "node:path";
 import { canonical } from "../../kernel/calls.ts";
 import { FactJournal } from "../../sdk/fact-journal.ts";
 import { writeDurableJson } from "../../sdk/durable-json.ts";
@@ -67,6 +68,16 @@ interface Commit {
   completions: { index: number; ref: ObjectRef }[];
   legacyDigest?: string;
 }
+interface IndexSnapshot {
+  schema: 1;
+  ledger: string;
+  through: number;
+  anchor: string;
+  jobs: ObjectRef[];
+  completions: ObjectRef[];
+  jobIds: (string | null)[];
+}
+const SNAPSHOT_LIMIT = 32 * 1024 * 1024;
 const MARKER = { schema: 2, layout: "content-addressed-journal-v1" };
 const OBJECT_LIMIT = 67_108_864;
 const NODE_LIMIT = 65_536;
@@ -213,6 +224,79 @@ export class ScriptStore {
   #jobLookup = new Map<string, number>();
   #jobIds: (string | undefined)[] = [];
   #fields = new WeakMap<object, Map<PropertyKey, Encoded>>();
+  #snapshotMatched = false;
+  /** Disposable sibling cache, never part of the authoritative ledger whitelist. */
+  get snapshotDirectory(): string {
+    const ledger = resolve(this.directory);
+    return dirname(ledger) + "/" + basename(ledger) + "-cache";
+  }
+  get snapshotMatched(): boolean {
+    return this.#snapshotMatched;
+  }
+  async #loadSnapshot(): Promise<IndexSnapshot | undefined> {
+    try {
+      const directory = await Deno.lstat(this.snapshotDirectory);
+      if (!directory.isDirectory || directory.isSymlink) return;
+      const path = this.snapshotDirectory + "/snapshot.json";
+      const stat = await Deno.lstat(path);
+      if (!stat.isFile || stat.isSymlink || stat.size > SNAPSHOT_LIMIT) return;
+      const { state, digest } = JSON.parse(await Deno.readTextFile(path)) as {
+        state: IndexSnapshot;
+        digest: string;
+      };
+      if (
+        state?.schema !== 1 || state.ledger !== resolve(this.directory) ||
+        !Number.isSafeInteger(state.through) || state.through < 0 ||
+        state.through !== this.#commits.count ||
+        !/^[a-f0-9]{64}$/.test(state.anchor) ||
+        !Array.isArray(state.jobs) || !state.jobs.every(reference) ||
+        !Array.isArray(state.completions) || !state.completions.every(reference) ||
+        !Array.isArray(state.jobIds) || state.jobIds.length !== state.jobs.length ||
+        !state.jobIds.every((id) => id === null || typeof id === "string") ||
+        digest !== hash(state as unknown as Json)
+      ) return;
+      // A checksum detects damage, not authority. Reconcile all refs after replay below.
+      const anchor = state.through
+        ? this.#commits.events[state.through - 1].digest
+        : "0".repeat(64);
+      if (state.anchor !== anchor) return;
+      return state;
+    } catch {
+      // Missing, malformed, oversized, or inaccessible caches always fall back.
+      return;
+    }
+  }
+  async #saveSnapshot(): Promise<void> {
+    if (this.#failed) return;
+    try {
+      await Deno.mkdir(this.snapshotDirectory, { mode: 0o700 });
+    } catch (error) {
+      if (!(error instanceof Deno.errors.AlreadyExists)) return;
+    }
+    try {
+      const stat = await Deno.lstat(this.snapshotDirectory);
+      if (!stat.isDirectory || stat.isSymlink) return;
+      const state: IndexSnapshot = {
+        schema: 1,
+        ledger: resolve(this.directory),
+        through: this.#commits.count,
+        anchor: this.#commits.count
+          ? this.#commits.events[this.#commits.count - 1].digest
+          : "0".repeat(64),
+        jobs: this.#jobs,
+        completions: this.#completions,
+        jobIds: Array.from(
+          { length: this.#jobs.length },
+          (_, index) => this.#jobIds[index] ?? null,
+        ),
+      };
+      const value = { state, digest: hash(state as unknown as Json) };
+      if (new TextEncoder().encode(JSON.stringify(value)).length + 1 > SNAPSHOT_LIMIT) return;
+      await writeDurableJson(this.snapshotDirectory + "/snapshot.json", value);
+    } catch {
+      // Cache persistence must not turn a successful fact commit into a failure.
+    }
+  }
   constructor(readonly directory: string) {
     this.#commits = new FactJournal(`${directory}/commits`);
   }
@@ -560,6 +644,7 @@ export class ScriptStore {
         legacy &&
         (legacy.schema !== 1 || !Array.isArray(legacy.jobs) || !Array.isArray(legacy.completions))
       ) throw new Error("invalid legacy");
+      const snapshot = await this.#loadSnapshot();
       for (const event of this.#commits.events) {
         if (event.kind !== "script_commit") throw new Error("invalid commit kind");
         const envelope = event.data as unknown as { schema: number; commit: ObjectRef };
@@ -595,6 +680,11 @@ export class ScriptStore {
       ) {
         throw new Error("legacy original missing or changed");
       }
+      // Even a correctly checksummed/anchored snapshot cannot replace authoritative replay.
+      this.#snapshotMatched = !!snapshot &&
+        canonical(snapshot.jobs as unknown as Json) === canonical(this.#jobs as unknown as Json) &&
+        canonical(snapshot.completions as unknown as Json) ===
+          canonical(this.#completions as unknown as Json);
       // 遍历并校验当前可达原件；不在内存保留正文，缺失引用不能启动成另一本账。
       const verified = new Set<string>();
       const verify = (ref: ObjectRef, stringOnly = false) => {
@@ -635,7 +725,17 @@ export class ScriptStore {
         visit(encoded as Encoded);
       };
       for (const ref of [...this.#jobs, ...this.#completions]) verify(ref);
+      if (this.#snapshotMatched && snapshot) {
+        // Prime lookup from fully checked metadata, not from cached job IDs.
+        // All reads still go through #readObject (type, symlink, exact size, hash).
+        for (let index = 0; index < this.#jobs.length; index++) {
+          if (snapshot.jobIds[index] === null) continue;
+          const job = this.#readJob(this.#jobs[index], index, false);
+          if (job.jobId !== snapshot.jobIds[index]) this.#snapshotMatched = false;
+        }
+      }
       this.#lock = lock;
+      await this.#saveSnapshot();
     } catch (error) {
       await this.#commits.close().catch(() => {});
       lock?.close();
@@ -720,6 +820,7 @@ export class ScriptStore {
     this.#closing = true;
     await this.#initializationFinished;
     await this.#tail;
+    await this.#saveSnapshot();
     this.#closed = true;
     await this.#commits.close().catch((error) => {
       this.#failed = true;

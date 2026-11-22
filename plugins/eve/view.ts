@@ -620,7 +620,7 @@ export function mechanicalCompression(
 ) {
   events = activeEvents(events);
   if (contextEstimate(render(events, prompt), tools, counter) < 500_000) return;
-  const previous = events.filter((event) => event.kind === "compression").at(-1);
+  const previous = lastActiveEvent(events, "compression");
   let throughSeq = Number((previous?.data as { throughSeq?: number } | undefined)?.throughSeq ?? 0);
   const candidates = blocks(events, throughSeq);
   let tailEstimate = estimate(candidates.flatMap((block) => block.messages));

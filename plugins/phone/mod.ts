@@ -86,6 +86,94 @@ function relationships(value: Json, ownerId?: string): Json {
   return value;
 }
 
+function compactMessage(raw: Json): Json {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const m = raw as Record<string, Json>;
+  const handle = m.handle as Record<string, Json> | undefined;
+  const sender = m.sender as Record<string, Json> | undefined;
+  const displayName = sender?.displayName as Record<string, Json> | undefined;
+  const time = m.time as Record<string, Json> | undefined;
+  const displayBody = m.displayBody as Record<string, Json> | undefined;
+  const body = (displayBody ?? m.body) as Record<string, Json> | undefined;
+  const atts = Array.isArray(m.attachments)
+    ? m.attachments.map((a) => {
+      if (!a || typeof a !== "object" || Array.isArray(a)) return a;
+      const item = a as Record<string, Json>;
+      const dl = item.download as Record<string, Json> | undefined;
+      const name = item.name as Record<string, Json> | undefined;
+      return {
+        i: item.index,
+        kind: item.kind,
+        ...(name?.text ? { name: name.text } : {}),
+        ...(dl?.state ? { dl: dl.state } : {}),
+      };
+    })
+    : [];
+  const ref = m.reference as Record<string, Json> | undefined;
+  const refTarget = ref?.target as Record<string, Json> | undefined;
+  const delivery = m.delivery as Record<string, Json> | undefined;
+  return {
+    seq: handle?.seq ?? null,
+    ...(handle?.conversationId ? { conversationId: handle.conversationId } : {}),
+    ...(sender?.platformUserId ? { platformUserId: sender.platformUserId } : {}),
+    ...(time?.status && time.status !== "known" ? { timeStatus: time.status } : {}),
+    ...(m.mentions ? { mentions: m.mentions } : {}),
+    ...(m.chatStyle ? { chatStyle: m.chatStyle } : {}),
+    ...(ref && !refTarget ? { reference: ref } : {}),
+    ...(time?.age ? { age: time.age } : time?.at ? { at: time.at } : {}),
+    who: displayName?.text ?? sender?.platformUserId ?? "?",
+    rel: sender?.relationship ?? "other",
+    ...(m.direction === "outgoing" ? { out: true } : {}),
+    text: body?.text ?? "",
+    ...(body?.truncated === true ? { truncated: true, chars: body.characters } : {}),
+    ...(atts.length ? { atts } : {}),
+    ...(refTarget?.seq ? { replyToSeq: refTarget.seq } : {}),
+    ...(delivery ? { delivery } : {}),
+  } as Json;
+}
+
+function compactPhoneScreen(method: string, value: Json): Json {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const v = value as Record<string, Json>;
+  if (method === "conversations" && Array.isArray(v.items)) {
+    const { items: _items, ...metadata } = v;
+    return {
+      ...metadata,
+      items: v.items.map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+        const c = item as Record<string, Json>;
+        const settings = c.settings as Record<string, Json> | undefined;
+        return {
+          id: c.conversationId,
+          ...(c.alias ? { alias: c.alias } : {}),
+          ...(c.platformName ? { name: c.platformName } : c.remark ? { name: c.remark } : {}),
+          kind: c.kind,
+          pend: c.pendingNotifications ?? 0,
+          ...(settings?.muted ? { muted: true } : {}),
+          ...(settings?.pinned ? { pinned: true } : {}),
+          latest: compactMessage(c.latest),
+        } as Json;
+      }),
+      ...(v.older ? { older: v.older } : {}),
+    };
+  }
+  if (Array.isArray(v.messages)) {
+    const { messages: _messages, ...metadata } = v;
+    const first = v.messages[0] as Record<string, Json> | undefined;
+    const firstHandle = first?.handle as Record<string, Json> | undefined;
+    return {
+      ...(firstHandle?.conversationId ? { conversationId: firstHandle.conversationId } : {}),
+      ...metadata,
+      count: v.messages.length,
+      ...(v.earlierMessagesNotShown !== undefined ? { earlier: v.earlierMessagesNotShown } : {}),
+      messages: v.messages.map(compactMessage),
+      ...(v.older ? { older: v.older } : {}),
+      ...(v.chatStyle ? { chatStyle: v.chatStyle } : {}),
+    };
+  }
+  return value;
+}
+
 export function createPhonePlugin(configPath: string) {
   let client: PhoneRpcClient | undefined;
   let ownerId: string | undefined;
@@ -146,8 +234,19 @@ export function createPhonePlugin(configPath: string) {
               download: raw.download,
             };
           }
-          const screen = relationships(await client.call(method, args), ownerId);
-          return chatStyle.project(method, screen);
+          const objArgs = args && typeof args === "object" && !Array.isArray(args)
+            ? args as Record<string, Json>
+            : undefined;
+          const brief = objArgs?.brief === true &&
+            ["open", "history", "conversations", "search"].includes(method);
+          let forwardArgs = args;
+          if (objArgs && Object.hasOwn(objArgs, "brief")) {
+            const { brief: _brief, ...rest } = objArgs;
+            forwardArgs = rest;
+          }
+          const screen = relationships(await client.call(method, forwardArgs), ownerId);
+          const projected = chatStyle.project(method, screen);
+          return brief ? compactPhoneScreen(method, projected) : projected;
         };
       }
       ctx.provide(PHONE, handlers);

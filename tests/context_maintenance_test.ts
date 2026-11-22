@@ -21,52 +21,52 @@ Deno.test("整理提醒：实测输入触线，四轮或15分钟重复；整理�
   };
   try {
     await journal.initialize();
-    await model(280_000);
-    let state = contextMaintenanceState(journal.events, 100_000, commit);
+    await model(150_000);
+    let state = contextMaintenanceState(journal.events, 45_000, commit);
     assert.equal(state.level, "urgent");
     assert.equal(state.due, true);
     const perception = await journal.append("perception", { contextMaintenance: state });
-    assert.equal(contextMaintenanceState(journal.events, 100_000, commit).due, false);
-    for (let i = 0; i < 3; i++) await model(280_000);
-    assert.equal(contextMaintenanceState(journal.events, 100_000, commit).due, false);
+    assert.equal(contextMaintenanceState(journal.events, 45_000, commit).due, false);
+    for (let i = 0; i < 3; i++) await model(150_000);
+    assert.equal(contextMaintenanceState(journal.events, 45_000, commit).due, false);
     assert.equal(
-      contextMaintenanceState(journal.events, 100_000, commit, Date.parse(perception.at) + 900_000)
+      contextMaintenanceState(journal.events, 45_000, commit, Date.parse(perception.at) + 900_000)
         .due,
       true,
     );
-    await model(280_000);
-    assert.equal(contextMaintenanceState(journal.events, 100_000, commit).due, true);
+    await model(150_000);
+    assert.equal(contextMaintenanceState(journal.events, 45_000, commit).due, true);
     await journal.append("compression", { throughSeq: 1, summary: "承接" });
-    state = contextMaintenanceState(journal.events, 95_000, commit);
+    state = contextMaintenanceState(journal.events, 40_000, commit);
     assert.equal(state.providerInput?.currentView, false);
     assert.equal(state.level, "normal");
     assert.equal(state.due, false);
-    await model(205_000);
-    assert.equal(contextMaintenanceState(journal.events, 100_000, commit).level, "due");
-    assert.equal(contextMaintenanceState(journal.events, 100_000, "new-release").level, "normal");
+    await model(105_000);
+    assert.equal(contextMaintenanceState(journal.events, 45_000, commit).level, "due");
+    assert.equal(contextMaintenanceState(journal.events, 45_000, "new-release").level, "normal");
     await model(0);
-    assert.equal(contextMaintenanceState(journal.events, 200_000, commit).level, "due");
+    assert.equal(contextMaintenanceState(journal.events, 100_000, commit).level, "due");
   } finally {
     await journal.close();
     await Deno.remove(directory, { recursive: true });
   }
 });
 
-Deno.test("整理提醒：200k只准备一次，不每四轮催压缩；270k才要求整理", async () => {
+Deno.test("整理提醒：100k只准备一次，不每四轮催压缩；140k才要求整理", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-context-watch-" });
   const journal = new ConsciousJournal(directory);
   try {
     await journal.initialize();
-    const state = contextMaintenanceState(journal.events, 205_000);
+    const state = contextMaintenanceState(journal.events, 105_000);
     assert.equal(state.compressionDue, false);
     assert.equal(state.due, true);
-    assert.ok(state.reminder?.includes("不因预提醒或睡前就压缩"));
+    assert.ok(state.reminder?.includes("正常继续"));
     await journal.append("perception", { contextMaintenance: state });
     for (let i = 0; i < 5; i++) {
       await journal.append("model_response", { response: { content: "接着聊", toolCalls: [] } });
     }
-    assert.equal(contextMaintenanceState(journal.events, 260_000).due, false);
-    const urgent = contextMaintenanceState(journal.events, 270_000);
+    assert.equal(contextMaintenanceState(journal.events, 135_000).due, false);
+    const urgent = contextMaintenanceState(journal.events, 140_000);
     assert.equal(urgent.compressionDue, true);
     assert.equal(urgent.due, true);
   } finally {
@@ -75,7 +75,7 @@ Deno.test("整理提醒：200k只准备一次，不每四轮催压缩；270k才�
   }
 });
 
-Deno.test("整理建议：完整边界优先满足100k目标，保留最近片段，不切未完成工具批次", async () => {
+Deno.test("整理建议：完整边界优先满足45k目标，保留最近片段，不切未完成工具批次", async () => {
   const directory = await Deno.makeTempDir({ prefix: "eve-context-boundaries-" });
   const journal = new ConsciousJournal(directory);
   try {
@@ -89,8 +89,8 @@ Deno.test("整理建议：完整边界优先满足100k目标，保留最近片�
     const inspected = inspectContext(journal.events, "身份", [], { limit: 1 });
     const recommendation = inspected.recommendation;
     assert.ok(recommendation.candidate);
-    assert.equal(recommendation.candidate.throughSeq, 6);
-    assert.equal(recommendation.retainedRecentBlocks, 6);
+    assert.equal(recommendation.candidate.throughSeq, 10);
+    assert.equal(recommendation.retainedRecentBlocks, 2);
     assert.ok(recommendation.candidate.throughSeq < response.seq);
     assert.equal(inspected.totalCandidates, 12);
     assert.equal(inspected.candidates.length, 1, "建议不依赖第一页是否包含合适边界");

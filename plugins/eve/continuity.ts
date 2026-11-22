@@ -275,7 +275,8 @@ export function continuityMessage(
           const focus = lastActiveEvent(events, "focus");
           return {
             record: focus?.seq ?? 0,
-            items: (focus?.data as { items?: Json } | undefined)?.items ?? [],
+            items: ((focus?.data as { items?: FocusItem[] } | undefined)?.items ?? [])
+              .filter((item) => item.state === "active" || item.state === "parked"),
             guidance:
               "自己维护的近期重心，不要求填满。自己的兴趣与别人委托分开；新反馈只调整被明确提到的那一项，旧依据不重复强化。过期、没人接或失去兴趣可搁置，完成或放弃后不反复重提。",
           };
@@ -292,12 +293,25 @@ export function continuityMessage(
           "pendingJobs是最近已保存的任务观察，不代表必须继续工作。queued可能仅为派工准入回执，不代表仍在排队；observation.record/recordedAt是意识记录编号和回执保存时刻，不是实时快照时刻，null表示来源时刻缺失。只利用已有完整任务回执更新，不猜进度或子任务状态，不为刷新展示轮询。",
         unknownJobCount: unknown.length,
         ...socialContext(events),
-        moment: momentContext(events),
-        lanterns: lanternContext(events),
+        ...(() => {
+          const moment = momentContext(events), lanterns = lanternContext(events);
+          return {
+            ...("feeling" in moment ? { moment } : {}),
+            ...(lanterns.status === "playing" ? { lanterns } : {}),
+          };
+        })(),
         leisure:
           "醒来有空、没急事，这次还没看群时，通常先挑一个常聊且未静音的群，看看有没有新鲜事。不等被点名，有趣就接，真惦记后续就问一句具体的。没有新内容、很晚或想休息就跳过，不反复读同一屏、不催人回。空下来也可玩、续上次的兴趣或独处。不把意愿当成已做的事。",
         recentUnknownJobs: unknown.slice(-5).map(([jobId]) => jobId),
-        recentToolFailures: recentToolFailures(events, rest?.seq ?? 0),
+        recentToolFailures: recentToolFailures(events, rest?.seq ?? 0).map((item) => {
+          const failure = item as Record<string, Json>;
+          return {
+            ...failure,
+            error: typeof failure.error === "string" && failure.error.length > 160
+              ? failure.error.slice(0, 160) + "..."
+              : failure.error,
+          };
+        }),
         failureRecovery:
           "调用完成不等于任务成功；以task.status和具体error为准。参数拒绝先查契约并修正，不把单个失败当成整条链路坏了。失败脚本可能已经执行部分动作，先查原jobId/actionId回执；unknown不可重放。仍可完成的部分继续或委派，确实受阻才记录原因、下一步与合理唤醒时间。",
         ownActivity:
